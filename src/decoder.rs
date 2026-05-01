@@ -203,7 +203,7 @@ fn decode_non_idr_via_inter(
         }
     }
     // sps_admvp_flag = 0 → no temporal_mvp_assigned_flag.
-    let _slice_deblocking_filter_flag = br.u1()?;
+    let slice_deblocking_filter_flag = br.u1()? != 0;
     let slice_qp = br.u(6)?;
     if slice_qp > 51 {
         return Err(Error::invalid(format!(
@@ -240,6 +240,7 @@ fn decode_non_idr_via_inter(
         slice_qp: slice_qp as i32,
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
+        enable_deblock: slice_deblocking_filter_flag,
     };
     let ref_view = RefPictureView {
         y: &last.y,

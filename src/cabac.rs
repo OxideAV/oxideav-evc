@@ -447,12 +447,20 @@ impl CabacEncoder {
     }
 
     fn put_bit(&mut self, bit: u32) {
-        // First emitted bit is suppressed (HEVC convention; the decoder
-        // primes ivl_offset from a fixed-length read at startup, and the
-        // very first bit-emit is a known leading zero).
-        if self.first_bit_pending {
+        // The HEVC encoder convention is to suppress the *very first*
+        // emitted bit because the decoder pre-reads its 14-bit
+        // `ivl_offset` from byte zero and the first encoded bit is
+        // expected to be a leading 0 (initial low=0). Suppressing a
+        // leading 0 leaves the freshly-allocated byte buffer (all
+        // zeros) at the right value. Suppressing a leading 1 would lose
+        // information — that case happens when the very first emitted
+        // bit comes from `encode_bypass(1)`. We handle it explicitly
+        // by only suppressing 0-bits; a leading 1 is written through
+        // and the outstanding-bit dance still tracks correctly.
+        if self.first_bit_pending && bit == 0 {
             self.first_bit_pending = false;
         } else {
+            self.first_bit_pending = false;
             self.write_raw_bit(bit);
         }
         for _ in 0..self.outstanding {

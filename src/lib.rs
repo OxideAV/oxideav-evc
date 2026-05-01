@@ -1,7 +1,9 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-4 status: a working **Baseline-profile IDR + P + B** decoder
-//! (no residuals, single reference per list). The crate decomposes into:
+//! Round-5 status: a working **Baseline-profile IDR + P + B** decoder
+//! with residual coding (RLE + dequant + IDCT for nTbS up to 64),
+//! deblocking (§8.8.2 luma path), and a single reference per list. The
+//! crate decomposes into:
 //!
 //! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
 //! * [`nal`] — 2-byte NAL header (§7.3.1.2) + length-prefixed framing.
@@ -18,10 +20,10 @@
 //! * [`inter`] — round-4 inter prediction (§8.5): MV resolution + 8-tap
 //!   luma + 4-tap chroma sub-pel interpolation (Tables 25 / 27 — Baseline
 //!   subset only) + AMVP candidate construction + default-weighted bipred.
-//! * [`transform`] — inverse DCT-II for nTbS ∈ {2, 4, 8, 16, 32} (eq.
-//!   1062-1070). The 64-point matrix (eq. 1071-1076) is parked pending a
-//!   clean reading of the spec's `m`/`n` indexing; round-3 fixtures cap
-//!   `MaxTbLog2SizeY` at 5.
+//! * [`transform`] — inverse DCT-II for nTbS ∈ {2, 4, 8, 16, 32, 64}
+//!   (eq. 1062-1076). The 64-point matrix is built from the closed-form
+//!   `M[m][n] = round(64·√2·cos(π·m·(2n+1)/128))` (m≥1, M[0][n]=64),
+//!   verified against every printed entry of eq. 1072 / 1074.
 //! * [`dequant`] — scaling + transform + final renorm (§8.7.2 / §8.7.3 /
 //!   §8.7.4) for the `sps_iqt_flag == 0` Baseline path.
 //! * [`picture`] — yuv420p 8-bit picture buffer + per-CU intra
@@ -30,12 +32,12 @@
 //!   `Decoder` for Baseline IDR + P/B bitstreams (8-bit 4:2:0, no
 //!   residuals, single reference).
 //!
-//! Round-4 deliberate omissions (pending round 5):
+//! Round-5 deliberate omissions (pending follow-up rounds):
 //!
-//! * non-zero CBFs (residual coding fires `Error::Unsupported`),
 //! * 10-bit support,
-//! * deblocking (`slice_deblocking_filter_flag` must be 0),
-//! * 64×64 transform,
+//! * advanced deblocking (`sps_addb_flag = 1` — round-5 supports the
+//!   `sps_addb_flag = 0` baseline filter only; addb is a Main-profile
+//!   feature),
 //! * multi-reference + reference list reordering,
 //! * Main-profile syntax branches (BTT / SUCO / ADMVP / EIPD / IBC /
 //!   ATS / ADCC / ALF / DRA / cm_init / AMVR / MMVD / affine / DMVR / HMVP).
@@ -48,6 +50,7 @@
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
+pub mod deblock;
 pub mod decoder;
 pub mod dequant;
 pub mod inter;
@@ -285,6 +288,7 @@ pub fn decode_idr_slice(
         slice_qp,
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
+        enable_deblock: false, // round-3 fixtures keep deblock off
     };
     slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
 }
