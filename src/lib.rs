@@ -1,48 +1,58 @@
-//! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1)
-//! decoder foundation.
+//! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! This crate currently implements the **parser foundation** only:
+//! Round-3 status: a working **Baseline-profile IDR-only** decoder. The
+//! crate decomposes into:
 //!
-//! * [`bitreader`] — MSB-first bit reader with `u(n)` / `ue(v)` / `se(v)` /
-//!   `uek(v)` helpers (§9.2).
-//! * [`nal`] — 2-byte NAL header (§7.3.1.2 / §7.4.2.2) plus length-prefixed
-//!   (Annex B raw bitstream) framing and a tolerant Annex-B-style start-code
-//!   scanner.
-//! * [`sps`] — `seq_parameter_set_rbsp()` (§7.3.2.1) parser, with
-//!   sanity-bounded picture dimensions (`MAX_DIMENSION = 32768`).
-//! * [`pps`] — `pic_parameter_set_rbsp()` (§7.3.2.2) parser.
-//! * [`aps`] — `adaptation_parameter_set_rbsp()` (§7.3.2.3) header parser
-//!   (ALF / DRA payload bytes captured raw for round-2).
-//! * [`slice_header`] — `slice_header()` (§7.3.4) round-1 subset (PPS id,
-//!   slice type, POC LSB, QP, deblocking offsets).
-//! * [`cabac`] — CABAC parsing process (§9.3): arithmetic decoding engine
-//!   (regular + bypass + terminate) plus binarization helpers (FL, U, TR,
-//!   EGk). Round-2 ships with the `sps_cm_init_flag == 0` Baseline-profile
-//!   context table (every variable initialised to `(256, 0)`); the
-//!   `sps_cm_init_flag == 1` per-table init lands in round 3 alongside
-//!   pixel emission.
-//! * [`slice_data`] — `slice_data()` walker (§7.3.8) for Baseline-profile
-//!   IDR slices. Drives the CABAC engine through every `ae(v)` syntax
-//!   element so an end-to-end IDR slice's bins are consumed cleanly via
-//!   the `end_of_tile_one_bit` terminate path. Pixel emission is round 3.
-//! * [`decoder`] — registry factory; the registered decoder returns
-//!   `Error::Unsupported("EVC pixel decode not yet implemented")` since
-//!   the per-CU pixel pipeline lands in round 3.
+//! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
+//! * [`nal`] — 2-byte NAL header (§7.3.1.2) + length-prefixed framing.
+//! * [`sps`] / [`pps`] / [`aps`] — parameter-set parsers (§7.3.2.x).
+//! * [`slice_header`] — `slice_header()` parse (§7.3.4).
+//! * [`cabac`] — full CABAC parsing process (§9.3): arithmetic decoding
+//!   engine (regular + bypass + terminate) plus the FL / U / TR / EGk
+//!   binarization helpers. `sps_cm_init_flag == 0` initialisation only.
+//! * [`slice_data`] — `slice_data()` walker + the **round-3** pixel
+//!   emission pipeline ([`slice_data::decode_baseline_idr_slice`]).
+//! * [`intra`] — intra prediction (§8.4.4) for the Baseline 5-mode set
+//!   (DC, HOR, VER, UL, UR; `sps_eipd_flag == 0` path).
+//! * [`transform`] — inverse DCT-II for nTbS ∈ {2, 4, 8, 16, 32} (eq.
+//!   1062-1070). The 64-point matrix (eq. 1071-1076) is parked pending a
+//!   clean reading of the spec's `m`/`n` indexing; round-3 fixtures cap
+//!   `MaxTbLog2SizeY` at 5.
+//! * [`dequant`] — scaling + transform + final renorm (§8.7.2 / §8.7.3 /
+//!   §8.7.4) for the `sps_iqt_flag == 0` Baseline path.
+//! * [`picture`] — yuv420p 8-bit picture buffer + per-CU intra
+//!   reconstruct glue (§8.7.5).
+//! * [`decoder`] — registered decoder factory returning a working
+//!   `Decoder` for Baseline IDR bitstreams (8-bit 4:2:0, no residuals).
+//!
+//! Round-3 deliberate omissions (pending round 4):
+//!
+//! * non-zero CBFs (residual coding fires `Error::Unsupported`),
+//! * P / B slices,
+//! * 10-bit support,
+//! * deblocking (`slice_deblocking_filter_flag` must be 0),
+//! * 64×64 transform,
+//! * Main-profile syntax branches (BTT / SUCO / ADMVP / EIPD / IBC /
+//!   ATS / ADCC / ALF / DRA / cm_init).
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)** at
 //! `docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf`. No third-party EVC
 //! decoder source (MPEG-5 reference, `xeve`, `xevd`, …) was consulted —
-//! every parser is spec-only.
+//! every module is spec-only.
 
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
 pub mod decoder;
+pub mod dequant;
+pub mod intra;
 pub mod nal;
+pub mod picture;
 pub mod pps;
 pub mod slice_data;
 pub mod slice_header;
 pub mod sps;
+pub mod transform;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry};
@@ -199,6 +209,108 @@ pub fn walk_idr_slice(
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
     };
     slice_data::walk_baseline_idr_slice(slice_data_bytes, inputs)
+}
+
+/// **Round-3** end-to-end decode of a Baseline-profile IDR slice.
+///
+/// Mirrors [`walk_idr_slice`] but invokes the pixel-emission pipeline:
+/// returns a freshly-reconstructed [`picture::YuvPicture`] populated by
+/// per-CU intra prediction and the spec's picture-construction step
+/// (§8.7.5). Round-3 fixtures must use `cbf_luma == cbf_cb == cbf_cr ==
+/// 0` for every CU; non-zero CBFs trigger `Error::Unsupported` (round-4
+/// scope).
+pub fn decode_idr_slice(
+    sps: &sps::Sps,
+    pps: &pps::Pps,
+    slice_nal_rbsp: &[u8],
+) -> oxideav_core::Result<(picture::YuvPicture, slice_data::SliceDecodeStats)> {
+    use oxideav_core::Error;
+    if sps.sps_btt_flag
+        || sps.sps_suco_flag
+        || sps.sps_admvp_flag
+        || sps.sps_eipd_flag
+        || sps.sps_alf_flag
+        || sps.sps_addb_flag
+        || sps.sps_dquant_flag
+        || sps.sps_ats_flag
+        || sps.sps_ibc_flag
+        || sps.sps_dra_flag
+        || sps.sps_adcc_flag
+        || sps.sps_cm_init_flag
+    {
+        return Err(Error::unsupported(
+            "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
+        ));
+    }
+    if !pps.single_tile_in_pic_flag {
+        return Err(Error::unsupported(
+            "evc decode_idr_slice: round-3 requires single_tile_in_pic_flag == 1",
+        ));
+    }
+    let mut hdr_br = crate::bitreader::BitReader::new(slice_nal_rbsp);
+    let slice_qp = parse_slice_header_for_decode(&mut hdr_br, sps, pps)?;
+    hdr_br.align_to_byte();
+    let consumed_bits = hdr_br.bit_position();
+    if consumed_bits % 8 != 0 {
+        return Err(Error::invalid(
+            "evc decode_idr_slice: slice header not byte-aligned after parse",
+        ));
+    }
+    let consumed_bytes = (consumed_bits / 8) as usize;
+    if consumed_bytes >= slice_nal_rbsp.len() {
+        return Err(Error::invalid(
+            "evc decode_idr_slice: no slice_data bytes after header",
+        ));
+    }
+    let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
+    let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
+    let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
+    let max_tb_log2_size_y = ctb_log2_size_y.min(5); // round-3: cap at 32x32
+    let walk = slice_data::SliceWalkInputs {
+        pic_width: sps.pic_width_in_luma_samples,
+        pic_height: sps.pic_height_in_luma_samples,
+        ctb_log2_size_y,
+        min_cb_log2_size_y,
+        max_tb_log2_size_y,
+        chroma_format_idc: sps.chroma_format_idc,
+        cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+    };
+    let decode = slice_data::SliceDecodeInputs {
+        slice_qp,
+        bit_depth_luma: sps.bit_depth_y(),
+        bit_depth_chroma: sps.bit_depth_c(),
+    };
+    slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
+}
+
+/// Helper for [`decode_idr_slice`]: parse the Baseline IDR slice header
+/// and recover `slice_qp` for downstream dequant. Round-3 supports the
+/// minimal set: `slice_pps_id`, `slice_type` (must be 2), trailing
+/// flags, `slice_qp ∈ 0..=51`, `slice_cb_qp_offset`, `slice_cr_qp_offset`.
+fn parse_slice_header_for_decode(
+    br: &mut crate::bitreader::BitReader,
+    _sps: &sps::Sps,
+    _pps: &pps::Pps,
+) -> oxideav_core::Result<i32> {
+    use oxideav_core::Error;
+    let _slice_pps_id = br.ue()?;
+    let slice_type = br.ue()?;
+    if slice_type != 2 {
+        return Err(Error::invalid(format!(
+            "evc decode_idr_slice: IDR slice_type must be 2 (got {slice_type})"
+        )));
+    }
+    let _no_output = br.u1()?;
+    let _slice_deblocking_filter_flag = br.u1()?;
+    let slice_qp = br.u(6)?;
+    if slice_qp > 51 {
+        return Err(Error::invalid(format!(
+            "evc decode_idr_slice: slice_qp {slice_qp} > 51"
+        )));
+    }
+    let _slice_cb_qp_offset = br.se()?;
+    let _slice_cr_qp_offset = br.se()?;
+    Ok(slice_qp as i32)
 }
 
 /// Internal helper that re-runs the slice header parse on a *borrowed*
@@ -369,13 +481,16 @@ mod tests {
     }
 
     #[test]
-    fn make_decoder_returns_unsupported_on_packet() {
+    fn make_decoder_handles_empty_packet() {
         use oxideav_core::{CodecParameters, Packet, TimeBase};
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let mut dec = decoder::make_decoder(&params).unwrap();
         let pkt = Packet::new(0, TimeBase::new(1, 90_000), Vec::new());
-        let err = dec.send_packet(&pkt).unwrap_err();
-        assert!(format!("{err}").contains("EVC pixel decode not yet implemented"));
+        // Empty packet → no NALs → ok, no frame emitted.
+        dec.send_packet(&pkt).unwrap();
+        let err = dec.receive_frame().unwrap_err();
+        // Iterating with no input must surface NeedMore (not Eof).
+        assert!(matches!(err, oxideav_core::Error::NeedMore));
     }
 
     /// End-to-end Baseline-IDR walk: build an SPS + PPS in-memory,
@@ -555,5 +670,218 @@ mod tests {
             err_text.contains("Baseline-profile toolset"),
             "got: {err_text}"
         );
+    }
+
+    /// Build a minimal Baseline SPS for an `(width × height)` 4:2:0 8-bit
+    /// picture. CTB size defaults to 64×64 (`log2_ctu_size_minus5 = 0` →
+    /// `CtbLog2SizeY = 5` since `sps_btt_flag = 0` keeps the spec's
+    /// default of `1` per §7.4.3.1, putting CTB at 32×32 — round-3
+    /// fixtures keep below 64×64 to dodge the unimplemented `nTbS = 64`
+    /// transform path).
+    fn build_baseline_sps_rbsp(width: u32, height: u32) -> Vec<u8> {
+        let mut sps_body = BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 0); // profile_idc Baseline
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(1); // chroma_format_idc 4:2:0
+        sps_body.ue(width);
+        sps_body.ue(height);
+        sps_body.ue(0); // bit_depth_luma_minus8
+        sps_body.ue(0); // bit_depth_chroma_minus8
+        for _ in 0..13 {
+            sps_body.u(1, 0);
+        }
+        sps_body.ue(1); // log2_sub_gop_length
+        sps_body.ue(1); // max_num_tid0_ref_pics
+        sps_body.u(1, 0); // picture_cropping_flag
+        sps_body.u(1, 0); // chroma_qp_table_present_flag
+        sps_body.u(1, 0); // vui_parameters_present_flag
+        sps_body.finish_with_trailing_bits();
+        sps_body.into_bytes()
+    }
+
+    /// Build a minimal Baseline PPS for `cu_qp_delta_enabled_flag = 0`.
+    fn build_baseline_pps_rbsp() -> Vec<u8> {
+        let mut pps_body = BitEmitter::new();
+        pps_body.ue(0); // pps_id
+        pps_body.ue(0); // sps_id
+        pps_body.ue(0);
+        pps_body.ue(0);
+        pps_body.ue(0);
+        pps_body.u(1, 0); // rpl1_idx_present_flag
+        pps_body.u(1, 1); // single_tile_in_pic_flag
+        pps_body.ue(0); // tile_id_len_minus1
+        pps_body.u(1, 0); // explicit_tile_id_flag
+        pps_body.u(1, 0); // pic_dra_enabled_flag
+        pps_body.u(1, 0); // arbitrary_slice_present_flag
+        pps_body.u(1, 0); // constrained_intra_pred_flag
+        pps_body.u(1, 0); // cu_qp_delta_enabled_flag = 0
+        pps_body.finish_with_trailing_bits();
+        pps_body.into_bytes()
+    }
+
+    /// **Round-3 end-to-end pixel decode.** Build a Baseline IDR slice
+    /// covering a 32×32 picture (one 32×32 CTU split into four 16×16
+    /// leaves; each leaf carries `intra_pred_mode = 0` (= INTRA_DC) and
+    /// `cbf_luma = cbf_cb = cbf_cr = 0`). Decode through
+    /// [`decode_idr_slice`] and verify the reconstructed Y plane is
+    /// uniformly 128 (the bit-depth substitution value for "no
+    /// neighbours" is 128, DC-prediction of all-128 references is 128,
+    /// and a zero residual leaves it at 128).
+    #[test]
+    fn round3_end_to_end_decode_grey_idr() {
+        use crate::cabac::CabacEncoder;
+        // 64×64 picture (1 CTU at the default CTB log2 = 6) — keeps the
+        // walker on the simple "CTB == picture" path, avoiding implicit
+        // boundary splits.
+        let sps = sps::parse(&build_baseline_sps_rbsp(64, 64)).unwrap();
+        let pps = pps::parse(&build_baseline_pps_rbsp()).unwrap();
+        // Slice header for an IDR with deblocking off, slice_qp = 22.
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2); // I slice
+        hdr.u(1, 0);
+        hdr.u(1, 0); // slice_deblocking_filter_flag = 0
+        hdr.u(6, 22);
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut slice_rbsp = hdr.into_bytes();
+        // Encode CABAC: one CTB split (32 → four 16x16 leaves), each
+        // leaf intra_pred_mode = 0 (one "0" bin), cbf_luma = cbf_cb =
+        // cbf_cr = 0 (no residual_coding fires).
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // CTB split_cu_flag = 1
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // child split_cu_flag = 0 (leaf)
+                                          // dual-tree luma CU: intra_pred_mode + cbf_luma
+            enc.encode_decision(0, 0, 0); // intra_pred_mode_idx = 0 (one "0" bin)
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                          // dual-tree chroma CU: cbf_cb + cbf_cr (no intra_pred_mode_idx
+                                          // for chroma in sps_eipd_flag=0 dual-tree path)
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        slice_rbsp.extend_from_slice(&enc.finish());
+
+        let (pic, stats) = decode_idr_slice(&sps, &pps, &slice_rbsp).unwrap();
+        // Picture geometry checks.
+        assert_eq!(pic.width, 64);
+        assert_eq!(pic.height, 64);
+        assert_eq!(pic.y.len(), 64 * 64);
+        assert_eq!(pic.cb.len(), 32 * 32);
+        assert_eq!(pic.cr.len(), 32 * 32);
+        // Stats: 1 CTU, 5 split_cu_flag bins (1 CTB + 4 children), 8
+        // coding_units (luma+chroma per leaf), 4 intra_pred_mode bins,
+        // 4 cbf_luma bins, 8 cbf_chroma bins.
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(stats.split_cu_flag_bins, 5);
+        assert_eq!(stats.coding_units, 8);
+        assert_eq!(stats.intra_pred_mode_bins, 4);
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        // Pixel content: every Y/Cb/Cr sample should be 128 (the IDR-with-
+        // no-neighbours INTRA_DC prediction value at bit-depth 8). Since
+        // the picture buffer was pre-filled with 128 and the prediction
+        // computes 128 from all-128 references with zero residual, the
+        // result is uniform 128.
+        let mismatched_y = pic.y.iter().filter(|&&v| v != 128).count();
+        assert_eq!(
+            mismatched_y, 0,
+            "Y plane should be uniform 128 (got {mismatched_y} non-128 samples)"
+        );
+        let mismatched_cb = pic.cb.iter().filter(|&&v| v != 128).count();
+        let mismatched_cr = pic.cr.iter().filter(|&&v| v != 128).count();
+        assert_eq!(mismatched_cb, 0);
+        assert_eq!(mismatched_cr, 0);
+        // PSNR check vs hand-computed reference (uniform 128): PSNR is
+        // infinite at MSE = 0 — we only assert MSE = 0.
+        let mse: f64 = pic
+            .y
+            .iter()
+            .map(|&v| (v as f64 - 128.0).powi(2))
+            .sum::<f64>()
+            / pic.y.len() as f64;
+        assert_eq!(mse, 0.0);
+    }
+
+    /// End-to-end pixel decode through `make_decoder` (the registered
+    /// codec factory). Wraps the Baseline IDR slice from above into a
+    /// length-prefixed NAL stream containing SPS + PPS + IDR, sends it
+    /// to the registered decoder, and pulls a `Frame::Video` out of
+    /// `receive_frame`. Verifies the pixel plane shape and content.
+    #[test]
+    fn round3_make_decoder_decodes_idr_to_grey_frame() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+
+        let sps_rbsp = build_baseline_sps_rbsp(64, 64);
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        // Slice header (IDR, slice_qp = 22, deblocking off).
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2);
+        hdr.u(1, 0);
+        hdr.u(1, 0);
+        hdr.u(6, 22);
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut idr_rbsp = hdr.into_bytes();
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // CTB split = 1
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // child split = 0
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&enc.finish());
+
+        // Build NAL headers + length-prefixed envelope.
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp)); // SPS NUT = 24
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp)); // PPS NUT = 25
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp)); // IDR NUT = 1
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let frame = dec.receive_frame().unwrap();
+        let video = match frame {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("expected video frame"),
+        };
+        assert_eq!(video.planes.len(), 3);
+        assert_eq!(video.planes[0].stride, 64);
+        assert_eq!(video.planes[0].data.len(), 64 * 64);
+        assert!(video.planes[0].data.iter().all(|&v| v == 128));
+        assert_eq!(video.planes[1].stride, 32);
+        assert_eq!(video.planes[1].data.len(), 32 * 32);
+        assert!(video.planes[1].data.iter().all(|&v| v == 128));
+        assert_eq!(video.planes[2].data.len(), 32 * 32);
     }
 }
