@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-evc"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-evc"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust EVC (MPEG-5 Essential Video Coding, ISO/IEC 23094-1) decoder — baseline + main profile. Round-1 scaffold: NAL + parameter-set parsing only; pixel decode pending."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-evc"
+keywords = ["multimedia", "video", "evc", "mpeg5", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
