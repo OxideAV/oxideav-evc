@@ -1,7 +1,7 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-3 status: a working **Baseline-profile IDR-only** decoder. The
-//! crate decomposes into:
+//! Round-4 status: a working **Baseline-profile IDR + P + B** decoder
+//! (no residuals, single reference per list). The crate decomposes into:
 //!
 //! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
 //! * [`nal`] — 2-byte NAL header (§7.3.1.2) + length-prefixed framing.
@@ -10,10 +10,14 @@
 //! * [`cabac`] — full CABAC parsing process (§9.3): arithmetic decoding
 //!   engine (regular + bypass + terminate) plus the FL / U / TR / EGk
 //!   binarization helpers. `sps_cm_init_flag == 0` initialisation only.
-//! * [`slice_data`] — `slice_data()` walker + the **round-3** pixel
-//!   emission pipeline ([`slice_data::decode_baseline_idr_slice`]).
+//! * [`slice_data`] — `slice_data()` walker plus the round-3 IDR pixel
+//!   pipeline ([`slice_data::decode_baseline_idr_slice`]) **and** the
+//!   round-4 inter pipeline ([`slice_data::decode_baseline_inter_slice`]).
 //! * [`intra`] — intra prediction (§8.4.4) for the Baseline 5-mode set
 //!   (DC, HOR, VER, UL, UR; `sps_eipd_flag == 0` path).
+//! * [`inter`] — round-4 inter prediction (§8.5): MV resolution + 8-tap
+//!   luma + 4-tap chroma sub-pel interpolation (Tables 25 / 27 — Baseline
+//!   subset only) + AMVP candidate construction + default-weighted bipred.
 //! * [`transform`] — inverse DCT-II for nTbS ∈ {2, 4, 8, 16, 32} (eq.
 //!   1062-1070). The 64-point matrix (eq. 1071-1076) is parked pending a
 //!   clean reading of the spec's `m`/`n` indexing; round-3 fixtures cap
@@ -23,17 +27,18 @@
 //! * [`picture`] — yuv420p 8-bit picture buffer + per-CU intra
 //!   reconstruct glue (§8.7.5).
 //! * [`decoder`] — registered decoder factory returning a working
-//!   `Decoder` for Baseline IDR bitstreams (8-bit 4:2:0, no residuals).
+//!   `Decoder` for Baseline IDR + P/B bitstreams (8-bit 4:2:0, no
+//!   residuals, single reference).
 //!
-//! Round-3 deliberate omissions (pending round 4):
+//! Round-4 deliberate omissions (pending round 5):
 //!
 //! * non-zero CBFs (residual coding fires `Error::Unsupported`),
-//! * P / B slices,
 //! * 10-bit support,
 //! * deblocking (`slice_deblocking_filter_flag` must be 0),
 //! * 64×64 transform,
+//! * multi-reference + reference list reordering,
 //! * Main-profile syntax branches (BTT / SUCO / ADMVP / EIPD / IBC /
-//!   ATS / ADCC / ALF / DRA / cm_init).
+//!   ATS / ADCC / ALF / DRA / cm_init / AMVR / MMVD / affine / DMVR / HMVP).
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)** at
 //! `docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf`. No third-party EVC
@@ -45,6 +50,7 @@ pub mod bitreader;
 pub mod cabac;
 pub mod decoder;
 pub mod dequant;
+pub mod inter;
 pub mod intra;
 pub mod nal;
 pub mod picture;
@@ -883,5 +889,131 @@ mod tests {
         assert_eq!(video.planes[1].data.len(), 32 * 32);
         assert!(video.planes[1].data.iter().all(|&v| v == 128));
         assert_eq!(video.planes[2].data.len(), 32 * 32);
+    }
+
+    /// **Round-4 end-to-end fixture through `make_decoder`.** Push an
+    /// SPS + PPS + IDR + P-slice sequence into the registered EVC
+    /// decoder. The IDR is a uniform grey 32×32 picture; the P-slice is
+    /// a single 32×32 leaf with `cu_skip_flag = 1` and `mvp_idx_l0 = 3`
+    /// (zero MV). Both frames must come out of `receive_frame`, with the
+    /// P frame being a verbatim copy of the IDR (since zero MV + zero
+    /// residual ≡ identity).
+    #[test]
+    fn round4_make_decoder_decodes_idr_plus_p_to_two_frames() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_baseline_sps_rbsp(32, 32);
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        // IDR: single 32×32 leaf at log2 = 5 (no split).
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0);
+        idr_hdr.ue(2); // I slice
+        idr_hdr.u(1, 0); // no_output
+        idr_hdr.u(1, 0); // slice_deblocking_filter_flag
+        idr_hdr.u(6, 22); // slice_qp
+        idr_hdr.ue(0);
+        idr_hdr.ue(0);
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        let mut idr_enc = CabacEncoder::new();
+        // 32x32 single leaf at log2 = 5 (no split needed since
+        // log2 == ctb_log2_size_y → no split_cu_flag emitted in walker
+        // path? Actually log2 > min so split is emitted).
+        // With ctb_log2 = 5 and min_cb_log2 = 4, the CTU is 32×32, and
+        // we want a single 32x32 leaf → split_cu_flag = 0.
+        idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0 at CTB
+                                          // dual-tree luma CU (32x32):
+        idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        idr_enc.encode_decision(0, 0, 0); // cbf_luma
+                                          // dual-tree chroma CU:
+        idr_enc.encode_decision(0, 0, 0); // cbf_cb
+        idr_enc.encode_decision(0, 0, 0); // cbf_cr
+        idr_enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&idr_enc.finish());
+
+        // P slice header: slice_type = 1 (P), no override, deblock off.
+        let mut p_hdr = BitEmitter::new();
+        p_hdr.ue(0); // slice_pps_id
+        p_hdr.ue(1); // slice_type = P
+                     // Not IDR + sps_pocs_flag = 0 → no POC LSB.
+                     // Not IDR + slice_type=P → ref-idx + admvp branch.
+        p_hdr.u(1, 0); // num_ref_idx_active_override_flag = 0
+                       // sps_admvp_flag = 0 → skip temporal_mvp.
+        p_hdr.u(1, 0); // slice_deblocking_filter_flag
+        p_hdr.u(6, 22); // slice_qp
+        p_hdr.ue(0);
+        p_hdr.ue(0);
+        while p_hdr.bit_position() % 8 != 0 {
+            p_hdr.u(1, 0);
+        }
+        let mut p_rbsp = p_hdr.into_bytes();
+        let mut p_enc = CabacEncoder::new();
+        p_enc.encode_decision(0, 0, 0); // split_cu_flag = 0 at CTB
+                                        // Single-tree inter CU:
+        p_enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        for _ in 0..3 {
+            p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 prefix (3 ones)
+        }
+        p_enc.encode_decision(0, 0, 0); // cbf_luma
+        p_enc.encode_decision(0, 0, 0); // cbf_cb
+        p_enc.encode_decision(0, 0, 0); // cbf_cr
+        p_enc.encode_terminate(true);
+        p_rbsp.extend_from_slice(&p_enc.finish());
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp)); // SPS
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp)); // PPS
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp)); // IDR
+        bs.extend_from_slice(&nal_envelope(0, &p_rbsp)); // NonIDR
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        // Pull the two frames.
+        let f0 = dec.receive_frame().unwrap();
+        let f1 = dec.receive_frame().unwrap();
+        let v0 = match f0 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v1 = match f1 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        // Both should be uniform 128 (the IDR is grey, the P slice is a
+        // zero-MV, zero-residual copy of the IDR → still grey).
+        assert!(v0.planes[0].data.iter().all(|&v| v == 128));
+        assert!(v1.planes[0].data.iter().all(|&v| v == 128));
+        assert_eq!(
+            v0.planes[0].data, v1.planes[0].data,
+            "P frame must equal IDR"
+        );
+        assert_eq!(v0.planes[1].data, v1.planes[1].data);
+        assert_eq!(v0.planes[2].data, v1.planes[2].data);
+        // PSNR Y = ∞ (MSE=0). The acceptance bar is ≥ 30 dB.
+        let mse: f64 = v0.planes[0]
+            .data
+            .iter()
+            .zip(v1.planes[0].data.iter())
+            .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+            .sum::<f64>()
+            / v0.planes[0].data.len() as f64;
+        assert_eq!(mse, 0.0, "PSNR must be infinite for identical frames");
     }
 }
