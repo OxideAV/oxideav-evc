@@ -491,6 +491,10 @@ pub(crate) mod tests {
             }
         }
 
+        pub fn bit_position(&self) -> u32 {
+            self.bit_pos
+        }
+
         pub fn finish_with_trailing_bits(&mut self) {
             // rbsp_trailing_bits(): one '1' then '0' padding to byte align.
             self.write_bit(1);
