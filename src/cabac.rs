@@ -1,12 +1,11 @@
 //! EVC CABAC parsing process (ISO/IEC 23094-1 §9.3).
 //!
 //! This module implements the binary arithmetic decoding engine and the
-//! binarization helpers used by `slice_data()` (§7.3.8). It does **not**
-//! contain the per–syntax-element context tables for the
-//! `sps_cm_init_flag == 1` initialization path: the round-2 deliverable
-//! covers Baseline-profile bitstreams (which mandate `sps_cm_init_flag == 0`,
-//! see Annex A.3.2), and round-3+ will populate the Main-profile init
-//! tables (Tables 40–90) when the per-CTU pixel pipeline lands.
+//! binarization helpers used by `slice_data()` (§7.3.8). The Baseline
+//! `sps_cm_init_flag == 0` path uses a single ctxTable=0 / ctxIdx=0
+//! context per Annex A.3.2; the Main-profile `sps_cm_init_flag == 1`
+//! per-syntax-element initValue tables (Tables 40-90) live in
+//! [`crate::cabac_init`] alongside the §9.3.4.2 ctxInc helpers.
 //!
 //! ## Engine state (§9.3.4.3)
 //!
@@ -20,10 +19,12 @@
 //! Each context variable is a `(valState, valMps)` pair. `valState` is in
 //! `0..512`, `valMps` is in `0..=1`. With `sps_cm_init_flag == 0`, every
 //! context is initialised to `valState = 256`, `valMps = 0` — independent
-//! of slice QP. The Main-profile path (`sps_cm_init_flag == 1`) needs the
-//! per-table `initValue`s and the slice-QP-driven derivation in eq. 1426;
-//! it is stubbed below ([`init_contexts_from_init_value`]) so the caller
-//! can install a table once round-3 transcribes them.
+//! of slice QP. The Main-profile path (`sps_cm_init_flag == 1`) draws
+//! the per-context `initValue` from Tables 40-90 (transcribed in
+//! [`crate::cabac_init`]) and combines it with the slice QP via
+//! [`init_contexts_from_init_value`] (eq. 1425/1426); call
+//! [`crate::cabac_init::init_main_profile_contexts`] to install the
+//! whole table set in one shot.
 //!
 //! ## Bin decoding (§9.3.4.3.1)
 //!
@@ -45,15 +46,17 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::BitReader;
 
 /// Maximum number of context variables we keep per `ctxTable`. The largest
-/// EVC ctxIdx range in Tables 39–90 is `coeff_zero_run` and friends at
-/// `0..=47` per `initType`, so 96 is a comfortable bound.
+/// EVC ctxIdx range in Tables 39–90 is `sig_coeff_flag` at 0..=93 per
+/// initType union, so 96 is a comfortable bound.
 pub const MAX_CTX_PER_TABLE: usize = 96;
 
 /// Maximum number of distinct `ctxTable` values referenced by the
-/// `sps_cm_init_flag == 1` path (Tables 40–90). With `sps_cm_init_flag == 0`
-/// every syntax element shares ctxTable 0, so a sized array is enough for
-/// round-2 fixtures.
-pub const MAX_CTX_TABLES: usize = 64;
+/// `sps_cm_init_flag == 1` path. The Main-profile tables 40 through 90
+/// of §9.3.5 are addressed by their spec table number, so we need
+/// indices 0..=90 — bumped to 91 here. With `sps_cm_init_flag == 0`
+/// every syntax element shares ctxTable 0, so the lower indices remain
+/// untouched in the Baseline path.
+pub const MAX_CTX_TABLES: usize = 91;
 
 /// One CABAC context variable (§9.3.2.2 outputs).
 #[derive(Clone, Copy, Debug)]
@@ -89,9 +92,10 @@ pub struct CabacEngine<'a> {
     ivl_curr_range: u32,
     ivl_offset: u32,
     /// `[ctxTable][ctxIdx]` — context variables. With `sps_cm_init_flag == 0`
-    /// only `[0][0]` is used (every regular bin lands on a single context),
-    /// but we keep the full table so the round-3 Main-profile path can drop
-    /// in real ctxIdx-driven entries without changing the call sites.
+    /// only `[0][0]` is used (every regular bin lands on a single context).
+    /// The Main-profile path
+    /// ([`crate::cabac_init::init_main_profile_contexts`]) populates
+    /// `[40..=90][·]` from the §9.3.5 init tables.
     ctx: Vec<Vec<ContextVar>>,
 }
 
@@ -134,8 +138,11 @@ impl<'a> CabacEngine<'a> {
         Ok(())
     }
 
-    /// Re-initialise the context table only (no engine restart). Intended
-    /// for round-3 Main-profile entry — pairs with [`init_contexts_from_init_value`].
+    /// Re-initialise the context table only (no engine restart). Pairs
+    /// with [`init_contexts_from_init_value`] /
+    /// [`crate::cabac_init::init_main_profile_contexts`] when the caller
+    /// wants to switch from one tile / dependent-slice segment to the
+    /// next without re-reading the 14-bit `ivl_offset` window.
     pub fn reset_contexts_default(&mut self) {
         for table in &mut self.ctx {
             for v in table.iter_mut() {
@@ -147,6 +154,25 @@ impl<'a> CabacEngine<'a> {
     /// Read-only view of a context variable. Useful for unit tests.
     pub fn context(&self, ctx_table: usize, ctx_idx: usize) -> ContextVar {
         self.ctx[ctx_table][ctx_idx]
+    }
+
+    /// Install a context variable at `(ctx_table, ctx_idx)`. Used by
+    /// the Main-profile init path
+    /// ([`crate::cabac_init::init_main_profile_contexts`]) to drop in
+    /// the per-syntax-element `(valState, valMps)` derived from
+    /// Tables 40–90 + slice_qp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] if the indices are out of range.
+    pub fn set_context(&mut self, ctx_table: usize, ctx_idx: usize, var: ContextVar) -> Result<()> {
+        if ctx_table >= self.ctx.len() || ctx_idx >= self.ctx[ctx_table].len() {
+            return Err(Error::invalid(format!(
+                "evc cabac: set_context out of range ({ctx_table}, {ctx_idx})"
+            )));
+        }
+        self.ctx[ctx_table][ctx_idx] = var;
+        Ok(())
     }
 
     /// Decode a single context-coded bin (§9.3.4.3.2). Updates the relevant
@@ -563,9 +589,10 @@ impl CabacEncoder {
 }
 
 /// Compute `valState`/`valMps` for the `sps_cm_init_flag == 1` path
-/// (§9.3.2.2, eq. 1425–1426). Round-3 will pull `init_value` from
-/// Tables 40–90; round-2 exposes the math so a future caller can install
-/// per-context variables once the tables are transcribed.
+/// (§9.3.2.2, eq. 1425–1426). Used by
+/// [`crate::cabac_init::init_main_profile_contexts`] to install
+/// per-syntax-element context variables from the Tables 40-90
+/// `initValue` arrays plus the slice-level QP.
 pub fn init_contexts_from_init_value(init_value: u16, slice_qp: i32) -> ContextVar {
     // eq. 1425
     let val_slope_mag = ((init_value & 14) << 4) as i32;

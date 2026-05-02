@@ -1,9 +1,12 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-6 status: a working **Baseline-profile IDR + P + B** decoder
+//! Round-7 status: a working **Baseline-profile IDR + P + B** decoder
 //! with residual coding (RLE + dequant + IDCT for nTbS up to 64),
 //! deblocking (§8.8.2 luma + chroma path), and a single reference per
-//! list. The crate decomposes into:
+//! list, plus the **Main-profile CABAC initialization tables**
+//! (Tables 40-90, §9.3.4.2 ctxInc helpers, eq. 1425/1426 init pipeline)
+//! ready for the next round to wire individual Main-profile tools.
+//! The crate decomposes into:
 //!
 //! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
 //! * [`nal`] — 2-byte NAL header (§7.3.1.2) + length-prefixed framing.
@@ -11,7 +14,14 @@
 //! * [`slice_header`] — `slice_header()` parse (§7.3.4).
 //! * [`cabac`] — full CABAC parsing process (§9.3): arithmetic decoding
 //!   engine (regular + bypass + terminate) plus the FL / U / TR / EGk
-//!   binarization helpers. `sps_cm_init_flag == 0` initialisation only.
+//!   binarization helpers. The Baseline `sps_cm_init_flag == 0` path uses
+//!   a single ctxTable=0 / ctxIdx=0 context.
+//! * [`cabac_init`] — Main-profile (`sps_cm_init_flag == 1`) initValue
+//!   tables (Tables 40-90 of §9.3.5) + the §9.3.2.2 init pipeline
+//!   ([`cabac_init::init_main_profile_contexts`]) + the §9.3.4.2 per-
+//!   syntax-element ctxInc helpers (`btt_split_flag`,
+//!   `last_sig_coeff_x/y_prefix`, `sig_coeff_flag`,
+//!   `coeff_abs_level_greaterA/B_flag`, etc.).
 //! * [`slice_data`] — `slice_data()` walker plus the round-3 IDR pixel
 //!   pipeline ([`slice_data::decode_baseline_idr_slice`]) **and** the
 //!   round-4 inter pipeline ([`slice_data::decode_baseline_inter_slice`]).
@@ -32,15 +42,18 @@
 //!   `Decoder` for Baseline IDR + P/B bitstreams (8-bit 4:2:0, no
 //!   residuals, single reference).
 //!
-//! Round-6 deliberate omissions (pending follow-up rounds):
+//! Round-7 deliberate omissions (pending follow-up rounds):
 //!
 //! * 10-bit support,
 //! * advanced deblocking (`sps_addb_flag = 1` — round-6 supports the
 //!   `sps_addb_flag = 0` baseline filter only, now for both luma and
 //!   chroma; addb is a Main-profile feature),
 //! * multi-reference + reference list reordering,
-//! * Main-profile syntax branches (BTT / SUCO / ADMVP / EIPD / IBC /
-//!   ATS / ADCC / ALF / DRA / cm_init / AMVR / MMVD / affine / DMVR / HMVP).
+//! * **Main-profile decode** — round 7 lands the CABAC infrastructure
+//!   (Tables 40-90 + ctxInc helpers) but the actual decode of
+//!   Main-profile syntax (BTT / SUCO / ADMVP / EIPD / IBC / ATS / ADCC /
+//!   ALF / DRA / AMVR / MMVD / affine / DMVR / HMVP) still bubbles up
+//!   `Error::Unsupported`.
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)** at
 //! `docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf`. No third-party EVC
@@ -50,6 +63,7 @@
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
+pub mod cabac_init;
 pub mod deblock;
 pub mod decoder;
 pub mod dequant;
