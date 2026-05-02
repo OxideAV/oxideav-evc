@@ -1,9 +1,9 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-5 status: a working **Baseline-profile IDR + P + B** decoder
+//! Round-6 status: a working **Baseline-profile IDR + P + B** decoder
 //! with residual coding (RLE + dequant + IDCT for nTbS up to 64),
-//! deblocking (§8.8.2 luma path), and a single reference per list. The
-//! crate decomposes into:
+//! deblocking (§8.8.2 luma + chroma path), and a single reference per
+//! list. The crate decomposes into:
 //!
 //! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
 //! * [`nal`] — 2-byte NAL header (§7.3.1.2) + length-prefixed framing.
@@ -32,12 +32,12 @@
 //!   `Decoder` for Baseline IDR + P/B bitstreams (8-bit 4:2:0, no
 //!   residuals, single reference).
 //!
-//! Round-5 deliberate omissions (pending follow-up rounds):
+//! Round-6 deliberate omissions (pending follow-up rounds):
 //!
 //! * 10-bit support,
-//! * advanced deblocking (`sps_addb_flag = 1` — round-5 supports the
-//!   `sps_addb_flag = 0` baseline filter only; addb is a Main-profile
-//!   feature),
+//! * advanced deblocking (`sps_addb_flag = 1` — round-6 supports the
+//!   `sps_addb_flag = 0` baseline filter only, now for both luma and
+//!   chroma; addb is a Main-profile feature),
 //! * multi-reference + reference list reordering,
 //! * Main-profile syntax branches (BTT / SUCO / ADMVP / EIPD / IBC /
 //!   ATS / ADCC / ALF / DRA / cm_init / AMVR / MMVD / affine / DMVR / HMVP).
@@ -289,6 +289,8 @@ pub fn decode_idr_slice(
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
         enable_deblock: false, // round-3 fixtures keep deblock off
+        slice_cb_qp_offset: 0,
+        slice_cr_qp_offset: 0,
     };
     slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
 }

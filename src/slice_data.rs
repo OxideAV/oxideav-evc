@@ -566,6 +566,25 @@ pub struct SliceDecodeInputs {
     /// `slice_deblocking_filter_flag` from the slice header. When true,
     /// the §8.8.2 deblocking pass runs after picture reconstruction.
     pub enable_deblock: bool,
+    /// `slice_cb_qp_offset` (range −12..=12) added to the slice QP for
+    /// the chroma deblock Table 33 lookup (eq. 1194). Defaults to 0 in
+    /// Baseline fixtures.
+    pub slice_cb_qp_offset: i32,
+    /// `slice_cr_qp_offset` (range −12..=12).
+    pub slice_cr_qp_offset: i32,
+}
+
+impl Default for SliceDecodeInputs {
+    fn default() -> Self {
+        Self {
+            slice_qp: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+        }
+    }
 }
 
 /// Stats from [`decode_baseline_idr_slice`]. A superset of
@@ -666,7 +685,23 @@ pub fn decode_baseline_idr_slice(
         ));
     }
     if decode.enable_deblock {
-        let edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+        let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+        if walk.chroma_format_idc != 0 {
+            edges += crate::deblock::deblock_chroma(
+                &mut pic,
+                &side_info,
+                decode.slice_qp,
+                decode.slice_cb_qp_offset,
+                1,
+            )?;
+            edges += crate::deblock::deblock_chroma(
+                &mut pic,
+                &side_info,
+                decode.slice_qp,
+                decode.slice_cr_qp_offset,
+                2,
+            )?;
+        }
         stats.deblock_edges = edges;
     }
     Ok((pic, stats))
@@ -1111,7 +1146,23 @@ pub fn decode_baseline_inter_slice(
         ));
     }
     if decode.enable_deblock {
-        let edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+        let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+        if walk.chroma_format_idc != 0 {
+            edges += crate::deblock::deblock_chroma(
+                &mut pic,
+                &side_info,
+                decode.slice_qp,
+                decode.slice_cb_qp_offset,
+                1,
+            )?;
+            edges += crate::deblock::deblock_chroma(
+                &mut pic,
+                &side_info,
+                decode.slice_qp,
+                decode.slice_cr_qp_offset,
+                2,
+            )?;
+        }
         stats.deblock_edges = edges;
     }
     Ok((pic, stats))
@@ -2023,6 +2074,8 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let inputs = InterDecodeInputs {
             walk,
@@ -2125,6 +2178,8 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let inputs = InterDecodeInputs {
             walk,
@@ -2243,6 +2298,8 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.coding_units, 2, "luma + chroma trees");
@@ -2325,6 +2382,8 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let inputs = InterDecodeInputs {
             walk,
@@ -2396,13 +2455,22 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: true,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
-        // 64×64 has 15 vertical edges (x = 4..60 step 4) × 16 rows of
-        // 4-sample runs = 240 vertical edges; same horizontal → 480.
-        assert_eq!(stats.deblock_edges, 480);
+        // Luma: 64×64 has 15 vertical edges (x = 4..60 step 4) × 16
+        // rows of 4-sample runs = 240 vertical edges; same horizontal
+        // → 480 luma edges.
+        // Chroma (32×32 per 4:2:0): 15 vertical edges (xC = 2..30 step
+        // 2) × 8 row-runs (yC = 0..28 step 4) = 120 per direction per
+        // plane × 2 planes × 2 directions = 480 chroma edges.
+        // Total = 480 + 480 = 960.
+        assert_eq!(stats.deblock_edges, 960);
         // All intra + cbf=0 → bS=0 everywhere → no filtering.
         assert!(pic.y.iter().all(|&v| v == 128));
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
     }
 
     /// 64×64 IDR transform path (no residual): exercises the IDCT-64
@@ -2440,6 +2508,8 @@ mod tests {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.ctus, 1);

@@ -1,5 +1,32 @@
 # Changelog
 
+## Round 6 — chroma deblocking
+
+- Extend §8.8.2 deblocking to the chroma planes per eq. 1167-1213. The
+  chroma path uses the 2-tap stencil (only `sB` and `sC` are modified —
+  eq. 1208/1209/1212/1213) instead of luma's 4-tap stencil, and looks
+  up Table 33 with `qp_c = Clip3(0, 51, slice_qp + slice_cb_qp_offset)`
+  for Cb (with `slice_cr_qp_offset` for Cr — eq. 1194).
+- The BS derivation reuses the luma 4×4 side-info grid (cbf_luma is
+  the spec's chroma-edge trigger per §8.8.2.3 step 2). Edge spacing
+  scales by `(SubWidthC, SubHeightC)` from Table 2: chroma edges land
+  every 2 chroma samples for 4:2:0 (= every 4 luma samples = the luma
+  cell boundary). 4:2:2 and 4:4:4 use the same code path with
+  Table 2 sub-sampling factors.
+- `SliceDecodeInputs` gains `slice_cb_qp_offset` and `slice_cr_qp_offset`
+  so the IDR + inter pipelines forward the per-slice chroma offsets
+  (range −12..=12). The Baseline PPS does not encode
+  `pps_cb_qp_offset` / `pps_cr_qp_offset` (always 0), so slice-level
+  offsets are sufficient.
+- Bumps the test count from 126 → 132. New fixtures cover the chroma
+  2-tap reference values, Table 2 sub-sampling factors, the chroma
+  no-op pass on uniform grey, the small-step inter+cbf edge smoothing
+  (`sB`/`sC` mutate, `sA`/`sD` stay), and the `chroma_qp_offset`
+  switching the filter on / off at `slice_qp = 17`.
+- The pre-existing `idr_decode_with_deblock_enabled_no_op` fixture now
+  asserts 960 edges (480 luma + 240 Cb + 240 Cr) and verifies all
+  three planes stay grey.
+
 ## Round 5 — residual coding, deblocking, and 64-point IDCT
 
 - Wire `residual_coding_rle()` per §7.3.8.7 through the IDR + inter

@@ -210,8 +210,8 @@ fn decode_non_idr_via_inter(
             "evc decoder: NonIDR slice_qp {slice_qp} > 51"
         )));
     }
-    let _slice_cb_qp_offset = br.se()?;
-    let _slice_cr_qp_offset = br.se()?;
+    let slice_cb_qp_offset = br.se()?;
+    let slice_cr_qp_offset = br.se()?;
     br.align_to_byte();
     let consumed_bits = br.bit_position();
     if consumed_bits % 8 != 0 {
@@ -241,6 +241,8 @@ fn decode_non_idr_via_inter(
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
         enable_deblock: slice_deblocking_filter_flag,
+        slice_cb_qp_offset,
+        slice_cr_qp_offset,
     };
     let ref_view = RefPictureView {
         y: &last.y,

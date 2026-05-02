@@ -7,11 +7,11 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Round-5 status
+## Round-6 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full
-residual coding, deblocking, and the 64-point IDCT. The remaining
-constraints (round-6 will lift them):
+residual coding, luma + chroma deblocking, and the 64-point IDCT. The
+remaining constraints (round-7 will lift them):
 
 - 8-bit luma + chroma (4:2:0).
 - `sps_addb_flag = 0` (deblocking uses the §8.8.2 baseline filter; the
@@ -24,6 +24,15 @@ constraints (round-6 will lift them):
 Anything outside the Baseline toolset (BTT, SUCO, ADMVP, EIPD, IBC, ATS,
 ADCC, ALF, DRA, AMVR, MMVD, affine, DMVR, HMVP, …) bubbles up as
 `Error::Unsupported`.
+
+## Round-6 deltas vs round 5
+
+- **Chroma deblocking**: §8.8.2 chroma path per eq. 1167-1213. The
+  2-tap stencil (only `sB` and `sC` mutate — eq. 1208/1209/1212/1213)
+  runs against both Cb and Cr planes after the luma pass. Table 33 is
+  keyed by `qp_c = Clip3(0, 51, slice_qp + slice_cb_qp_offset)` for Cb
+  (with `slice_cr_qp_offset` for Cr — eq. 1194). Edge spacing scales
+  via Table 2 sub-sampling factors (4:2:0 → every 2 chroma samples).
 
 ## Round-5 deltas vs round 4
 
@@ -40,8 +49,10 @@ ADCC, ALF, DRA, AMVR, MMVD, affine, DMVR, HMVP, …) bubbles up as
   the 4-tap edge filter from eq. 1148-1158, and per-4×4-grid side-info
   tracking (PredMode + CBF + MV + RefIdx) populated as CUs decode.
 
-126 unit tests cover the CABAC engine, NAL / parameter-set parsing, the
+132 unit tests cover the CABAC engine, NAL / parameter-set parsing, the
 `slice_data()` walker, the IDR pixel pipeline, the inter-prediction
 primitives, the residual / dequant / IDCT chain, the 64-point IDCT
-construction, and the deblocking filter math (Table 33 spot checks +
-end-to-end no-op fixture).
+construction, and the deblocking filter math for both luma (4-tap) and
+chroma (2-tap) — Table 33 spot checks, BS rules, edge smoothing
+fixtures, the `chroma_qp_offset` switch, and the end-to-end no-op
+pass on a uniform-grey IDR.
