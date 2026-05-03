@@ -406,8 +406,8 @@ mod tests {
     fn mat_64_dc_row_is_64s() {
         let m = mat_64();
         assert_eq!(m.len(), 64 * 64);
-        for c in 0..64 {
-            assert_eq!(m[c], 64, "row 0 col {c} must be 64");
+        for (c, &v) in m.iter().take(64).enumerate() {
+            assert_eq!(v, 64, "row 0 col {c} must be 64");
         }
         // Spec eq. 1072 row 1 col 0..15 should match.
         let row1_col0_15 = [
