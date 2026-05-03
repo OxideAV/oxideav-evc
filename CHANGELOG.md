@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.1](https://github.com/OxideAV/oxideav-evc/compare/v0.0.0...v0.0.1) - 2026-05-03
+
+### Other
+
+- rewrite mat_64_dc_row_is_64s loop to use iter().take()
+
 ## Round 7 — Main-profile CABAC initialization tables
 
 - New [`cabac_init`](src/cabac_init.rs) module transcribes every
