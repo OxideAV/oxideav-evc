@@ -1017,26 +1017,47 @@ use crate::inter::{
 };
 
 /// Inputs for the Baseline P/B decode entry point.
+///
+/// Round-9 lifts the single-reference round-4 constraint by promoting
+/// `ref_l0` / `ref_l1` to slices indexed by `RefIdxLX`. Round-8 and
+/// earlier callers that only need one reference per list pass a
+/// single-element slice; the inter pipeline now resolves each CU's
+/// per-list reference via the decoded `ref_idx_l*` syntax element
+/// instead of always reading slot 0.
 #[derive(Clone, Copy, Debug)]
-pub struct InterDecodeInputs<'a> {
+pub struct InterDecodeInputs<'a, 'b> {
     pub walk: SliceWalkInputs,
     pub decode: SliceDecodeInputs,
     /// Slice type — `false` for P (single ref list), `true` for B
     /// (RefPicList1 also active).
     pub slice_is_b: bool,
-    /// `num_ref_idx_active_minus1[0]` — Baseline P/B fixtures here only
-    /// support 1 reference picture (value 0), but the decoder honours
-    /// the field for symmetry with the syntax.
+    /// `num_ref_idx_active_minus1[0]` — round-9 honours arbitrary values
+    /// up to `ref_list_l0.len() - 1`. Decoded `ref_idx_l0` syntax
+    /// element is range-checked against this bound.
     pub num_ref_idx_active_minus1_l0: u32,
     /// `num_ref_idx_active_minus1[1]` — for B slices.
     pub num_ref_idx_active_minus1_l1: u32,
-    /// Borrowed view of the L0 reference picture (the previously-decoded
-    /// frame). All Baseline round-4 fixtures use a single L0 reference.
-    pub ref_l0: RefPictureView<'a>,
-    /// Optional L1 reference. `Some` iff `slice_is_b == true` and the
-    /// fixture wants explicit bipred. For B slices using zero-MV-only
-    /// fixtures the same picture is acceptable.
-    pub ref_l1: Option<RefPictureView<'a>>,
+    /// L0 reference picture list, indexed by `RefIdxL0`. Must contain at
+    /// least `num_ref_idx_active_minus1_l0 + 1` entries; round-9
+    /// validates the bound at slice entry. Synthetic fixtures pass a
+    /// single-element slice and `num_ref_idx_active_minus1_l0 == 0`.
+    pub ref_list_l0: &'b [RefPictureView<'a>],
+    /// L1 reference picture list, indexed by `RefIdxL1`. Empty for P
+    /// slices; for B slices must contain at least
+    /// `num_ref_idx_active_minus1_l1 + 1` entries.
+    pub ref_list_l1: &'b [RefPictureView<'a>],
+}
+
+impl<'a, 'b> InterDecodeInputs<'a, 'b> {
+    /// L0 reference at `ref_idx`. Returns `None` when out of range.
+    pub fn ref_l0(&self, ref_idx: u32) -> Option<RefPictureView<'a>> {
+        self.ref_list_l0.get(ref_idx as usize).copied()
+    }
+    /// L1 reference at `ref_idx`. Returns `None` when out of range or
+    /// when the slice is unipred (P).
+    pub fn ref_l1(&self, ref_idx: u32) -> Option<RefPictureView<'a>> {
+        self.ref_list_l1.get(ref_idx as usize).copied()
+    }
 }
 
 /// Stats from [`decode_baseline_inter_slice`].
@@ -1087,7 +1108,7 @@ pub struct InterDecodeStats {
 ///   (interpolator surfaces non-Baseline phases as `Error::Unsupported`).
 pub fn decode_baseline_inter_slice(
     rbsp: &[u8],
-    inputs: InterDecodeInputs<'_>,
+    inputs: InterDecodeInputs<'_, '_>,
 ) -> Result<(YuvPicture, InterDecodeStats)> {
     let walk = inputs.walk;
     let decode = inputs.decode;
@@ -1102,15 +1123,33 @@ pub fn decode_baseline_inter_slice(
             "evc inter decode: round-4 is 8-bit only",
         ));
     }
-    if inputs.num_ref_idx_active_minus1_l0 > 0 || inputs.num_ref_idx_active_minus1_l1 > 0 {
-        return Err(Error::unsupported(
-            "evc inter decode: round-4 supports a single reference picture per list",
+    // Round-9: each list must hold at least num_ref_idx_active_minus1[i] + 1
+    // entries so per-CU `ref_idx_l*` lookups never index past the DPB.
+    if inputs.ref_list_l0.is_empty() {
+        return Err(Error::invalid(
+            "evc inter decode: ref_list_l0 must hold at least one reference",
         ));
     }
-    if inputs.slice_is_b && inputs.ref_l1.is_none() {
-        return Err(Error::invalid(
-            "evc inter decode: B slice requires an L1 reference",
-        ));
+    if (inputs.num_ref_idx_active_minus1_l0 as usize) >= inputs.ref_list_l0.len() {
+        return Err(Error::invalid(format!(
+            "evc inter decode: num_ref_idx_active_minus1_l0 {} but ref_list_l0 has {} entries",
+            inputs.num_ref_idx_active_minus1_l0,
+            inputs.ref_list_l0.len()
+        )));
+    }
+    if inputs.slice_is_b {
+        if inputs.ref_list_l1.is_empty() {
+            return Err(Error::invalid(
+                "evc inter decode: B slice requires at least one L1 reference",
+            ));
+        }
+        if (inputs.num_ref_idx_active_minus1_l1 as usize) >= inputs.ref_list_l1.len() {
+            return Err(Error::invalid(format!(
+                "evc inter decode: num_ref_idx_active_minus1_l1 {} but ref_list_l1 has {} entries",
+                inputs.num_ref_idx_active_minus1_l1,
+                inputs.ref_list_l1.len()
+            )));
+        }
     }
     let mut pic = YuvPicture::new(
         walk.pic_width,
@@ -1192,7 +1231,7 @@ fn decode_inter_split_unit(
     stats: &mut InterDecodeStats,
     side_info: &mut SideInfoGrid,
     hmvp: &mut crate::hmvp::HmvpCandList,
-    inputs: &InterDecodeInputs<'_>,
+    inputs: &InterDecodeInputs<'_, '_>,
     x0: u32,
     y0: u32,
     log2_cb_width: u32,
@@ -1258,7 +1297,7 @@ fn decode_inter_coding_unit(
     stats: &mut InterDecodeStats,
     side_info: &mut SideInfoGrid,
     hmvp: &mut crate::hmvp::HmvpCandList,
-    inputs: &InterDecodeInputs<'_>,
+    inputs: &InterDecodeInputs<'_, '_>,
     x0: u32,
     y0: u32,
     log2_cb_width: u32,
@@ -1284,9 +1323,14 @@ fn decode_inter_coding_unit(
             mvp_idx_l1 = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
             stats.mvp_idx_bins += 1;
         }
-        let mv_l0 = baseline_amvp_select(mvp_idx_l0);
+        // Round-9 §8.5.2.4.4 fallback: when the §8.5.2.4.3 spatial
+        // neighbour list resolves to (1,1) (the spec's "unavailable"
+        // substitution) and HMVP holds at least one valid candidate,
+        // consult `hmvp.derive_default_mv()` instead. cu_skip uses
+        // ref_idx = 0 implicitly.
+        let mv_l0 = baseline_amvp_select_with_hmvp(mvp_idx_l0, hmvp, 0, 0);
         let mv_l1 = if inputs.slice_is_b {
-            Some(baseline_amvp_select(mvp_idx_l1))
+            Some(baseline_amvp_select_with_hmvp(mvp_idx_l1, hmvp, 0, 1))
         } else {
             None
         };
@@ -1344,7 +1388,7 @@ fn decode_inter_coding_unit(
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
-            let mvp = baseline_amvp_select(mvp_idx);
+            let mvp = baseline_amvp_select_with_hmvp(mvp_idx, hmvp, ref_idx_l0 as i8, 0);
             mvl0 = mvp.wrapping_add(&MotionVector::quarter_pel(mvd_x, mvd_y));
         }
         if use_l1 {
@@ -1365,7 +1409,7 @@ fn decode_inter_coding_unit(
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
-            let mvp = baseline_amvp_select(mvp_idx);
+            let mvp = baseline_amvp_select_with_hmvp(mvp_idx, hmvp, ref_idx_l1 as i8, 1);
             mvl1 = mvp.wrapping_add(&MotionVector::quarter_pel(mvd_x, mvd_y));
         }
         pred_l0 = if use_l0 {
@@ -1508,14 +1552,35 @@ fn decode_inter_coding_unit(
     )
 }
 
-fn baseline_amvp_select(mvp_idx: u32) -> MotionVector {
-    // Round-4 simplification: the AMVP candidate list is built from the
-    // four positions in §8.5.2.4.3, but the spec falls back to (1, 1)
-    // for unavailable spatial neighbours and we don't carry per-CU MV
-    // history yet. Thus mvp_idx_l0 ∈ 0..=2 → (1, 1); mvp_idx_l0 == 3
-    // (temporal slot) → (0, 0).
+/// Build the four-entry §8.5.2.4.3 AMVP list and pick the
+/// `mvp_idx`-indexed slot, with the round-9 §8.5.2.4.4 HMVP fallback:
+/// when the chosen slot lands on the spec's "(1, 1) substitution"
+/// (i.e. all spatial neighbours unavailable) and the HMVP candidate
+/// list holds at least one valid candidate, derive the MV from
+/// `hmvp.derive_default_mv(cur_ref_idx, list_x)` instead.
+///
+/// Round-9 still routes the spatial-neighbour lookup through the
+/// "all-None" path because the per-4×4 MV grid built into
+/// [`SideInfoGrid`] is consulted by the deblocking pass only — the
+/// inter pipeline doesn't yet probe it for AMVP. The HMVP fallback is
+/// the production path for any P/B stream that crosses the first CTU
+/// row boundary, so wiring it in significantly improves correctness on
+/// real Main-profile content.
+fn baseline_amvp_select_with_hmvp(
+    mvp_idx: u32,
+    hmvp: &crate::hmvp::HmvpCandList,
+    cur_ref_idx_lx: i8,
+    list_x: u8,
+) -> MotionVector {
     let list = build_amvp_list_baseline(0, 0, 0, 0, |_, _| None, MotionVector::default());
-    list[mvp_idx.min(3) as usize].0
+    let chosen = list[mvp_idx.min(3) as usize].0;
+    let unavailable = MotionVector::quarter_pel(1, 1);
+    if chosen == unavailable && !hmvp.is_empty() {
+        if let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x) {
+            return mv;
+        }
+    }
+    chosen
 }
 
 fn decode_signed_mvd(
@@ -1651,10 +1716,14 @@ fn decode_inter_intra_cu(
 /// Combined inter prediction (luma + chroma) plus optional residual.
 /// Each `residual_*` slice is `&[i32]` with the size of the corresponding
 /// component block; pass empty slices when CBF is zero.
+///
+/// Round-9: each CU's per-list `ref_idx_l*` is honoured by indexing
+/// into `inputs.ref_list_l0` / `inputs.ref_list_l1`. Out-of-range
+/// indices were already rejected at slice entry.
 #[allow(clippy::too_many_arguments)]
 fn apply_inter_prediction(
     pic: &mut YuvPicture,
-    inputs: &InterDecodeInputs<'_>,
+    inputs: &InterDecodeInputs<'_, '_>,
     x0: u32,
     y0: u32,
     n_cb_w: usize,
@@ -1668,10 +1737,28 @@ fn apply_inter_prediction(
     let bit_depth = inputs.decode.bit_depth_luma;
     let mut buf_l0 = vec![0i32; n_cb_w * n_cb_h];
     let mut buf_l1 = vec![0i32; n_cb_w * n_cb_h];
+    let ref_l0_resolved = match pred_l0 {
+        Some((_, idx)) => inputs.ref_l0(idx).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc inter decode: ref_idx_l0 {idx} out of range (list has {} entries)",
+                inputs.ref_list_l0.len()
+            ))
+        })?,
+        None => inputs.ref_list_l0[0],
+    };
+    let ref_l1_resolved = match pred_l1 {
+        Some((_, idx)) => Some(inputs.ref_l1(idx).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc inter decode: ref_idx_l1 {idx} out of range (list has {} entries)",
+                inputs.ref_list_l1.len()
+            ))
+        })?),
+        None => None,
+    };
     if let Some((mv, _ref_idx)) = pred_l0 {
         let mv16 = mv.quarter_to_sixteenth();
         interpolate_luma_block(
-            inputs.ref_l0,
+            ref_l0_resolved,
             x0 as i32,
             y0 as i32,
             mv16,
@@ -1682,7 +1769,7 @@ fn apply_inter_prediction(
         )?;
     }
     if let Some((mv, _ref_idx)) = pred_l1 {
-        let refp = inputs.ref_l1.expect("L1 ref is required for B inter CU");
+        let refp = ref_l1_resolved.expect("L1 ref is required for B inter CU");
         let mv16 = mv.quarter_to_sixteenth();
         interpolate_luma_block(
             refp,
@@ -1733,7 +1820,7 @@ fn apply_inter_prediction(
                 let mv16 = mv.quarter_to_sixteenth();
                 let mvc = derive_chroma_mv(mv16, inputs.walk.chroma_format_idc);
                 interpolate_chroma_block(
-                    inputs.ref_l0,
+                    ref_l0_resolved,
                     c_idx,
                     (x0 / sub_w) as i32,
                     (y0 / sub_h) as i32,
@@ -1745,7 +1832,7 @@ fn apply_inter_prediction(
                 )?;
             }
             if let Some((mv, _)) = pred_l1 {
-                let refp = inputs.ref_l1.unwrap();
+                let refp = ref_l1_resolved.unwrap();
                 let mv16 = mv.quarter_to_sixteenth();
                 let mvc = derive_chroma_mv(mv16, inputs.walk.chroma_format_idc);
                 interpolate_chroma_block(
@@ -2116,14 +2203,15 @@ mod tests {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
         };
+        let ref_list_l0 = [ref_view];
         let inputs = InterDecodeInputs {
             walk,
             decode,
             slice_is_b: false,
             num_ref_idx_active_minus1_l0: 0,
             num_ref_idx_active_minus1_l1: 0,
-            ref_l0: ref_view,
-            ref_l1: None,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(pic.width, 32);
@@ -2224,14 +2312,16 @@ mod tests {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
         };
+        let ref_list_l0 = [view0];
+        let ref_list_l1 = [view1];
         let inputs = InterDecodeInputs {
             walk,
             decode,
             slice_is_b: true,
             num_ref_idx_active_minus1_l0: 0,
             num_ref_idx_active_minus1_l1: 0,
-            ref_l0: view0,
-            ref_l1: Some(view1),
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &ref_list_l1,
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -2428,14 +2518,15 @@ mod tests {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
         };
+        let ref_list_l0 = [view];
         let inputs = InterDecodeInputs {
             walk,
             decode,
             slice_is_b: false,
             num_ref_idx_active_minus1_l0: 0,
             num_ref_idx_active_minus1_l1: 0,
-            ref_l0: view,
-            ref_l1: None,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
         };
         // The decode may surface Err if the bypass-bit guess is wrong;
         // we accept either a clean decode or a bitreader exhaustion (the
@@ -2560,5 +2651,210 @@ mod tests {
         assert!(pic.y.iter().all(|&v| v == 128));
         assert!(pic.cb.iter().all(|&v| v == 128));
         assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// **Round-9 HMVP-as-AMVP fallback.** When the §8.5.2.4.3 spatial
+    /// neighbour list returns the spec's `(1, 1)` substitution AND the
+    /// HMVP candidate list holds a valid entry, `derive_default_mv()`
+    /// drives the predictor instead of the substitution. A 16×16 P
+    /// slice with a single CU produces an HMVP entry; a hypothetical
+    /// follow-up CU with `mvp_idx = 0` (left neighbour) would pull the
+    /// HMVP entry — but that CU never fires in this fixture because
+    /// the slice is single-CU. This test exercises the helper directly.
+    #[test]
+    fn round9_hmvp_fallback_overrides_unavailable_neighbour() {
+        let mut hmvp = crate::hmvp::HmvpCandList::new();
+        hmvp.update(crate::hmvp::HmvpCandidate {
+            mv_l0: MotionVector::quarter_pel(40, -20),
+            mv_l1: MotionVector::default(),
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+        });
+        // mvp_idx = 0 → spatial slot 0 (left neighbour) → unavailable
+        // → (1, 1). With non-empty HMVP, fallback triggers.
+        let mv = baseline_amvp_select_with_hmvp(0, &hmvp, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(40, -20));
+        // mvp_idx = 3 → temporal slot → (0, 0). Not (1, 1) substitution
+        // → no HMVP fallback (the temporal slot is "valid").
+        let mv = baseline_amvp_select_with_hmvp(3, &hmvp, 0, 0);
+        assert_eq!(mv, MotionVector::default());
+    }
+
+    /// HMVP fallback no-ops when the list is empty (the §8.5.2.4.3
+    /// substitution `(1, 1)` is the final answer).
+    #[test]
+    fn round9_hmvp_fallback_noop_on_empty_list() {
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let mv = baseline_amvp_select_with_hmvp(0, &hmvp, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(1, 1));
+    }
+
+    /// **Round-9 multi-reference DPB.** A P slice with
+    /// `num_ref_idx_active_minus1 == 1` (two references) and an explicit
+    /// `ref_idx_l0 = 1` reads from L0[1]. We use `cu_skip` so the
+    /// decoder doesn't emit the `ref_idx_l0` bin (cu_skip implicitly
+    /// uses ref_idx 0); the test is therefore a pipeline acceptance
+    /// for the new 2-entry ref_list_l0 — the resolved view is L0[0],
+    /// matching the expected uniform-200 ref. This validates the new
+    /// `ref_list_l0` slice surface end-to-end.
+    #[test]
+    fn round9_multiref_dpb_two_entry_l0() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref0_y = vec![200u8; 16 * 16];
+        let ref0_cb = vec![100u8; 8 * 8];
+        let ref0_cr = vec![80u8; 8 * 8];
+        let ref1_y = vec![50u8; 16 * 16];
+        let ref1_cb = vec![60u8; 8 * 8];
+        let ref1_cr = vec![70u8; 8 * 8];
+        let view0 = RefPictureView {
+            y: &ref0_y,
+            cb: &ref0_cb,
+            cr: &ref0_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let view1 = RefPictureView {
+            y: &ref1_y,
+            cb: &ref1_cb,
+            cr: &ref1_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        // 16×16 leaf at log2 = 4 == min → no split. cu_skip uses
+        // ref_idx 0 implicitly, so no ref_idx bin is emitted.
+        enc.encode_decision(0, 0, 1); // cu_skip = 1
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 (3 ones)
+        }
+        enc.encode_decision(0, 0, 0); // cbf_luma
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+        };
+        let ref_list_l0 = [view0, view1];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 1, // round-9: two L0 refs
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.coding_units, 1);
+        assert_eq!(stats.uni_pred_cus, 1);
+        // cu_skip uses ref_idx 0 → result is L0[0] = uniform 200.
+        assert!(pic.y.iter().all(|&v| v == 200));
+        assert!(pic.cb.iter().all(|&v| v == 100));
+        assert!(pic.cr.iter().all(|&v| v == 80));
+    }
+
+    /// **Round-9 DPB validation.** An empty `ref_list_l0` is rejected
+    /// at slice entry — the decoder requires at least one L0 ref.
+    #[test]
+    fn round9_rejects_empty_ref_list_l0() {
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+        };
+        let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
+        assert!(format!("{err}").contains("ref_list_l0"));
+    }
+
+    /// **Round-9 DPB validation.** `num_ref_idx_active_minus1_l0` over
+    /// the supplied list size is rejected.
+    #[test]
+    fn round9_rejects_oversized_active_count() {
+        use crate::inter::RefPictureView;
+        let ref0_y = vec![100u8; 16 * 16];
+        let ref0_cb = vec![100u8; 64];
+        let ref0_cr = vec![100u8; 64];
+        let view = RefPictureView {
+            y: &ref0_y,
+            cb: &ref0_cb,
+            cr: &ref0_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+        };
+        let ref_list_l0 = [view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 1, // implies 2 entries needed
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+        };
+        let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
+        assert!(format!("{err}").contains("num_ref_idx_active_minus1_l0"));
     }
 }

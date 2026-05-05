@@ -7,56 +7,91 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Round-8 status
+## Round-9 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full
 residual coding, luma + chroma deblocking, the 64-point IDCT, the
 **Main-profile CABAC initialization tables** (Tables 40-90) and
-§9.3.4.2 ctxInc derivation helpers, plus the round-8 additions:
+§9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
+infrastructure, plus the round-9 production-pipeline additions:
 
-* **Reference picture list parsing** (§7.3.7 / §7.4.8) — the new
-  [`rpl`](src/rpl.rs) module fully parses every
-  `ref_pic_list_struct(listIdx, rplsIdx, ltrpFlag)` entry (STRP +
-  LTRP), including the `delta_poc_st` / `strp_entry_sign_flag` /
-  `poc_lsb_lt` per-entry shape. The SPS parser populates
-  `num_ref_pic_lists_in_sps[i]` and the per-list candidate arrays
-  (no longer "skip"-only); the slice-header parser walks the non-IDR
-  RPL branch (`sps_rpl_flag == 1`), handles both the SPS-pointer
-  (`ref_pic_list_sps_flag = 1`) and inline-RPL paths, derives
-  `SliceRplsIdx[i]` per eq. 83, and consumes the per-LTRP
-  `additional_poc_lsb_present_flag` / `additional_poc_lsb_val` loop.
-  Round-8 unblocks decode of any non-IDR slice that carries an RPL
-  (the prior gate was `Error::Unsupported`).
-* **History-based MV prediction** (§8.5.2.7 + §8.5.2.4.4) — the new
-  [`hmvp`](src/hmvp.rs) module implements the 23-entry HMVP candidate
-  list with the spec's left-shift-on-full LRU update, per-CTU-row
-  reset (`if (xCtb == xFirstCtb) NumHmvpCand = 0`), and the §8.5.2.4.4
-  `derive_default_mv()` walk that prefers an exact-refIdx match in
-  the last 4 entries before falling back to the most-recent valid
-  candidate. The list is threaded through
-  `decode_baseline_inter_slice` and updated after every inter CU; the
-  final `NumHmvpCand` is surfaced via `InterDecodeStats`.
+* **Multi-reference DPB** (§8.3) — `EvcDecoder` now carries a
+  16-slot decoded-picture buffer indexed by POC. Every freshly-decoded
+  picture is held in the DPB; IDR slices flush the buffer (and reset
+  POC to 0); non-IDR slices are inserted at the resolved POC.
+  Eviction at capacity drops the lowest POC. The
+  `InterDecodeInputs::ref_list_l0` / `ref_list_l1` slice surfaces
+  expose every active reference at once; `apply_inter_prediction`
+  resolves each CU's per-list `ref_idx_l*` against the right slot.
+  The round-4 single-reference gate (`Error::Unsupported` when
+  `num_ref_idx_active_minus1_l? > 0`) is gone.
+* **HMVP-driven AMVP fallback** (§8.5.2.4.4) — the round-8 HMVP
+  candidate list now drives MV selection, not just shadows it. When
+  the §8.5.2.4.3 spatial AMVP slot would land on the spec's `(1, 1)`
+  substitution AND HMVP holds at least one valid candidate, the
+  predictor falls through to `hmvp.derive_default_mv(ref_idx, list_x)`.
+  The fallback fires on every inter CU after the first one in a
+  CTU row and significantly improves correctness on real Main-profile
+  content (the round-4 stub always returned `(1, 1)` or zero).
+* **POC reordering** (§8.3.1) — `derive_poc()` implements the spec's
+  wrap-detection on `slice_pic_order_cnt_lsb` (forward wrap when the
+  new LSB falls more than half-`MaxPicOrderCntLsb` below the previous
+  LSB; backward in the symmetric case). The decoder's output queue is
+  POC-sorted via a parallel `out_pocs` buffer so callers see frames in
+  display order even when bitstream coding order differs (e.g.
+  B-pyramid GOPs).
 
-The decoder's NonIDR path now routes through
-`crate::slice_header::parse_consume`, so any production stream with
-`sps_rpl_flag = 1` (with or without `sps_pocs_flag = 1`) decodes
-through the canonical parser. The Baseline residual / inter / intra /
-deblock pipeline is unchanged.
+Per-slice reference-list construction walks the slice's
+`ref_pic_list_struct()` and applies each STRP entry's signed
+`delta_poc_st` (per §7.4.8 eq. 124) to the current slice's POC,
+chaining entry-to-entry per §8.3.5; the resolved POCs are looked up in
+the DPB. Streams with `sps_rpl_flag = 0` keep the round-4 implicit
+fallback (highest-POC DPB entry as the single reference).
 
 The remaining Baseline constraints (future rounds will lift them):
 
 - 8-bit luma + chroma (4:2:0).
 - `sps_addb_flag = 0` (deblocking uses the §8.8.2 baseline filter; the
   Main-profile advanced deblocking §8.8.3 is parked).
-- Single reference picture per list (`num_ref_idx_active_minus1_l? = 0`).
+- Long-term references (`Ltrp` RPL entries) surface as
+  `Error::Unsupported` — round-9 only resolves STRP deltas.
 - Sub-pel MV phases restricted to the Baseline 1/4-pel grid for luma
   (Table 25 phases 4, 8, 12) and 1/8-pel grid for chroma (Table 27
   phases 4, 8, 12, 16, 20, 24, 28).
 
 Anything outside the Baseline toolset (BTT, SUCO, ADMVP, EIPD, IBC, ATS,
 ADCC, ALF, DRA, AMVR, MMVD, affine, DMVR, …) bubbles up as
-`Error::Unsupported` — but the CABAC contexts, the RPL parse path and
-the HMVP candidate list are now ready.
+`Error::Unsupported` — but the CABAC contexts, the RPL parse path,
+the HMVP candidate list (now production-wired into AMVP), the
+POC-indexed DPB, and the POC-sorted output queue are all ready.
+
+## Round-9 deltas vs round 8
+
+- **Multi-reference DPB**: `EvcDecoder` carries a 16-slot DPB
+  (`Vec<DpbEntry>`) keyed by POC. IDR flushes; non-IDR appends.
+  `InterDecodeInputs::ref_list_l0` / `ref_list_l1` are now
+  `&[RefPictureView]` slices; `apply_inter_prediction` resolves each
+  CU's `ref_idx_l*` against the right slot. The round-4 single-ref
+  gate is removed.
+- **HMVP-as-AMVP**: `baseline_amvp_select_with_hmvp` consults
+  `hmvp.derive_default_mv()` whenever the §8.5.2.4.3 spatial slot
+  resolves to the `(1, 1)` substitution and HMVP holds a valid
+  candidate. Round-8 only built the HMVP list; round-9 makes it
+  drive MV selection.
+- **POC + reordering**: `derive_poc()` implements §8.3.1 wrap
+  detection. Output queue is POC-sorted via a parallel `out_pocs`
+  buffer so display order is preserved even when coding order isn't.
+- **Per-slice RPL → DPB resolution**: `decode_non_idr` walks the
+  slice's `ref_pic_list_struct()` deltas (chained from `cur_poc` per
+  §8.3.5), looks each POC up in the DPB, and packs the results into
+  the inter pipeline's `ref_list_l0` / `ref_list_l1`.
+- **Implicit fallback**: streams with `sps_rpl_flag = 0` still work —
+  the highest-POC DPB entry becomes the single L0 ref. Preserves
+  round-4 fixture behaviour.
+- 196 unit tests pass (was 187); 9 new tests cover the round-9
+  pipeline (HMVP fallback direct + no-op, multi-ref DPB acceptance,
+  empty/oversized validation, POC wrap, DPB eviction, DPB flush,
+  three-frame IDR + P + P end-to-end).
 
 ## Round-8 deltas vs round 7
 

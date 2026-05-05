@@ -2,6 +2,82 @@
 
 ## [Unreleased]
 
+### Round 9 — multi-reference DPB + HMVP-as-AMVP fallback + POC reordering
+
+#### Added
+- DPB inside `EvcDecoder`: every decoded picture is held in a
+  16-slot `Vec<DpbEntry>` indexed by POC. IDR slices flush the buffer;
+  non-IDR slices append at the resolved POC. Eviction at capacity
+  drops the lowest POC. New `dpb_find()` / `dpb_insert()` /
+  `dpb_flush()` helpers.
+- POC derivation per §8.3.1 (`derive_poc`): wraps `PicOrderCntMsb`
+  forward when the new `slice_pic_order_cnt_lsb` falls more than
+  half-`MaxPicOrderCntLsb` below the previous LSB, and backward in the
+  symmetric direction. Round-9 routes every non-IDR slice through it.
+- POC-ordered output queue (`out_pocs` parallel buffer): the decoder
+  inserts each freshly-decoded picture into the `out` queue at its
+  sorted POC position so callers see frames in display order even when
+  bitstream coding order differs.
+- `InterDecodeInputs::ref_list_l0` / `ref_list_l1` slice surfaces
+  (was single-entry `ref_l0` / `ref_l1`), plus `ref_l0(idx)` /
+  `ref_l1(idx)` resolver helpers. Slice entry validates that each
+  list holds at least `num_ref_idx_active_minus1[i] + 1` entries.
+- `baseline_amvp_select_with_hmvp()`: when the §8.5.2.4.3 spatial
+  AMVP slot would land on the spec's `(1, 1)` substitution AND the
+  HMVP candidate list is non-empty, the predictor falls through to
+  `hmvp.derive_default_mv(ref_idx, list_x)`. Wires the round-8
+  HMVP infrastructure into actual MV selection per §8.5.2.4.4.
+- `decoder::decode_non_idr` end-to-end: parses the slice header,
+  derives POC, walks the slice's `ref_pic_list_struct()` to build
+  per-list POC arrays (delta-POC chained from the current POC),
+  resolves each POC against the DPB, and threads the resulting
+  `RefPictureView` slices through the inter pipeline.
+- `implicit_ref_pocs()` fallback for streams with `sps_rpl_flag = 0`:
+  uses the highest-POC DPB entry as the single reference, preserving
+  round-4 behaviour without requiring RPL signalling.
+
+#### Changed
+- `InterDecodeInputs` ref fields are now `&'b [RefPictureView<'a>]`
+  (was `RefPictureView` / `Option<RefPictureView>`). Tests passing a
+  single reference wrap it in a single-element array. The
+  round-4-era `num_ref_idx_active_minus1_l? > 0` `Error::Unsupported`
+  gate is gone — multi-reference bitstreams now decode end-to-end.
+- `apply_inter_prediction` resolves L0 / L1 ref via `ref_l0(ref_idx)`
+  on the inputs struct instead of always reading `ref_l0[0]`. Each
+  CU's per-list `ref_idx_l*` is honoured.
+- `decode_inter_coding_unit` cu_skip + explicit-MV paths use
+  `baseline_amvp_select_with_hmvp` instead of the round-4 stubbed
+  `baseline_amvp_select`. The HMVP fallback is queried with the
+  resolved `ref_idx_l*` so the §8.5.2.4.4 ref-idx-match rule fires
+  on real CUs.
+- Decoder NonIDR routing replaced: the old `decode_non_idr_via_inter`
+  free function is gone, replaced by the `EvcDecoder::decode_non_idr`
+  method (needs `&mut self` for DPB updates + POC tracker).
+- Round-8 fixture `round8_rpl_non_idr_decodes_to_two_frames` now
+  signs its inline `delta_poc_st` as negative (sign=0) so the ref
+  POC = 1 + (-1) = 0 resolves to the IDR; the previous fixture's
+  positive sign pointed at a future POC and only worked because
+  round 8 ignored the delta entirely.
+
+#### Tests
+- 196 unit tests pass (up from 187). 9 new tests cover the round-9
+  pipeline:
+  - `round9_hmvp_fallback_overrides_unavailable_neighbour` — direct
+    helper test verifying the AMVP `(1, 1)` slot is replaced with
+    the HMVP entry when ref-idx matches.
+  - `round9_hmvp_fallback_noop_on_empty_list` — verifies the
+    fallback is silent when HMVP is fresh.
+  - `round9_multiref_dpb_two_entry_l0` — pipeline acceptance for a
+    P slice with `num_ref_idx_active_minus1_l0 = 1` (two L0 refs).
+  - `round9_rejects_empty_ref_list_l0` and
+    `round9_rejects_oversized_active_count` — DPB validation tests.
+  - `derive_poc_wraps_on_lsb_rollover` — §8.3.1 POC derivation.
+  - `dpb_evicts_lowest_poc_at_capacity` — DPB eviction.
+  - `dpb_flush_clears_all` — DPB reset on IDR.
+  - `round9_three_frame_idr_p_p_with_dpb` — end-to-end fixture
+    decoding IDR + P (POC 1) + P (POC 2) where the second P
+    references the first via inline RPL `delta_poc_st = 1, sign = 0`.
+
 ### Round 8 — RPL non-IDR + HMVP infrastructure
 
 #### Added

@@ -1156,11 +1156,13 @@ mod tests {
         //   ref_pic_list_sps_flag[i] omitted because
         //     num_ref_pic_lists_in_sps[i] == 0 → not signalled.
         //   The inline `ref_pic_list_struct()` follows directly.
-        // RPL L0 inline: 1 STRP, delta=1, sign=1.
+        // RPL L0 inline: 1 STRP, delta=1, sign=0 (negative). Round-9
+        // resolves the ref POC as `slice_poc + signed_delta`, so
+        // sign=0 → ref POC = 1 + (-1) = 0 → matches the IDR.
         p_hdr.ue(1); // num_strp_entries
         p_hdr.ue(1); // delta_poc_st = 1
-        p_hdr.u(1, 1); // sign positive
-                       // RPL L1 inline: same shape (delta=1 sign=0).
+        p_hdr.u(1, 0); // sign negative → -1
+                       // RPL L1 inline: same shape (delta=1, sign=0).
         p_hdr.ue(1);
         p_hdr.ue(1);
         p_hdr.u(1, 0);
@@ -1232,5 +1234,126 @@ mod tests {
             .sum::<f64>()
             / v0.planes[0].data.len() as f64;
         assert_eq!(mse, 0.0, "RPL P-slice must be bit-identical to the IDR");
+    }
+
+    /// **Round-9 multi-frame DPB + POC fixture.** Decode an IDR + two P
+    /// slices (POC 0, 1, 2) where each P slice references the
+    /// previously-decoded frame via an inline RPL. The DPB must keep
+    /// the IDR + the first P alive long enough for the second P's RPL
+    /// (`delta_poc_st = 1, sign = 0` → `cur - 1`) to resolve. All three
+    /// frames come back as uniform-128 (the IDR is grey + the P slices
+    /// are zero-MV identity copies of the previous frame).
+    #[test]
+    fn round9_three_frame_idr_p_p_with_dpb() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_rpl_sps_rbsp(32, 32);
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        // IDR slice (POC 0).
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0);
+        idr_hdr.ue(2); // I slice
+        idr_hdr.u(1, 0); // no_output
+        idr_hdr.u(1, 0); // slice_deblocking_filter_flag
+        idr_hdr.u(6, 22); // slice_qp
+        idr_hdr.ue(0);
+        idr_hdr.ue(0);
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        let mut idr_enc = CabacEncoder::new();
+        idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        idr_enc.encode_decision(0, 0, 0); // cbf_luma
+        idr_enc.encode_decision(0, 0, 0); // cbf_cb
+        idr_enc.encode_decision(0, 0, 0); // cbf_cr
+        idr_enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&idr_enc.finish());
+
+        // Helper to build a P slice referencing POC = cur_poc - 1.
+        fn build_p_slice(cur_poc_lsb: u32) -> Vec<u8> {
+            use crate::cabac::CabacEncoder;
+            let mut p_hdr = BitEmitter::new();
+            p_hdr.ue(0); // slice_pps_id
+            p_hdr.ue(1); // slice_type = P
+            p_hdr.u(8, cur_poc_lsb); // POC LSB
+                                     // RPL L0 inline: 1 STRP, delta=1, sign=0 → ref = cur - 1.
+            p_hdr.ue(1);
+            p_hdr.ue(1);
+            p_hdr.u(1, 0);
+            // RPL L1 inline: same shape.
+            p_hdr.ue(1);
+            p_hdr.ue(1);
+            p_hdr.u(1, 0);
+            p_hdr.u(1, 0); // num_ref_idx_active_override_flag
+            p_hdr.u(1, 0); // slice_deblocking_filter_flag
+            p_hdr.u(6, 22); // slice_qp
+            p_hdr.ue(0);
+            p_hdr.ue(0);
+            while p_hdr.bit_position() % 8 != 0 {
+                p_hdr.u(1, 0);
+            }
+            let mut p_rbsp = p_hdr.into_bytes();
+            let mut p_enc = CabacEncoder::new();
+            p_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+            p_enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+            for _ in 0..3 {
+                p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3
+            }
+            p_enc.encode_decision(0, 0, 0); // cbf_luma
+            p_enc.encode_decision(0, 0, 0); // cbf_cb
+            p_enc.encode_decision(0, 0, 0); // cbf_cr
+            p_enc.encode_terminate(true);
+            p_rbsp.extend_from_slice(&p_enc.finish());
+            p_rbsp
+        }
+        let p1_rbsp = build_p_slice(1);
+        let p2_rbsp = build_p_slice(2);
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp));
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp));
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp));
+        bs.extend_from_slice(&nal_envelope(0, &p1_rbsp));
+        bs.extend_from_slice(&nal_envelope(0, &p2_rbsp));
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let f0 = dec.receive_frame().unwrap();
+        let f1 = dec.receive_frame().unwrap();
+        let f2 = dec.receive_frame().unwrap();
+        let v0 = match f0 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v1 = match f1 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v2 = match f2 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        assert!(v0.planes[0].data.iter().all(|&v| v == 128));
+        assert!(v1.planes[0].data.iter().all(|&v| v == 128));
+        assert!(v2.planes[0].data.iter().all(|&v| v == 128));
+        assert_eq!(v0.planes[0].data, v1.planes[0].data);
+        assert_eq!(v1.planes[0].data, v2.planes[0].data);
     }
 }
