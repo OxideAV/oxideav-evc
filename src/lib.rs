@@ -1108,9 +1108,11 @@ mod tests {
     /// **Round-8 RPL non-IDR fixture.** Same shape as the round-4 IDR+P
     /// fixture but with an SPS that turns on `sps_rpl_flag = 1` and
     /// `sps_pocs_flag = 1`, so the P slice header carries:
+    ///
     ///   * `slice_pic_order_cnt_lsb` (8 bits per `log2_max_poc_lsb=8`),
     ///   * a per-list inline `ref_pic_list_struct()` (one STRP entry each
     ///     because `num_ref_pic_lists_in_sps[i] = 0`).
+    ///
     /// The decoder must walk these fields cleanly via the canonical
     /// slice_header parser, then drive the inter pipeline as before.
     /// Both the IDR and the P frame come back as uniform-128 — PSNR Y =
