@@ -2,6 +2,91 @@
 
 ## [Unreleased]
 
+### Round 10 — spatial-neighbour MV grid AMVP + LTRP RPL resolution + flush() drain
+
+#### Added
+- `baseline_amvp_select_with_grid_and_hmvp` (`slice_data`): the
+  Baseline §8.5.2.4 AMVP `mvpList[]` is now built from the per-4×4
+  `SideInfoGrid` at the spec's three spatial probe positions:
+  - `mvpList[0]` ← MV at `(xCb − 1, yCb + nCbH − 1)` (left column,
+    bottom-most cell of the CU).
+  - `mvpList[1]` ← MV at `(xCb + nCbW − 1, yCb − 1)` (above row,
+    right-most cell of the CU).
+  - `mvpList[2]` ← MV at `(xCb + nCbW, yCb − 1)` (above-right corner).
+  - `mvpList[3]` ← temporal slot (still zero MV — §8.5.2.5 collocated
+    is parked for a follow-up round).
+  Each spatial probe is gated on `(pred_mode == Inter && ref_idx_l* ==
+  cur_ref_idx_lx)` per §8.5.2.4.3 — an in-picture neighbour with a
+  different reference is unavailable. When any spatial slot would
+  land on the spec's `(1, 1)` substitution AND the round-8
+  `HmvpCandList` holds a valid candidate, `derive_default_mv` is
+  consulted (§8.5.2.4.4 fallback unchanged from round 9).
+- `spatial_neighbour_mv` helper: probes the side-info grid at luma
+  coordinates `(x, y)` for an inter neighbour with a matching
+  ref-idx on `list_x`. Returns `Some(mv)` only when the cell is in
+  picture, `pred_mode == Inter`, and `ref_idx_l* == cur_ref_idx_lx`.
+- `EvcDecoder::build_ref_pocs` (was a free function `build_ref_pocs`):
+  promoted to a method so it can resolve LTRP entries against the
+  DPB. `RefPicListEntry::Ltrp { poc_lsb_lt }` is matched against
+  `(poc & (max_poc_lsb − 1))` for every DPB slot; the matching POC
+  becomes the LTRP slot's resolved reference. STRP entries continue
+  to advance the running delta-POC chain unchanged. The round-9
+  `Error::Unsupported` gate on LTRP is gone.
+- `EvcDecoder::drain_dpb_to_output`: pushes every DPB entry whose
+  `output_emitted == false` to the `out` queue in ascending POC order.
+- `DpbEntry::output_emitted` field: tracks whether the entry has been
+  pushed to the output queue. `enqueue_for_output` flips it to `true`
+  after the picture is queued; `drain_dpb_to_output` skips entries
+  that already have `output_emitted == true` so flush() is idempotent.
+
+#### Changed
+- `Decoder::flush()`: was a no-op; now drains unemitted DPB entries
+  to the output queue in POC order. Pictures already in `out`
+  (low-delay GOPs) stay in place — flush is idempotent and a no-op
+  when every DPB entry is already emitted.
+- `decode_inter_coding_unit` cu_skip + explicit-MV paths now call
+  `baseline_amvp_select_with_grid_and_hmvp` (passing `side_info`,
+  `x0`, `y0`, `n_cb_w`, `n_cb_h`, `ref_idx`, `list_x`) instead of
+  the round-9 `baseline_amvp_select_with_hmvp` (which always faked
+  the spatial slots as unavailable). The round-9 helper is kept
+  `#[cfg(test)]` for direct unit tests of the (1, 1) → HMVP
+  fallback path in isolation.
+
+#### Tests
+- 205 unit tests pass (up from 196). 9 new tests cover round-10:
+  - `round10_spatial_neighbour_left_drives_amvp_slot_0` — grid lookup
+    for slot 0 (left position).
+  - `round10_spatial_neighbour_above_right_drives_slot_2` — grid
+    lookup for slot 2 (above-right).
+  - `round10_spatial_neighbour_ref_idx_mismatch_is_unavailable` —
+    strict ref-idx match per §8.5.2.4.3.
+  - `round10_spatial_amvp_falls_through_to_hmvp` — empty grid +
+    non-empty HMVP still hits the §8.5.2.4.4 fallback.
+  - `round10_ltrp_rpl_resolves_against_dpb` — LTRP `poc_lsb_lt` →
+    DPB POC.
+  - `round10_ltrp_missing_dpb_entry_is_invalid` — LTRP with no
+    matching DPB POC is rejected as invalid bitstream.
+  - `round10_mixed_strp_and_ltrp_resolve` — STRP delta chain plus
+    LTRP slot in one RPL walk.
+  - `round10_flush_drains_unemitted_dpb_entries_in_poc_order` —
+    direct `drain_dpb_to_output` test.
+  - `round10_flush_after_receive_is_idempotent` — end-to-end
+    IDR + P decode through `Decoder::flush()`; no duplicate frames.
+
+#### Deferred to round 11
+- ALF (§8.9 adaptive loop filter) — APS-driven coefficient sets are
+  parsed in round-7's `cabac_init`, but the filter tap-pass is not
+  yet implemented (still surfaces `sps_alf_flag = 1` SPS as
+  `Error::Unsupported`).
+- DRA (§8.10 dynamic range adjustment) — APS-driven mapping tables
+  are parsed but the range-mapping post-pass is not yet implemented.
+- §8.5.2.5 temporal AMVP (collocated-picture) — slot `mvpList[3]` is
+  still zero. Needs the temporal MV buffer to be threaded through
+  the DPB.
+- §8.3.2 sliding-window unmark of LTRPs — the `output_emitted` field
+  exists but no automatic LTRP eviction happens; the DPB only flushes
+  on IDR.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-evc/compare/v0.0.0...v0.0.1) - 2026-05-05
 
 ### Other

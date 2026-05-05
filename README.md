@@ -7,13 +7,39 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Round-9 status
+## Round-10 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full
 residual coding, luma + chroma deblocking, the 64-point IDCT, the
 **Main-profile CABAC initialization tables** (Tables 40-90) and
 §9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
-infrastructure, plus the round-9 production-pipeline additions:
+infrastructure, the round-9 multi-ref DPB + POC reordering, plus the
+round-10 spec-compliance additions:
+
+* **Spatial-neighbour MV grid AMVP** (§8.5.2.4): the per-CU `mvpList[]`
+  now sources its left / above / above-right slots from the per-4×4
+  `SideInfoGrid` instead of always falling back to the spec's
+  `(1, 1)` substitution. The strict-match gate of §8.5.2.4.3 — the
+  neighbour is only available when its `pred_mode == Inter` AND its
+  `ref_idx_l*` matches the current CU's `cur_ref_idx_lx` — is honoured.
+  When all three spatial slots resolve to `(1, 1)`, the round-9 HMVP
+  fallback (§8.5.2.4.4) still fires. The temporal slot stays at zero
+  MV (the §8.5.2.5 collocated path is parked for a follow-up round).
+* **LTRP entries in slice RPL → DPB resolution** (§8.3.2 / §8.3.5):
+  `RefPicListEntry::Ltrp { poc_lsb_lt }` no longer surfaces as
+  `Error::Unsupported`. Instead the entry is matched against
+  `(poc & (max_poc_lsb − 1))` for every DPB slot; the matching POC
+  becomes the LTRP slot's resolved reference. STRP entries continue
+  to advance the running delta-POC chain unchanged. A mixed
+  STRP + LTRP RPL works end-to-end.
+* **`flush()` drain** (output queue): every DPB entry that hasn't yet
+  been pushed to the output queue is now emitted by `Decoder::flush()`,
+  in ascending POC order. Pictures already in `out` (the typical case
+  for low-delay GOPs where decode order == display order) stay in
+  place — flush is idempotent. A new `output_emitted: bool` field on
+  the DPB entry tracks the per-picture emission state.
+
+## Round-9 deltas vs round 8
 
 * **Multi-reference DPB** (§8.3) — `EvcDecoder` now carries a
   16-slot decoded-picture buffer indexed by POC. Every freshly-decoded
@@ -53,17 +79,51 @@ The remaining Baseline constraints (future rounds will lift them):
 - 8-bit luma + chroma (4:2:0).
 - `sps_addb_flag = 0` (deblocking uses the §8.8.2 baseline filter; the
   Main-profile advanced deblocking §8.8.3 is parked).
-- Long-term references (`Ltrp` RPL entries) surface as
-  `Error::Unsupported` — round-9 only resolves STRP deltas.
 - Sub-pel MV phases restricted to the Baseline 1/4-pel grid for luma
   (Table 25 phases 4, 8, 12) and 1/8-pel grid for chroma (Table 27
   phases 4, 8, 12, 16, 20, 24, 28).
+- **ALF** (§8.9 adaptive loop filter) — APS-driven coefficient sets are
+  parsed but the filter tap-pass is not yet implemented.
+- **DRA** (§8.10 dynamic range adjustment) — APS-driven mapping tables
+  are parsed but the range-mapping post-pass is not yet implemented.
+- The §8.5.2.5 temporal AMVP (collocated-picture) candidate is still
+  zero — round-10 only wires the spatial neighbours.
 
 Anything outside the Baseline toolset (BTT, SUCO, ADMVP, EIPD, IBC, ATS,
-ADCC, ALF, DRA, AMVR, MMVD, affine, DMVR, …) bubbles up as
-`Error::Unsupported` — but the CABAC contexts, the RPL parse path,
-the HMVP candidate list (now production-wired into AMVP), the
-POC-indexed DPB, and the POC-sorted output queue are all ready.
+ADCC, AMVR, MMVD, affine, DMVR, …) bubbles up as `Error::Unsupported` —
+but the CABAC contexts, the RPL parse path (with LTRP resolution),
+the HMVP candidate list (production-wired into AMVP), the
+spatial-neighbour AMVP grid, the POC-indexed DPB with `flush()` drain,
+and the POC-sorted output queue are all ready.
+
+## Round-10 deltas vs round 9
+
+- **Spatial-neighbour MV grid AMVP** (§8.5.2.4): new helper
+  `baseline_amvp_select_with_grid_and_hmvp` consults the per-4×4
+  `SideInfoGrid` at the spec's left `(xCb − 1, yCb + nCbH − 1)`,
+  above `(xCb + nCbW − 1, yCb − 1)` and above-right
+  `(xCb + nCbW, yCb − 1)` positions. The strict ref-idx-match gate of
+  §8.5.2.4.3 is honoured; mismatched refIdx is treated as unavailable.
+  When all spatial slots resolve to `(1, 1)`, the round-9 HMVP
+  fallback fires. `decode_inter_coding_unit` now threads CU
+  `(x0, y0, n_cb_w, n_cb_h)` through to the AMVP selection so the
+  grid can be probed.
+- **LTRP entries in slice RPL → DPB resolution**: `EvcDecoder::build_ref_pocs`
+  now resolves both STRP (signed delta-POC chain per eq. 124) and
+  LTRP (`poc_lsb_lt` matched against `(POC & (max_poc_lsb − 1))`)
+  entries in a single walk. Mixed STRP + LTRP RPLs work end-to-end.
+  The round-9 `Error::Unsupported` gate on LTRP is gone.
+- **`flush()` drain**: `Decoder::flush()` now emits every DPB entry
+  that hasn't yet been pushed to the output queue, in ascending POC
+  order. Pictures already in `out` (low-delay GOPs) stay in place —
+  flush is idempotent and a no-op when every DPB entry is already
+  emitted. New `output_emitted: bool` field on `DpbEntry` tracks the
+  per-picture state.
+- 205 unit tests pass (was 196); 9 new tests cover round-10:
+  4 spatial-neighbour AMVP cases (left, above-right, refIdx mismatch,
+  HMVP fallback), 3 LTRP RPL cases (resolve, missing DPB entry,
+  mixed STRP + LTRP), 1 `drain_dpb_to_output` direct, 1 end-to-end
+  flush()-after-receive idempotence.
 
 ## Round-9 deltas vs round 8
 

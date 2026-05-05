@@ -1,12 +1,16 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-8 status: a working **Baseline-profile IDR + P + B** decoder
+//! Round-10 status: a working **Baseline-profile IDR + P + B** decoder
 //! with residual coding (RLE + dequant + IDCT for nTbS up to 64),
 //! deblocking (§8.8.2 luma + chroma path), Main-profile CABAC init
 //! tables (Tables 40-90, §9.3.4.2 ctxInc helpers, eq. 1425/1426),
-//! plus full **reference-picture-list parsing** (§7.3.7 / §7.4.8) for
-//! non-IDR slices (`sps_rpl_flag = 1`) and the **HMVP candidate list**
-//! (§8.5.2.7 / §8.5.2.4.4) wired through the inter pipeline.
+//! full **reference-picture-list parsing** (§7.3.7 / §7.4.8) for
+//! non-IDR slices (`sps_rpl_flag = 1`), the **HMVP candidate list**
+//! (§8.5.2.7 / §8.5.2.4.4) wired through the inter pipeline, the
+//! round-9 **multi-ref DPB + POC reordering**, and the round-10
+//! **spatial-neighbour MV grid AMVP** (§8.5.2.4) +
+//! **LTRP RPL → DPB resolution** (§8.3.2 / §8.3.5) +
+//! **`flush()` drain** of the output queue.
 //!
 //! The crate decomposes into:
 //!
@@ -1355,5 +1359,100 @@ mod tests {
         assert!(v2.planes[0].data.iter().all(|&v| v == 128));
         assert_eq!(v0.planes[0].data, v1.planes[0].data);
         assert_eq!(v1.planes[0].data, v2.planes[0].data);
+    }
+
+    /// **Round-10 flush() drain end-to-end.** Decodes a 2-frame
+    /// IDR + P bitstream and verifies that calling `flush()` after
+    /// receiving every frame is idempotent — no duplicate frames
+    /// surface, and `receive_frame` returns `NeedMore` once the queue
+    /// is drained.
+    #[test]
+    fn round10_flush_after_receive_is_idempotent() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_rpl_sps_rbsp(32, 32);
+        let pps_rbsp = build_baseline_pps_rbsp();
+        // IDR slice (POC 0) — uniform 128.
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0);
+        idr_hdr.ue(2);
+        idr_hdr.u(1, 0);
+        idr_hdr.u(1, 0);
+        idr_hdr.u(6, 22);
+        idr_hdr.ue(0);
+        idr_hdr.ue(0);
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        let mut idr_enc = CabacEncoder::new();
+        idr_enc.encode_decision(0, 0, 0);
+        idr_enc.encode_decision(0, 0, 0);
+        idr_enc.encode_decision(0, 0, 0);
+        idr_enc.encode_decision(0, 0, 0);
+        idr_enc.encode_decision(0, 0, 0);
+        idr_enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&idr_enc.finish());
+        // P slice (POC 1).
+        let mut p_hdr = BitEmitter::new();
+        p_hdr.ue(0);
+        p_hdr.ue(1);
+        p_hdr.u(8, 1);
+        p_hdr.ue(1);
+        p_hdr.ue(1);
+        p_hdr.u(1, 0);
+        p_hdr.ue(1);
+        p_hdr.ue(1);
+        p_hdr.u(1, 0);
+        p_hdr.u(1, 0);
+        p_hdr.u(1, 0);
+        p_hdr.u(6, 22);
+        p_hdr.ue(0);
+        p_hdr.ue(0);
+        while p_hdr.bit_position() % 8 != 0 {
+            p_hdr.u(1, 0);
+        }
+        let mut p_rbsp = p_hdr.into_bytes();
+        let mut p_enc = CabacEncoder::new();
+        p_enc.encode_decision(0, 0, 0);
+        p_enc.encode_decision(0, 0, 1);
+        for _ in 0..3 {
+            p_enc.encode_decision(0, 0, 1);
+        }
+        p_enc.encode_decision(0, 0, 0);
+        p_enc.encode_decision(0, 0, 0);
+        p_enc.encode_decision(0, 0, 0);
+        p_enc.encode_terminate(true);
+        p_rbsp.extend_from_slice(&p_enc.finish());
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp));
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp));
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp));
+        bs.extend_from_slice(&nal_envelope(0, &p_rbsp));
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        // Drain both frames.
+        let _f0 = dec.receive_frame().unwrap();
+        let _f1 = dec.receive_frame().unwrap();
+        // Now flush() should be a no-op (every DPB entry has output_emitted = true).
+        dec.flush().unwrap();
+        let next = dec.receive_frame();
+        assert!(matches!(next, Err(oxideav_core::Error::NeedMore)));
     }
 }

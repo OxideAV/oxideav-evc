@@ -1011,9 +1011,11 @@ fn decode_transform_unit(
 // Round-4 Baseline P / B slice decode pipeline.
 // =====================================================================
 
+#[cfg(test)]
+use crate::inter::build_amvp_list_baseline;
 use crate::inter::{
-    average_bipred, build_amvp_list_baseline, derive_chroma_mv, interpolate_chroma_block,
-    interpolate_luma_block, MotionVector, RefPictureView,
+    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
+    MotionVector, RefPictureView,
 };
 
 /// Inputs for the Baseline P/B decode entry point.
@@ -1323,14 +1325,35 @@ fn decode_inter_coding_unit(
             mvp_idx_l1 = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
             stats.mvp_idx_bins += 1;
         }
-        // Round-9 §8.5.2.4.4 fallback: when the §8.5.2.4.3 spatial
-        // neighbour list resolves to (1,1) (the spec's "unavailable"
-        // substitution) and HMVP holds at least one valid candidate,
-        // consult `hmvp.derive_default_mv()` instead. cu_skip uses
-        // ref_idx = 0 implicitly.
-        let mv_l0 = baseline_amvp_select_with_hmvp(mvp_idx_l0, hmvp, 0, 0);
+        // Round-10 §8.5.2.4 spatial-neighbour AMVP. The mvpList[] is
+        // built from the per-4×4 SideInfoGrid at left, above and
+        // above-right CU positions; mvpList[3] is the temporal/zero
+        // slot. Round-9 §8.5.2.4.4 HMVP fallback still fires for any
+        // spatial slot that resolves to the spec's (1, 1) substitution.
+        // cu_skip uses ref_idx = 0 implicitly.
+        let mv_l0 = baseline_amvp_select_with_grid_and_hmvp(
+            mvp_idx_l0,
+            side_info,
+            hmvp,
+            x0 as i32,
+            y0 as i32,
+            n_cb_w as i32,
+            n_cb_h as i32,
+            0,
+            0,
+        );
         let mv_l1 = if inputs.slice_is_b {
-            Some(baseline_amvp_select_with_hmvp(mvp_idx_l1, hmvp, 0, 1))
+            Some(baseline_amvp_select_with_grid_and_hmvp(
+                mvp_idx_l1,
+                side_info,
+                hmvp,
+                x0 as i32,
+                y0 as i32,
+                n_cb_w as i32,
+                n_cb_h as i32,
+                0,
+                1,
+            ))
         } else {
             None
         };
@@ -1388,7 +1411,17 @@ fn decode_inter_coding_unit(
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
-            let mvp = baseline_amvp_select_with_hmvp(mvp_idx, hmvp, ref_idx_l0 as i8, 0);
+            let mvp = baseline_amvp_select_with_grid_and_hmvp(
+                mvp_idx,
+                side_info,
+                hmvp,
+                x0 as i32,
+                y0 as i32,
+                n_cb_w as i32,
+                n_cb_h as i32,
+                ref_idx_l0 as i8,
+                0,
+            );
             mvl0 = mvp.wrapping_add(&MotionVector::quarter_pel(mvd_x, mvd_y));
         }
         if use_l1 {
@@ -1409,7 +1442,17 @@ fn decode_inter_coding_unit(
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
-            let mvp = baseline_amvp_select_with_hmvp(mvp_idx, hmvp, ref_idx_l1 as i8, 1);
+            let mvp = baseline_amvp_select_with_grid_and_hmvp(
+                mvp_idx,
+                side_info,
+                hmvp,
+                x0 as i32,
+                y0 as i32,
+                n_cb_w as i32,
+                n_cb_h as i32,
+                ref_idx_l1 as i8,
+                1,
+            );
             mvl1 = mvp.wrapping_add(&MotionVector::quarter_pel(mvd_x, mvd_y));
         }
         pred_l0 = if use_l0 {
@@ -1559,13 +1602,14 @@ fn decode_inter_coding_unit(
 /// list holds at least one valid candidate, derive the MV from
 /// `hmvp.derive_default_mv(cur_ref_idx, list_x)` instead.
 ///
-/// Round-9 still routes the spatial-neighbour lookup through the
+/// Round-9 still routed the spatial-neighbour lookup through the
 /// "all-None" path because the per-4×4 MV grid built into
-/// [`SideInfoGrid`] is consulted by the deblocking pass only — the
-/// inter pipeline doesn't yet probe it for AMVP. The HMVP fallback is
-/// the production path for any P/B stream that crosses the first CTU
-/// row boundary, so wiring it in significantly improves correctness on
-/// real Main-profile content.
+/// [`SideInfoGrid`] was consulted by the deblocking pass only — the
+/// inter pipeline didn't yet probe it for AMVP. Round-10's
+/// [`baseline_amvp_select_with_grid_and_hmvp`] wires the grid in.
+/// This helper is kept for direct unit tests of the (1, 1) → HMVP
+/// fallback path in isolation.
+#[cfg(test)]
 fn baseline_amvp_select_with_hmvp(
     mvp_idx: u32,
     hmvp: &crate::hmvp::HmvpCandList,
@@ -1575,6 +1619,107 @@ fn baseline_amvp_select_with_hmvp(
     let list = build_amvp_list_baseline(0, 0, 0, 0, |_, _| None, MotionVector::default());
     let chosen = list[mvp_idx.min(3) as usize].0;
     let unavailable = MotionVector::quarter_pel(1, 1);
+    if chosen == unavailable && !hmvp.is_empty() {
+        if let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x) {
+            return mv;
+        }
+    }
+    chosen
+}
+
+/// Probe the side-info grid at luma coordinates `(x, y)` for an inter
+/// neighbour with a matching `ref_idx` on `list_x`. Returns the
+/// neighbour's MV when the cell exists in-picture, was coded as inter,
+/// and `ref_idx_l*` matches `cur_ref_idx_lx`. Per §8.5.2.4.3 the
+/// strict ref-idx-match gate means a neighbour with a different
+/// reference is treated as unavailable.
+fn spatial_neighbour_mv(
+    side_info: &SideInfoGrid,
+    x: i32,
+    y: i32,
+    cur_ref_idx_lx: i8,
+    list_x: u8,
+) -> Option<MotionVector> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let x_cell = (x as u32) >> 2;
+    let y_cell = (y as u32) >> 2;
+    if (x_cell as usize) >= side_info.w_cells || (y_cell as usize) >= side_info.h_cells {
+        return None;
+    }
+    let info = side_info.at(x_cell as usize, y_cell as usize);
+    if info.pred_mode != CuPredMode::Inter {
+        return None;
+    }
+    let (ref_idx, mv_x, mv_y) = if list_x == 0 {
+        (info.ref_idx_l0, info.mv_l0_x, info.mv_l0_y)
+    } else {
+        (info.ref_idx_l1, info.mv_l1_x, info.mv_l1_y)
+    };
+    if ref_idx < 0 || ref_idx != cur_ref_idx_lx {
+        return None;
+    }
+    Some(MotionVector::quarter_pel(mv_x, mv_y))
+}
+
+/// Round-10 §8.5.2.4 spatial-neighbour AMVP. Builds the per-CU
+/// `mvpList[]` by probing the [`SideInfoGrid`] at the spec's left,
+/// above and above-right positions:
+///
+/// * `mvpList[0]` ← MV at `(xCb − 1, yCb + nCbH − 1)` (left column,
+///   bottom-most cell of the CU).
+/// * `mvpList[1]` ← MV at `(xCb + nCbW − 1, yCb − 1)` (above row,
+///   right-most cell of the CU).
+/// * `mvpList[2]` ← MV at `(xCb + nCbW, yCb − 1)` (above-right corner).
+/// * `mvpList[3]` ← temporal slot (round-10 still uses zero MV — the
+///   §8.5.2.5 collocated-picture path is parked for a follow-up round
+///   that wires the temporal-merge candidate through).
+///
+/// Each spatial probe is gated on `(pred_mode == Inter && ref_idx_l* ==
+/// cur_ref_idx_lx)` per §8.5.2.4.3 — an in-picture neighbour with a
+/// different reference is unavailable. When any spatial slot would
+/// land on the spec's `(1, 1)` "all-neighbours-unavailable"
+/// substitution AND the round-8 [`HmvpCandList`] holds a valid
+/// candidate, [`HmvpCandList::derive_default_mv`] is consulted
+/// (§8.5.2.4.4) to fill the slot. The temporal slot keeps its zero
+/// MV regardless (HMVP only substitutes for the `(1, 1)` slots).
+#[allow(clippy::too_many_arguments)]
+fn baseline_amvp_select_with_grid_and_hmvp(
+    mvp_idx: u32,
+    side_info: &SideInfoGrid,
+    hmvp: &crate::hmvp::HmvpCandList,
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w: i32,
+    n_cb_h: i32,
+    cur_ref_idx_lx: i8,
+    list_x: u8,
+) -> MotionVector {
+    let unavailable = MotionVector::quarter_pel(1, 1);
+    let nb_left = spatial_neighbour_mv(
+        side_info,
+        x_cb - 1,
+        y_cb + n_cb_h - 1,
+        cur_ref_idx_lx,
+        list_x,
+    );
+    let nb_above = spatial_neighbour_mv(
+        side_info,
+        x_cb + n_cb_w - 1,
+        y_cb - 1,
+        cur_ref_idx_lx,
+        list_x,
+    );
+    let nb_above_right =
+        spatial_neighbour_mv(side_info, x_cb + n_cb_w, y_cb - 1, cur_ref_idx_lx, list_x);
+    let list = [
+        nb_left.unwrap_or(unavailable),
+        nb_above.unwrap_or(unavailable),
+        nb_above_right.unwrap_or(unavailable),
+        MotionVector::default(), // temporal/zero
+    ];
+    let chosen = list[mvp_idx.min(3) as usize];
     if chosen == unavailable && !hmvp.is_empty() {
         if let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x) {
             return mv;
@@ -2687,6 +2832,112 @@ mod tests {
         let hmvp = crate::hmvp::HmvpCandList::new();
         let mv = baseline_amvp_select_with_hmvp(0, &hmvp, 0, 0);
         assert_eq!(mv, MotionVector::quarter_pel(1, 1));
+    }
+
+    /// **Round-10 spatial-neighbour AMVP.** Stamp an inter neighbour
+    /// into the side-info grid at the left position, then verify
+    /// `baseline_amvp_select_with_grid_and_hmvp` pulls its MV at
+    /// `mvp_idx = 0` instead of falling back to (1, 1).
+    #[test]
+    fn round10_spatial_neighbour_left_drives_amvp_slot_0() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        // CU at (16, 16), 16×16. Left position = (15, 31). Stamp a
+        // 4×4 inter cell there with MV = (24, -12), refIdx = 0.
+        grid.stamp_block(
+            12,
+            28,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 24,
+                mv_l0_y: -12,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        // mvp_idx = 0 → left slot. Spatial probe at (15, 31) → cell
+        // (3, 7) → matches stamped block.
+        let mv = baseline_amvp_select_with_grid_and_hmvp(0, &grid, &hmvp, 16, 16, 16, 16, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(24, -12));
+        // mvp_idx = 1 → above slot at (xCb + nCbW − 1, yCb − 1) = (31, 15)
+        // → cell (7, 3) → never stamped → unavailable. With empty HMVP
+        // the result is the (1, 1) substitution.
+        let mv = baseline_amvp_select_with_grid_and_hmvp(1, &grid, &hmvp, 16, 16, 16, 16, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(1, 1));
+    }
+
+    /// **Round-10 spatial AMVP ref-idx mismatch is treated as
+    /// unavailable.** A neighbour with the wrong refIdx must not
+    /// satisfy the §8.5.2.4.3 strict-match gate.
+    #[test]
+    fn round10_spatial_neighbour_ref_idx_mismatch_is_unavailable() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        grid.stamp_block(
+            12,
+            28,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 24,
+                mv_l0_y: -12,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 2, // mismatched against current cur_ref_idx=0
+                ref_idx_l1: -1,
+            },
+        );
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let mv = baseline_amvp_select_with_grid_and_hmvp(0, &grid, &hmvp, 16, 16, 16, 16, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(1, 1));
+    }
+
+    /// **Round-10 spatial AMVP HMVP fallback.** Empty grid + non-empty
+    /// HMVP should still deliver the HMVP entry on a (1, 1) slot.
+    #[test]
+    fn round10_spatial_amvp_falls_through_to_hmvp() {
+        let grid = SideInfoGrid::new(64, 64);
+        let mut hmvp = crate::hmvp::HmvpCandList::new();
+        hmvp.update(crate::hmvp::HmvpCandidate {
+            mv_l0: MotionVector::quarter_pel(8, 8),
+            mv_l1: MotionVector::default(),
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+        });
+        let mv = baseline_amvp_select_with_grid_and_hmvp(0, &grid, &hmvp, 16, 16, 16, 16, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(8, 8));
+    }
+
+    /// Above-right corner probe at (xCb + nCbW, yCb − 1).
+    #[test]
+    fn round10_spatial_neighbour_above_right_drives_slot_2() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        // CU at (16, 16), 16×16. Above-right position = (32, 15) → cell (8, 3).
+        grid.stamp_block(
+            32,
+            12,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: -16,
+                mv_l0_y: 4,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let mv = baseline_amvp_select_with_grid_and_hmvp(2, &grid, &hmvp, 16, 16, 16, 16, 0, 0);
+        assert_eq!(mv, MotionVector::quarter_pel(-16, 4));
     }
 
     /// **Round-9 multi-reference DPB.** A P slice with

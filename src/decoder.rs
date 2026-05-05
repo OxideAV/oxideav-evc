@@ -37,8 +37,8 @@ use crate::slice_data::{InterDecodeInputs, SliceDecodeInputs, SliceWalkInputs};
 use crate::sps::{self, Sps};
 use crate::CODEC_ID_STR;
 
-/// Decoded-picture buffer entry (round-9). Each slot keeps the
-/// reconstructed picture, its POC and the original presentation
+/// Decoded-picture buffer entry (round-9 / round-10). Each slot keeps
+/// the reconstructed picture, its POC and the original presentation
 /// timestamp so frames can be re-ordered by POC before emission.
 #[derive(Clone, Debug)]
 struct DpbEntry {
@@ -48,10 +48,14 @@ struct DpbEntry {
     /// `true` while the picture is still needed as a reference. Round-9
     /// keeps every IDR + short-term ref alive until a fresh IDR flushes
     /// the buffer. Long-term references and explicit RPL-driven
-    /// removal are deferred — the field is parked here for round-10's
+    /// removal are deferred — the field is parked here for round-11's
     /// sliding-window unmark step.
     #[allow(dead_code)]
     used_for_reference: bool,
+    /// Round-10: whether this DPB entry has already been pushed to the
+    /// `out` output queue. Stops `flush()` from re-emitting frames the
+    /// caller has already received.
+    output_emitted: bool,
 }
 
 /// Build the round-3 decoder for the registry.
@@ -198,6 +202,7 @@ impl Decoder for EvcDecoder {
                         poc: 0,
                         pts: packet.pts,
                         used_for_reference: true,
+                        output_emitted: false,
                     };
                     self.prev_poc_lsb = 0;
                     self.poc_msb = 0;
@@ -221,6 +226,7 @@ impl Decoder for EvcDecoder {
                         poc,
                         pts: packet.pts,
                         used_for_reference: true,
+                        output_emitted: false,
                     };
                     self.dpb_insert(entry);
                     self.enqueue_for_output(poc);
@@ -245,9 +251,13 @@ impl Decoder for EvcDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Drain remaining DPB entries to the output queue in POC order.
-        // Round-9: only entries that haven't already been emitted are
-        // pushed; the output queue itself is emitted by `receive_frame`.
+        // Round-10 drain: every DPB entry that hasn't yet been pushed
+        // to the output queue is emitted now, in ascending POC order.
+        // Pictures already in `out` (the typical case for low-delay GOPs
+        // where decode order == display order) stay in place and are
+        // not duplicated. After flush(), the next `receive_frame` calls
+        // will pull every reconstructed picture in display order.
+        self.drain_dpb_to_output();
         Ok(())
     }
 }
@@ -258,13 +268,15 @@ impl EvcDecoder {
     /// queue stays sorted by POC even when bitstream coding-order
     /// differs from display-order (e.g. B-pyramid GOPs). The frame is
     /// inserted at the unique position where every earlier frame has a
-    /// smaller POC and every later frame has a greater POC.
+    /// smaller POC and every later frame has a greater POC. Round-10
+    /// marks the corresponding DPB entry as `output_emitted = true` so
+    /// `flush()` doesn't re-push it.
     fn enqueue_for_output(&mut self, poc: i32) {
-        let entry = match self.dpb_find(poc) {
-            Some(e) => e.clone(),
+        let (frame, pts) = match self.dpb_find(poc) {
+            Some(e) => (picture_to_video_frame(&e.pic, e.pts), e.pts),
             None => return,
         };
-        let frame = picture_to_video_frame(&entry.pic, entry.pts);
+        let _ = pts; // silence unused
         let pos = self.out_pocs.iter().position(|&p| p > poc);
         match pos {
             Some(i) => {
@@ -275,6 +287,28 @@ impl EvcDecoder {
                 self.out.push_back(frame);
                 self.out_pocs.push_back(poc);
             }
+        }
+        if let Some(entry) = self.dpb.iter_mut().find(|e| e.poc == poc) {
+            entry.output_emitted = true;
+        }
+    }
+
+    /// Round-10 `flush()` drain: emit every DPB entry that hasn't yet
+    /// been queued for output, in ascending POC order. Pictures already
+    /// in `out` (the typical case for low-delay GOPs) are skipped so
+    /// the caller never sees the same frame twice.
+    ///
+    /// Used by [`Decoder::flush`] but also exposed as a helper for
+    /// tests that want to verify the drain path independently.
+    fn drain_dpb_to_output(&mut self) {
+        // Sort indices by POC so we emit in display order.
+        let mut idxs: Vec<usize> = (0..self.dpb.len())
+            .filter(|&i| !self.dpb[i].output_emitted)
+            .collect();
+        idxs.sort_by_key(|&i| self.dpb[i].poc);
+        for i in idxs {
+            let poc = self.dpb[i].poc;
+            self.enqueue_for_output(poc);
         }
     }
 
@@ -375,7 +409,7 @@ impl EvcDecoder {
         };
         let pocs_l0 = if sps.sps_rpl_flag {
             let rpl_l0 = self.resolve_slice_rpl(&header, sps, 0)?;
-            build_ref_pocs(&rpl_l0, poc, n_active_l0)?
+            self.build_ref_pocs(&rpl_l0, poc, n_active_l0, max_poc_lsb)?
         } else {
             // §8.3.5 round-9 implicit fallback: with no per-slice or
             // SPS RPL signalling, use the highest-POC decoded picture
@@ -385,7 +419,7 @@ impl EvcDecoder {
         let pocs_l1 = if slice_is_b {
             if sps.sps_rpl_flag {
                 let rpl_l1 = self.resolve_slice_rpl(&header, sps, 1)?;
-                build_ref_pocs(&rpl_l1, poc, n_active_l1)?
+                self.build_ref_pocs(&rpl_l1, poc, n_active_l1, max_poc_lsb)?
             } else {
                 self.implicit_ref_pocs(n_active_l1)?
             }
@@ -529,36 +563,66 @@ impl EvcDecoder {
     }
 }
 
-/// Walk an `RefPicListStruct` to produce up to `n_active` reference POCs
-/// per §8.3.5. Each STRP entry contributes the running-sum POC. LTRPs
-/// would carry an absolute POC (poc_lsb_lt) which round-9 doesn't yet
-/// resolve — they're skipped with an invalid-bitstream error if the
-/// active count would require them.
-fn build_ref_pocs(
-    rpl: &crate::rpl::RefPicListStruct,
-    cur_poc: i32,
-    n_active: usize,
-) -> Result<Vec<i32>> {
-    let mut out = Vec::with_capacity(n_active);
-    let mut running = cur_poc;
-    for entry in rpl.entries.iter().take(n_active) {
-        // STRP delta-POC is signed; entry.signed_delta_poc applies the
-        // sign bit per §7.4.8 eq. 124. LTRP entries return None.
-        let delta = entry.signed_delta_poc().ok_or_else(|| {
-            Error::unsupported(
-                "evc decoder: round-9 long-term-reference resolution not implemented",
-            )
-        })?;
-        running += delta;
-        out.push(running);
+impl EvcDecoder {
+    /// Walk an `RefPicListStruct` to produce up to `n_active` reference
+    /// POCs per §8.3.5. Each STRP entry contributes a running-sum POC
+    /// (delta added to the prior entry's POC, with the slice's current
+    /// POC seeding the chain). Round-10 also resolves LTRP entries by
+    /// matching the entry's `poc_lsb_lt` against `(POC & (max_poc_lsb − 1))`
+    /// for every DPB entry; the matching DPB POC is the LTRP's POC.
+    ///
+    /// LTRP resolution does NOT advance the running STRP delta sum:
+    /// per §8.3.2 / §8.3.5 the spec defines the LTRP slot independently
+    /// (the POC carried by the LTRP entry is absolute, not relative to
+    /// the previous entry).
+    fn build_ref_pocs(
+        &self,
+        rpl: &crate::rpl::RefPicListStruct,
+        cur_poc: i32,
+        n_active: usize,
+        max_poc_lsb: i32,
+    ) -> Result<Vec<i32>> {
+        let mut out = Vec::with_capacity(n_active);
+        let mut running = cur_poc;
+        for entry in rpl.entries.iter().take(n_active) {
+            match entry {
+                crate::rpl::RefPicListEntry::Strp { .. } => {
+                    // STRP delta-POC is signed per §7.4.8 eq. 124.
+                    let delta = entry.signed_delta_poc().expect("STRP carries signed delta");
+                    running += delta;
+                    out.push(running);
+                }
+                crate::rpl::RefPicListEntry::Ltrp { poc_lsb_lt } => {
+                    // §8.3.2 LTRP marking: match the entry's poc_lsb_lt
+                    // against (poc & mask) for each DPB entry. The first
+                    // matching long-term-marked entry (or any entry if
+                    // none have been explicitly marked LT yet) is the
+                    // resolved POC. round-10 keeps every IDR + non-IDR
+                    // picture marked as `used_for_reference == true`,
+                    // so we accept any matching POC.
+                    let mask = max_poc_lsb - 1;
+                    let lsb = (*poc_lsb_lt as i32) & mask;
+                    let matched =
+                        self.dpb
+                            .iter()
+                            .find(|e| (e.poc & mask) == lsb)
+                            .ok_or_else(|| {
+                                Error::invalid(format!(
+                                    "evc decoder: LTRP poc_lsb_lt {lsb} not in DPB"
+                                ))
+                            })?;
+                    out.push(matched.poc);
+                }
+            }
+        }
+        if out.len() < n_active {
+            return Err(Error::invalid(format!(
+                "evc decoder: RPL has {} entries but n_active = {n_active}",
+                out.len()
+            )));
+        }
+        Ok(out)
     }
-    if out.len() < n_active {
-        return Err(Error::invalid(format!(
-            "evc decoder: RPL has {} entries but n_active = {n_active}",
-            out.len()
-        )));
-    }
-    Ok(out)
 }
 
 fn picture_to_video_frame(pic: &crate::picture::YuvPicture, pts: Option<i64>) -> VideoFrame {
@@ -620,6 +684,7 @@ mod tests {
                 poc: i as i32,
                 pts: None,
                 used_for_reference: true,
+                output_emitted: false,
             });
         }
         assert_eq!(dec.dpb.len(), MAX_DPB_ENTRIES);
@@ -640,6 +705,7 @@ mod tests {
             poc: 5,
             pts: None,
             used_for_reference: true,
+            output_emitted: false,
         });
         dec.poc_msb = 256;
         dec.prev_poc_lsb = 100;
@@ -647,5 +713,127 @@ mod tests {
         assert!(dec.dpb.is_empty());
         assert_eq!(dec.poc_msb, 0);
         assert_eq!(dec.prev_poc_lsb, 0);
+    }
+
+    /// **Round-10 flush() drain.** A DPB entry that was never pushed
+    /// to the output queue (synthesised here by direct insertion) is
+    /// emitted by `flush()` in POC order without duplicating entries
+    /// that were already enqueued.
+    #[test]
+    fn round10_flush_drains_unemitted_dpb_entries_in_poc_order() {
+        use crate::picture::YuvPicture;
+        let mut dec = EvcDecoder::new();
+        // Insert three DPB entries directly. POC 1 is marked emitted
+        // (simulating "already in out queue from a prior receive_frame").
+        // POCs 0 and 2 are NOT yet in `out`. After flush(), the out
+        // queue holds POCs {0, 2} in ascending POC order.
+        let pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        dec.dpb_insert(DpbEntry {
+            pic: pic.clone(),
+            poc: 1,
+            pts: None,
+            used_for_reference: true,
+            output_emitted: true,
+        });
+        dec.dpb_insert(DpbEntry {
+            pic: pic.clone(),
+            poc: 0,
+            pts: None,
+            used_for_reference: true,
+            output_emitted: false,
+        });
+        dec.dpb_insert(DpbEntry {
+            pic,
+            poc: 2,
+            pts: None,
+            used_for_reference: true,
+            output_emitted: false,
+        });
+        assert!(dec.out.is_empty());
+        dec.drain_dpb_to_output();
+        // Expect POCs 0 and 2 in the out queue, sorted ascending.
+        let pocs: Vec<i32> = dec.out_pocs.iter().copied().collect();
+        assert_eq!(pocs, vec![0, 2]);
+        // Calling flush again is idempotent: no duplicate emission.
+        dec.drain_dpb_to_output();
+        let pocs: Vec<i32> = dec.out_pocs.iter().copied().collect();
+        assert_eq!(pocs, vec![0, 2]);
+    }
+
+    /// **Round-10 LTRP RPL resolution.** An LTRP entry's `poc_lsb_lt`
+    /// resolves to the matching DPB entry's POC (matched against
+    /// `poc & (max_poc_lsb − 1)`).
+    #[test]
+    fn round10_ltrp_rpl_resolves_against_dpb() {
+        use crate::picture::YuvPicture;
+        use crate::rpl::{RefPicListEntry, RefPicListStruct};
+        let mut dec = EvcDecoder::new();
+        // 8-bit POC LSB → max_poc_lsb = 256. Insert DPB entries at
+        // POCs 0, 1, 5. We'll request an LTRP with poc_lsb_lt = 5
+        // (matches POC 5 directly because 5 & 0xFF = 5).
+        let pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        for &p in &[0, 1, 5] {
+            dec.dpb_insert(DpbEntry {
+                pic: pic.clone(),
+                poc: p,
+                pts: None,
+                used_for_reference: true,
+                output_emitted: true,
+            });
+        }
+        let rpl = RefPicListStruct {
+            num_strp_entries: 0,
+            num_ltrp_entries: 1,
+            entries: vec![RefPicListEntry::Ltrp { poc_lsb_lt: 5 }],
+        };
+        let pocs = dec.build_ref_pocs(&rpl, /* cur_poc */ 6, 1, 256).unwrap();
+        assert_eq!(pocs, vec![5]);
+    }
+
+    /// LTRP entry with no DPB match is rejected as invalid bitstream.
+    #[test]
+    fn round10_ltrp_missing_dpb_entry_is_invalid() {
+        use crate::rpl::{RefPicListEntry, RefPicListStruct};
+        let dec = EvcDecoder::new(); // empty DPB
+        let rpl = RefPicListStruct {
+            num_strp_entries: 0,
+            num_ltrp_entries: 1,
+            entries: vec![RefPicListEntry::Ltrp { poc_lsb_lt: 7 }],
+        };
+        let err = dec.build_ref_pocs(&rpl, 10, 1, 256).unwrap_err();
+        assert!(format!("{err}").contains("LTRP"));
+    }
+
+    /// Mixed STRP + LTRP RPL: STRP delta chain advances normally
+    /// while LTRP slot pulls the absolute POC out of the DPB.
+    #[test]
+    fn round10_mixed_strp_and_ltrp_resolve() {
+        use crate::picture::YuvPicture;
+        use crate::rpl::{RefPicListEntry, RefPicListStruct};
+        let mut dec = EvcDecoder::new();
+        let pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        // DPB: POCs 0, 4, 7. cur_poc = 8. RPL = [STRP delta=-1, LTRP poc_lsb_lt=4].
+        for &p in &[0, 4, 7] {
+            dec.dpb_insert(DpbEntry {
+                pic: pic.clone(),
+                poc: p,
+                pts: None,
+                used_for_reference: true,
+                output_emitted: true,
+            });
+        }
+        let rpl = RefPicListStruct {
+            num_strp_entries: 1,
+            num_ltrp_entries: 1,
+            entries: vec![
+                RefPicListEntry::Strp {
+                    delta_poc_st: 1,
+                    sign: false,
+                }, // delta = -1 → 8 + (-1) = 7
+                RefPicListEntry::Ltrp { poc_lsb_lt: 4 }, // → POC 4
+            ],
+        };
+        let pocs = dec.build_ref_pocs(&rpl, 8, 2, 256).unwrap();
+        assert_eq!(pocs, vec![7, 4]);
     }
 }
