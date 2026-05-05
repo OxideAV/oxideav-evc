@@ -75,6 +75,7 @@
 //! decoder source (MPEG-5 reference, `xeve`, `xevd`, …) was consulted —
 //! every module is spec-only.
 
+pub mod alf;
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;
@@ -82,6 +83,7 @@ pub mod cabac_init;
 pub mod deblock;
 pub mod decoder;
 pub mod dequant;
+pub mod dra;
 pub mod hmvp;
 pub mod inter;
 pub mod intra;
@@ -193,16 +195,16 @@ pub fn walk_idr_slice(
     };
     // Round-2 walker requires the Baseline profile constraint set (Annex
     // A.3.2). Refuse anything else cleanly.
+    // sps_alf_flag and sps_dra_flag are no longer gated here (round-11
+    // handles them as post-filter passes).
     if sps.sps_btt_flag
         || sps.sps_suco_flag
         || sps.sps_admvp_flag
         || sps.sps_eipd_flag
-        || sps.sps_alf_flag
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
         || sps.sps_ibc_flag
-        || sps.sps_dra_flag
         || sps.sps_adcc_flag
         || sps.sps_cm_init_flag
         || sps.sps_amvr_flag
@@ -274,12 +276,10 @@ pub fn decode_idr_slice(
         || sps.sps_suco_flag
         || sps.sps_admvp_flag
         || sps.sps_eipd_flag
-        || sps.sps_alf_flag
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
         || sps.sps_ibc_flag
-        || sps.sps_dra_flag
         || sps.sps_adcc_flag
         || sps.sps_cm_init_flag
     {
@@ -287,6 +287,8 @@ pub fn decode_idr_slice(
             "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
         ));
     }
+    // sps_alf_flag and sps_dra_flag are handled by the round-11 post-filter
+    // pipeline and no longer gate this function.
     if !pps.single_tile_in_pic_flag {
         return Err(Error::unsupported(
             "evc decode_idr_slice: round-3 requires single_tile_in_pic_flag == 1",

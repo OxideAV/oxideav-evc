@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Round 11 — ALF adaptive loop filter + DRA dynamic range adjustment
+
+#### Added
+- `alf` module (`src/alf.rs`): `parse_alf_data` parses §7.3.5
+  `alf_data()` APS-type-0 payload. Luma: up to 25 filter sets, each
+  with 12 abs-coded 6-bit symmetric tap coefficients and DC offset
+  (eq. 1264: `c[12] = 128 − 2·Σ|c[0..11]|`). Chroma: up to 4
+  alternates, each with 6 abs-coded taps + DC. `apply_alf_luma` /
+  `apply_alf_chroma` clone the source plane, run a boundary-clamped
+  convolution with the 7×7 luma diamond (12 tap pairs) or 5×5 chroma
+  diamond (6 tap pairs), and write results in-place. `apply_alf` is
+  the one-call entry point (luma filter[0] then chroma alt[0]).
+- `dra` module (`src/dra.rs`): `parse_dra_data` parses §7.3.6
+  `dra_data()` APS-type-1 payload. `build_luma_lut` produces a
+  256-entry piecewise-linear LUT from up to 16 segments; first scale
+  is 11-bit unsigned Q8.3; subsequent scales are 12-bit signed deltas.
+  `apply_dra` maps every Y sample through the LUT and offsets Cb/Cr by
+  the segment-0 `chroma_qp_offset`. `find_segment` is a linear scan
+  from the tail for boundary matching.
+- `EvcDecoder::alf_aps` / `EvcDecoder::dra_aps`: decoder caches the
+  most-recent parsed `AlfData` and `DraData` from `NalUnitType::Aps`
+  NAL units.
+- `EvcDecoder::apply_post_filters`: runs ALF then DRA on every decoded
+  `YuvPicture` (IDR and non-IDR) when the SPS gates are set and APS
+  data is available.
+
+#### Changed
+- `sps_alf_flag = 1` no longer returns `Error::Unsupported` in
+  `walk_idr_slice`, `decode_idr_slice`, or `decode_non_idr`; instead
+  the ALF post-filter pass is applied when APS data is present.
+- `sps_dra_flag = 1` no longer returns `Error::Unsupported` in
+  `walk_idr_slice`, `decode_idr_slice`, or `decode_non_idr`; instead
+  the DRA post-filter pass is applied when APS data is present.
+- 226 unit tests pass (was 205); 21 new tests cover ALF and DRA parse
+  + application paths.
+
 ### Round 10 — spatial-neighbour MV grid AMVP + LTRP RPL resolution + flush() drain
 
 #### Added

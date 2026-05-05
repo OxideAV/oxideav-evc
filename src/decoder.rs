@@ -29,6 +29,8 @@ use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
+use crate::alf::{self, AlfData};
+use crate::dra::{self, DraData};
 use crate::inter::RefPictureView;
 use crate::nal::{iter_length_prefixed, NalUnitType};
 use crate::picture::YuvPicture;
@@ -88,6 +90,12 @@ pub struct EvcDecoder {
     /// `prevPicOrderCntLsb` from §8.3.1: the POC LSB of the most
     /// recently decoded reference picture in coding order.
     prev_poc_lsb: i32,
+    /// Round-11: cached ALF data from the most recently parsed ALF APS.
+    /// Keyed by `adaptation_parameter_set_id` (5-bit, 0..=31). Only
+    /// slot 0 is consulted for now (round-11 per-CTU selection deferred).
+    alf_aps: Option<AlfData>,
+    /// Round-11: cached DRA data from the most recently parsed DRA APS.
+    dra_aps: Option<DraData>,
 }
 
 const MAX_DPB_ENTRIES: usize = 16;
@@ -104,6 +112,8 @@ impl EvcDecoder {
             dpb: Vec::new(),
             poc_msb: 0,
             prev_poc_lsb: 0,
+            alf_aps: None,
+            dra_aps: None,
         }
     }
 
@@ -194,9 +204,11 @@ impl Decoder for EvcDecoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("evc decoder: IDR slice before PPS"))?
                         .clone();
-                    let (pic, _stats) = crate::decode_idr_slice(&sps, &pps, nal.rbsp())?;
+                    let (mut pic, _stats) = crate::decode_idr_slice(&sps, &pps, nal.rbsp())?;
                     // §8.3.1: IDR resets POC to 0, flushes the DPB.
                     self.dpb_flush();
+                    // Round-11: ALF + DRA post-filter pass.
+                    self.apply_post_filters(&mut pic, &sps);
                     let entry = DpbEntry {
                         pic,
                         poc: 0,
@@ -220,7 +232,9 @@ impl Decoder for EvcDecoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("evc decoder: NonIDR slice before PPS"))?
                         .clone();
-                    let (pic, poc) = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
+                    let (mut pic, poc) = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
+                    // Round-11: ALF + DRA post-filter pass.
+                    self.apply_post_filters(&mut pic, &sps);
                     let entry = DpbEntry {
                         pic,
                         poc,
@@ -231,8 +245,25 @@ impl Decoder for EvcDecoder {
                     self.dpb_insert(entry);
                     self.enqueue_for_output(poc);
                 }
+                NalUnitType::Aps => {
+                    // Round-11: parse the APS and cache ALF / DRA data.
+                    // Errors in APS parsing are non-fatal — the filter simply
+                    // won't fire for this sequence.
+                    let rbsp = nal.rbsp();
+                    if let Ok(aps) = crate::aps::parse(rbsp) {
+                        if aps.is_alf() && !aps.payload_raw.is_empty() {
+                            if let Ok(alf_data) = alf::parse_alf_data(&aps.payload_raw) {
+                                self.alf_aps = Some(alf_data);
+                            }
+                        } else if aps.is_dra() && !aps.payload_raw.is_empty() {
+                            if let Ok(dra_data) = dra::parse_dra_data(&aps.payload_raw) {
+                                self.dra_aps = Some(dra_data);
+                            }
+                        }
+                    }
+                }
                 _ => {
-                    // APS / SEI / FD / etc. — skipped for round 3.
+                    // SEI / FD / etc. — skipped.
                 }
             }
         }
@@ -326,12 +357,10 @@ impl EvcDecoder {
             || sps.sps_suco_flag
             || sps.sps_admvp_flag
             || sps.sps_eipd_flag
-            || sps.sps_alf_flag
             || sps.sps_addb_flag
             || sps.sps_dquant_flag
             || sps.sps_ats_flag
             || sps.sps_ibc_flag
-            || sps.sps_dra_flag
             || sps.sps_adcc_flag
             || sps.sps_cm_init_flag
         {
@@ -339,6 +368,8 @@ impl EvcDecoder {
                 "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",
             ));
         }
+        // sps_alf_flag and sps_dra_flag are handled by the round-11 post-filter
+        // pipeline — they no longer gate the Unsupported path.
         if !pps.single_tile_in_pic_flag {
             return Err(Error::unsupported(
                 "evc decoder: P/B requires single_tile_in_pic_flag == 1",
@@ -560,6 +591,25 @@ impl EvcDecoder {
             });
         }
         Ok(out)
+    }
+
+    /// Round-11 post-filter pass: apply ALF (§8.9) then DRA (§8.10) to
+    /// a decoded picture if the corresponding APS has been cached and the
+    /// SPS flags indicate they are active. This is called after deblocking
+    /// for every IDR and non-IDR slice.
+    fn apply_post_filters(&self, pic: &mut YuvPicture, sps: &Sps) {
+        let bd_y = sps.bit_depth_y();
+        let bd_c = sps.bit_depth_c();
+        if sps.sps_alf_flag {
+            if let Some(ref alf_data) = self.alf_aps {
+                alf::apply_alf(pic, alf_data, bd_y, bd_c);
+            }
+        }
+        if sps.sps_dra_flag {
+            if let Some(ref dra_data) = self.dra_aps {
+                dra::apply_dra(pic, dra_data, bd_y, bd_c);
+            }
+        }
     }
 }
 

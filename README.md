@@ -7,15 +7,30 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Round-10 status
+## Round-11 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full
 residual coding, luma + chroma deblocking, the 64-point IDCT, the
 **Main-profile CABAC initialization tables** (Tables 40-90) and
 §9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
-infrastructure, the round-9 multi-ref DPB + POC reordering, plus the
-round-10 spec-compliance additions:
+infrastructure, the round-9 multi-ref DPB + POC reordering, the
+round-10 spec-compliance additions, plus the round-11 post-filter
+pipeline:
 
+* **ALF (Adaptive Loop Filter)** (§8.9): APS-type 0 payload is now
+  fully parsed into `AlfData` (up to 25 luma filter sets × 13 taps,
+  up to 4 chroma alternates × 7 taps). When `sps_alf_flag = 1` and an
+  ALF APS has been received, `apply_alf` applies luma filter[0] (7×7
+  diamond, 12 symmetric tap pairs + DC offset per eq. 1263) and chroma
+  filter[0] (5×5 diamond, 6 symmetric pairs + DC per eq. 1290) as a
+  post-deblocking in-loop pass. `sps_alf_flag = 1` streams no longer
+  return `Error::Unsupported`.
+* **DRA (Dynamic Range Adjustment)** (§8.10): APS-type 1 payload is
+  fully parsed into `DraData` (up to 16 piecewise-linear segments with
+  Q8.3 scale + chroma QP offset per segment). `build_luma_lut` produces
+  a 256-entry mapping table; `apply_dra` maps every Y sample through the
+  LUT and offsets Cb/Cr by the segment-0 chroma offset. `sps_dra_flag =
+  1` streams no longer return `Error::Unsupported`.
 * **Spatial-neighbour MV grid AMVP** (§8.5.2.4): the per-CU `mvpList[]`
   now sources its left / above / above-right slots from the per-4×4
   `SideInfoGrid` instead of always falling back to the spec's
@@ -82,10 +97,10 @@ The remaining Baseline constraints (future rounds will lift them):
 - Sub-pel MV phases restricted to the Baseline 1/4-pel grid for luma
   (Table 25 phases 4, 8, 12) and 1/8-pel grid for chroma (Table 27
   phases 4, 8, 12, 16, 20, 24, 28).
-- **ALF** (§8.9 adaptive loop filter) — APS-driven coefficient sets are
-  parsed but the filter tap-pass is not yet implemented.
-- **DRA** (§8.10 dynamic range adjustment) — APS-driven mapping tables
-  are parsed but the range-mapping post-pass is not yet implemented.
+- ALF applies filter set 0 only; per-CTU filter-set selection (the
+  `alf_ctb_flag` signalling loop per §8.9.2.4) is deferred.
+- DRA applies segment-0 chroma offset uniformly; per-pixel segment
+  lookup for chroma is deferred.
 - The §8.5.2.5 temporal AMVP (collocated-picture) candidate is still
   zero — round-10 only wires the spatial neighbours.
 
@@ -95,6 +110,36 @@ but the CABAC contexts, the RPL parse path (with LTRP resolution),
 the HMVP candidate list (production-wired into AMVP), the
 spatial-neighbour AMVP grid, the POC-indexed DPB with `flush()` drain,
 and the POC-sorted output queue are all ready.
+
+## Round-11 deltas vs round 10
+
+- **`alf` module** (`src/alf.rs`): `parse_alf_data` parses the §7.3.5
+  `alf_data()` payload (APS type 0). Luma: up to 25 filter sets, each
+  with 12 abs-coded 6-bit symmetric tap coefficients and a derived DC
+  offset (eq. 1264: `c[12] = 128 − 2·Σ|c[0..11]|`). Chroma: up to 4
+  alternates, each with 6 abs-coded taps + derived DC. `apply_alf_luma`
+  / `apply_alf_chroma` clone the source plane, run the convolution with
+  boundary-clamped reads, and write results back in-place. `apply_alf`
+  is the one-call entry point (luma filter[0] then chroma alt[0]).
+- **`dra` module** (`src/dra.rs`): `parse_dra_data` parses the §7.3.6
+  `dra_data()` payload (APS type 1). `build_luma_lut` produces a
+  256-entry piecewise-linear LUT from up to 16 segments with Q8.3 scale
+  values (first scale is 11-bit unsigned; subsequent scales are 12-bit
+  signed deltas). `apply_dra` maps every Y sample through the LUT and
+  offsets Cb/Cr by the segment-0 `chroma_qp_offset`.
+- **APS → post-filter wiring** (`decoder.rs`): `EvcDecoder` caches the
+  most-recent parsed `AlfData` and `DraData` from `NalUnitType::Aps`
+  NAL units. The new `apply_post_filters` method runs ALF then DRA on
+  every decoded `YuvPicture` (IDR and non-IDR) when the SPS gates are
+  set and APS data is available. `sps_alf_flag = 1` and `sps_dra_flag =
+  1` no longer return `Error::Unsupported` anywhere in the decoder.
+- 226 unit tests pass (was 205 before round 11); 21 new tests cover:
+  ALF APS parse (identity, explicit coefficients, chroma-only, error
+  cases, negative coefficients), ALF filter application (luma + chroma
+  with DC), DRA APS parse (not-present, single-range, two-ranges, error
+  cases), DRA LUT construction (identity, not-present identity, 2× scale
+  clip), and DRA application (noop, identity preserves, chroma offset
+  shift, `find_segment` index).
 
 ## Round-10 deltas vs round 9
 
