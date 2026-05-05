@@ -143,9 +143,11 @@ impl Decoder for EvcDecoder {
 }
 
 /// Decode a NonIDR (P or B) slice into a fresh [`YuvPicture`] using the
-/// previous picture as the L0 reference. Round-4 supports a single ref
-/// per list and uses the same picture for L0 and L1 in B slices (no
-/// multi-frame reordering yet).
+/// previous picture as the L0 reference. Round-8 lifts the Baseline-only
+/// slice-header parsing to use the canonical [`crate::slice_header::parse`]
+/// so streams with `sps_rpl_flag == 1` (per-slice or SPS-resident RPL)
+/// decode through a single code path. The HMVP candidate list state lives
+/// per-slice inside [`crate::slice_data::decode_baseline_inter_slice`].
 fn decode_non_idr_via_inter(
     sps: &Sps,
     pps: &Pps,
@@ -166,52 +168,59 @@ fn decode_non_idr_via_inter(
         || sps.sps_cm_init_flag
     {
         return Err(Error::unsupported(
-            "evc decoder: round-4 P/B requires Baseline-profile toolset",
+            "evc decoder: P/B requires Baseline-profile toolset (round-8 adds RPL + HMVP)",
         ));
     }
     if !pps.single_tile_in_pic_flag {
         return Err(Error::unsupported(
-            "evc decoder: round-4 P/B requires single_tile_in_pic_flag == 1",
+            "evc decoder: P/B requires single_tile_in_pic_flag == 1",
         ));
     }
-    // Parse the slice header just enough to recover slice_type, slice_qp,
-    // and the byte alignment for slice_data().
-    let mut br = crate::bitreader::BitReader::new(slice_nal_rbsp);
-    let _slice_pps_id = br.ue()?;
-    let slice_type = br.ue()?; // 0=B, 1=P, 2=I
-    let slice_is_b = match slice_type {
-        0 => true,
-        1 => false,
-        other => {
-            return Err(Error::invalid(format!(
-                "evc decoder: NonIDR slice_type must be 0 (B) or 1 (P), got {other}"
-            )))
+    // Round-8: route the entire slice header through the canonical
+    // parser so sps_rpl_flag = 1 is supported. The parser walks the
+    // RPL list-struct entries and the optional additional_poc_lsb_val
+    // fields, then byte-aligns; we reconstruct the bit position by
+    // re-running the parse through a counting BitReader.
+    let ctx = crate::slice_header::SliceParseContext {
+        single_tile_in_pic_flag: pps.single_tile_in_pic_flag,
+        arbitrary_slice_present_flag: pps.arbitrary_slice_present_flag,
+        tile_id_len_minus1: pps.tile_id_len_minus1,
+        num_tile_columns_minus1: pps.num_tile_columns_minus1,
+        num_tile_rows_minus1: pps.num_tile_rows_minus1,
+        sps_pocs_flag: sps.sps_pocs_flag,
+        sps_rpl_flag: sps.sps_rpl_flag,
+        sps_alf_flag: sps.sps_alf_flag,
+        sps_mmvd_flag: sps.sps_mmvd_flag,
+        sps_admvp_flag: sps.sps_admvp_flag,
+        sps_addb_flag: sps.sps_addb_flag,
+        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
+        chroma_array_type: sps.chroma_array_type(),
+        num_ref_pic_lists_in_sps_l0: sps.num_ref_pic_lists_in_sps_l0,
+        num_ref_pic_lists_in_sps_l1: sps.num_ref_pic_lists_in_sps_l1,
+        rpl1_idx_present_flag: pps.rpl1_idx_present_flag,
+        long_term_ref_pics_flag: sps.long_term_ref_pics_flag,
+        additional_lt_poc_lsb_len: pps.additional_lt_poc_lsb_len,
+    };
+    let header = crate::slice_header::parse(slice_nal_rbsp, NalUnitType::NonIdr, &ctx)?;
+    let slice_is_b = match header.slice_type {
+        crate::slice_header::SliceType::B => true,
+        crate::slice_header::SliceType::P => false,
+        crate::slice_header::SliceType::I => {
+            return Err(Error::invalid(
+                "evc decoder: NonIDR slice cannot be slice_type == I",
+            ));
         }
     };
-    // sps_pocs_flag = 0 (Baseline), sps_rpl_flag = 0, sps_alf_flag = 0,
-    // sps_mmvd_flag = 0 → no extra fields in this region.
-    // We must read the P/B-only ref_idx fields per slice_header parser.
-    // For Baseline single-ref: num_ref_idx_active_override_flag = 0 →
-    // skip the explicit overrides.
-    let num_ref_idx_active_override_flag = br.u1()?;
-    let mut num_ref_idx_active_minus1_l0 = 0u32;
-    let mut num_ref_idx_active_minus1_l1 = 0u32;
-    if num_ref_idx_active_override_flag != 0 {
-        num_ref_idx_active_minus1_l0 = br.ue()?;
-        if slice_is_b {
-            num_ref_idx_active_minus1_l1 = br.ue()?;
-        }
-    }
-    // sps_admvp_flag = 0 → no temporal_mvp_assigned_flag.
-    let slice_deblocking_filter_flag = br.u1()? != 0;
-    let slice_qp = br.u(6)?;
-    if slice_qp > 51 {
-        return Err(Error::invalid(format!(
-            "evc decoder: NonIDR slice_qp {slice_qp} > 51"
-        )));
-    }
-    let slice_cb_qp_offset = br.se()?;
-    let slice_cr_qp_offset = br.se()?;
+    let num_ref_idx_active_minus1_l0 = header.num_ref_idx_active_minus1[0];
+    let num_ref_idx_active_minus1_l1 = header.num_ref_idx_active_minus1[1];
+    let slice_deblocking_filter_flag = header.slice_deblocking_filter_flag;
+    let slice_qp = header.slice_qp;
+    let slice_cb_qp_offset = header.slice_cb_qp_offset;
+    let slice_cr_qp_offset = header.slice_cr_qp_offset;
+    // Re-run the parse on a counting BitReader to discover where the
+    // slice header ends so slice_data can pick up at the next byte.
+    let mut br = crate::bitreader::BitReader::new(slice_nal_rbsp);
+    crate::slice_header::parse_consume(&mut br, NalUnitType::NonIdr, &ctx)?;
     br.align_to_byte();
     let consumed_bits = br.bit_position();
     if consumed_bits % 8 != 0 {

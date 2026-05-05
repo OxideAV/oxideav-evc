@@ -1,5 +1,69 @@
 # Changelog
 
+## [Unreleased]
+
+### Round 8 — RPL non-IDR + HMVP infrastructure
+
+#### Added
+- New [`rpl`](src/rpl.rs) module: `parse_ref_pic_list_struct()` walks
+  every entry of an EVC `ref_pic_list_struct(listIdx, rplsIdx,
+  ltrpFlag)` (§7.3.7 / §7.4.8). STRP entries surface a signed
+  `delta_poc_st` via `RefPicListEntry::signed_delta_poc()`
+  (§7.4.8 eq. 124); LTRP entries surface the fixed-length
+  `poc_lsb_lt`. Caps the per-list entry count at
+  `MAX_REF_PIC_LIST_ENTRIES = 64` to bound allocations.
+- New [`hmvp`](src/hmvp.rs) module: 23-entry `HmvpCandList` with
+  the §8.5.2.7 LRU update process (left-shift-on-full, no-op on
+  invalid candidates) and `derive_default_mv()` per §8.5.2.4.4
+  (last-4-tail walk, ref-idx-match preferred, fallback to most-recent
+  valid candidate). `reset()` clears the list at CTU-row left
+  boundaries per §7.3.8.2.
+- `Sps` exposes `num_ref_pic_lists_in_sps_l0/l1` plus per-list
+  `Vec<RefPicListStruct>`. The previous skip-only RPL handling is
+  replaced with the real parser; `rpl1_same_as_rpl0_flag = 1`
+  inherits list 1 from list 0 per §7.4.3.1.
+- `SliceHeader` exposes `ref_pic_list_sps_flag[2]`,
+  `ref_pic_list_idx[2]`, `slice_rpl[2]: Option<RefPicListStruct>`
+  and `slice_rpls_idx[2]` (§7.4.5 eq. 83).
+- `slice_header::parse_consume()` parses off an existing BitReader so
+  callers can recover the slice-data byte offset.
+- `InterDecodeStats::hmvp_cand_count_final` exposes
+  `NumHmvpCand` at slice end for fixture verification.
+
+#### Changed
+- `slice_header::parse` now consumes the non-IDR `sps_rpl_flag` branch
+  end-to-end: `ref_pic_list_sps_flag[i]` (with the §7.4.5 inference
+  rules for `i == 1` when `rpl1_idx_present_flag = 0`),
+  `ref_pic_list_idx[i]` (sized by `Ceil(Log2(n_in_sps))`), inline
+  `ref_pic_list_struct()` for slices that supply their own RPL, and
+  the per-LTRP `additional_poc_lsb_present_flag` /
+  `additional_poc_lsb_val` loop. The prior `Error::Unsupported` gate
+  is gone.
+- `decoder::decode_non_idr_via_inter` re-routes through the canonical
+  `slice_header::parse_consume`, so any production stream with
+  `sps_rpl_flag = 1` decodes through a single tested code path.
+- `decode_baseline_inter_slice` threads an `HmvpCandList` through
+  every inter CU, resets it on CTU-row boundaries, and updates it
+  after each inter CU per §8.5.2.7.
+- `SliceParseContext` adds `num_ref_pic_lists_in_sps_l0/l1`,
+  `rpl1_idx_present_flag`, `long_term_ref_pics_flag`,
+  `additional_lt_poc_lsb_len` (passed from SPS + PPS by the lib-level
+  helper).
+
+#### Tests
+- 187 unit tests pass (up from 167). 20 new tests cover the RPL
+  parser (STRP-only, mixed STRP+LTRP, zero-delta no-sign-bit,
+  empty list, oversized-count rejection on both STRP and LTRP),
+  HMVP (LRU shift-on-full, exact-refIdx walk in tail, fallback
+  to most-recent valid, last-4 walk bound, L1-field selection,
+  invalid candidate dropped, reset semantics), slice-header RPL
+  paths (inline RPL on both lists, SPS-pointer with
+  `rpl1_idx_present_flag = 0` inferring list 1, `ceil_log2`
+  helper), and the round-8 end-to-end fixture
+  `round8_rpl_non_idr_decodes_to_two_frames` driving the
+  registered decoder through an IDR + P with `sps_rpl_flag = 1`
+  and inline RPL.
+
 ## Round 7 — Main-profile CABAC initialization tables
 
 - New [`cabac_init`](src/cabac_init.rs) module transcribes every

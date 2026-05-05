@@ -17,6 +17,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::rpl::{parse_ref_pic_list_struct, RefPicListStruct};
 
 /// Hard sanity bound on the SPS-declared picture dimensions. Larger values
 /// are surfaced as `Error::Invalid` so a hostile bitstream cannot trigger
@@ -81,6 +82,18 @@ pub struct Sps {
     pub sps_max_dec_pic_buffering_minus1: u32,
     pub long_term_ref_pics_flag: bool,
     pub rpl1_same_as_rpl0_flag: bool,
+    /// `num_ref_pic_lists_in_sps[ 0 ]` — `0` when `sps_rpl_flag == 0`.
+    pub num_ref_pic_lists_in_sps_l0: u32,
+    /// `num_ref_pic_lists_in_sps[ 1 ]` — `0` when `sps_rpl_flag == 0`.
+    /// Inferred to `num_ref_pic_lists_in_sps_l0` when `rpl1_same_as_rpl0_flag == 1`.
+    pub num_ref_pic_lists_in_sps_l1: u32,
+    /// SPS-resident `ref_pic_list_struct(0, j, ltrpFlag)` candidates
+    /// indexed by `j`. Empty when `sps_rpl_flag == 0`.
+    pub ref_pic_list_structs_l0: Vec<RefPicListStruct>,
+    /// SPS-resident `ref_pic_list_struct(1, j, ltrpFlag)` candidates.
+    /// When `rpl1_same_as_rpl0_flag == 1` this is set to a clone of
+    /// [`Self::ref_pic_list_structs_l0`] per §7.4.3.1.
+    pub ref_pic_list_structs_l1: Vec<RefPicListStruct>,
 
     pub picture_cropping_flag: bool,
     pub picture_crop_left_offset: u32,
@@ -244,28 +257,53 @@ pub fn parse(rbsp: &[u8]) -> Result<Sps> {
     let mut sps_max_dec_pic_buffering_minus1 = 0;
     let mut long_term_ref_pics_flag = false;
     let mut rpl1_same_as_rpl0_flag = false;
+    let mut num_ref_pic_lists_in_sps_l0 = 0u32;
+    let mut num_ref_pic_lists_in_sps_l1 = 0u32;
+    let mut ref_pic_list_structs_l0: Vec<RefPicListStruct> = Vec::new();
+    let mut ref_pic_list_structs_l1: Vec<RefPicListStruct> = Vec::new();
     if !sps_rpl_flag {
         max_num_tid0_ref_pics = br.ue()?;
     } else {
         sps_max_dec_pic_buffering_minus1 = br.ue()?;
         long_term_ref_pics_flag = br.u1()? != 0;
         rpl1_same_as_rpl0_flag = br.u1()? != 0;
-        // Sanity-bound `num_ref_pic_lists_in_sps[i]` so a bogus value cannot
-        // trigger a giant allocation in the inner loop.
-        let lists_to_read = if rpl1_same_as_rpl0_flag { 1 } else { 2 };
-        for _ in 0..lists_to_read {
-            let n = br.ue()?;
-            if n > 64 {
+        // §7.3.2.1: list 0 is always coded; list 1 only when
+        // `rpl1_same_as_rpl0_flag == 0` (else inferred per §7.4.3.1 to be
+        // identical to list 0).
+        let log2_max_poc_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
+        // List 0.
+        num_ref_pic_lists_in_sps_l0 = br.ue()?;
+        if num_ref_pic_lists_in_sps_l0 > 64 {
+            return Err(Error::invalid(format!(
+                "evc sps: num_ref_pic_lists_in_sps[0] {num_ref_pic_lists_in_sps_l0} > 64"
+            )));
+        }
+        ref_pic_list_structs_l0.reserve(num_ref_pic_lists_in_sps_l0 as usize);
+        for _ in 0..num_ref_pic_lists_in_sps_l0 {
+            ref_pic_list_structs_l0.push(parse_ref_pic_list_struct(
+                &mut br,
+                long_term_ref_pics_flag,
+                log2_max_poc_lsb,
+            )?);
+        }
+        // List 1.
+        if rpl1_same_as_rpl0_flag {
+            num_ref_pic_lists_in_sps_l1 = num_ref_pic_lists_in_sps_l0;
+            ref_pic_list_structs_l1 = ref_pic_list_structs_l0.clone();
+        } else {
+            num_ref_pic_lists_in_sps_l1 = br.ue()?;
+            if num_ref_pic_lists_in_sps_l1 > 64 {
                 return Err(Error::invalid(format!(
-                    "evc sps: num_ref_pic_lists_in_sps[i] {n} > 64 sanity bound"
+                    "evc sps: num_ref_pic_lists_in_sps[1] {num_ref_pic_lists_in_sps_l1} > 64"
                 )));
             }
-            for _ in 0..n {
-                // ref_pic_list_struct() is part of the RPL machinery; its
-                // shape is not needed for round-1 probe but the encoder
-                // still emits the bytes. Skip the structure body — round-2
-                // will replace this with a real parser.
-                skip_ref_pic_list_struct(&mut br, long_term_ref_pics_flag)?;
+            ref_pic_list_structs_l1.reserve(num_ref_pic_lists_in_sps_l1 as usize);
+            for _ in 0..num_ref_pic_lists_in_sps_l1 {
+                ref_pic_list_structs_l1.push(parse_ref_pic_list_struct(
+                    &mut br,
+                    long_term_ref_pics_flag,
+                    log2_max_poc_lsb,
+                )?);
             }
         }
     }
@@ -355,6 +393,10 @@ pub fn parse(rbsp: &[u8]) -> Result<Sps> {
         sps_max_dec_pic_buffering_minus1,
         long_term_ref_pics_flag,
         rpl1_same_as_rpl0_flag,
+        num_ref_pic_lists_in_sps_l0,
+        num_ref_pic_lists_in_sps_l1,
+        ref_pic_list_structs_l0,
+        ref_pic_list_structs_l1,
         picture_cropping_flag,
         picture_crop_left_offset,
         picture_crop_right_offset,
@@ -364,43 +406,9 @@ pub fn parse(rbsp: &[u8]) -> Result<Sps> {
     })
 }
 
-/// Skip a single `ref_pic_list_struct()` (§7.3.7). Round-1 only needs to
-/// keep the bit reader in step; the structure itself is consumed by round-2.
-fn skip_ref_pic_list_struct(br: &mut BitReader, long_term_ref_pics_flag: bool) -> Result<()> {
-    // Per §7.3.7 / §7.4.8 the structure is essentially:
-    //   num_ref_pics: ue(v)        — sanity-bound below
-    //   for i in 0..num_ref_pics:
-    //     if long_term_ref_pics_flag: lt_ref_pic_flag: u(1)
-    //     if !lt_ref_pic_flag (or LT not enabled):
-    //       abs_delta_poc_st_minus1: ue(v)
-    //       if abs_delta_poc_st_minus1 != 0: strp_entry_sign_flag: u(1)
-    //     else:
-    //       poc_lsb_lt: u(log2_max_pic_order_cnt_lsb) — round-1 cannot
-    //       resolve the dynamic length without a fully-parsed SPS; we
-    //       conservatively skip 4 bits which matches the spec default
-    //       log2_max_pic_order_cnt_lsb_minus4 == 0.
-    let num_ref_pics = br.ue()?;
-    if num_ref_pics > 64 {
-        return Err(Error::invalid(format!(
-            "evc sps rpl: num_ref_pics {num_ref_pics} > 64 sanity bound"
-        )));
-    }
-    for _ in 0..num_ref_pics {
-        let mut is_lt = false;
-        if long_term_ref_pics_flag {
-            is_lt = br.u1()? != 0;
-        }
-        if !is_lt {
-            let abs_delta_poc_st_minus1 = br.ue()?;
-            if abs_delta_poc_st_minus1 > 0 {
-                let _sign = br.u1()?;
-            }
-        } else {
-            let _poc_lsb_lt = br.u(4)?;
-        }
-    }
-    Ok(())
-}
+// Per-`ref_pic_list_struct()` parsing now lives in `crate::rpl`. The SPS
+// parser pre-resolves `log2_max_pic_order_cnt_lsb` from the active POC
+// settings and feeds it through `parse_ref_pic_list_struct`.
 
 #[cfg(test)]
 pub(crate) mod tests {

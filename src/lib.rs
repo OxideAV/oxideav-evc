@@ -1,11 +1,13 @@
 //! Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1).
 //!
-//! Round-7 status: a working **Baseline-profile IDR + P + B** decoder
+//! Round-8 status: a working **Baseline-profile IDR + P + B** decoder
 //! with residual coding (RLE + dequant + IDCT for nTbS up to 64),
-//! deblocking (§8.8.2 luma + chroma path), and a single reference per
-//! list, plus the **Main-profile CABAC initialization tables**
-//! (Tables 40-90, §9.3.4.2 ctxInc helpers, eq. 1425/1426 init pipeline)
-//! ready for the next round to wire individual Main-profile tools.
+//! deblocking (§8.8.2 luma + chroma path), Main-profile CABAC init
+//! tables (Tables 40-90, §9.3.4.2 ctxInc helpers, eq. 1425/1426),
+//! plus full **reference-picture-list parsing** (§7.3.7 / §7.4.8) for
+//! non-IDR slices (`sps_rpl_flag = 1`) and the **HMVP candidate list**
+//! (§8.5.2.7 / §8.5.2.4.4) wired through the inter pipeline.
+//!
 //! The crate decomposes into:
 //!
 //! * [`bitreader`] — MSB-first bit reader (§9.2 helpers).
@@ -41,18 +43,27 @@
 //! * [`decoder`] — registered decoder factory returning a working
 //!   `Decoder` for Baseline IDR + P/B bitstreams (8-bit 4:2:0, no
 //!   residuals, single reference).
+//! * [`rpl`] — round-8 `ref_pic_list_struct()` parser (§7.3.7 /
+//!   §7.4.8). Handles STRP + LTRP entries with the per-entry
+//!   `delta_poc_st` / `strp_entry_sign_flag` / `poc_lsb_lt` shape.
+//! * [`hmvp`] — round-8 history-based MV prediction (§8.5.2.7 LRU
+//!   update + §8.5.2.4.4 derive_default_mv walk). 23-entry list with
+//!   per-CTU-row reset.
 //!
-//! Round-7 deliberate omissions (pending follow-up rounds):
+//! Round-8 deliberate omissions (pending follow-up rounds):
 //!
 //! * 10-bit support,
 //! * advanced deblocking (`sps_addb_flag = 1` — round-6 supports the
 //!   `sps_addb_flag = 0` baseline filter only, now for both luma and
 //!   chroma; addb is a Main-profile feature),
-//! * multi-reference + reference list reordering,
+//! * multi-reference DPB + reference list reordering (round 8 parses
+//!   the RPL and the slice-side `num_ref_idx_active_minus1[]`, but the
+//!   inter pipeline still keys off the previous picture only),
 //! * **Main-profile decode** — round 7 lands the CABAC infrastructure
-//!   (Tables 40-90 + ctxInc helpers) but the actual decode of
-//!   Main-profile syntax (BTT / SUCO / ADMVP / EIPD / IBC / ATS / ADCC /
-//!   ALF / DRA / AMVR / MMVD / affine / DMVR / HMVP) still bubbles up
+//!   (Tables 40-90 + ctxInc helpers); round 8 lands the RPL parse path
+//!   and the HMVP candidate list. The actual Main-profile syntax
+//!   decode (BTT / SUCO / ADMVP / EIPD / IBC / ATS / ADCC / ALF / DRA
+//!   / AMVR / MMVD / affine / DMVR) still bubbles up
 //!   `Error::Unsupported`.
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)** at
@@ -67,11 +78,13 @@ pub mod cabac_init;
 pub mod deblock;
 pub mod decoder;
 pub mod dequant;
+pub mod hmvp;
 pub mod inter;
 pub mod intra;
 pub mod nal;
 pub mod picture;
 pub mod pps;
+pub mod rpl;
 pub mod slice_data;
 pub mod slice_header;
 pub mod sps;
@@ -168,6 +181,11 @@ pub fn walk_idr_slice(
         sps_addb_flag: sps.sps_addb_flag,
         log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
         chroma_array_type: sps.chroma_array_type(),
+        num_ref_pic_lists_in_sps_l0: sps.num_ref_pic_lists_in_sps_l0,
+        num_ref_pic_lists_in_sps_l1: sps.num_ref_pic_lists_in_sps_l1,
+        rpl1_idx_present_flag: pps.rpl1_idx_present_flag,
+        long_term_ref_pics_flag: sps.long_term_ref_pics_flag,
+        additional_lt_poc_lsb_len: pps.additional_lt_poc_lsb_len,
     };
     // Round-2 walker requires the Baseline profile constraint set (Annex
     // A.3.2). Refuse anything else cleanly.
@@ -728,6 +746,56 @@ mod tests {
         sps_body.into_bytes()
     }
 
+    /// Round-8 helper: build a Baseline-shaped SPS that turns on
+    /// `sps_rpl_flag = 1` and `sps_pocs_flag = 1` so non-IDR slice
+    /// headers exercise the RPL parsing path. `num_ref_pic_lists_in_sps`
+    /// is set to 0 for both lists so the slice header MUST carry an
+    /// inline `ref_pic_list_struct()`.
+    fn build_rpl_sps_rbsp(width: u32, height: u32) -> Vec<u8> {
+        let mut sps_body = sps::tests::BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 0); // profile_idc
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(1); // chroma_format_idc 4:2:0
+        sps_body.ue(width);
+        sps_body.ue(height);
+        sps_body.ue(0); // bit_depth_luma_minus8
+        sps_body.ue(0); // bit_depth_chroma_minus8
+                        // 13 toolset bit-flags up to (and including) sps_cm_init/sps_iqt
+                        // — all default to 0 except sps_rpl_flag and sps_pocs_flag.
+        sps_body.u(1, 0); // sps_btt
+        sps_body.u(1, 0); // sps_suco
+        sps_body.u(1, 0); // sps_admvp
+        sps_body.u(1, 0); // sps_eipd
+        sps_body.u(1, 0); // sps_cm_init
+        sps_body.u(1, 0); // sps_iqt
+        sps_body.u(1, 0); // sps_addb
+        sps_body.u(1, 0); // sps_alf
+        sps_body.u(1, 0); // sps_htdf
+        sps_body.u(1, 1); // sps_rpl  ← enable
+        sps_body.u(1, 1); // sps_pocs ← enable
+        sps_body.u(1, 0); // sps_dquant
+        sps_body.u(1, 0); // sps_dra
+                          // sps_pocs_flag=1 → log2_max_pic_order_cnt_lsb_minus4
+        sps_body.ue(4); // log2_max_pic_order_cnt_lsb_minus4 = 4 → 8 bits
+                        // sps_rpl_flag=1 path:
+                        //   sps_max_dec_pic_buffering_minus1, long_term_ref_pics_flag,
+                        //   rpl1_same_as_rpl0_flag, num_ref_pic_lists_in_sps[0],
+                        //   (num_ref_pic_lists_in_sps[1] when not same).
+        sps_body.ue(1); // sps_max_dec_pic_buffering_minus1
+        sps_body.u(1, 0); // long_term_ref_pics_flag
+        sps_body.u(1, 0); // rpl1_same_as_rpl0_flag (need both lists explicitly)
+        sps_body.ue(0); // num_ref_pic_lists_in_sps[0] = 0 (force inline RPL)
+        sps_body.ue(0); // num_ref_pic_lists_in_sps[1] = 0
+        sps_body.u(1, 0); // picture_cropping_flag
+        sps_body.u(1, 0); // chroma_qp_table_present_flag
+        sps_body.u(1, 0); // vui_parameters_present_flag
+        sps_body.finish_with_trailing_bits();
+        sps_body.into_bytes()
+    }
+
     /// Build a minimal Baseline PPS for `cu_qp_delta_enabled_flag = 0`.
     fn build_baseline_pps_rbsp() -> Vec<u8> {
         let mut pps_body = BitEmitter::new();
@@ -1035,5 +1103,132 @@ mod tests {
             .sum::<f64>()
             / v0.planes[0].data.len() as f64;
         assert_eq!(mse, 0.0, "PSNR must be infinite for identical frames");
+    }
+
+    /// **Round-8 RPL non-IDR fixture.** Same shape as the round-4 IDR+P
+    /// fixture but with an SPS that turns on `sps_rpl_flag = 1` and
+    /// `sps_pocs_flag = 1`, so the P slice header carries:
+    ///   * `slice_pic_order_cnt_lsb` (8 bits per `log2_max_poc_lsb=8`),
+    ///   * a per-list inline `ref_pic_list_struct()` (one STRP entry each
+    ///     because `num_ref_pic_lists_in_sps[i] = 0`).
+    /// The decoder must walk these fields cleanly via the canonical
+    /// slice_header parser, then drive the inter pipeline as before.
+    /// Both the IDR and the P frame come back as uniform-128 — PSNR Y =
+    /// ∞ (MSE = 0), well above the 30 dB acceptance bar.
+    #[test]
+    fn round8_rpl_non_idr_decodes_to_two_frames() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_rpl_sps_rbsp(32, 32);
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        // IDR slice (slice_type=I, no RPL fields per §7.3.4 IDR branch).
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0);
+        idr_hdr.ue(2); // I slice
+        idr_hdr.u(1, 0); // no_output
+        idr_hdr.u(1, 0); // slice_deblocking_filter_flag
+        idr_hdr.u(6, 22); // slice_qp
+        idr_hdr.ue(0);
+        idr_hdr.ue(0);
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        let mut idr_enc = CabacEncoder::new();
+        idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        idr_enc.encode_decision(0, 0, 0); // cbf_luma
+        idr_enc.encode_decision(0, 0, 0); // cbf_cb
+        idr_enc.encode_decision(0, 0, 0); // cbf_cr
+        idr_enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&idr_enc.finish());
+
+        // P slice header with inline RPL on both lists.
+        let mut p_hdr = BitEmitter::new();
+        p_hdr.ue(0); // slice_pps_id
+        p_hdr.ue(1); // slice_type = P
+                     // sps_pocs_flag = 1 + non-IDR → POC LSB (8 bits).
+        p_hdr.u(8, 1);
+        // sps_rpl_flag = 1 path — for both i = 0 and i = 1:
+        //   ref_pic_list_sps_flag[i] omitted because
+        //     num_ref_pic_lists_in_sps[i] == 0 → not signalled.
+        //   The inline `ref_pic_list_struct()` follows directly.
+        // RPL L0 inline: 1 STRP, delta=1, sign=1.
+        p_hdr.ue(1); // num_strp_entries
+        p_hdr.ue(1); // delta_poc_st = 1
+        p_hdr.u(1, 1); // sign positive
+                       // RPL L1 inline: same shape (delta=1 sign=0).
+        p_hdr.ue(1);
+        p_hdr.ue(1);
+        p_hdr.u(1, 0);
+        // P slice → ref_idx + admvp branch:
+        p_hdr.u(1, 0); // num_ref_idx_active_override_flag
+                       // sps_admvp_flag = 0 → no temporal_mvp.
+        p_hdr.u(1, 0); // slice_deblocking_filter_flag
+        p_hdr.u(6, 22); // slice_qp
+        p_hdr.ue(0);
+        p_hdr.ue(0);
+        while p_hdr.bit_position() % 8 != 0 {
+            p_hdr.u(1, 0);
+        }
+        let mut p_rbsp = p_hdr.into_bytes();
+        let mut p_enc = CabacEncoder::new();
+        p_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+                                        // Single-tree inter CU:
+        p_enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        for _ in 0..3 {
+            p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 prefix
+        }
+        p_enc.encode_decision(0, 0, 0); // cbf_luma
+        p_enc.encode_decision(0, 0, 0); // cbf_cb
+        p_enc.encode_decision(0, 0, 0); // cbf_cr
+        p_enc.encode_terminate(true);
+        p_rbsp.extend_from_slice(&p_enc.finish());
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp));
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp));
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp));
+        bs.extend_from_slice(&nal_envelope(0, &p_rbsp));
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let f0 = dec.receive_frame().unwrap();
+        let f1 = dec.receive_frame().unwrap();
+        let v0 = match f0 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v1 = match f1 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        // Both are uniform 128 (zero-MV inter copy of the all-128 IDR).
+        assert!(v0.planes[0].data.iter().all(|&v| v == 128));
+        assert!(v1.planes[0].data.iter().all(|&v| v == 128));
+        assert_eq!(v0.planes[0].data, v1.planes[0].data);
+        let mse: f64 = v0.planes[0]
+            .data
+            .iter()
+            .zip(v1.planes[0].data.iter())
+            .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+            .sum::<f64>()
+            / v0.planes[0].data.len() as f64;
+        assert_eq!(mse, 0.0, "RPL P-slice must be bit-identical to the IDR");
     }
 }

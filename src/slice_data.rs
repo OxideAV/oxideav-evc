@@ -1064,6 +1064,11 @@ pub struct InterDecodeStats {
     /// Number of edges visited by the deblocking pass (luma + chroma
     /// summed). Zero when `slice_deblocking_filter_flag = 0`.
     pub deblock_edges: u32,
+    /// `NumHmvpCand` at slice end — useful for fixture tests that want
+    /// to confirm the §8.5.2.7 update process actually fired. Resets
+    /// every CTU row, so on a single-CTU-row slice this equals the
+    /// number of inter CUs decoded (capped at 23).
+    pub hmvp_cand_count_final: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -1116,6 +1121,11 @@ pub fn decode_baseline_inter_slice(
     let mut eng = CabacEngine::new(rbsp)?;
     let mut stats = InterDecodeStats::default();
     let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
+    // §8.5.2.7 / §7.3.8.2: HMVP candidate list lives per-CTU-row and
+    // resets at the left boundary of each row. The list is consulted by
+    // §8.5.2.4.4 when an inter CU's neighbour-based AMVP candidates are
+    // all unavailable (the round-8 fallback path).
+    let mut hmvp = crate::hmvp::HmvpCandList::new();
     let n_ctus = walk
         .pic_width_in_ctus()
         .checked_mul(walk.pic_height_in_ctus())
@@ -1126,11 +1136,17 @@ pub fn decode_baseline_inter_slice(
     for ctu_idx in 0..n_ctus {
         let x_ctb = (ctu_idx % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
         let y_ctb = (ctu_idx / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        // §7.3.8.2: `if (xCtb == xFirstCtb) NumHmvpCand = 0`. With the
+        // round-8 single-tile constraint xFirstCtb == 0.
+        if x_ctb == 0 {
+            hmvp.reset();
+        }
         decode_inter_split_unit(
             &mut eng,
             &mut pic,
             &mut stats,
             &mut side_info,
+            &mut hmvp,
             &inputs,
             x_ctb,
             y_ctb,
@@ -1145,6 +1161,7 @@ pub fn decode_baseline_inter_slice(
             "evc inter decode: end_of_tile_one_bit must terminate",
         ));
     }
+    stats.hmvp_cand_count_final = hmvp.len() as u32;
     if decode.enable_deblock {
         let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
         if walk.chroma_format_idc != 0 {
@@ -1174,6 +1191,7 @@ fn decode_inter_split_unit(
     pic: &mut YuvPicture,
     stats: &mut InterDecodeStats,
     side_info: &mut SideInfoGrid,
+    hmvp: &mut crate::hmvp::HmvpCandList,
     inputs: &InterDecodeInputs<'_>,
     x0: u32,
     y0: u32,
@@ -1199,15 +1217,23 @@ fn decode_inter_split_unit(
         let half_h = log2_cb_height.saturating_sub(1);
         let x1 = x0 + (1u32 << half_w);
         let y1 = y0 + (1u32 << half_h);
-        decode_inter_split_unit(eng, pic, stats, side_info, inputs, x0, y0, half_w, half_h)?;
+        decode_inter_split_unit(
+            eng, pic, stats, side_info, hmvp, inputs, x0, y0, half_w, half_h,
+        )?;
         if x1 < walk.pic_width {
-            decode_inter_split_unit(eng, pic, stats, side_info, inputs, x1, y0, half_w, half_h)?;
+            decode_inter_split_unit(
+                eng, pic, stats, side_info, hmvp, inputs, x1, y0, half_w, half_h,
+            )?;
         }
         if y1 < walk.pic_height {
-            decode_inter_split_unit(eng, pic, stats, side_info, inputs, x0, y1, half_w, half_h)?;
+            decode_inter_split_unit(
+                eng, pic, stats, side_info, hmvp, inputs, x0, y1, half_w, half_h,
+            )?;
         }
         if x1 < walk.pic_width && y1 < walk.pic_height {
-            decode_inter_split_unit(eng, pic, stats, side_info, inputs, x1, y1, half_w, half_h)?;
+            decode_inter_split_unit(
+                eng, pic, stats, side_info, hmvp, inputs, x1, y1, half_w, half_h,
+            )?;
         }
         return Ok(());
     }
@@ -1216,6 +1242,7 @@ fn decode_inter_split_unit(
         pic,
         stats,
         side_info,
+        hmvp,
         inputs,
         x0,
         y0,
@@ -1230,6 +1257,7 @@ fn decode_inter_coding_unit(
     pic: &mut YuvPicture,
     stats: &mut InterDecodeStats,
     side_info: &mut SideInfoGrid,
+    hmvp: &mut crate::hmvp::HmvpCandList,
     inputs: &InterDecodeInputs<'_>,
     x0: u32,
     y0: u32,
@@ -1386,6 +1414,17 @@ fn decode_inter_coding_unit(
             ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
         },
     );
+    // §8.5.2.7 HMVP update: append the just-decoded inter CU's motion
+    // data to the history list. Empty (no valid refs) entries are dropped
+    // by `update()`. The list itself is consulted by §8.5.2.4.4 when an
+    // upcoming CU's AMVP neighbour candidates are all unavailable.
+    let cand = crate::hmvp::HmvpCandidate {
+        mv_l0: pred_l0.map(|(m, _)| m).unwrap_or_default(),
+        mv_l1: pred_l1.map(|(m, _)| m).unwrap_or_default(),
+        ref_idx_l0: pred_l0.map(|(_, r)| r as i8).unwrap_or(-1),
+        ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
+    };
+    hmvp.update(cand);
     // Decode residual blocks per component.
     let log2_tb_w = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_h = log2_cb_height.min(walk.max_tb_log2_size_y);
@@ -2095,6 +2134,10 @@ mod tests {
         assert_eq!(stats.mvp_idx_bins, 4);
         assert_eq!(stats.uni_pred_cus, 4);
         assert_eq!(stats.bi_pred_cus, 0);
+        // §8.5.2.7 HMVP update fired once per inter CU (4 here). All four
+        // CUs land in the same CTU row, so no reset between them; the
+        // final NumHmvpCand equals the CU count (capped at 23).
+        assert_eq!(stats.hmvp_cand_count_final, 4);
         // Verify pixel-perfect copy of the reference picture.
         assert_eq!(pic.y, ref_y, "Y plane must match reference");
         assert_eq!(pic.cb, ref_cb, "Cb plane must match reference");
