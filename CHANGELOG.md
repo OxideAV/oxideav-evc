@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-evc/compare/v0.0.0...v0.0.1) - 2026-05-05
+
+### Other
+
+- multi-reference DPB + HMVP-as-AMVP fallback + POC reordering
+- fix doc_lazy_continuation in round8 fixture comment
+- RPL non-IDR parse + HMVP candidate list
+- rewrite mat_64_dc_row_is_64s loop to use iter().take()
+
 ### Round 9 — multi-reference DPB + HMVP-as-AMVP fallback + POC reordering
 
 #### Added
