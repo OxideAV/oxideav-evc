@@ -7,6 +7,59 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-73 status
+
+Working **Baseline-profile** decoder for IDR + P + B slices with full
+residual coding, luma + chroma deblocking, the 64-point IDCT, the
+**Main-profile CABAC initialization tables** (Tables 40-90) and
+§9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
+infrastructure, the round-9 multi-ref DPB + POC reordering, the
+round-10 spec-compliance additions, the round-11 post-filter
+pipeline, plus the round-73 **IBC primitive scaffold** (§8.6
+derivation + validation + integer-pel block copy as pure functions;
+`sps_ibc_flag = 1` SPS gate is unchanged — full `coding_unit()`
+wiring is a follow-up round).
+
+## Round-73 deltas vs round 11
+
+- **`ibc` module** (`src/ibc.rs`): clean-room transcription of
+  ISO/IEC 23094-1 §8.6 (decoding process for IBC-coded CUs).
+  Four pure-function primitives:
+  - `derive_ibc_luma_mv(mvd)` — §8.6.2.1 eq. 1025-1039. Folds `MvdL0`
+    into a signed-16-bit `mvL` via `(mvp + mvd + 2^16) % 2^16` (mvp=0
+    for IBC), then `<< 4` to land on the 1/16-pel grid.
+  - `derive_ibc_chroma_mv(mvL, chroma_format_idc)` — §8.6.2.2 eq.
+    1040-1041. Handles monochrome / 4:2:0 / 4:2:2 / 4:4:4.
+  - `validate_ibc_constraints(mvL, xCb, yCb, nCbW, nCbH,
+    ctbLog2SizeY)` — §8.6.2.1 bitstream conformance: above-or-left
+    guard, eq. 1035/1036 same-CTU-row, eq. 1037/1038 current-or-left
+    CTU column, fractional-pel rejection, negative-coords rejection.
+    Returns `Err(Error::Invalid)` on any violation. `sps_suco_flag=1`
+    extra rules deferred (suco isn't supported elsewhere either).
+  - `predict_ibc_block(...)` — §8.6.3 integer-pel rectangular copy
+    from the current picture's already-reconstructed region into
+    luma + chroma prediction buffers. eq. 1039's `<< 4` guarantees
+    integer-pel landing, so the spec's "invoke §8.5.4.3.1 fractional
+    sample interpolation" step collapses to a memcpy (clean-room
+    observation).
+- 25 new tests cover: luma MV derivation (zero/±/wrap), chroma MV
+  derivation (monochrome/4:2:0/4:2:2/4:4:4/sign), constraint
+  validation (above-only, left-only, overlapping, cross-CTU-row,
+  left-neighbour CTU ok, two-CTUs-left rejected, fractional BV
+  rejected, zero dims, bad CtbLog2SizeY, negative ref origin), block
+  prediction (above block, left block, luma-only, buffer mismatch,
+  fractional MV rejected), and the `derive → validate →
+  derive_chroma → predict` pipeline end-to-end on a 32×32 gradient.
+- 251 unit tests pass (was 226 in round 11).
+- The `sps_ibc_flag = 1` SPS-level gate is **unchanged** — round 73
+  only lands the §8.6.2 / §8.6.3 primitives. Lifting the gate
+  requires the next round to (a) emit `ibc_flag` from CABAC in
+  `coding_unit()` (§7.3.8.4 + §9.3.4.2.4 ctxInc — helper
+  `ctx_inc_neighbour_sum` already exists), (b) parse `abs_mvd_l0` +
+  `mvd_l0_sign_flag` for the IBC case (also already in the binariser),
+  and (c) wire the §8.6.1 5-step pipeline (deriveMV → deriveChromaMV
+  → predict → residual → reconstruct).
+
 ## Round-11 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full

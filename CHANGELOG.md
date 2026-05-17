@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+### Round 73 — IBC (Intra Block Copy) primitive scaffold
+
+#### Added
+- `ibc` module (`src/ibc.rs`): clean-room transcription of ISO/IEC
+  23094-1 §8.6 (decoding process for IBC-coded coding units). Four
+  pure-function primitives:
+  - `derive_ibc_luma_mv(mvd)` — §8.6.2.1 eq. 1025-1039. Folds the
+    parsed `MvdL0` into a signed-16-bit `mvL` via the spec's
+    `(mvp + mvd + 2^16) % 2^16` modular wrap (mvp = 0 for IBC), then
+    shifts left by 4 to land on the 1/16-pel grid the §8.5.4.3
+    interpolator expects.
+  - `derive_ibc_chroma_mv(mvL, chroma_format_idc)` — §8.6.2.2 eq.
+    1040-1041. Computes `mvC[k] = (mvL[k] >> (3 + SubXC)) * 32`,
+    handling all four `chroma_format_idc` values (monochrome → zero
+    chroma MV; 4:2:0 / 4:2:2 / 4:4:4 → spec sub-sampling).
+  - `validate_ibc_constraints(mvL, xCb, yCb, nCbW, nCbH, ctbLog2SizeY)`
+    — §8.6.2.1 bitstream-conformance rules. Enforces:
+    - the "at least one of mvL[0]+nCbW ≤ 0, mvL[1]+nCbH ≤ 0" guard
+      (reference block lies strictly above-or-left of current CB);
+    - eq. 1035/1036 — same-CTU-row constraint on yRefTL and yRefBL;
+    - eq. 1037 — xRefTL must be in current or left CTU column;
+    - eq. 1038 — xRefTR cannot cross into the right CTU;
+    - fractional-pel BVs are rejected (eq. 1039 guarantees mvL low
+      nibble is zero);
+    - negative reference-picture coordinates are rejected.
+    Returns `Err(Error::Invalid)` with a per-condition diagnostic on
+    non-conformant BVs. The `sps_suco_flag = 1` extra rules are
+    deferred (suco_flag isn't supported anywhere else in the decoder
+    either).
+  - `predict_ibc_block(cur_pic, xCb, yCb, nCbW, nCbH, mvL, mvC,
+    chroma_present, pred_y, pred_cb, pred_cr)` — §8.6.3. Integer-pel
+    rectangular copy from the current picture's already-reconstructed
+    region into the luma + chroma prediction buffers. Since eq. 1039
+    makes the BV land on an integer sample, this collapses the spec's
+    "invoke §8.5.4.3.1 fractional sample interpolation" step into a
+    direct memcpy (a clean-room observation, not from a reference
+    decoder). Picture-edge clamping is per the standard
+    `Clip3(0, picW − 1, …)` convention.
+- 25 unit tests (`ibc::tests::*`) covering:
+  - Luma MV derivation: zero MVD, negative MVD, positive MVD, 16-bit
+    wrap;
+  - Chroma MV derivation: monochrome (returns zero), 4:2:0 (halves x
+    and y), 4:2:2 (halves x only), 4:4:4 (no halving), negative-sign
+    preservation through arithmetic shift;
+  - Constraint validation: above-only reference (ok), left-only (ok),
+    overlapping reference (rejected), cross-CTU-row (rejected),
+    left-neighbour CTU (allowed), two CTUs to the left (rejected),
+    fractional BV (rejected), zero CB dims (rejected), bad
+    `ctbLog2SizeY` (rejected: 4 and 8), negative reference origin
+    (rejected);
+  - Block prediction: copy of an above block (gradient pattern
+    verified per-pixel), copy of a left block, luma-only path when
+    `chroma_present = false` (chroma buffers untouched), buffer-size
+    mismatch (rejected), fractional luma MV (rejected);
+  - Pipeline integration: `derive → validate → derive_chroma → predict`
+    end-to-end on a 32×32 gradient picture with the left-neighbour BV.
+
+#### Changed
+- 251 unit tests pass (was 226 before round 73). The `sps_ibc_flag = 1`
+  SPS-level gate in `walk_idr_slice`, `decode_idr_slice` and
+  `decode_non_idr` is **unchanged** — the next round will lift it
+  once the CABAC walker emits IBC CUs and the §8.6.1 5-step
+  decoding pipeline is wired in `coding_unit()`. Round 73 only lands
+  the §8.6.2 / §8.6.3 primitives with unit-test coverage; the new
+  module is `pub` so external integration tests can drive it
+  directly.
+
+#### Notes
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
+  No xeve, xevd, ETM reference, libavcodec evcdec consulted.
+
 ### Round 11 — ALF adaptive loop filter + DRA dynamic range adjustment
 
 #### Added
