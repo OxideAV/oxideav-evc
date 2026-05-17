@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-evc/compare/v0.0.1...v0.0.2) - 2026-05-17
+
+### Other
+
+- IBC primitive scaffold — §8.6 derivation + validation + integer-pel block copy
+- ALF adaptive loop filter + DRA dynamic range adjustment
+- spatial-neighbour MV grid AMVP + LTRP RPL resolution + flush() drain
+
 ### Round 73 — IBC (Intra Block Copy) primitive scaffold
 
 #### Added
