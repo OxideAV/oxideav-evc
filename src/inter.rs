@@ -94,6 +94,39 @@ fn wrap16(v: i32) -> i32 {
     }
 }
 
+/// §8.5.3.10 Rounding process for motion vectors — eq. 907/908/909.
+///
+/// Inputs:
+///   * `mv` — the motion vector to round.
+///   * `right_shift` — right-shift parameter for rounding.
+///   * `left_shift` — left-shift parameter for resolution increase
+///     after rounding.
+///
+/// Output: the rounded motion vector. Per the spec, the offset is
+/// `(rightShift == 0) ? 0 : (1 << (rightShift − 1))`, and each component
+/// is rounded as `((mv + offset − (mv >= 0 ? 1 : 0)) >> rightShift) << leftShift`.
+///
+/// The `− (mv >= 0)` term gives "round half away from zero" for negative
+/// values and "round half toward negative infinity" for positives, which
+/// matches the spec's expression `mv[ k ] >= 0` (a boolean coerced to
+/// `{ 0, 1 }`). This is the rounding mode used by §8.5.3 affine derivation
+/// (eq. 911, 918, 953, 962, 1023) and by AMVR resolution scaling.
+pub fn round_motion_vector(mv: MotionVector, right_shift: u32, left_shift: u32) -> MotionVector {
+    let offset: i32 = if right_shift == 0 {
+        0
+    } else {
+        1i32 << (right_shift - 1)
+    };
+    let round_component = |c: i32| -> i32 {
+        let nonneg_adj = if c >= 0 { 1 } else { 0 };
+        ((c + offset - nonneg_adj) >> right_shift) << left_shift
+    };
+    MotionVector {
+        x: round_component(mv.x),
+        y: round_component(mv.y),
+    }
+}
+
 /// A reference picture as the inter-prediction module sees it: borrowed
 /// luma + chroma planes plus their dimensions. The buffer is owned by
 /// the decoder's reference-frame cache; this view is `Copy`-cheap.
@@ -692,5 +725,67 @@ mod tests {
         let mv = MotionVector::quarter_pel(3, -5);
         let mv16 = mv.quarter_to_sixteenth();
         assert_eq!(mv16, MotionVector::quarter_pel(12, -20));
+    }
+
+    // -------- §8.5.3.10 round_motion_vector (eq. 907/908/909) --------
+
+    /// `right_shift == 0` short-circuits the offset to 0, so the round
+    /// reduces to a pure `(mv − (mv >= 0)) << leftShift`.
+    #[test]
+    fn round_mv_zero_right_shift_no_offset() {
+        // Positive component: (5 - 1) >> 0 << 0 = 4.
+        // Negative component: (-5 - 0) >> 0 << 0 = -5.
+        let mv = MotionVector::quarter_pel(5, -5);
+        let r = round_motion_vector(mv, 0, 0);
+        assert_eq!(r, MotionVector::quarter_pel(4, -5));
+    }
+
+    /// Round-toward-negative-infinity flavour on positive values:
+    /// rounding by 4 (right_shift = 2) with no left_shift sends 7 to 1 (not 2),
+    /// because the spec subtracts 1 from positives before the shift.
+    #[test]
+    fn round_mv_positive_right_shift_two() {
+        // For mv = 7: (7 + 2 - 1) >> 2 << 0 = 8 >> 2 = 2.
+        // For mv = 8: (8 + 2 - 1) >> 2 << 0 = 9 >> 2 = 2.
+        // For mv = 4: (4 + 2 - 1) >> 2 << 0 = 5 >> 2 = 1.
+        let r = round_motion_vector(MotionVector::quarter_pel(7, 8), 2, 0);
+        assert_eq!(r, MotionVector::quarter_pel(2, 2));
+        let r = round_motion_vector(MotionVector::quarter_pel(4, 5), 2, 0);
+        assert_eq!(r, MotionVector::quarter_pel(1, 1));
+    }
+
+    /// On negatives, the `nonneg_adj = 0` branch fires so the offset is
+    /// applied directly; the arithmetic right shift rounds toward
+    /// negative infinity.
+    #[test]
+    fn round_mv_negative_right_shift_two() {
+        // For mv = -7: (-7 + 2 - 0) >> 2 << 0 = -5 >> 2 = -2 (arith shift
+        // rounds toward -inf: -5 = ..1011 → ..1111110 = -2).
+        // For mv = -8: (-8 + 2 - 0) >> 2 << 0 = -6 >> 2 = -2.
+        // For mv = -4: (-4 + 2 - 0) >> 2 << 0 = -2 >> 2 = -1.
+        // For mv = -5: (-5 + 2 - 0) >> 2 << 0 = -3 >> 2 = -1.
+        let r = round_motion_vector(MotionVector::quarter_pel(-7, -8), 2, 0);
+        assert_eq!(r, MotionVector::quarter_pel(-2, -2));
+        let r = round_motion_vector(MotionVector::quarter_pel(-4, -5), 2, 0);
+        assert_eq!(r, MotionVector::quarter_pel(-1, -1));
+    }
+
+    /// Combined right-then-left shift: round to 1/4-pel, scale back to
+    /// 1/16-pel. (rightShift=2, leftShift=2.)
+    #[test]
+    fn round_mv_then_resolution_increase() {
+        // mv = 11: (11 + 2 - 1) >> 2 << 2 = (12 >> 2) << 2 = 3 << 2 = 12.
+        // mv = -11: (-11 + 2 - 0) >> 2 << 2 = (-9 >> 2) << 2 = -3 << 2 = -12.
+        let r = round_motion_vector(MotionVector::quarter_pel(11, -11), 2, 2);
+        assert_eq!(r, MotionVector::quarter_pel(12, -12));
+    }
+
+    /// At right_shift == 1, the offset is `1 << 0 = 1` so the round
+    /// becomes `(mv + 1 - (mv >= 0)) >> 1 << leftShift` — which for
+    /// mv == 0 cancels exactly (1 + 0 - 1 = 0) and stays at 0.
+    #[test]
+    fn round_mv_zero_round_trip_at_right_shift_one() {
+        let r = round_motion_vector(MotionVector::default(), 1, 0);
+        assert_eq!(r, MotionVector::default());
     }
 }

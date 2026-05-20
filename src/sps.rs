@@ -119,6 +119,23 @@ impl Sps {
     pub fn chroma_array_type(&self) -> u32 {
         self.chroma_format_idc
     }
+
+    /// `log2MaxIbcCandSize` per §7.4.3.1, eq. 70:
+    /// `log2MaxIbcCandSize = 2 + log2_max_ibc_cand_size_minus2`.
+    /// Returns `None` when IBC is not enabled (`sps_ibc_flag == 0`).
+    pub fn log2_max_ibc_cand_size(&self) -> Option<u32> {
+        if !self.sps_ibc_flag {
+            None
+        } else {
+            Some(2 + self.log2_max_ibc_cand_size_minus2)
+        }
+    }
+
+    /// `MaxIbcCandSize` — `1 << log2MaxIbcCandSize`. Returns `None` when
+    /// IBC is not enabled.
+    pub fn max_ibc_cand_size(&self) -> Option<u32> {
+        self.log2_max_ibc_cand_size().map(|n| 1u32 << n)
+    }
 }
 
 /// Parse a SPS RBSP body (§7.3.2.1). The 2-byte NAL header has already
@@ -643,5 +660,97 @@ pub(crate) mod tests {
         assert_eq!(sps.bit_depth_y(), 10);
         assert!(sps.sps_btt_flag);
         assert_eq!(sps.log2_ctu_size_minus5, 1);
+    }
+
+    /// `Sps::log2_max_ibc_cand_size()` returns `None` when IBC is
+    /// disabled.
+    #[test]
+    fn log2_max_ibc_cand_size_none_when_disabled() {
+        let sps = Sps {
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size_minus2: 3, // would be 5 if enabled
+            ..baseline_sps_for_test()
+        };
+        assert_eq!(sps.log2_max_ibc_cand_size(), None);
+        assert_eq!(sps.max_ibc_cand_size(), None);
+    }
+
+    /// `log2_max_ibc_cand_size` adds 2 to the SPS field per eq. 70.
+    #[test]
+    fn log2_max_ibc_cand_size_from_field() {
+        // Spec range: log2_max_ibc_cand_size_minus2 ∈ 0..=4, so the
+        // resolved log2 is 2..=6 (block sizes 4..=64).
+        for minus2 in 0..=4u32 {
+            let sps = Sps {
+                sps_ibc_flag: true,
+                log2_max_ibc_cand_size_minus2: minus2,
+                ..baseline_sps_for_test()
+            };
+            assert_eq!(sps.log2_max_ibc_cand_size(), Some(2 + minus2));
+            assert_eq!(sps.max_ibc_cand_size(), Some(1u32 << (2 + minus2)));
+        }
+    }
+
+    /// Helper: build a baseline-ish `Sps` for test fixtures that only
+    /// need to twiddle the IBC fields.
+    fn baseline_sps_for_test() -> Sps {
+        Sps {
+            sps_seq_parameter_set_id: 0,
+            profile_idc: 0,
+            level_idc: 30,
+            toolset_idc_h: 0,
+            toolset_idc_l: 0,
+            chroma_format_idc: 1,
+            pic_width_in_luma_samples: 64,
+            pic_height_in_luma_samples: 64,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            sps_btt_flag: false,
+            log2_ctu_size_minus5: 0,
+            log2_min_cb_size_minus2: 0,
+            log2_diff_ctu_max_14_cb_size: 0,
+            log2_diff_ctu_max_tt_cb_size: 0,
+            log2_diff_min_cb_min_tt_cb_size_minus2: 0,
+            sps_suco_flag: false,
+            log2_diff_ctu_size_max_suco_cb_size: 0,
+            log2_diff_max_suco_min_suco_cb_size: 0,
+            sps_admvp_flag: false,
+            sps_affine_flag: false,
+            sps_amvr_flag: false,
+            sps_dmvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_hmvp_flag: false,
+            sps_eipd_flag: false,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size_minus2: 0,
+            sps_cm_init_flag: false,
+            sps_adcc_flag: false,
+            sps_iqt_flag: false,
+            sps_ats_flag: false,
+            sps_addb_flag: false,
+            sps_alf_flag: false,
+            sps_htdf_flag: false,
+            sps_rpl_flag: false,
+            sps_pocs_flag: false,
+            sps_dquant_flag: false,
+            sps_dra_flag: false,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            log2_sub_gop_length: 0,
+            log2_ref_pic_gap_length: 0,
+            max_num_tid0_ref_pics: 0,
+            sps_max_dec_pic_buffering_minus1: 0,
+            long_term_ref_pics_flag: false,
+            rpl1_same_as_rpl0_flag: false,
+            num_ref_pic_lists_in_sps_l0: 0,
+            num_ref_pic_lists_in_sps_l1: 0,
+            ref_pic_list_structs_l0: Vec::new(),
+            ref_pic_list_structs_l1: Vec::new(),
+            picture_cropping_flag: false,
+            picture_crop_left_offset: 0,
+            picture_crop_right_offset: 0,
+            picture_crop_top_offset: 0,
+            picture_crop_bottom_offset: 0,
+            vui_parameters_present_flag: false,
+        }
     }
 }

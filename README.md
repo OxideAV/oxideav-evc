@@ -7,7 +7,7 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Round-73 status
+## Round-74 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full
 residual coding, luma + chroma deblocking, the 64-point IDCT, the
@@ -15,10 +15,57 @@ residual coding, luma + chroma deblocking, the 64-point IDCT, the
 §9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
 infrastructure, the round-9 multi-ref DPB + POC reordering, the
 round-10 spec-compliance additions, the round-11 post-filter
-pipeline, plus the round-73 **IBC primitive scaffold** (§8.6
-derivation + validation + integer-pel block copy as pure functions;
-`sps_ibc_flag = 1` SPS gate is unchanged — full `coding_unit()`
-wiring is a follow-up round).
+pipeline, the round-73 **IBC primitive scaffold** (§8.6 derivation +
+validation + integer-pel block copy), and the round-74 IBC
+**pipeline + utility** layer (§8.6.1 `decode_ibc_cu` chains steps
+1-3 of the spec's 5-step process; §7.4.5 `isIbcAllowed` size gate;
+SPS `log2MaxIbcCandSize` / `MaxIbcCandSize` helpers per eq. 70;
+§8.5.3.10 `round_motion_vector` rounding primitive eq. 907-909
+needed by the affine and AMVR paths).
+
+## Round-74 deltas vs round 73
+
+- **`ibc::decode_ibc_cu`** (`src/ibc.rs`): one-call wrapper that
+  chains §8.6.1 steps 1-3: `derive_ibc_luma_mv` → `validate_ibc_constraints`
+  → `derive_ibc_chroma_mv` (when chroma is present) → `predict_ibc_block`.
+  Returns the resolved `(mvL, mvC)` pair so the caller can stamp the
+  side-info grid and update HMVP. Step 4 (residual) and step 5
+  (picture reconstruction §8.7.5) stay in their existing modules — they
+  are shared with the inter pipeline.
+- **`ibc::is_ibc_allowed_for_size`**: the structural part of the
+  §7.4.5 `isIbcAllowed` predicate — `sps_ibc_flag == 1` AND both
+  `log2CbWidth, log2CbHeight ≤ log2MaxIbcCandSize`. The `treeType` /
+  `predModeConstraint` rules stay caller-side because they depend on
+  the dual-tree state the CABAC walker tracks.
+- **`Sps::log2_max_ibc_cand_size` / `Sps::max_ibc_cand_size`**: eq. 70
+  derived variables. Return `None` when IBC is disabled at the SPS
+  level so the caller can short-circuit before consulting the cand
+  size.
+- **`inter::round_motion_vector`** (`src/inter.rs`): §8.5.3.10 eq.
+  907-909 standalone helper. `((mv + offset − (mv >= 0)) >> rightShift)
+  << leftShift` with `offset = (rightShift == 0) ? 0 : 1 << (rightShift − 1)`.
+  Needed by the §8.5.3 affine derivation paths (eq. 911, 918, 953, 962,
+  1023) and by AMVR resolution scaling.
+- 14 new unit tests (now 265 total, was 251): IBC pipeline end-to-end
+  (chains match individual derivers; non-conformant BV short-circuits
+  before any sample read; luma-only path leaves chroma buffers
+  untouched), `isIbcAllowed` size gate (flag-off, equal-to-limit
+  acceptance, larger-than-limit rejection, per-axis independence),
+  SPS `log2_max_ibc_cand_size` (disabled → None; enabled across the
+  full spec range 0..=4 of `log2_max_ibc_cand_size_minus2`), and
+  §8.5.3.10 rounding (zero-right-shift no-offset, positive vs negative
+  rounding direction at right_shift=2, combined right+left shift, and
+  the right_shift=1 zero-MV round-trip).
+- The `sps_ibc_flag = 1` SPS-level gate in `walk_idr_slice`,
+  `decode_idr_slice`, and `decode_non_idr` is **still unchanged** —
+  lifting it needs the CABAC walker to emit `ibc_flag` in
+  `coding_unit()`, parse `abs_mvd_l0` / `mvd_l0_sign_flag` for the
+  IBC case (binariser already supports both), then wire
+  `decode_ibc_cu` into the per-CU path. The §8.6.1 step-4 residual
+  decode currently lives in the inter slice walker; sharing it for
+  IBC needs a small refactor of the slice-data residual code.
+
+## Round-73 status
 
 ## Round-73 deltas vs round 11
 

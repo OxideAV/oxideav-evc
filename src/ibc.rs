@@ -312,6 +312,116 @@ pub fn predict_ibc_block(
     Ok(())
 }
 
+/// §8.6.1 IBC CU decoding pipeline — steps 1, 2, 3 chained.
+///
+/// Runs the spec's first three ordered steps for an IBC-coded coding
+/// unit:
+///
+/// 1. derive luma MV (§8.6.2.1, eq. 1025-1039);
+/// 2. derive chroma MV when chroma is present (§8.6.2.2, eq. 1040-1041);
+/// 3. predict the block from the current picture's already-reconstructed
+///    region (§8.6.3).
+///
+/// Steps 4 (residual decode) and 5 (picture reconstruction prior to
+/// in-loop filtering) live elsewhere — they're shared with the inter
+/// pipeline (§8.5.6.1) and the picture-construction process (§8.7.5),
+/// so they don't belong in this module.
+///
+/// The MV is also **validated** in-line against §8.6.2.1 bitstream
+/// conformance via `validate_ibc_constraints`. A non-conformant BV
+/// short-circuits to `Err(Error::Invalid)` before any sample read.
+///
+/// Inputs:
+///   * `cur_pic` — the current picture (luma + chroma planes already
+///     populated up to the current CU's position).
+///   * `x_cb`, `y_cb` — top-left luma sample of the current CB.
+///   * `n_cb_w_l`, `n_cb_h_l` — luma CB dimensions.
+///   * `mvd` — parsed `MvdL0` (signed, in integer-pel units for IBC).
+///   * `ctb_log2_size_y` — `CtbLog2SizeY` (5..=7 in EVC).
+///   * `chroma_present` — whether to fill chroma prediction buffers.
+///
+/// Outputs:
+///   * `pred_y` — `n_cb_w_l × n_cb_h_l` luma prediction samples (row-major).
+///   * `pred_cb` / `pred_cr` — chroma prediction samples (row-major) when
+///     `chroma_present` is true. The buffers must already be sized to
+///     `(n_cb_w_l / SubWidthC) * (n_cb_h_l / SubHeightC)` for the
+///     picture's `chroma_format_idc`.
+///   * Returns the derived `(mvL, mvC)` pair on success so the caller
+///     can drive HMVP update / side-info-grid stamp.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_ibc_cu(
+    cur_pic: &YuvPicture,
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w_l: usize,
+    n_cb_h_l: usize,
+    mvd: MotionVector,
+    ctb_log2_size_y: u32,
+    chroma_present: bool,
+    pred_y: &mut [i32],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
+) -> Result<(MotionVector, MotionVector)> {
+    // Step 1: derive luma MV (§8.6.2.1).
+    let mv_l = derive_ibc_luma_mv(mvd);
+    // Inline conformance check before any sample read. The validator's
+    // CB-dimension check covers nCbW / nCbH non-positive, so we don't
+    // duplicate that guard here.
+    validate_ibc_constraints(
+        mv_l,
+        x_cb,
+        y_cb,
+        n_cb_w_l as i32,
+        n_cb_h_l as i32,
+        ctb_log2_size_y,
+    )?;
+    // Step 2: derive chroma MV (§8.6.2.2).
+    let mv_c = if chroma_present {
+        derive_ibc_chroma_mv(mv_l, cur_pic.chroma_format_idc)
+    } else {
+        MotionVector { x: 0, y: 0 }
+    };
+    // Step 3: predict (§8.6.3).
+    predict_ibc_block(
+        cur_pic,
+        x_cb,
+        y_cb,
+        n_cb_w_l,
+        n_cb_h_l,
+        mv_l,
+        mv_c,
+        chroma_present,
+        pred_y,
+        pred_cb,
+        pred_cr,
+    )?;
+    Ok((mv_l, mv_c))
+}
+
+/// §7.4.5 `isIbcAllowed` predicate (the structural part — the CABAC
+/// walker still has to gate on `treeType` and `predModeConstraint`).
+///
+/// Returns `true` iff all of:
+///   * `sps_ibc_flag == 1`,
+///   * `log2CbWidth <= log2MaxIbcCandSize` AND
+///     `log2CbHeight <= log2MaxIbcCandSize`.
+///
+/// The remaining bullet (`treeType != DUAL_TREE_CHROMA`, `predModeConstraint`
+/// rules) is decided by the caller from the dual-tree / pred-mode state
+/// the walker tracks — keeping it out of this predicate lets unit tests
+/// drive the size + flag side of the gate without faking a tree-type
+/// enum.
+pub fn is_ibc_allowed_for_size(
+    sps_ibc_flag: bool,
+    log2_max_ibc_cand_size: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> bool {
+    sps_ibc_flag
+        && log2_cb_width <= log2_max_ibc_cand_size
+        && log2_cb_height <= log2_max_ibc_cand_size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +760,93 @@ mod tests {
         assert_eq!(py[0], 0);
         // Y[15][15] should be source (15, 15) = (15+15)&0xFF = 30.
         assert_eq!(py[15 * 16 + 15], 30);
+    }
+
+    // -------- decode_ibc_cu (§8.6.1 steps 1-3) --------
+
+    #[test]
+    fn ibc_decode_cu_chains_derive_validate_predict() {
+        // Same pic + BV as the end-to-end test; verifies that the
+        // pipeline returns the same (mvL, mvC) pair the individual
+        // derivers do, AND fills the prediction buffer identically.
+        let pic = make_pic_with_gradient(32, 32);
+        let mvd = MotionVector { x: -16, y: 0 };
+        let mut py = vec![0i32; 256];
+        let mut pcb = vec![0i32; 64];
+        let mut pcr = vec![0i32; 64];
+        let (mv_l, mv_c) = decode_ibc_cu(
+            &pic, 16, 0, 16, 16, mvd, 5, true, &mut py, &mut pcb, &mut pcr,
+        )
+        .expect("pipeline ok");
+        assert_eq!(mv_l, derive_ibc_luma_mv(mvd));
+        assert_eq!(mv_c, derive_ibc_chroma_mv(mv_l, pic.chroma_format_idc));
+        // Corner spot-checks (mirroring the end-to-end test above).
+        assert_eq!(py[0], 0);
+        assert_eq!(py[15 * 16 + 15], 30);
+    }
+
+    #[test]
+    fn ibc_decode_cu_rejects_non_conformant_bv() {
+        // Same pic; BV (-8, 0) overlaps current CU → cond_left + cond_above
+        // both false → validate_ibc_constraints rejects.
+        let pic = make_pic_with_gradient(32, 32);
+        let mvd = MotionVector { x: -8, y: 0 };
+        let mut py = vec![0i32; 256];
+        let mut pcb = vec![0i32; 64];
+        let mut pcr = vec![0i32; 64];
+        let r = decode_ibc_cu(
+            &pic, 16, 16, 16, 16, mvd, 5, true, &mut py, &mut pcb, &mut pcr,
+        );
+        assert!(r.is_err(), "expected rejection, got {r:?}");
+        // No samples touched on the early-out path.
+        assert_eq!(py[0], 0);
+    }
+
+    #[test]
+    fn ibc_decode_cu_luma_only_skips_chroma_buffers() {
+        let pic = make_pic_with_gradient(32, 32);
+        let mvd = MotionVector { x: -16, y: 0 };
+        let mut py = vec![0i32; 256];
+        let mut pcb = vec![999i32; 64]; // sentinel
+        let mut pcr = vec![999i32; 64]; // sentinel
+        let (mv_l, mv_c) = decode_ibc_cu(
+            &pic, 16, 0, 16, 16, mvd, 5, false, &mut py, &mut pcb, &mut pcr,
+        )
+        .expect("pipeline ok");
+        // Chroma MV is zero when chroma is not present.
+        assert_eq!(mv_c, MotionVector { x: 0, y: 0 });
+        // Sentinel preserved — chroma buffer never touched.
+        assert_eq!(pcb[0], 999);
+        assert_eq!(pcr[0], 999);
+        // Luma still derived + predicted.
+        assert_eq!(mv_l, derive_ibc_luma_mv(mvd));
+        assert_eq!(py[0], 0);
+    }
+
+    // -------- is_ibc_allowed_for_size (§7.4.5 isIbcAllowed) --------
+
+    #[test]
+    fn ibc_size_gate_blocks_when_flag_off() {
+        assert!(!is_ibc_allowed_for_size(false, 6, 4, 4));
+    }
+
+    #[test]
+    fn ibc_size_gate_accepts_equal_to_limit() {
+        // log2_max_ibc_cand_size = 6 → max block = 64. A 64×64 CB is fine.
+        assert!(is_ibc_allowed_for_size(true, 6, 6, 6));
+    }
+
+    #[test]
+    fn ibc_size_gate_rejects_larger_than_limit() {
+        // 128×128 CB exceeds the 64-sample limit.
+        assert!(!is_ibc_allowed_for_size(true, 6, 7, 7));
+    }
+
+    #[test]
+    fn ibc_size_gate_independent_per_axis() {
+        // 64-wide × 32-tall under a 64-sample limit is allowed (both ≤).
+        assert!(is_ibc_allowed_for_size(true, 6, 6, 5));
+        // But 128-wide × 32-tall is rejected purely on the width side.
+        assert!(!is_ibc_allowed_for_size(true, 6, 7, 5));
     }
 }

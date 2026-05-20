@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### Round 74 — IBC pipeline composition + MV rounding helper
+
+#### Added
+- `ibc::decode_ibc_cu(cur_pic, xCb, yCb, nCbWL, nCbHL, mvd, ctbLog2SizeY,
+  chroma_present, pred_y, pred_cb, pred_cr)` — chains §8.6.1 steps 1
+  through 3 (derive luma MV → validate bitstream-conformance constraints
+  → derive chroma MV → predict block) in a single call. Returns the
+  resolved `(mvL, mvC)` pair so the caller can stamp the per-4×4 side-
+  info grid and run an HMVP update. Steps 4 (residual decode, §8.5.6.1)
+  and 5 (picture-construction prior to in-loop filtering, §8.7.5) stay
+  in their existing modules — they are shared with the inter pipeline.
+- `ibc::is_ibc_allowed_for_size(sps_ibc_flag, log2MaxIbcCandSize,
+  log2CbWidth, log2CbHeight)` — the structural part of the §7.4.5
+  `isIbcAllowed` predicate. The dual-tree / `predModeConstraint`
+  bullet stays caller-side (the walker tracks the tree-type enum
+  internally).
+- `Sps::log2_max_ibc_cand_size()` / `Sps::max_ibc_cand_size()` — eq. 70
+  derived variables (`log2MaxIbcCandSize = 2 + log2_max_ibc_cand_size_minus2`
+  and the corresponding `1 << log2MaxIbcCandSize`). Both return `None`
+  when `sps_ibc_flag == 0` so callers don't read an undefined field.
+- `inter::round_motion_vector(mv, rightShift, leftShift)` — §8.5.3.10
+  eq. 907-909 standalone helper. Computes
+  `((mv[k] + offset − (mv[k] >= 0)) >> rightShift) << leftShift`
+  with `offset = (rightShift == 0) ? 0 : 1 << (rightShift − 1)`. The
+  arithmetic right shift preserves the sign for negative MVs (rounding
+  toward negative infinity), and the `− (mv >= 0)` term gives the
+  spec's asymmetric rounding direction (round toward negative infinity
+  on positives too). Needed by the §8.5.3 affine derivation paths
+  (eq. 911, 918, 953, 962, 1023) and by AMVR resolution scaling.
+
+#### Tests
+- 265 unit tests pass (up from 251). 14 new tests cover:
+  - `ibc::decode_ibc_cu` (3 tests): pipeline matches individual
+    derivers + predictor on a 32×32 gradient; non-conformant BV
+    short-circuits before any sample read; luma-only path leaves
+    sentinel chroma buffers untouched.
+  - `ibc::is_ibc_allowed_for_size` (4 tests): flag-off rejects;
+    equal-to-limit accepts; larger-than-limit rejects; per-axis
+    independence (a 64-wide × 32-tall under a 64-sample limit
+    accepts; a 128-wide × 32-tall under the same limit rejects on
+    width alone).
+  - `Sps::log2_max_ibc_cand_size` (2 tests): IBC-disabled returns
+    `None`; IBC-enabled returns `2 + minus2` across the full spec
+    range 0..=4 of `log2_max_ibc_cand_size_minus2`.
+  - `inter::round_motion_vector` (5 tests): `right_shift = 0`
+    short-circuits the offset; `right_shift = 2` rounds positive
+    components toward negative infinity (7 → 2, 4 → 1); negative
+    components also round toward negative infinity (−4 → −1, −7 → −2,
+    −8 → −2); combined right-then-left shift recovers MV resolution
+    (11 → 12 at rs=2, ls=2); zero MV at `right_shift = 1` is identity
+    (offset cancels exactly).
+
+#### Notes
+- The `sps_ibc_flag = 1` SPS-level gate in `walk_idr_slice`,
+  `decode_idr_slice`, and `decode_non_idr` is **still unchanged**.
+  Lifting it needs the CABAC walker to emit `ibc_flag` in
+  `coding_unit()`, parse the IBC `abs_mvd_l0` / `mvd_l0_sign_flag`
+  (binariser already supports both), and route through
+  `decode_ibc_cu`. The §8.6.1 step-4 residual decode currently lives
+  in the inter slice walker; sharing it for IBC needs a small
+  refactor.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
+  No xeve, xevd, ETM reference, libavcodec evcdec consulted.
+
 ### Round 73 — IBC (Intra Block Copy) primitive scaffold
 
 #### Added
