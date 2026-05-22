@@ -360,7 +360,6 @@ impl EvcDecoder {
             || sps.sps_addb_flag
             || sps.sps_dquant_flag
             || sps.sps_ats_flag
-            || sps.sps_ibc_flag
             || sps.sps_adcc_flag
             || sps.sps_cm_init_flag
         {
@@ -368,6 +367,12 @@ impl EvcDecoder {
                 "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",
             ));
         }
+        // Round 95: sps_ibc_flag is no longer part of the unsupported gate.
+        // The §7.3.8.4 IBC branch is surfaced inside the per-CU inter
+        // walker (`decode_inter_coding_unit`) so non-IDR (P/B) slices with
+        // IBC-enabled SPS now decode the `ibc_flag` syntax element + the
+        // §8.6.1 IBC pipeline symmetrically to the IDR path lifted in
+        // round 90.
         // sps_alf_flag and sps_dra_flag are handled by the round-11 post-filter
         // pipeline — they no longer gate the Unsupported path.
         if !pps.single_tile_in_pic_flag {

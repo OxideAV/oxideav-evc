@@ -7,6 +7,95 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-95 status
+
+Working **Baseline-profile** decoder for IDR + P + B slices with full
+residual coding, luma + chroma deblocking, the 64-point IDCT, the
+**Main-profile CABAC initialization tables** (Tables 40-90) and
+§9.3.4.2 ctxInc derivation helpers, the round-8 RPL parser + HMVP
+infrastructure, the round-9 multi-ref DPB + POC reordering, the
+round-10 spec-compliance additions, the round-11 post-filter
+pipeline, the round-73/74 **IBC primitives**, the round-90
+**IDR-slice IBC `coding_unit()` wiring**, and round-95's **non-IDR
+(P/B) IBC `coding_unit()` wiring**: the `decode_inter_coding_unit`
+path now decodes the regular-coded `ibc_flag` under §7.4.5
+`isIbcAllowed`, the §7.3.8.4 lines 2868–2876 IBC syntax (two
+`abs_mvd_l0` EG-0 magnitudes + optional `mvd_l0_sign_flag` per
+component), and routes through a new `decode_inter_ibc_branch` →
+`apply_inter_ibc_branch_predict_and_reconstruct` pair that closes
+the §8.6.1 1-5 pipeline (single-tree luma + chroma reconstruction,
+side-info grid stamp, HMVP-no-op gate). The SPS-level `sps_ibc_flag
+= 1` gate is now **lifted on both IDR and non-IDR (P/B) paths**.
+
+## Round-95 deltas vs round 90
+
+- **`decode_inter_coding_unit` IBC branch** (`src/slice_data.rs`):
+  inside the `!cu_skip_flag` branch, after the `pred_mode_flag` is
+  consumed, when `is_ibc_allowed_for_size(decode.sps_ibc_flag,
+  decode.log2_max_ibc_cand_size, log2CbWidth, log2CbHeight)` holds,
+  the walker decodes the regular-coded `ibc_flag` bin (Table 90 →
+  Table 66 init; `sps_cm_init_flag = 0` ⇒ single ctxIdx 0). On
+  `ibc_flag = 1` the walker parses `abs_mvd_l0[0/1]` (EG-0 bypass)
+  + optional `mvd_l0_sign_flag` per component, then hands the
+  resolved `MotionVector` to **`decode_inter_ibc_branch`**. Per
+  §7.4.9.5 the IBC flag always wins over `pred_mode_flag` when
+  `predModeConstraint = PRED_MODE_NO_CONSTRAINT`.
+- **`decode_inter_ibc_branch`**: drives the §8.6.1 IBC pipeline for
+  the single-tree P/B CU. Reads `cbf_luma` + (optionally) `cbf_cb`
+  / `cbf_cr` on the standard Baseline cbf path, decodes per-component
+  residual coefficients via `decode_residual_coding_rle`, then hands
+  off to `apply_inter_ibc_branch_predict_and_reconstruct`.
+- **`apply_inter_ibc_branch_predict_and_reconstruct`**: pure-compute
+  closure of the §8.6.1 step 1-5 pipeline. Calls `ibc::decode_ibc_cu`
+  for luma + chroma prediction, scales + IDCT the residuals,
+  `clip(pred + res)` per eq. 1091, stamps `CuPredMode::Ibc` into
+  the side-info grid. Single-tree inter slices have no
+  DUAL_TREE_CHROMA pass to compensate, so the helper scales the
+  luma `(x0, y0)` to chroma-pel coordinates before `pic.store_block`
+  on the chroma planes (`x_c = x0 / SubWidthC`, similarly for y).
+  The §8.5.2.7 HMVP update is a no-op for IBC CUs (both ref_idx
+  slots remain −1, so `HmvpCandList::update`'s validity gate drops
+  the candidate by construction — matching the spec intent that
+  IBC CUs do not contribute an inter-AMVP candidate).
+- **`InterDecodeStats`**: new IBC counters — `ibc_flag_bins`,
+  `ibc_cus`, `ibc_abs_mvd_bins`, `ibc_mvd_sign_bins` — mirroring
+  the round-90 IDR-side trackers.
+- **SPS gate lifted on non-IDR path**: `decoder.rs::decode_non_idr`
+  no longer returns `Error::Unsupported` for `sps_ibc_flag = 1`
+  streams. The remaining Baseline-toolset gate (`sps_btt_flag`,
+  `sps_admvp_flag`, `sps_eipd_flag`, etc.) is unchanged.
+- **277 unit tests pass** (was 272). 5 new tests:
+  - `round95_inter_decode_without_ibc_flag_consumes_no_ibc_bins`:
+    `sps_ibc_flag = 0` ⇒ zero `ibc_flag` / IBC-counter bins on the
+    P-slice cu_skip path.
+  - `round95_inter_decode_skips_ibc_flag_when_cu_exceeds_cand_size`:
+    `sps_ibc_flag = 1` but `log2_max_ibc_cand_size = 1` ⇒ §7.4.5
+    size gate suppresses `ibc_flag` emission.
+  - `round95_inter_ibc_branch_predicts_from_left_neighbour`: direct
+    exercise of the pure-compute helper. Pre-stamps a 4×4 luma
+    pattern on the left half of an 8×4 monochrome picture, then
+    runs the inter IBC helper with BV = (−4, 0) at the right-half
+    CU. Verifies the right-half samples are a bit-exact copy of
+    the left half, the side-info grid is stamped `CuPredMode::Ibc`
+    with `mv_l0_x = −64` (1/16-pel grid), and the HMVP list
+    remains empty.
+  - `round95_inter_ibc_branch_rejects_non_conformant_bv`: BV (0, 0)
+    overlapping the current CU short-circuits with `Error::Invalid`
+    from `validate_ibc_constraints` before any sample is written.
+  - `round95_inter_ibc_branch_chroma_residual_roundtrips`: 8×8 luma
+    CB on a 4:2:0 picture verifies the chroma-pel coordinate
+    scaling in `pic.store_block` puts the IBC chroma samples at
+    the correct chroma destination.
+
+### Round 95 follow-ups
+
+- The CabacEncoder `encode_bypass` defer bug (documented in the
+  round-90 follow-ups) still blocks end-to-end CABAC fixtures for
+  the inter IBC active-decode path. Bit-exact reconstruction is
+  covered by the pure-compute helper tests; revisiting the encoder
+  to enable a full CABAC-driven inter IBC fixture remains scoped
+  for a future round.
+
 ## Round-90 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full

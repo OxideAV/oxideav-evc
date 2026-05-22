@@ -2,6 +2,87 @@
 
 ## [Unreleased]
 
+### Round 95 — non-IDR (P/B) IBC `coding_unit()` wiring
+
+#### Added
+- `decode_inter_coding_unit` (`src/slice_data.rs`): inside the
+  `!cu_skip_flag` branch, after `pred_mode_flag` is consumed, the
+  walker now evaluates §7.4.5 `isIbcAllowed` against the inter
+  `SliceDecodeInputs::sps_ibc_flag` + `log2_max_ibc_cand_size`. When
+  the gate holds, the regular-coded `ibc_flag` (Table 90 → Table 66
+  init; under `sps_cm_init_flag = 0` the only ctxIdx is 0) is
+  decoded. On `ibc_flag = 1` — and per §7.4.9.5 the IBC bit always
+  wins over `pred_mode_flag` for `predModeConstraint =
+  PRED_MODE_NO_CONSTRAINT` — the walker takes the §7.3.8.4
+  lines 2868–2876 IBC syntax path: two `abs_mvd_l0` EG-0 bypass
+  magnitudes (x then y) each with an optional `mvd_l0_sign_flag`
+  bypass bit.
+- `decode_inter_ibc_branch`: drives the §8.6.1 IBC pipeline inside
+  the single-tree inter walker. Reads `cbf_luma` + (optionally)
+  `cbf_cb` / `cbf_cr` via the normal Baseline cbf path, decodes per
+  component residual coefficients, then hands off to
+  `apply_inter_ibc_branch_predict_and_reconstruct`. The helper is
+  symmetric to the IDR-side `decode_ibc_branch` (round 90) but
+  operates against `InterDecodeStats` / `InterDecodeInputs` and
+  single-tree.
+- `apply_inter_ibc_branch_predict_and_reconstruct`: pure-compute
+  closure (no CABAC engine, no bitstream) of the §8.6.1 step 1-5
+  pipeline for the inter path. Calls `ibc::decode_ibc_cu` to predict
+  luma + chroma from the current picture's reconstructed region,
+  scale + IDCT the per-component residual coefficients, do the
+  `clip(pred + res)` reconstruction (§8.7.5 eq. 1091), stamp
+  `CuPredMode::Ibc` + the 1/16-pel luma MV into the side-info grid,
+  and leave the HMVP candidate list untouched (per §8.5.2.7, IBC
+  CUs do not contribute an inter-AMVP candidate). Single-tree
+  inter-slice chroma destinations are scaled to chroma-pel
+  coordinates before `pic.store_block` (no DUAL_TREE_CHROMA pass to
+  compensate, unlike the IDR-side wiring).
+- `InterDecodeStats`: new counters mirroring the IDR-side IBC
+  trackers — `ibc_flag_bins`, `ibc_cus`, `ibc_abs_mvd_bins`,
+  `ibc_mvd_sign_bins`.
+
+#### Changed
+- `decoder.rs::decode_non_idr`: lifted `sps_ibc_flag` from the
+  Baseline-toolset unsupported gate. P/B slices with IBC-enabled SPS
+  now drive through the slice walker symmetrically to the IDR path
+  unblocked in round 90.
+
+#### Tests
+- 277 pass (was 272). 5 new tests:
+  - `round95_inter_decode_without_ibc_flag_consumes_no_ibc_bins`:
+    `sps_ibc_flag = 0` ⇒ zero `ibc_flag` / IBC-counter bins on the
+    P-slice cu_skip path.
+  - `round95_inter_decode_skips_ibc_flag_when_cu_exceeds_cand_size`:
+    `sps_ibc_flag = 1` but `log2_max_ibc_cand_size = 1` ⇒ §7.4.5
+    size gate suppresses `ibc_flag` emission (verified on the
+    cu_skip path which intrinsically skips `ibc_flag` anyway).
+  - `round95_inter_ibc_branch_predicts_from_left_neighbour`: direct
+    exercise of the pure-compute helper. Pre-stamps a 4×4 luma
+    pattern on the left half of an 8×4 monochrome picture, then
+    runs the inter IBC helper with BV = (−4, 0) at the right-half
+    CU. Verifies the right-half samples are a bit-exact copy of
+    the left half, the side-info grid is stamped `CuPredMode::Ibc`,
+    and the HMVP list remains empty.
+  - `round95_inter_ibc_branch_rejects_non_conformant_bv`: BV (0, 0)
+    overlapping the current CU short-circuits with `Error::Invalid`
+    before any sample write.
+  - `round95_inter_ibc_branch_chroma_residual_roundtrips`: 8×8 luma
+    CB at (8, 0) on a 4:2:0 picture with chroma pre-fill on the
+    left half + BV (−8, 0). Verifies the chroma destination
+    coordinate scaling in `pic.store_block` puts the IBC chroma
+    samples at the correct chroma-pel position.
+
+#### Notes
+- The crate-private test-only `CabacEncoder` has a pre-existing
+  `encode_bypass` defer bug that breaks long mixed regular+bypass
+  streams (documented in the round-90 CHANGELOG entry). End-to-end
+  CABAC-driven fixtures for the inter IBC path therefore exercise
+  the negative gates (`sps_ibc_flag = 0` + cu_skip suppression) and
+  the bit-exact reconstruction is covered by the pure-compute
+  helper tests.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
+  No xeve, xevd, ETM reference, or libavcodec evcdec consulted.
+
 ### Round 90 — IBC `coding_unit()` wiring
 
 #### Added
