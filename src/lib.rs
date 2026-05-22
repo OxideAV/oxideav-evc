@@ -205,7 +205,6 @@ pub fn walk_idr_slice(
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
-        || sps.sps_ibc_flag
         || sps.sps_adcc_flag
         || sps.sps_cm_init_flag
         || sps.sps_amvr_flag
@@ -243,10 +242,13 @@ pub fn walk_idr_slice(
         ));
     }
     let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
-    // Build SliceWalkInputs from SPS / PPS.
+    // Build SliceWalkInputs from SPS / PPS. Round 90 surfaces the IBC
+    // SPS gates so the coding_unit() walker can apply §7.4.5
+    // `isIbcAllowed` per-CU.
     let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
     let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
     let max_tb_log2_size_y = ctb_log2_size_y.min(6);
+    let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
     let inputs = slice_data::SliceWalkInputs {
         pic_width: sps.pic_width_in_luma_samples,
         pic_height: sps.pic_height_in_luma_samples,
@@ -255,6 +257,8 @@ pub fn walk_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_ibc_flag: sps.sps_ibc_flag,
+        log2_max_ibc_cand_size,
     };
     slice_data::walk_baseline_idr_slice(slice_data_bytes, inputs)
 }
@@ -280,7 +284,6 @@ pub fn decode_idr_slice(
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
-        || sps.sps_ibc_flag
         || sps.sps_adcc_flag
         || sps.sps_cm_init_flag
     {
@@ -314,6 +317,7 @@ pub fn decode_idr_slice(
     let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
     let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
     let max_tb_log2_size_y = ctb_log2_size_y.min(5); // round-3: cap at 32x32
+    let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
     let walk = slice_data::SliceWalkInputs {
         pic_width: sps.pic_width_in_luma_samples,
         pic_height: sps.pic_height_in_luma_samples,
@@ -322,6 +326,8 @@ pub fn decode_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_ibc_flag: sps.sps_ibc_flag,
+        log2_max_ibc_cand_size,
     };
     let decode = slice_data::SliceDecodeInputs {
         slice_qp,
@@ -330,6 +336,8 @@ pub fn decode_idr_slice(
         enable_deblock: false, // round-3 fixtures keep deblock off
         slice_cb_qp_offset: 0,
         slice_cr_qp_offset: 0,
+        sps_ibc_flag: sps.sps_ibc_flag,
+        log2_max_ibc_cand_size,
     };
     slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
 }

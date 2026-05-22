@@ -477,6 +477,7 @@ impl EvcDecoder {
         let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
         let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
         let max_tb_log2_size_y = ctb_log2_size_y.min(5);
+        let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
         let walk = SliceWalkInputs {
             pic_width: sps.pic_width_in_luma_samples,
             pic_height: sps.pic_height_in_luma_samples,
@@ -485,6 +486,8 @@ impl EvcDecoder {
             max_tb_log2_size_y,
             chroma_format_idc: sps.chroma_format_idc,
             cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+            sps_ibc_flag: sps.sps_ibc_flag,
+            log2_max_ibc_cand_size,
         };
         let decode = SliceDecodeInputs {
             slice_qp: slice_qp as i32,
@@ -493,6 +496,8 @@ impl EvcDecoder {
             enable_deblock: slice_deblocking_filter_flag,
             slice_cb_qp_offset,
             slice_cr_qp_offset,
+            sps_ibc_flag: sps.sps_ibc_flag,
+            log2_max_ibc_cand_size,
         };
         // Resolve POCs to DPB views. This consumes immutable borrows
         // of `self.dpb`, so we collect into an owned Vec<RefPictureView>

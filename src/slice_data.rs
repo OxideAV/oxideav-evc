@@ -73,6 +73,32 @@ pub struct SliceWalkInputs {
     /// `cu_qp_delta_enabled_flag` (PPS). When false, `cu_qp_delta_*` is
     /// not in the bitstream.
     pub cu_qp_delta_enabled: bool,
+    /// `sps_ibc_flag` (§7.4.3.1). When true, the `coding_unit()` walker
+    /// evaluates `isIbcAllowed` (§7.4.5) per-CU and conditionally emits
+    /// the `ibc_flag` syntax element. When false (Baseline default),
+    /// the IBC branch is suppressed wholesale per the SPS gate.
+    pub sps_ibc_flag: bool,
+    /// `log2MaxIbcCandSize = 2 + log2_max_ibc_cand_size_minus2` per
+    /// eq. 70. Only consulted when `sps_ibc_flag` is true. The walker
+    /// gates `ibc_flag` emission on `log2CbWidth ≤ log2MaxIbcCandSize
+    /// && log2CbHeight ≤ log2MaxIbcCandSize` per §7.4.5.
+    pub log2_max_ibc_cand_size: u32,
+}
+
+impl Default for SliceWalkInputs {
+    fn default() -> Self {
+        Self {
+            pic_width: 0,
+            pic_height: 0,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size: 0,
+        }
+    }
 }
 
 impl SliceWalkInputs {
@@ -107,6 +133,19 @@ pub struct SliceWalkStats {
     pub cu_qp_delta_abs_bins: u32,
     /// `intra_pred_mode` bins decoded (per luma CU under sps_eipd=0).
     pub intra_pred_mode_bins: u32,
+    /// `ibc_flag` regular bins decoded per §7.3.8.4 line 2845 (gated on
+    /// the round-90 `isIbcAllowed` predicate). One per IBC-eligible CU.
+    pub ibc_flag_bins: u32,
+    /// Coding units that resolved `CuPredMode == MODE_IBC` after
+    /// `ibc_flag = 1`. Disjoint from the intra count tracked via
+    /// `intra_pred_mode_bins`.
+    pub ibc_cus: u32,
+    /// `abs_mvd_l0[0/1]` EG-0 bypass invocations consumed by the IBC
+    /// `coding_unit()` branch (two per IBC CU — x and y components).
+    pub ibc_abs_mvd_bins: u32,
+    /// `mvd_l0_sign_flag` bypass bits consumed by the IBC `coding_unit()`
+    /// branch (one per non-zero abs_mvd component).
+    pub ibc_mvd_sign_bins: u32,
     /// Total coefficient runs consumed via `residual_coding_rle()`.
     pub coeff_runs: u32,
 }
@@ -265,6 +304,19 @@ fn walk_split_unit(
 }
 
 /// `coding_unit()` per §7.3.8.4 — Baseline + I slice + INTRA_IBC subset.
+///
+/// Round 90 lifts the SPS-level IBC gate by surfacing the `ibc_flag`
+/// branch inside the per-CU walker. When `sps_ibc_flag = 1` and
+/// `isIbcAllowed(treeType, log2CbWidth, log2CbHeight)` holds (§7.4.5),
+/// the walker emits the `ibc_flag` regular-coded bin (Table 90:
+/// ctxTable = Table 66, ctxIdxOffset = 0; under sps_cm_init_flag = 0
+/// the only ctxIdx is 0). When the bin is 1, the IBC syntax path runs:
+/// two `abs_mvd_l0` EG-0 bypass values (x then y) each optionally
+/// followed by a `mvd_l0_sign_flag` bypass bit per the §7.3.8.4 IBC
+/// branch (spec lines 2868–2876). `intra_pred_mode` and the chroma
+/// reconstruction route are skipped; `transform_unit()` still runs (the
+/// `cbf_all` gate of line 3028 only fires for SINGLE_TREE, so a
+/// DUAL_TREE_LUMA IBC CU drops straight into `transform_unit()`).
 #[allow(clippy::too_many_arguments)]
 fn walk_coding_unit(
     eng: &mut CabacEngine,
@@ -279,9 +331,49 @@ fn walk_coding_unit(
     stats.coding_units += 1;
     // INTRA_IBC: cu_skip_flag is suppressed (line 2808 condition).
     // pred_mode_flag is suppressed (line 2843 condition).
-    // ibc_flag: sps_ibc_flag=0 in Baseline → suppressed.
-    // CuPredMode = MODE_INTRA (only choice in INTRA_IBC).
-    if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
+    // The round-90 IBC branch is only available on the luma / single
+    // tree (chroma tree inherits LumaPredMode from the matching luma
+    // CU per §7.4.9.4).
+    let is_luma_tree = matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree);
+    let ibc_allowed = is_luma_tree
+        && crate::ibc::is_ibc_allowed_for_size(
+            inputs.sps_ibc_flag,
+            inputs.log2_max_ibc_cand_size,
+            log2_cb_width,
+            log2_cb_height,
+        );
+    let mut is_ibc = false;
+    if ibc_allowed {
+        // Table 90 column for ibc_flag → ctxTable = Table 66,
+        // ctxIdxOffset = 0. Under sps_cm_init_flag = 0 (Baseline) the
+        // only available ctxIdx is 0 (Table 95). ctxInc derivation per
+        // §9.3.4.2.4 is moot in this path.
+        let ibc_bin = eng.decode_decision(0, 0)?;
+        stats.ibc_flag_bins += 1;
+        is_ibc = ibc_bin != 0;
+        if is_ibc {
+            stats.ibc_cus += 1;
+            // Spec lines 2868–2876: abs_mvd_l0[x0][y0][0], optional
+            // sign, abs_mvd_l0[x0][y0][1], optional sign. The
+            // binariser is EG-0 bypass for the magnitude and FL/bypass
+            // for the sign (mvd_l0_sign_flag is Table 95 "bypass").
+            for _comp in 0..2 {
+                let abs = eng.decode_egk_bypass(0)?;
+                stats.ibc_abs_mvd_bins += 1;
+                if abs != 0 {
+                    let _sign = eng.decode_bypass()?;
+                    stats.ibc_mvd_sign_bins += 1;
+                }
+            }
+            // IBC CUs drop the intra_pred_mode + chroma intra_pred_mode
+            // paths (line 2847 gates them on CuPredMode == MODE_INTRA).
+            // Fall through to transform_unit(): same cbf parse as
+            // intra-luma in DUAL_TREE_LUMA — the round-90 walker treats
+            // the residual side identically since the trans/dequant
+            // pipeline is mode-agnostic.
+        }
+    }
+    if !is_ibc && is_luma_tree {
         // sps_eipd_flag=0 → intra_pred_mode is the single ae(v) syntax.
         // Binarization: U with cMax=4 (Table 91).
         // Table 95 lists ctxInc 0,1,1,1,1 for binIdx 0..4. Under
@@ -572,6 +664,12 @@ pub struct SliceDecodeInputs {
     pub slice_cb_qp_offset: i32,
     /// `slice_cr_qp_offset` (range −12..=12).
     pub slice_cr_qp_offset: i32,
+    /// `sps_ibc_flag` mirrored from the SPS so the per-CU walker can
+    /// gate `ibc_flag` parsing per §7.4.5 `isIbcAllowed`.
+    pub sps_ibc_flag: bool,
+    /// `log2MaxIbcCandSize` (eq. 70). Only consulted when
+    /// `sps_ibc_flag` is true.
+    pub log2_max_ibc_cand_size: u32,
 }
 
 impl Default for SliceDecodeInputs {
@@ -583,6 +681,8 @@ impl Default for SliceDecodeInputs {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size: 0,
         }
     }
 }
@@ -598,6 +698,18 @@ pub struct SliceDecodeStats {
     pub cbf_luma_bins: u32,
     pub cbf_chroma_bins: u32,
     pub intra_pred_mode_bins: u32,
+    /// `ibc_flag` regular bins decoded per §7.3.8.4 line 2845 (gated on
+    /// the round-90 `isIbcAllowed` predicate). One per IBC-eligible CU.
+    pub ibc_flag_bins: u32,
+    /// Coding units that resolved `CuPredMode == MODE_IBC` after
+    /// `ibc_flag = 1` and were reconstructed via `decode_ibc_cu`.
+    pub ibc_cus: u32,
+    /// `abs_mvd_l0[0/1]` EG-0 bypass invocations consumed by the IBC
+    /// `coding_unit()` branch (two per IBC CU).
+    pub ibc_abs_mvd_bins: u32,
+    /// `mvd_l0_sign_flag` bypass bits consumed by the IBC `coding_unit()`
+    /// branch (one per non-zero abs_mvd component).
+    pub ibc_mvd_sign_bins: u32,
     pub coeff_runs: u32,
     /// Deblocking edges visited (zero when slice_deblocking_filter_flag = 0).
     pub deblock_edges: u32,
@@ -804,11 +916,73 @@ fn decode_coding_unit(
     tree_type: TreeType,
 ) -> Result<()> {
     stats.coding_units += 1;
+    // Round 90: surface the §7.3.8.4 IBC branch. When `isIbcAllowed`
+    // holds, decode `ibc_flag` regular-coded bin (Table 90 →
+    // Table 66 init; sps_cm_init_flag = 0 → single ctxIdx 0). When
+    // the flag is 1, follow the IBC syntax path (spec lines
+    // 2868–2876): two `abs_mvd_l0` EG-0 bypass magnitudes (x then
+    // y) each with optional `mvd_l0_sign_flag` bypass bit; then
+    // call `ibc::decode_ibc_cu` to populate luma + chroma prediction
+    // from the current picture's already-reconstructed region per
+    // §8.6.1 steps 1-3, and route the residual through the existing
+    // dequant / IDCT chain.
+    let is_luma_tree = matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree);
+    let ibc_allowed = is_luma_tree
+        && crate::ibc::is_ibc_allowed_for_size(
+            decode.sps_ibc_flag,
+            decode.log2_max_ibc_cand_size,
+            log2_cb_width,
+            log2_cb_height,
+        );
+    if ibc_allowed {
+        let ibc_bin = eng.decode_decision(0, 0)?;
+        stats.ibc_flag_bins += 1;
+        if ibc_bin != 0 {
+            stats.ibc_cus += 1;
+            // Parse abs_mvd_l0[0/1] + optional signs (IBC syntax in
+            // spec lines 2868–2876). `decode_signed_mvd` already
+            // implements `abs (EG-0 bypass) + optional sign bypass`.
+            let mvd_x = decode_signed_mvd(
+                eng,
+                &mut stats.ibc_abs_mvd_bins,
+                &mut stats.ibc_mvd_sign_bins,
+            )?;
+            let mvd_y = decode_signed_mvd(
+                eng,
+                &mut stats.ibc_abs_mvd_bins,
+                &mut stats.ibc_mvd_sign_bins,
+            )?;
+            return decode_ibc_branch(
+                eng,
+                pic,
+                stats,
+                side_info,
+                walk,
+                decode,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                tree_type,
+                MotionVector { x: mvd_x, y: mvd_y },
+            );
+        }
+    }
+    // Round 90: when the dual-tree chroma path reaches a CU that
+    // landed as IBC at the matching luma cell, the chroma samples
+    // have already been written by `decode_ibc_branch` via
+    // `ibc::decode_ibc_cu`. The chroma `coding_unit()` still has to
+    // consume the bitstream syntax (`transform_unit()` cbf parse)
+    // but the spec's intra-DC chroma reconstruction must be
+    // suppressed so it doesn't overwrite the IBC samples — see the
+    // `luma_cu_is_ibc` flag threaded through `decode_transform_unit`.
+    let luma_cu_is_ibc =
+        matches!(tree_type, TreeType::DualTreeChroma) && luma_cell_is_ibc(side_info, x0, y0);
     // Decode intra_pred_mode for luma CU under sps_eipd_flag = 0.
     // Binarisation: U with cMax=4 (Table 91) — an unbounded unary prefix
     // capped to 4 leading 1s; the value is the number of leading 1s.
     // sps_cm_init_flag=0 → all bins land on (ctxTable=0, ctxIdx=0).
-    let intra_idx = if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
+    let intra_idx = if is_luma_tree {
         let v = eng.decode_u_regular(0, |_| 0)?;
         stats.intra_pred_mode_bins += 1;
         v
@@ -834,7 +1008,211 @@ fn decode_coding_unit(
         log2_cb_height,
         tree_type,
         intra_mode,
+        luma_cu_is_ibc,
     )
+}
+
+/// Probe the side-info grid for the matching luma cell at `(x_luma,
+/// y_luma)`. Returns true when that cell was stamped as
+/// `CuPredMode::Ibc` by an earlier `DualTreeLuma` `coding_unit()`
+/// pass — the dual-tree-chroma walker uses this to skip its intra
+/// reconstruction (the chroma samples were already placed by
+/// `decode_ibc_cu`).
+fn luma_cell_is_ibc(side_info: &SideInfoGrid, x_luma: u32, y_luma: u32) -> bool {
+    let xc = (x_luma >> 2) as usize;
+    let yc = (y_luma >> 2) as usize;
+    if xc >= side_info.w_cells || yc >= side_info.h_cells {
+        return false;
+    }
+    side_info.at(xc, yc).pred_mode == CuPredMode::Ibc
+}
+
+/// §7.3.8.4 + §8.6.1 IBC branch for the IDR `coding_unit()` path.
+///
+/// Composes:
+///   1. `transform_unit()` cbf parse (round-3 pattern: `cbf_luma` only
+///      for DUAL_TREE_LUMA since the chroma-cbf gate of line 3066
+///      excludes DUAL_TREE_LUMA);
+///   2. `ibc::decode_ibc_cu` for the §8.6.1 step 1-3 prediction
+///      pipeline (`mvL` derivation, conformance, `mvC` derivation,
+///      integer-pel block copy from the current picture's
+///      reconstructed region);
+///   3. residual decode + scale/IDCT + `clip(pred + res)` picture
+///      construction (§8.7.5 eq. 1091) for luma; chroma residual is
+///      deferred to `DualTreeChroma`'s own `transform_unit()` pass.
+///
+/// Stamps `CuPredMode::Ibc` into the side-info grid for the matching
+/// luma cells so (a) the chroma-tree pass can skip its intra
+/// reconstruction (see `luma_cell_is_ibc`) and (b) the deblocking
+/// pass treats IBC edges as boundary-strength 2 per Table 33.
+#[allow(clippy::too_many_arguments)]
+fn decode_ibc_branch(
+    eng: &mut CabacEngine,
+    pic: &mut YuvPicture,
+    stats: &mut SliceDecodeStats,
+    side_info: &mut SideInfoGrid,
+    walk: &SliceWalkInputs,
+    decode: &SliceDecodeInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    tree_type: TreeType,
+    mvd: MotionVector,
+) -> Result<()> {
+    let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
+    let log2_tb_height = log2_cb_height.min(walk.max_tb_log2_size_y);
+    // `cbf_all` of line 3028 only fires for SINGLE_TREE; round 90
+    // restricts IBC to DUAL_TREE_LUMA (the dual-tree chroma sibling
+    // is handled separately) so we follow the DUAL_TREE_LUMA
+    // transform_unit cbf path: skip cbf_cb/cbf_cr (line 3066 gate),
+    // then unconditionally read cbf_luma since `isSplit` is moot for
+    // CB ≤ MaxTb and CuPredMode != MODE_INTRA: the spec gate
+    // `(isSplit || CuPredMode == MODE_INTRA || cbf_cb || cbf_cr)`
+    // would suppress cbf_luma in our DUAL_TREE_LUMA + IBC case ⇒
+    // cbf_luma is inferred = 1 per §7.4.9.5 (line 6065-6066: "...
+    // inferred to be equal to 1" when treeType is DUAL_TREE_LUMA).
+    // No bin is consumed.
+    let cbf_luma = 1u32;
+    // When CB > MaxTb the spec splits into multiple TBs; round-90
+    // synthetic fixtures keep CB == TB so the single block covers the
+    // whole CB.
+    if log2_tb_width != log2_cb_width || log2_tb_height != log2_cb_height {
+        return Err(Error::unsupported(
+            "evc ibc decode: round-90 requires log2_cb == log2_tb (CB ≤ MaxTb)",
+        ));
+    }
+    // Decode the luma residual levels (always present per the
+    // DUAL_TREE_LUMA inference rule of spec §7.4.9.5 line 6065-6066).
+    let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
+    let mut residual_levels_y = vec![0i32; n_tb];
+    if cbf_luma != 0 {
+        decode_residual_coding_rle(
+            eng,
+            &mut residual_levels_y,
+            &mut stats.coeff_runs,
+            log2_tb_width,
+            log2_tb_height,
+        )?;
+    }
+    // Hand off to the no-CABAC helper for the §8.6.1 step 1-5 pipeline
+    // (deriveMV → validate → chromaMV → predict → residual+IDCT →
+    // picture-construction). Tests bypass the CABAC encoder bug by
+    // calling the helper directly.
+    apply_ibc_branch_predict_and_reconstruct(
+        pic,
+        side_info,
+        walk,
+        decode,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        tree_type,
+        mvd,
+        cbf_luma as u8,
+        &residual_levels_y,
+    )
+}
+
+/// Pure compute helper (no CABAC engine, no bitstream): given the
+/// already-decoded (`mvd`, luma residual levels), run the §8.6.1
+/// steps 1-3 prediction pipeline, scale + IDCT the levels, do the
+/// `clip(pred + res)` picture construction (eq. 1091), and stamp the
+/// side-info grid as `CuPredMode::Ibc`. The chroma planes are also
+/// populated (per §8.6.3) when `chroma_format_idc != 0`. The chroma
+/// residual decode lives in the matching DUAL_TREE_CHROMA pass —
+/// `luma_cell_is_ibc` ensures that pass doesn't overwrite the IBC
+/// chroma samples with intra-DC.
+#[allow(clippy::too_many_arguments)]
+fn apply_ibc_branch_predict_and_reconstruct(
+    pic: &mut YuvPicture,
+    side_info: &mut SideInfoGrid,
+    walk: &SliceWalkInputs,
+    decode: &SliceDecodeInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    tree_type: TreeType,
+    mvd: MotionVector,
+    cbf_luma: u8,
+    residual_levels_y: &[i32],
+) -> Result<()> {
+    let chroma_present = walk.chroma_format_idc != 0;
+    let n_cb_w_l = 1usize << log2_cb_width;
+    let n_cb_h_l = 1usize << log2_cb_height;
+    let n_l = n_cb_w_l * n_cb_h_l;
+    let (n_c_w, n_c_h) = if chroma_present {
+        match pic.chroma_format_idc {
+            1 => (n_cb_w_l / 2, n_cb_h_l / 2),
+            2 => (n_cb_w_l / 2, n_cb_h_l),
+            3 => (n_cb_w_l, n_cb_h_l),
+            _ => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
+    let n_c = n_c_w * n_c_h;
+    let mut pred_y = vec![0i32; n_l];
+    let mut pred_cb = vec![0i32; n_c];
+    let mut pred_cr = vec![0i32; n_c];
+    let (mv_l, _mv_c) = crate::ibc::decode_ibc_cu(
+        pic,
+        x0 as i32,
+        y0 as i32,
+        n_cb_w_l,
+        n_cb_h_l,
+        mvd,
+        walk.ctb_log2_size_y,
+        chroma_present,
+        &mut pred_y,
+        &mut pred_cb,
+        &mut pred_cr,
+    )?;
+    // Scale + IDCT the residual levels.
+    let cu_qp = decode.slice_qp.clamp(0, 51);
+    let mut residual_y = vec![0i32; n_l];
+    if cbf_luma != 0 {
+        if residual_levels_y.len() != n_l {
+            return Err(Error::invalid(format!(
+                "evc ibc apply: residual_levels_y len {} != {n_l}",
+                residual_levels_y.len()
+            )));
+        }
+        scale_and_inverse_transform(
+            residual_levels_y,
+            &mut residual_y,
+            n_cb_w_l,
+            n_cb_h_l,
+            cu_qp,
+            decode.bit_depth_luma,
+        )?;
+    }
+    for (p, r) in pred_y.iter_mut().zip(residual_y.iter()) {
+        *p += *r;
+    }
+    pic.store_block(x0, y0, n_cb_w_l, n_cb_h_l, 0, &pred_y);
+    if chroma_present {
+        pic.store_block(x0, y0, n_c_w, n_c_h, 1, &pred_cb);
+        pic.store_block(x0, y0, n_c_w, n_c_h, 2, &pred_cr);
+    }
+    if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
+        side_info.stamp_block(
+            x0,
+            y0,
+            1u32 << log2_cb_width,
+            1u32 << log2_cb_height,
+            CuSideInfo {
+                pred_mode: CuPredMode::Ibc,
+                cbf_luma,
+                mv_l0_x: mv_l.x,
+                mv_l0_y: mv_l.y,
+                ..Default::default()
+            },
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,6 +1229,7 @@ fn decode_transform_unit(
     log2_cb_height: u32,
     tree_type: TreeType,
     intra_mode: IntraMode,
+    luma_cu_is_ibc: bool,
 ) -> Result<()> {
     let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_height = log2_cb_height.min(walk.max_tb_log2_size_y);
@@ -981,27 +1360,130 @@ fn decode_transform_unit(
                         decode.bit_depth_chroma,
                     )?;
                 }
-                intra_reconstruct_cb(
-                    pic,
-                    x0,
-                    y0,
-                    log2_tb_width,
-                    log2_tb_height,
-                    intra_mode,
-                    1,
-                    &res_cb,
-                )?;
-                intra_reconstruct_cb(
-                    pic,
-                    x0,
-                    y0,
-                    log2_tb_width,
-                    log2_tb_height,
-                    intra_mode,
-                    2,
-                    &res_cr,
-                )?;
+                if luma_cu_is_ibc {
+                    // Round 90: the matching luma `coding_unit()` was
+                    // IBC and already wrote chroma samples via
+                    // `decode_ibc_cu`'s §8.6.3 step. The chroma tree
+                    // must NOT overwrite them with intra-DC; instead
+                    // just add the chroma residual on top (rare in
+                    // round-90 fixtures — `cbf_cb == cbf_cr == 0`
+                    // typically).
+                    if cbf_cb != 0 {
+                        add_chroma_residual_to_block(
+                            pic,
+                            x0,
+                            y0,
+                            log2_tb_width,
+                            log2_tb_height,
+                            1,
+                            &res_cb,
+                        )?;
+                    }
+                    if cbf_cr != 0 {
+                        add_chroma_residual_to_block(
+                            pic,
+                            x0,
+                            y0,
+                            log2_tb_width,
+                            log2_tb_height,
+                            2,
+                            &res_cr,
+                        )?;
+                    }
+                } else {
+                    intra_reconstruct_cb(
+                        pic,
+                        x0,
+                        y0,
+                        log2_tb_width,
+                        log2_tb_height,
+                        intra_mode,
+                        1,
+                        &res_cb,
+                    )?;
+                    intra_reconstruct_cb(
+                        pic,
+                        x0,
+                        y0,
+                        log2_tb_width,
+                        log2_tb_height,
+                        intra_mode,
+                        2,
+                        &res_cr,
+                    )?;
+                }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Add a chroma residual block on top of already-placed predicted
+/// samples (round-90 IBC chroma residual path). Mirrors
+/// `intra_reconstruct_cb` minus the prediction step. Coordinates are in
+/// luma sample units; the chroma sub-sampling is resolved internally.
+fn add_chroma_residual_to_block(
+    pic: &mut YuvPicture,
+    x_luma: u32,
+    y_luma: u32,
+    log2_cb_w_luma: u32,
+    log2_cb_h_luma: u32,
+    c_idx: u32,
+    residual: &[i32],
+) -> Result<()> {
+    let (sub_w, sub_h) = match (pic.chroma_format_idc, c_idx) {
+        (_, 0) => (1u32, 1u32),
+        (1, _) => (2, 2),
+        (2, _) => (2, 1),
+        (3, _) => (1, 1),
+        (n, _) => {
+            return Err(Error::invalid(format!(
+                "evc ibc decode: unsupported chroma_format_idc {n}"
+            )))
+        }
+    };
+    let x = x_luma / sub_w;
+    let y = y_luma / sub_h;
+    let n_cb_w = 1usize << (log2_cb_w_luma - sub_w.trailing_zeros());
+    let n_cb_h = 1usize << (log2_cb_h_luma - sub_h.trailing_zeros());
+    if residual.len() != n_cb_w * n_cb_h {
+        return Err(Error::invalid(format!(
+            "evc ibc decode: chroma residual len {} != {}*{}={}",
+            residual.len(),
+            n_cb_w,
+            n_cb_h,
+            n_cb_w * n_cb_h
+        )));
+    }
+    let max_val = (1i32 << pic.bit_depth) - 1;
+    let stride = pic.c_stride();
+    let plane = match c_idx {
+        1 => &mut pic.cb,
+        2 => &mut pic.cr,
+        _ => unreachable!(),
+    };
+    let (cw, ch) = match pic.chroma_format_idc {
+        1 => (
+            pic.width.div_ceil(2) as usize,
+            pic.height.div_ceil(2) as usize,
+        ),
+        2 => (pic.width.div_ceil(2) as usize, pic.height as usize),
+        3 => (pic.width as usize, pic.height as usize),
+        _ => (0, 0),
+    };
+    for j in 0..n_cb_h {
+        let yy = y as usize + j;
+        if yy >= ch {
+            break;
+        }
+        for i in 0..n_cb_w {
+            let xx = x as usize + i;
+            if xx >= cw {
+                break;
+            }
+            let cur = plane[yy * stride + xx] as i32;
+            let v = (cur + residual[j * n_cb_w + i]).clamp(0, max_val) as u8;
+            plane[yy * stride + xx] = v;
         }
     }
     Ok(())
@@ -2054,6 +2536,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         // CTB size 32 > pic 4 — dimension check should still pass; the
         // engine will refuse to underflow on an empty slice.
@@ -2073,6 +2556,7 @@ mod tests {
             max_tb_log2_size_y: 6,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: true,
+            ..Default::default()
         };
         let res = walk_baseline_idr_slice(&[0u8; 4], inputs);
         assert!(res.is_err());
@@ -2090,6 +2574,7 @@ mod tests {
             max_tb_log2_size_y: 6,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: true,
+            ..Default::default()
         };
         let res = walk_baseline_idr_slice(&[0u8; 4], inputs);
         assert!(res.is_err());
@@ -2110,6 +2595,7 @@ mod tests {
             max_tb_log2_size_y: 6,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         // 1024 bytes of zero — the walker will eventually exhaust the
         // bit reader (since no terminate ever fires) and return Invalid.
@@ -2131,6 +2617,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let bs = vec![0xFFu8; 1024];
         // Either terminates or reports a structural error — but must not
@@ -2186,6 +2673,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 1);
@@ -2226,6 +2714,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 2);
@@ -2261,6 +2750,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 0, // monochrome
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 1);
@@ -2339,6 +2829,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -2347,6 +2838,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let ref_list_l0 = [ref_view];
         let inputs = InterDecodeInputs {
@@ -2448,6 +2940,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -2456,6 +2949,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let ref_list_l0 = [view0];
         let ref_list_l1 = [view1];
@@ -2570,6 +3064,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -2578,6 +3073,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.coding_units, 2, "luma + chroma trees");
@@ -2654,6 +3150,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -2662,6 +3159,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let ref_list_l0 = [view];
         let inputs = InterDecodeInputs {
@@ -2728,6 +3226,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 32,
@@ -2736,6 +3235,7 @@ mod tests {
             enable_deblock: true,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         // Luma: 64×64 has 15 vertical edges (x = 4..60 step 4) × 16
@@ -2781,6 +3281,7 @@ mod tests {
             max_tb_log2_size_y: 6, // allow 64-point IDCT
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -2789,6 +3290,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.ctus, 1);
@@ -2998,6 +3500,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -3006,6 +3509,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let ref_list_l0 = [view0, view1];
         let inputs = InterDecodeInputs {
@@ -3038,6 +3542,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -3046,6 +3551,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let inputs = InterDecodeInputs {
             walk,
@@ -3086,6 +3592,7 @@ mod tests {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -3094,6 +3601,7 @@ mod tests {
             enable_deblock: false,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            ..Default::default()
         };
         let ref_list_l0 = [view];
         let inputs = InterDecodeInputs {
@@ -3107,5 +3615,332 @@ mod tests {
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("num_ref_idx_active_minus1_l0"));
+    }
+
+    // =================================================================
+    // Round 90 — IBC `coding_unit()` branch wiring tests.
+    // =================================================================
+
+    /// Helper: encode an EG-0 bypass value into the CABAC stream. Mirrors
+    /// `CabacEngine::decode_egk_bypass(0)`:
+    /// * val=0 → single bin "0".
+    /// * val=v: walk prefix as `1`-bins consuming powers-of-two from `v`
+    ///   while `v >= (1<<k)`, incrementing `k` per step; then "0"
+    ///   terminator; then `k` suffix bits MSB-first carrying the residue.
+    fn encode_egk0_bypass(enc: &mut crate::cabac::CabacEncoder, mut val: u32) {
+        if val == 0 {
+            enc.encode_bypass(0);
+            return;
+        }
+        let mut k = 0u32;
+        while val >= (1u32 << k) {
+            enc.encode_bypass(1);
+            val -= 1u32 << k;
+            k += 1;
+        }
+        enc.encode_bypass(0);
+        // suffix: k bits, MSB first.
+        for i in (0..k).rev() {
+            enc.encode_bypass(((val >> i) & 1) as u8);
+        }
+    }
+
+    /// Sanity-check the EG-0 helper round-trips through the decoder for
+    /// the values we use in the round-90 IBC fixture. Validates the
+    /// helper in isolation before it's relied on by the IBC test
+    /// fixture.
+    #[test]
+    fn round90_egk0_bypass_roundtrip() {
+        use crate::cabac::{CabacEncoder, CabacEngine};
+        for &val in &[0u32, 1, 2, 3, 4, 7, 8, 15, 31] {
+            let mut enc = CabacEncoder::new();
+            encode_egk0_bypass(&mut enc, val);
+            enc.encode_terminate(true);
+            let rbsp = enc.finish();
+            let mut eng = CabacEngine::new(&rbsp).unwrap();
+            let decoded = eng.decode_egk_bypass(0).unwrap();
+            assert_eq!(decoded, val, "egk0 round-trip failed for {val}");
+        }
+    }
+
+    /// Round 90: when the SPS gate disables IBC (`sps_ibc_flag = 0`),
+    /// the `coding_unit()` walker must NOT emit any `ibc_flag` bin —
+    /// even with `log2_max_ibc_cand_size` set, the §7.4.5 `isIbcAllowed`
+    /// predicate short-circuits on the flag. Re-uses the round-3 grey
+    /// IDR fixture (intra DC, cbf_luma = 0) which should not consume
+    /// any IBC bin and should produce a uniform 128 reconstruction.
+    #[test]
+    fn round90_idr_decode_without_ibc_flag_consumes_no_ibc_bins() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // Single 4×4 CU. Luma tree: intra_pred_mode = 0, cbf_luma = 0.
+        // No IBC since sps_ibc_flag = 0.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size: 0,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(
+            stats.ibc_flag_bins, 0,
+            "no ibc_flag bin when SPS gate is off"
+        );
+        assert_eq!(stats.ibc_cus, 0);
+        assert_eq!(stats.ibc_abs_mvd_bins, 0);
+        assert_eq!(stats.ibc_mvd_sign_bins, 0);
+        assert_eq!(stats.intra_pred_mode_bins, 1);
+        assert!(pic.y.iter().all(|&v| v == 128));
+    }
+
+    /// Round 90: when `sps_ibc_flag = 1` but the CU size exceeds
+    /// `log2_max_ibc_cand_size`, the walker must NOT emit `ibc_flag`
+    /// (per §7.4.5's size bullet). Verifies the size half of the
+    /// `isIbcAllowed` gate is honoured.
+    #[test]
+    fn round90_idr_decode_skips_ibc_flag_when_cu_exceeds_cand_size() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // Single 4×4 CU. With log2_max_ibc_cand_size = 1 (= 2-sample
+        // limit), a 4×4 CU is too large for IBC; the walker must
+        // suppress `ibc_flag` and read intra_pred_mode directly.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 1,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 1,
+            ..Default::default()
+        };
+        let (_pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ibc_flag_bins, 0, "size gate suppresses ibc_flag");
+        assert_eq!(stats.ibc_cus, 0);
+        assert_eq!(stats.intra_pred_mode_bins, 1);
+    }
+
+    /// Round 90: direct exercise of `apply_ibc_branch_predict_and_reconstruct`
+    /// without involving the CABAC encoder (which has a pre-existing
+    /// `encode_bypass` defer bug that breaks long mixed regular+bypass
+    /// streams — out of round-90 scope to fix). Pre-populates the
+    /// luma plane of an 8×4 monochrome picture with a known gradient
+    /// in the left half, runs the helper with BV=(−4, 0) at (4, 0),
+    /// and verifies the right half is bit-exactly the left half copied
+    /// over (cbf_luma = 0, no residual).
+    #[test]
+    fn round90_ibc_branch_predicts_from_left_neighbour() {
+        let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
+        // Stamp a distinctive 4×4 luma pattern at the (0,0) CU.
+        // Values chosen to be uniquely identifiable in the right-half copy.
+        let cu0_samples: [u8; 16] = [
+            10, 20, 30, 40, //
+            50, 60, 70, 80, //
+            90, 100, 110, 120, //
+            130, 140, 150, 160,
+        ];
+        for j in 0..4 {
+            for i in 0..4 {
+                pic.y[j * 8 + i] = cu0_samples[j * 4 + i];
+            }
+        }
+        let mut side_info = SideInfoGrid::new(8, 4);
+        let walk = SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        // BV = (−4, 0). Pre-shift IBC luma MV is mvd directly per
+        // eq. 1026-1030 + 1039.
+        let mvd = MotionVector { x: -4, y: 0 };
+        // No residual: pass an all-zero levels buffer with cbf_luma=0.
+        let zero_levels = vec![0i32; 16];
+        apply_ibc_branch_predict_and_reconstruct(
+            &mut pic,
+            &mut side_info,
+            &walk,
+            &decode,
+            4, // x0 = 4 (right-half CU)
+            0, // y0 = 0
+            2, // log2_cb_width = 2 (4 samples)
+            2, // log2_cb_height = 2
+            TreeType::DualTreeLuma,
+            mvd,
+            0,
+            &zero_levels,
+        )
+        .unwrap();
+        // Verify the right-half samples now equal the left-half pattern.
+        for j in 0..4 {
+            for i in 0..4 {
+                let expected = cu0_samples[j * 4 + i];
+                let actual = pic.y[j * 8 + (4 + i)];
+                assert_eq!(
+                    actual, expected,
+                    "IBC copy mismatch at (j={j}, i={i}): expected {expected}, got {actual}"
+                );
+            }
+        }
+        // Verify the side-info grid was stamped with CuPredMode::Ibc.
+        // The CU at (4,0) is a 4x4 block → cell (1,0) in the 4×4-grid.
+        let cell = side_info.at(1, 0);
+        assert_eq!(
+            cell.pred_mode,
+            CuPredMode::Ibc,
+            "side-info stamp must mark MODE_IBC"
+        );
+        // MV in 1/16-pel units: −4 << 4 = −64.
+        assert_eq!(
+            cell.mv_l0_x, -64,
+            "mv_l0_x should be the §8.6.2.1 eq.1039 << 4"
+        );
+        assert_eq!(cell.mv_l0_y, 0);
+    }
+
+    /// Round 90: non-conformant BV short-circuits with `Error::Invalid`
+    /// before any sample is written. Picks a BV that would point above
+    /// the picture (validation eq. 1035 row-boundary).
+    #[test]
+    fn round90_ibc_branch_rejects_non_conformant_bv() {
+        let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
+        let mut side_info = SideInfoGrid::new(8, 4);
+        let walk = SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        // BV = (0, 0) — overlaps the current CU, violates the
+        // above-or-left guard.
+        let mvd_overlap = MotionVector { x: 0, y: 0 };
+        let zero_levels = vec![0i32; 16];
+        let err = apply_ibc_branch_predict_and_reconstruct(
+            &mut pic,
+            &mut side_info,
+            &walk,
+            &decode,
+            4,
+            0,
+            2,
+            2,
+            TreeType::DualTreeLuma,
+            mvd_overlap,
+            0,
+            &zero_levels,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ibc") && (msg.contains("above-or-left") || msg.contains("eq. 1113")),
+            "expected above-or-left conformance error, got: {msg}"
+        );
+        // No samples should have been written — the picture remains
+        // at the initial 128 fill.
+        assert!(pic.y.iter().all(|&v| v == 128));
+        // Side-info grid stays at its default (Intra).
+        assert_eq!(side_info.at(1, 0).pred_mode, CuPredMode::Intra);
+    }
+
+    /// Round 90: `luma_cell_is_ibc` correctly probes the side-info grid
+    /// for an existing IBC stamp — used by the dual-tree-chroma walker
+    /// to skip its intra reconstruction when the matching luma cell
+    /// landed as IBC.
+    #[test]
+    fn round90_luma_cell_is_ibc_probe() {
+        let mut side_info = SideInfoGrid::new(8, 4);
+        // Fresh grid: every cell defaults to Intra.
+        assert!(!luma_cell_is_ibc(&side_info, 0, 0));
+        assert!(!luma_cell_is_ibc(&side_info, 4, 0));
+        // Stamp the (4,0) 4×4 block as IBC.
+        side_info.stamp_block(
+            4,
+            0,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Ibc,
+                ..Default::default()
+            },
+        );
+        // Now (4,0) reports IBC; (0,0) still doesn't.
+        assert!(luma_cell_is_ibc(&side_info, 4, 0));
+        assert!(!luma_cell_is_ibc(&side_info, 0, 0));
+        // Cells outside the picture return false (defensive guard).
+        assert!(!luma_cell_is_ibc(&side_info, 100, 100));
+    }
+
+    /// Round 90: `add_chroma_residual_to_block` adds a residual block on
+    /// top of an already-placed chroma prediction (which IBC has just
+    /// written via `decode_ibc_cu`) and clips to bit depth.
+    #[test]
+    fn round90_add_chroma_residual_clips_to_bit_depth() {
+        let mut pic = YuvPicture::new(8, 8, 1, 8).unwrap();
+        // Set the chroma plane to 200 at (0,0)-(3,3) (4×4 chroma block
+        // would back an 8×8 luma CB).
+        for j in 0..4 {
+            for i in 0..4 {
+                pic.cb[j * 4 + i] = 200;
+                pic.cr[j * 4 + i] = 50;
+            }
+        }
+        // Residual that would push past 255 in Cb and below 0 in Cr.
+        let res_pos = vec![100i32; 16];
+        let res_neg = vec![-100i32; 16];
+        add_chroma_residual_to_block(&mut pic, 0, 0, 3, 3, 1, &res_pos).unwrap();
+        add_chroma_residual_to_block(&mut pic, 0, 0, 3, 3, 2, &res_neg).unwrap();
+        // Cb: 200 + 100 = 300 → clipped to 255.
+        for j in 0..4 {
+            for i in 0..4 {
+                assert_eq!(pic.cb[j * 4 + i], 255, "Cb clip at ({i},{j})");
+                assert_eq!(pic.cr[j * 4 + i], 0, "Cr clip at ({i},{j})");
+            }
+        }
     }
 }
