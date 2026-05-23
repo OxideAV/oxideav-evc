@@ -493,6 +493,15 @@ impl EvcDecoder {
             cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
             sps_ibc_flag: sps.sps_ibc_flag,
             log2_max_ibc_cand_size,
+            // §7.3.8.2: thread the slice-header ALF map controls so the
+            // CTU walker decodes the per-CTU `alf_ctb_*` applicability
+            // map when the slice signals it.
+            slice_alf_enabled_flag: header.slice_alf_enabled_flag,
+            slice_alf_map_flag: header.slice_alf_map_flag,
+            slice_chroma_alf_enabled_flag: header.slice_chroma_alf_enabled_flag,
+            slice_alf_chroma_map_flag: header.slice_alf_chroma_map_flag,
+            slice_chroma2_alf_enabled_flag: header.slice_chroma2_alf_enabled_flag,
+            slice_alf_chroma2_map_flag: header.slice_alf_chroma2_map_flag,
         };
         let decode = SliceDecodeInputs {
             slice_qp: slice_qp as i32,

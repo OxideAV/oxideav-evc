@@ -88,6 +88,28 @@ pub struct SliceHeader {
     pub no_output_of_prior_pics_flag: bool,
     pub mmvd_group_enable_flag: bool,
     pub slice_alf_enabled_flag: bool,
+    /// `slice_alf_map_flag` (§7.4.5). When `slice_alf_enabled_flag` is 0,
+    /// inferred 0. Gates the per-CTU luma `alf_ctb_flag` in
+    /// `coding_tree_unit()` (§7.3.8.2 line 2626).
+    pub slice_alf_map_flag: bool,
+    /// `slice_alf_chroma_idc` (§7.4.5). 0 → no chroma ALF; 1 → Cb; 2 →
+    /// Cr; 3 → both. Inferred 0 when not present.
+    pub slice_alf_chroma_idc: u32,
+    /// `sliceChromaAlfEnabledFlag` (§7.4.5 derived): set when
+    /// `slice_alf_chroma_idc ∈ {1, 3}`.
+    pub slice_chroma_alf_enabled_flag: bool,
+    /// `sliceChroma2AlfEnabledFlag` (§7.4.5 derived): set when
+    /// `slice_alf_chroma_idc ∈ {2, 3}`.
+    pub slice_chroma2_alf_enabled_flag: bool,
+    /// `slice_alf_chroma_map_flag` (§7.4.5). Only signalled when
+    /// `ChromaArrayType == 3 && sliceChromaAlfEnabledFlag`; inferred 0
+    /// otherwise (so 0 for every Baseline 4:2:0 slice). Gates
+    /// `alf_ctb_chroma_flag` in `coding_tree_unit()` (line 2628).
+    pub slice_alf_chroma_map_flag: bool,
+    /// `slice_alf_chroma2_map_flag` (§7.4.5). Only signalled when
+    /// `ChromaArrayType == 3 && sliceChroma2AlfEnabledFlag`; inferred 0
+    /// otherwise. Gates `alf_ctb_chroma2_flag` (line 2630).
+    pub slice_alf_chroma2_map_flag: bool,
     pub slice_pic_order_cnt_lsb: u32,
     pub num_ref_idx_active_override_flag: bool,
     pub num_ref_idx_active_minus1: [u32; 2],
@@ -193,25 +215,53 @@ fn parse_from_bitreader(
         mmvd_group_enable_flag = br.u1()? != 0;
     }
 
+    // §7.3.4 ALF slice-header block, gated on `sps_alf_flag`. The
+    // round-107 parse surfaces the per-CTU-map control fields
+    // (`slice_alf_map_flag`, `slice_alf_chroma_idc` + its derived
+    // enable flags, and the `ChromaArrayType == 3`-only chroma map
+    // flags) so the `coding_tree_unit()` walker can decode
+    // `alf_ctb_flag` / `alf_ctb_chroma_flag` / `alf_ctb_chroma2_flag`
+    // per §7.3.8.2 lines 2626-2631.
     let mut slice_alf_enabled_flag = false;
+    let mut slice_alf_map_flag = false;
+    let mut slice_alf_chroma_idc = 0u32;
+    let mut slice_alf_chroma_map_flag = false;
+    let mut slice_alf_chroma2_map_flag = false;
     if ctx.sps_alf_flag {
         slice_alf_enabled_flag = br.u1()? != 0;
-        // We intentionally skip the rest of the ALF APS-id selection —
-        // round-2 will route this through the APS parser. Surfacing the
-        // enable flag is enough for round-1 probe.
         if slice_alf_enabled_flag {
-            // slice_alf_luma_aps_id: u(5) + slice_alf_map_flag: u(1) +
-            // slice_alf_chroma_idc: u(2) — when chroma is present.
-            let _luma_id = br.u(5)?;
-            let _map_flag = br.u1()?;
-            let chroma_idc = br.u(2)?;
-            if (ctx.chroma_array_type == 1 || ctx.chroma_array_type == 2) && chroma_idc > 0 {
-                let _chroma_id = br.u(5)?;
+            let _slice_alf_luma_aps_id = br.u(5)?;
+            slice_alf_map_flag = br.u1()? != 0;
+            slice_alf_chroma_idc = br.u(2)?;
+            if (ctx.chroma_array_type == 1 || ctx.chroma_array_type == 2)
+                && slice_alf_chroma_idc > 0
+            {
+                let _slice_alf_chroma_aps_id = br.u(5)?;
             }
-            // ChromaArrayType == 3 branch would add chroma2 fields; not
-            // needed for the round-1 fixtures we drive.
+        }
+        // §7.4.5: when ChromaArrayType == 0, slice_alf_chroma_idc shall
+        // be 0 (bitstream conformance). For ChromaArrayType == 3 the
+        // chroma idc may be re-signalled when ALF is luma-disabled, and
+        // the per-component chroma map flags + APS ids are present.
+        if ctx.chroma_array_type == 3 {
+            if !slice_alf_enabled_flag {
+                slice_alf_chroma_idc = br.u(2)?;
+            }
+            // §7.4.5 derived: sliceChromaAlfEnabledFlag set for idc 1/3.
+            if slice_alf_chroma_idc == 1 || slice_alf_chroma_idc == 3 {
+                let _slice_alf_chroma_aps_id = br.u(5)?;
+                slice_alf_chroma_map_flag = br.u1()? != 0;
+            }
+            // §7.4.5 derived: sliceChroma2AlfEnabledFlag set for idc 2/3.
+            if slice_alf_chroma_idc == 2 || slice_alf_chroma_idc == 3 {
+                let _slice_alf_chroma2_aps_id = br.u(5)?;
+                slice_alf_chroma2_map_flag = br.u1()? != 0;
+            }
         }
     }
+    // §7.4.5 derived variables (independent of ChromaArrayType).
+    let slice_chroma_alf_enabled_flag = slice_alf_chroma_idc == 1 || slice_alf_chroma_idc == 3;
+    let slice_chroma2_alf_enabled_flag = slice_alf_chroma_idc == 2 || slice_alf_chroma_idc == 3;
 
     let mut slice_pic_order_cnt_lsb = 0;
     if !matches!(nal_unit_type, NalUnitType::Idr) && ctx.sps_pocs_flag {
@@ -356,6 +406,12 @@ fn parse_from_bitreader(
         no_output_of_prior_pics_flag,
         mmvd_group_enable_flag,
         slice_alf_enabled_flag,
+        slice_alf_map_flag,
+        slice_alf_chroma_idc,
+        slice_chroma_alf_enabled_flag,
+        slice_chroma2_alf_enabled_flag,
+        slice_alf_chroma_map_flag,
+        slice_alf_chroma2_map_flag,
         slice_pic_order_cnt_lsb,
         num_ref_idx_active_override_flag,
         num_ref_idx_active_minus1,
@@ -413,6 +469,84 @@ mod tests {
         assert!(sh.no_output_of_prior_pics_flag);
         assert!(sh.slice_deblocking_filter_flag);
         assert_eq!(sh.slice_qp, 26);
+    }
+
+    /// Round 107 — §7.3.4 ALF slice-header block surfaces the per-CTU
+    /// map controls. A Baseline (ChromaArrayType == 1) IDR slice with
+    /// `slice_alf_enabled_flag = 1`, `slice_alf_map_flag = 1`,
+    /// `slice_alf_chroma_idc = 3` (both Cb and Cr): the parser consumes
+    /// the luma APS id + map flag + chroma idc + the (idc > 0) chroma
+    /// APS id, surfaces the derived enable flags, and leaves the chroma
+    /// map flags inferred 0 (those are ChromaArrayType == 3-only).
+    #[test]
+    fn round107_alf_map_fields_baseline_chroma1() {
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: true,
+            sps_alf_flag: true,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.ue(2); // slice_type = I
+        e.u(1, 0); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_alf_enabled_flag
+        e.u(5, 7); // slice_alf_luma_aps_id
+        e.u(1, 1); // slice_alf_map_flag
+        e.u(2, 3); // slice_alf_chroma_idc = 3 (both)
+        e.u(5, 4); // slice_alf_chroma_aps_id (idc > 0, ChromaArrayType 1)
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // cb offset
+        e.ue(0); // cr offset
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &ctx).unwrap();
+        assert!(sh.slice_alf_enabled_flag);
+        assert!(sh.slice_alf_map_flag);
+        assert_eq!(sh.slice_alf_chroma_idc, 3);
+        assert!(sh.slice_chroma_alf_enabled_flag);
+        assert!(sh.slice_chroma2_alf_enabled_flag);
+        // ChromaArrayType != 3 ⇒ chroma map flags inferred 0.
+        assert!(!sh.slice_alf_chroma_map_flag);
+        assert!(!sh.slice_alf_chroma2_map_flag);
+        // Trailing fields still parse, proving bit alignment held.
+        assert!(sh.slice_deblocking_filter_flag);
+        assert_eq!(sh.slice_qp, 26);
+    }
+
+    /// `slice_alf_chroma_idc = 0` derives both chroma enable flags off,
+    /// and the chroma APS id is not in the bitstream (so `slice_qp`
+    /// still lands at the right offset).
+    #[test]
+    fn round107_alf_map_chroma_idc_zero() {
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: true,
+            sps_alf_flag: true,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0);
+        e.ue(2); // I
+        e.u(1, 0); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_alf_enabled_flag
+        e.u(5, 0); // luma aps id
+        e.u(1, 0); // slice_alf_map_flag = 0
+        e.u(2, 0); // slice_alf_chroma_idc = 0 → no chroma aps id
+        e.u(1, 0); // slice_deblocking_filter_flag
+        e.u(6, 30); // slice_qp
+        e.ue(0);
+        e.ue(0);
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &ctx).unwrap();
+        assert!(sh.slice_alf_enabled_flag);
+        assert!(!sh.slice_alf_map_flag);
+        assert_eq!(sh.slice_alf_chroma_idc, 0);
+        assert!(!sh.slice_chroma_alf_enabled_flag);
+        assert!(!sh.slice_chroma2_alf_enabled_flag);
+        assert_eq!(sh.slice_qp, 30);
     }
 
     #[test]

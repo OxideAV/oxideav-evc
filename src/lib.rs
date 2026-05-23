@@ -259,6 +259,16 @@ pub fn walk_idr_slice(
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
         sps_ibc_flag: sps.sps_ibc_flag,
         log2_max_ibc_cand_size,
+        // This entry point uses a minimal header parse that doesn't yet
+        // surface the §7.3.4 ALF map fields; default them off (no
+        // per-CTU ALF map signalled) so `coding_tree_unit()` reads no
+        // `alf_ctb_*` bins. `decode_non_idr` threads the real values.
+        slice_alf_enabled_flag: false,
+        slice_alf_map_flag: false,
+        slice_chroma_alf_enabled_flag: false,
+        slice_alf_chroma_map_flag: false,
+        slice_chroma2_alf_enabled_flag: false,
+        slice_alf_chroma2_map_flag: false,
     };
     slice_data::walk_baseline_idr_slice(slice_data_bytes, inputs)
 }
@@ -328,6 +338,13 @@ pub fn decode_idr_slice(
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
         sps_ibc_flag: sps.sps_ibc_flag,
         log2_max_ibc_cand_size,
+        // Minimal-header entry point: ALF map fields default off.
+        slice_alf_enabled_flag: false,
+        slice_alf_map_flag: false,
+        slice_chroma_alf_enabled_flag: false,
+        slice_alf_chroma_map_flag: false,
+        slice_chroma2_alf_enabled_flag: false,
+        slice_alf_chroma2_map_flag: false,
     };
     let decode = slice_data::SliceDecodeInputs {
         slice_qp,

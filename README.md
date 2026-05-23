@@ -7,6 +7,36 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-107 status
+
+Round 107 lands the §7.3.8.2 `coding_tree_unit()` **adaptive-loop-filter
+applicability map** — the per-CTU `alf_ctb_flag` / `alf_ctb_chroma_flag`
+/ `alf_ctb_chroma2_flag` syntax that, until now, every CTU loop skipped
+(rounds ≤103 recursed straight into `split_unit()`). The slice-header
+parser (§7.3.4) now surfaces the map controls it used to parse-and-drop —
+`slice_alf_map_flag`, `slice_alf_chroma_idc` with its §7.4.5-derived
+`sliceChromaAlfEnabledFlag` / `sliceChroma2AlfEnabledFlag`, and the
+`ChromaArrayType == 3`-only chroma map flags. A new
+`decode_coding_tree_unit_alf` helper decodes the 0-3 ae(v) flags (FL
+`cMax = 1`, Table 40, ctxInc 0 under `sps_cm_init_flag == 0`) gated
+exactly as the spec syntax and applies the §7.4.9.2 not-present
+inference, returning an `AlfCtbFlags` triplet. It is wired into all three
+CTU loops (IDR walk, IDR decode, P/B inter decode) before `split_unit()`;
+the `decode_non_idr` path threads the real slice-header values through new
+`SliceWalkInputs` fields. For Baseline 4:2:0 only the luma bin can appear
+(chroma map flags are inferred 0); the full triplet is decoded for
+spec-completeness on the ChromaArrayType-3 path. New `AlfCtbStats`
+counters (`luma_bins` / `chroma_cb_bins` / `chroma_cr_bins` /
+`luma_on_ctus`) thread into all three stats structs. 292 unit tests pass
+(was 284): engine-level isolation of the present/absent/inferred gating,
+the ChromaArrayType-3 three-bin path, end-to-end IDR decode with and
+without the luma map, and slice-header parse of the new fields. Masking
+the §8.9 ALF apply per-CTB by the decoded map (today `apply_alf` filters
+whole planes) is a documented follow-up. Suggested workspace-README row
+delta: EVC now decodes the §7.3.8.2 per-CTU ALF applicability map in
+every CTU loop (lacks: per-CTB ALF apply-masking, Main-profile toolset —
+BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-103 status
 
 Round 103 extends the §7.3.8.5 `cu_qp_delta` wiring to the **two IBC

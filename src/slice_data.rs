@@ -83,6 +83,29 @@ pub struct SliceWalkInputs {
     /// gates `ibc_flag` emission on `log2CbWidth ≤ log2MaxIbcCandSize
     /// && log2CbHeight ≤ log2MaxIbcCandSize` per §7.4.5.
     pub log2_max_ibc_cand_size: u32,
+    /// `slice_alf_enabled_flag` (§7.4.5). When true (and the SPS-level
+    /// `sps_alf_flag` is set, which the slice header enforces) the
+    /// `coding_tree_unit()` may carry the per-CTU ALF applicability map.
+    pub slice_alf_enabled_flag: bool,
+    /// `slice_alf_map_flag` (§7.4.5). Per §7.3.8.2 line 2626 the luma
+    /// `alf_ctb_flag` bin is present in `coding_tree_unit()` iff
+    /// `slice_alf_enabled_flag && slice_alf_map_flag`.
+    pub slice_alf_map_flag: bool,
+    /// `sliceChromaAlfEnabledFlag` (§7.4.5 derived). Gates
+    /// `alf_ctb_chroma_flag` together with `slice_alf_chroma_map_flag`
+    /// (line 2628). For Baseline 4:2:0 the chroma map flag is inferred
+    /// 0 so this only contributes when `ChromaArrayType == 3`.
+    pub slice_chroma_alf_enabled_flag: bool,
+    /// `slice_alf_chroma_map_flag` (§7.4.5). Inferred 0 unless
+    /// `ChromaArrayType == 3`.
+    pub slice_alf_chroma_map_flag: bool,
+    /// `sliceChroma2AlfEnabledFlag` (§7.4.5 derived). Gates
+    /// `alf_ctb_chroma2_flag` together with `slice_alf_chroma2_map_flag`
+    /// (line 2630).
+    pub slice_chroma2_alf_enabled_flag: bool,
+    /// `slice_alf_chroma2_map_flag` (§7.4.5). Inferred 0 unless
+    /// `ChromaArrayType == 3`.
+    pub slice_alf_chroma2_map_flag: bool,
 }
 
 impl Default for SliceWalkInputs {
@@ -97,6 +120,12 @@ impl Default for SliceWalkInputs {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            slice_alf_enabled_flag: false,
+            slice_alf_map_flag: false,
+            slice_chroma_alf_enabled_flag: false,
+            slice_alf_chroma_map_flag: false,
+            slice_chroma2_alf_enabled_flag: false,
+            slice_alf_chroma2_map_flag: false,
         }
     }
 }
@@ -111,6 +140,97 @@ impl SliceWalkInputs {
     fn pic_height_in_ctus(&self) -> u32 {
         (self.pic_height + self.ctb_size() - 1) >> self.ctb_log2_size_y
     }
+}
+
+/// Per-CTU adaptive-loop-filter applicability decoded from
+/// `coding_tree_unit()` (§7.3.8.2 lines 2626-2631). Each field carries
+/// the resolved on/off state for the CTB after applying the §7.4.9.2
+/// inference rules: when the corresponding flag is not present in the
+/// bitstream it is inferred to the slice-level enable (luma →
+/// `slice_alf_enabled_flag`, Cb → `sliceChromaAlfEnabledFlag`, Cr →
+/// `sliceChroma2AlfEnabledFlag`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlfCtbFlags {
+    /// `alf_ctb_flag[ ][ ]` — luma ALF applied to this CTB.
+    pub luma: bool,
+    /// `alf_ctb_chroma_flag[ ][ ]` — Cb ALF applied to this CTB.
+    pub chroma_cb: bool,
+    /// `alf_ctb_chroma2_flag[ ][ ]` — Cr ALF applied to this CTB.
+    pub chroma_cr: bool,
+}
+
+/// Tallies of the per-CTU ALF map bins actually consumed from the
+/// CABAC stream. Threaded into each path's stats struct so fixtures can
+/// assert the §7.3.8.2 presence gating fired exactly as the spec
+/// requires.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlfCtbStats {
+    /// `alf_ctb_flag` regular bins decoded (one per CTU when present).
+    pub luma_bins: u32,
+    /// `alf_ctb_chroma_flag` regular bins decoded.
+    pub chroma_cb_bins: u32,
+    /// `alf_ctb_chroma2_flag` regular bins decoded.
+    pub chroma_cr_bins: u32,
+    /// CTUs whose resolved luma `alf_ctb_flag` is 1 (present-and-set or
+    /// inferred-to-`slice_alf_enabled_flag`).
+    pub luma_on_ctus: u32,
+}
+
+/// `coding_tree_unit()` ALF prefix (§7.3.8.2 lines 2626-2631). Decodes
+/// the 0-3 `alf_ctb_*` flags that gate the per-CTB adaptive loop filter,
+/// returning the resolved (present-or-inferred) applicability triplet.
+///
+/// Each flag is FL-binarised with `cMax = 1` (a single ae(v) bin per
+/// Table "Binarizations" line 20074-20078) and context-coded against
+/// Table 40 with ctxInc fixed at 0 under `sps_cm_init_flag == 0` (the
+/// only Baseline case — see the §9.3.4.2 assignment table lines
+/// 19275-19277). The walker's shared `(0, 0)` context slot is the same
+/// one `split_cu_flag` etc. use, matching the rest of this module's
+/// single-slot convention.
+///
+/// Presence is gated exactly as the spec syntax:
+/// * luma `alf_ctb_flag`   — `slice_alf_enabled_flag && slice_alf_map_flag`
+/// * `alf_ctb_chroma_flag` — `sliceChromaAlfEnabledFlag && slice_alf_chroma_map_flag`
+/// * `alf_ctb_chroma2_flag`— `sliceChroma2AlfEnabledFlag && slice_alf_chroma2_map_flag`
+///
+/// When a flag is absent it is inferred (§7.4.9.2) to the corresponding
+/// slice-level enable.
+fn decode_coding_tree_unit_alf(
+    eng: &mut CabacEngine,
+    inputs: &SliceWalkInputs,
+    stats: &mut AlfCtbStats,
+) -> Result<AlfCtbFlags> {
+    let mut flags = AlfCtbFlags::default();
+
+    if inputs.slice_alf_enabled_flag && inputs.slice_alf_map_flag {
+        let bin = eng.decode_decision(0, 0)?;
+        stats.luma_bins += 1;
+        flags.luma = bin != 0;
+    } else {
+        // §7.4.9.2: inferred to slice_alf_enabled_flag.
+        flags.luma = inputs.slice_alf_enabled_flag;
+    }
+    if flags.luma {
+        stats.luma_on_ctus += 1;
+    }
+
+    if inputs.slice_chroma_alf_enabled_flag && inputs.slice_alf_chroma_map_flag {
+        let bin = eng.decode_decision(0, 0)?;
+        stats.chroma_cb_bins += 1;
+        flags.chroma_cb = bin != 0;
+    } else {
+        flags.chroma_cb = inputs.slice_chroma_alf_enabled_flag;
+    }
+
+    if inputs.slice_chroma2_alf_enabled_flag && inputs.slice_alf_chroma2_map_flag {
+        let bin = eng.decode_decision(0, 0)?;
+        stats.chroma_cr_bins += 1;
+        flags.chroma_cr = bin != 0;
+    } else {
+        flags.chroma_cr = inputs.slice_chroma2_alf_enabled_flag;
+    }
+
+    Ok(flags)
 }
 
 /// Counters reported back to the caller after a successful walk. Each one
@@ -148,6 +268,10 @@ pub struct SliceWalkStats {
     pub ibc_mvd_sign_bins: u32,
     /// Total coefficient runs consumed via `residual_coding_rle()`.
     pub coeff_runs: u32,
+    /// Per-CTU `alf_ctb_*` map bins from `coding_tree_unit()`
+    /// (§7.3.8.2). Zero unless the slice signals an ALF applicability
+    /// map (`slice_alf_map_flag` for luma, etc.).
+    pub alf_ctb: AlfCtbStats,
 }
 
 /// Predicate marking which kind of `coding_unit()` invocation we're in.
@@ -202,8 +326,11 @@ pub fn walk_baseline_idr_slice(rbsp: &[u8], inputs: SliceWalkInputs) -> Result<S
     for ctu_idx in 0..n_ctus {
         let x_ctb = (ctu_idx % inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
         let y_ctb = (ctu_idx / inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
-        // §7.3.8.2 coding_tree_unit(): no ALF flags in Baseline; recurse
-        // straight into split_unit().
+        // §7.3.8.2 coding_tree_unit(): decode the per-CTU ALF
+        // applicability map (`alf_ctb_flag` + chroma variants) before
+        // recursing into split_unit(). The flags are absent (inferred)
+        // unless the slice signals the corresponding map.
+        let _alf = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats.alf_ctb)?;
         walk_split_unit(
             &mut eng,
             &mut stats,
@@ -718,6 +845,10 @@ pub struct SliceDecodeStats {
     pub coeff_runs: u32,
     /// Deblocking edges visited (zero when slice_deblocking_filter_flag = 0).
     pub deblock_edges: u32,
+    /// Per-CTU `alf_ctb_*` map bins from `coding_tree_unit()`
+    /// (§7.3.8.2). Zero unless the slice signals an ALF applicability
+    /// map.
+    pub alf_ctb: AlfCtbStats,
 }
 
 /// Decode a Baseline-profile IDR slice into a freshly-allocated
@@ -781,6 +912,8 @@ pub fn decode_baseline_idr_slice(
     for ctu_idx in 0..n_ctus {
         let x_ctb = (ctu_idx % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
         let y_ctb = (ctu_idx / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        // §7.3.8.2: per-CTU ALF applicability map before split_unit().
+        let _alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
         decode_split_unit(
             &mut eng,
             &mut pic,
@@ -1633,6 +1766,10 @@ pub struct InterDecodeStats {
     /// set on the CU. One increment per CU that decodes the syntax
     /// element (mirrors the IDR-side `SliceDecodeStats` tracker).
     pub cu_qp_delta_abs_bins: u32,
+    /// Round 107: per-CTU `alf_ctb_*` map bins from `coding_tree_unit()`
+    /// (§7.3.8.2). Zero unless the inter slice signals an ALF
+    /// applicability map.
+    pub alf_ctb: AlfCtbStats,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -1723,6 +1860,8 @@ pub fn decode_baseline_inter_slice(
         if x_ctb == 0 {
             hmvp.reset();
         }
+        // §7.3.8.2: per-CTU ALF applicability map before split_unit().
+        let _alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
         decode_inter_split_unit(
             &mut eng,
             &mut pic,
@@ -4140,6 +4279,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4182,6 +4322,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 1,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4230,6 +4371,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4302,6 +4444,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4455,6 +4598,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4525,6 +4669,7 @@ mod tests {
             cu_qp_delta_enabled: true,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4706,6 +4851,7 @@ mod tests {
             cu_qp_delta_enabled: true,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4783,6 +4929,7 @@ mod tests {
             cu_qp_delta_enabled: true,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4880,6 +5027,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 1, // 2-sample limit ⇒ 32×32 too big
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -4942,6 +5090,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -5015,6 +5164,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -5091,6 +5241,7 @@ mod tests {
             cu_qp_delta_enabled: false,
             sps_ibc_flag: true,
             log2_max_ibc_cand_size: 5,
+            ..Default::default()
         };
         let decode = SliceDecodeInputs {
             slice_qp: 22,
@@ -5145,5 +5296,211 @@ mod tests {
         let cell = side_info.at(2, 0);
         assert_eq!(cell.pred_mode, CuPredMode::Ibc);
         assert_eq!(hmvp.len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Round 107 — §7.3.8.2 coding_tree_unit() ALF applicability map.
+    // ----------------------------------------------------------------
+
+    /// `decode_coding_tree_unit_alf` reads no bins when no ALF map is
+    /// signalled (the round ≤103 behaviour). The resolved luma flag is
+    /// inferred to `slice_alf_enabled_flag` per §7.4.9.2, which is 0
+    /// here, so `luma_on_ctus` stays 0.
+    #[test]
+    fn round107_ctu_alf_no_map_consumes_no_bins() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // Just a terminate — the helper should consume nothing first.
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let inputs = SliceWalkInputs::default(); // all ALF fields false
+        let mut stats = AlfCtbStats::default();
+        let flags = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats).unwrap();
+        assert_eq!(stats.luma_bins, 0);
+        assert_eq!(stats.chroma_cb_bins, 0);
+        assert_eq!(stats.chroma_cr_bins, 0);
+        assert_eq!(stats.luma_on_ctus, 0);
+        assert!(!flags.luma);
+        // The terminate bin is still the next thing in the stream.
+        assert!(eng.decode_terminate().unwrap());
+    }
+
+    /// When the slice signals an ALF map but the SPS-level enable is
+    /// off, no luma bin is read and the inferred flag follows
+    /// `slice_alf_enabled_flag` — here 0. Confirms the presence gate is
+    /// the AND of enable && map, not just map.
+    #[test]
+    fn round107_ctu_alf_map_without_enable_infers_off() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let inputs = SliceWalkInputs {
+            slice_alf_enabled_flag: false,
+            slice_alf_map_flag: true,
+            ..Default::default()
+        };
+        let mut stats = AlfCtbStats::default();
+        let flags = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats).unwrap();
+        assert_eq!(stats.luma_bins, 0, "enable off ⇒ no luma bin");
+        assert!(!flags.luma);
+    }
+
+    /// With `slice_alf_enabled_flag && slice_alf_map_flag`, one luma
+    /// `alf_ctb_flag` bin is read. A coded "1" resolves the CTB to ALF
+    /// on; a coded "0" resolves it off. The chroma variants stay absent
+    /// for a Baseline slice (chroma map flags inferred 0).
+    #[test]
+    fn round107_ctu_alf_luma_map_reads_one_bin() {
+        use crate::cabac::CabacEncoder;
+        // alf_ctb_flag = 1 on the first call, = 0 on the second.
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1);
+        enc.encode_decision(0, 0, 0);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let inputs = SliceWalkInputs {
+            slice_alf_enabled_flag: true,
+            slice_alf_map_flag: true,
+            ..Default::default()
+        };
+        let mut stats = AlfCtbStats::default();
+        let first = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats).unwrap();
+        assert_eq!(stats.luma_bins, 1);
+        assert_eq!(stats.luma_on_ctus, 1);
+        assert!(first.luma, "coded 1 ⇒ ALF on");
+        assert_eq!(stats.chroma_cb_bins, 0, "Baseline: no chroma map bin");
+        assert_eq!(stats.chroma_cr_bins, 0);
+        let second = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats).unwrap();
+        assert_eq!(stats.luma_bins, 2);
+        assert_eq!(stats.luma_on_ctus, 1, "second CTB coded 0 ⇒ still 1 on");
+        assert!(!second.luma, "coded 0 ⇒ ALF off");
+        assert!(eng.decode_terminate().unwrap());
+    }
+
+    /// ChromaArrayType == 3 path: with both chroma idc bits set and the
+    /// chroma map flags on, the helper reads three bins (luma + Cb + Cr).
+    /// Verifies the §7.3.8.2 lines 2628/2630 presence gates fire and
+    /// each component resolves independently.
+    #[test]
+    fn round107_ctu_alf_chroma3_reads_three_bins() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // alf_ctb_flag (luma) = 1
+        enc.encode_decision(0, 0, 0); // alf_ctb_chroma_flag (Cb) = 0
+        enc.encode_decision(0, 0, 1); // alf_ctb_chroma2_flag (Cr) = 1
+                                      // A couple of trailing zero bins so the M-coder has enough body
+                                      // to flush; the helper only reads the three ALF flags above.
+        enc.encode_decision(0, 0, 0);
+        enc.encode_decision(0, 0, 0);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let inputs = SliceWalkInputs {
+            slice_alf_enabled_flag: true,
+            slice_alf_map_flag: true,
+            slice_chroma_alf_enabled_flag: true,
+            slice_alf_chroma_map_flag: true,
+            slice_chroma2_alf_enabled_flag: true,
+            slice_alf_chroma2_map_flag: true,
+            ..Default::default()
+        };
+        let mut stats = AlfCtbStats::default();
+        let flags = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats).unwrap();
+        assert_eq!(stats.luma_bins, 1);
+        assert_eq!(stats.chroma_cb_bins, 1);
+        assert_eq!(stats.chroma_cr_bins, 1);
+        assert!(flags.luma);
+        assert!(!flags.chroma_cb);
+        assert!(flags.chroma_cr);
+    }
+
+    /// End-to-end IDR decode: a 32×32 monochrome CTB split into four
+    /// 16×16 leaves, with the luma ALF map signalled. `coding_tree_unit()`
+    /// now reads the per-CTU `alf_ctb_flag` bin (coded 1) before the
+    /// `split_cu_flag` + per-leaf CU bins. The decoded picture is
+    /// unchanged (ALF apply remains whole-plane this round) but
+    /// `stats.alf_ctb` records the consumed map bin. The four-leaf body
+    /// gives the test-only M-coder enough flush budget that the final
+    /// renorm stays inside the padded tail.
+    #[test]
+    fn round107_idr_decode_reads_alf_ctb_flag_bin() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // §7.3.8.2: alf_ctb_flag = 1 (luma map on for this CTB).
+        enc.encode_decision(0, 0, 1);
+        // Parent CTB (log2=5, min=4) → split_cu_flag = 1.
+        enc.encode_decision(0, 0, 1);
+        // Four 16×16 luma leaves (monochrome): intra_pred_mode + cbf_luma.
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = "0"
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: false,
+            slice_alf_enabled_flag: true,
+            slice_alf_map_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(stats.alf_ctb.luma_bins, 1, "one alf_ctb_flag bin consumed");
+        assert_eq!(stats.alf_ctb.luma_on_ctus, 1);
+        assert_eq!(stats.alf_ctb.chroma_cb_bins, 0);
+        assert_eq!(stats.split_cu_flag_bins, 1);
+        assert_eq!(stats.intra_pred_mode_bins, 4);
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert!(pic.y.iter().all(|&v| v == 128), "grey IDR DC pred");
+    }
+
+    /// Negative gate: the same 32×32 monochrome IDR slice with no ALF
+    /// map signalled reads zero `alf_ctb_*` bins — the round ≤103
+    /// layout. Confirms the `coding_tree_unit()` ALF prefix is inert
+    /// when the slice header doesn't signal the map.
+    #[test]
+    fn round107_idr_decode_without_alf_map_reads_no_alf_bins() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode
+            enc.encode_decision(0, 0, 0); // cbf_luma
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (_pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.alf_ctb.luma_bins, 0);
+        assert_eq!(stats.alf_ctb.luma_on_ctus, 0);
+        assert_eq!(stats.split_cu_flag_bins, 1);
+        assert_eq!(stats.cbf_luma_bins, 4);
     }
 }

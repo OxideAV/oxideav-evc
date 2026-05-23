@@ -2,6 +2,68 @@
 
 ## [Unreleased]
 
+### Round 107 — `coding_tree_unit()` ALF applicability map (§7.3.8.2)
+
+#### Added
+- `slice_header.rs`: the §7.3.4 ALF slice-header block now surfaces the
+  per-CTU map controls instead of parsing-and-discarding them. New
+  `SliceHeader` fields: `slice_alf_map_flag`, `slice_alf_chroma_idc`,
+  the §7.4.5-derived `slice_chroma_alf_enabled_flag` /
+  `slice_chroma2_alf_enabled_flag`, and the `ChromaArrayType == 3`-only
+  `slice_alf_chroma_map_flag` / `slice_alf_chroma2_map_flag`. The parser
+  also consumes the previously-skipped `ChromaArrayType == 3` branch
+  (re-signalled `slice_alf_chroma_idc` when ALF is luma-disabled, the
+  per-component chroma APS ids, and the chroma map flags).
+- `slice_data.rs`: `decode_coding_tree_unit_alf` implements the
+  §7.3.8.2 lines 2626-2631 `coding_tree_unit()` ALF prefix. It decodes
+  the 0-3 `alf_ctb_flag` / `alf_ctb_chroma_flag` / `alf_ctb_chroma2_flag`
+  bins (each FL `cMax = 1`, ae(v), Table 40, ctxInc 0 under
+  `sps_cm_init_flag == 0`) gated exactly as the spec syntax
+  (`slice_alf_enabled_flag && slice_alf_map_flag` for luma, etc.), and
+  applies the §7.4.9.2 not-present inference (each flag → the matching
+  slice-level enable). Returns an `AlfCtbFlags` triplet. For Baseline
+  4:2:0 (ChromaArrayType 1) the chroma map flags are inferred 0, so only
+  the luma bin can appear — but the full triplet is decoded for
+  spec-completeness on the ChromaArrayType-3 path.
+- The helper is wired into all three CTU loops — `walk_baseline_idr_slice`,
+  `decode_baseline_idr_slice`, and `decode_baseline_inter_slice` — at the
+  top of each per-CTU iteration, before `split_unit()`. New
+  `SliceWalkInputs` fields thread the slice-header map controls; the
+  `decode_non_idr` path in `decoder.rs` populates them from the parsed
+  `SliceHeader`. The two `lib.rs` minimal-header entry points default
+  them off.
+- New `AlfCtbStats` (`luma_bins` / `chroma_cb_bins` / `chroma_cr_bins` /
+  `luma_on_ctus`) embedded into `SliceWalkStats`, `SliceDecodeStats`, and
+  `InterDecodeStats` so fixtures can assert the §7.3.8.2 presence gating.
+
+#### Tests
+- 292 pass (was 284). 8 new tests:
+  - `round107_ctu_alf_no_map_consumes_no_bins`: no map signalled ⇒ zero
+    bins, luma inferred from (off) `slice_alf_enabled_flag`.
+  - `round107_ctu_alf_map_without_enable_infers_off`: map flag on but
+    enable off ⇒ no luma bin (presence is enable && map).
+  - `round107_ctu_alf_luma_map_reads_one_bin`: two CTBs, coded 1 then 0,
+    one bin each; `luma_on_ctus` tracks only the set one.
+  - `round107_ctu_alf_chroma3_reads_three_bins`: ChromaArrayType-3 path
+    decodes luma + Cb + Cr bins, each resolving independently.
+  - `round107_idr_decode_reads_alf_ctb_flag_bin` /
+    `..._without_alf_map_reads_no_alf_bins`: end-to-end 32×32 monochrome
+    IDR decode with/without the luma map, asserting the consumed
+    `alf_ctb_flag` bin count and unchanged grey reconstruction.
+  - `round107_alf_map_fields_baseline_chroma1` /
+    `round107_alf_map_chroma_idc_zero`: slice-header parse surfaces the
+    new fields + derived enables with correct bit alignment.
+
+#### Notes
+- This round lands the ALF *applicability-map parse + per-CTU on/off
+  decision*. Actually masking the §8.9 ALF apply per-CTB by the decoded
+  map (today's `apply_alf` filters whole planes) is a follow-up: the
+  per-CTB `AlfCtbFlags` are decoded and counted but not yet consulted by
+  the post-filter pass.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
+  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec evcdec
+  consulted; no web access.
+
 ### Round 103 — IBC-branch `cu_qp_delta` wiring (§7.3.8.5)
 
 #### Added
