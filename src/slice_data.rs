@@ -710,6 +710,11 @@ pub struct SliceDecodeStats {
     /// `mvd_l0_sign_flag` bypass bits consumed by the IBC `coding_unit()`
     /// branch (one per non-zero abs_mvd component).
     pub ibc_mvd_sign_bins: u32,
+    /// `cu_qp_delta_abs` U-binarized syntax elements decoded inside the
+    /// IDR-path `transform_unit()` (§7.3.8.5 line 3073-3078). One increment
+    /// per CU (intra or IBC) that satisfies the presence condition
+    /// `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`.
+    pub cu_qp_delta_abs_bins: u32,
     pub coeff_runs: u32,
     /// Deblocking edges visited (zero when slice_deblocking_filter_flag = 0).
     pub deblock_edges: u32,
@@ -1082,6 +1087,34 @@ fn decode_ibc_branch(
             "evc ibc decode: round-90 requires log2_cb == log2_tb (CB ≤ MaxTb)",
         ));
     }
+    // §7.3.8.5 transform_unit() cu_qp_delta (line 3073-3078). The presence
+    // condition is mode-independent and follows the cbf decode, so an
+    // IBC-coded CU reads `cu_qp_delta_abs` / `cu_qp_delta_sign_flag`
+    // identically to the intra single-tree path (round-3 wiring) and the
+    // regular inter path (round-100 wiring). With Baseline's
+    // `sps_dquant_flag == 0` the guard collapses to
+    // `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`; the
+    // IBC DUAL_TREE_LUMA branch infers `cbf_luma = 1` and carries no
+    // chroma cbf, so the condition reduces to `cu_qp_delta_enabled_flag`.
+    // `cu_qp_delta_abs` is U-binarized with ctxInc 0 for every bin
+    // (Table 95) under Table 78 init; `cu_qp_delta_sign_flag` is
+    // bypass-coded and only present when the magnitude is non-zero. The
+    // signed delta is applied to the slice QP per eq. 148, clamped to the
+    // legal 8-bit-depth range [0, 51].
+    let mut qp_delta: i32 = 0;
+    if walk.cu_qp_delta_enabled && cbf_luma != 0 {
+        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        stats.cu_qp_delta_abs_bins += 1;
+        if qp_delta_abs > 0 {
+            let sign = eng.decode_bypass()?;
+            qp_delta = if sign != 0 {
+                -(qp_delta_abs as i32)
+            } else {
+                qp_delta_abs as i32
+            };
+        }
+    }
+    let cu_qp = (decode.slice_qp + qp_delta).clamp(0, 51);
     // Decode the luma residual levels (always present per the
     // DUAL_TREE_LUMA inference rule of spec §7.4.9.5 line 6065-6066).
     let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
@@ -1112,6 +1145,7 @@ fn decode_ibc_branch(
         mvd,
         cbf_luma as u8,
         &residual_levels_y,
+        cu_qp,
     )
 }
 
@@ -1138,6 +1172,7 @@ fn apply_ibc_branch_predict_and_reconstruct(
     mvd: MotionVector,
     cbf_luma: u8,
     residual_levels_y: &[i32],
+    cu_qp: i32,
 ) -> Result<()> {
     let chroma_present = walk.chroma_format_idc != 0;
     let n_cb_w_l = 1usize << log2_cb_width;
@@ -1170,8 +1205,9 @@ fn apply_ibc_branch_predict_and_reconstruct(
         &mut pred_cb,
         &mut pred_cr,
     )?;
-    // Scale + IDCT the residual levels.
-    let cu_qp = decode.slice_qp.clamp(0, 51);
+    // Scale + IDCT the residual levels at the per-CU QP (the round-103
+    // `cu_qp_delta`-derived value resolved by `decode_ibc_branch`; the
+    // direct-call tests pass the slice QP unchanged).
     let mut residual_y = vec![0i32; n_l];
     if cbf_luma != 0 {
         if residual_levels_y.len() != n_l {
@@ -1253,6 +1289,7 @@ fn decode_transform_unit(
     let mut qp_delta: i32 = 0;
     if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
         let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        stats.cu_qp_delta_abs_bins += 1;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
             qp_delta = if sign != 0 {
@@ -2489,6 +2526,30 @@ fn decode_inter_ibc_branch(
         cbf_cr = eng.decode_decision(0, 0)?;
         stats.cbf_chroma_bins += 2;
     }
+    // §7.3.8.5 transform_unit() cu_qp_delta (line 3073-3078). The presence
+    // condition is mode-independent — a MODE_IBC inter CU reads
+    // `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` identically to the
+    // regular MODE_INTER single-tree path (round-100 wiring). With
+    // Baseline's `sps_dquant_flag == 0` the guard collapses to
+    // `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`.
+    // `cu_qp_delta_abs` is U-binarized with ctxInc 0 (Table 95) under
+    // Table 78 init; `cu_qp_delta_sign_flag` is bypass-coded and only
+    // present for a non-zero magnitude. The derived QP follows eq. 148,
+    // clamped to [0, 51].
+    let mut qp_delta: i32 = 0;
+    if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        stats.cu_qp_delta_abs_bins += 1;
+        if qp_delta_abs > 0 {
+            let sign = eng.decode_bypass()?;
+            qp_delta = if sign != 0 {
+                -(qp_delta_abs as i32)
+            } else {
+                qp_delta_abs as i32
+            };
+        }
+    }
+    let cu_qp = (decode.slice_qp + qp_delta).clamp(0, 51);
     // Residual decode per component.
     let n_tb_y = (1usize << log2_tb_width) * (1usize << log2_tb_height);
     let mut residual_levels_y = vec![0i32; n_tb_y];
@@ -2547,6 +2608,7 @@ fn decode_inter_ibc_branch(
         &residual_levels_cb,
         cbf_cr,
         &residual_levels_cr,
+        cu_qp,
     )
 }
 
@@ -2585,6 +2647,7 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
     residual_levels_cb: &[i32],
     cbf_cr: u8,
     residual_levels_cr: &[i32],
+    cu_qp: i32,
 ) -> Result<()> {
     let chroma_present = walk.chroma_format_idc != 0;
     let n_cb_w_l = 1usize << log2_cb_width;
@@ -2617,8 +2680,9 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
         &mut pred_cb,
         &mut pred_cr,
     )?;
-    // Luma scale + IDCT + add.
-    let cu_qp = decode.slice_qp.clamp(0, 51);
+    // Luma scale + IDCT + add at the per-CU QP (round-103 `cu_qp_delta`
+    // value resolved by `decode_inter_ibc_branch`; direct-call tests pass
+    // the slice QP unchanged).
     let mut residual_y = vec![0i32; n_l];
     if cbf_luma != 0 {
         if residual_levels_y.len() != n_l {
@@ -4191,6 +4255,7 @@ mod tests {
             mvd,
             0,
             &zero_levels,
+            decode.slice_qp.clamp(0, 51),
         )
         .unwrap();
         // Verify the right-half samples now equal the left-half pattern.
@@ -4261,6 +4326,7 @@ mod tests {
             mvd_overlap,
             0,
             &zero_levels,
+            decode.slice_qp.clamp(0, 51),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4548,6 +4614,228 @@ mod tests {
         assert_eq!(derive(50, 10, 0), 51);
     }
 
+    // =================================================================
+    // Round 103: §7.3.8.5 cu_qp_delta wired into the two IBC branches.
+    // =================================================================
+    //
+    // Round 100 wired `cu_qp_delta` into the regular (non-IBC) inter
+    // path; the two IBC branches (IDR-side `decode_ibc_branch` and
+    // non-IDR `decode_inter_ibc_branch`) still hard-coded
+    // `cu_qp = slice_qp`. The cu_qp_delta presence condition of
+    // §7.3.8.5 line 3073 is mode-independent, so an IBC-coded CU reads
+    // the element exactly as the intra / regular-inter paths do. The
+    // test-only encoder's `encode_bypass` defer bug (round-90/95 notes)
+    // still blocks a full-slice non-skip CABAC fixture, so coverage is
+    // split into the round-100 style: engine-level isolation of the new
+    // read + direct-call helper checks that the threaded per-CU QP
+    // actually drives the residual scaling.
+
+    /// Round 103: engine-level isolation of the exact transform_unit()
+    /// prefix the IDR-side `decode_ibc_branch` reads. cbf_luma is
+    /// inferred = 1 (DUAL_TREE_LUMA, no bin), so the very next read is
+    /// `cu_qp_delta_abs` as a U-binarized value with ctxInc 0 for every
+    /// bin (Table 95). With `cu_qp_delta_abs = 0` the read is a single
+    /// all-regular U "0" terminator (no bypass sign bit), robust against
+    /// the test-only encoder's `encode_bypass` defer bug.
+    #[test]
+    fn round103_idr_ibc_branch_cu_qp_delta_abs_zero_is_single_u_bin() {
+        use crate::cabac::{CabacEncoder, CabacEngine};
+        let mut enc = CabacEncoder::new();
+        // cbf_luma is INFERRED 1 for the IBC DUAL_TREE_LUMA branch — no
+        // bin is emitted — so the stream starts with cu_qp_delta_abs.
+        enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0 (U "0")
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        // The exact call the IBC branch makes for cu_qp_delta_abs:
+        let qp_delta_abs = eng.decode_u_regular(0, |_| 0).unwrap();
+        assert_eq!(
+            qp_delta_abs, 0,
+            "cu_qp_delta_abs = 0 → single U \"0\" terminator, no sign bit"
+        );
+    }
+
+    /// Round 103: the eq. 148 signed-magnitude derivation + [0, 51]
+    /// clamp the IBC branches apply is identical to the round-100 inter
+    /// path. Exercise the sign + saturation corners directly (the CABAC
+    /// reads are covered by
+    /// `round103_idr_ibc_branch_cu_qp_delta_abs_zero_is_single_u_bin`).
+    #[test]
+    fn round103_ibc_cu_qp_delta_signed_magnitude_and_clamp() {
+        let derive = |slice_qp: i32, abs: u32, sign: u8| -> i32 {
+            let mut qp_delta: i32 = 0;
+            if abs > 0 {
+                qp_delta = if sign != 0 { -(abs as i32) } else { abs as i32 };
+            }
+            (slice_qp + qp_delta).clamp(0, 51)
+        };
+        assert_eq!(derive(22, 4, 0), 26); // positive delta
+        assert_eq!(derive(22, 4, 1), 18); // negative delta
+        assert_eq!(derive(22, 0, 0), 22); // abs 0 → unchanged
+        assert_eq!(derive(2, 9, 1), 0); // floor clamp
+        assert_eq!(derive(48, 9, 0), 51); // ceiling clamp
+    }
+
+    /// Round 103: the IDR-side `apply_ibc_branch_predict_and_reconstruct`
+    /// now takes the per-CU QP rather than hard-coding the slice QP. Run
+    /// the same IBC block-copy + non-zero luma residual through the
+    /// helper at two different QPs and confirm the reconstructed samples
+    /// differ — proving the threaded `cu_qp` actually drives the
+    /// §8.7.3 residual scaling. Direct call avoids the encoder bypass
+    /// defer bug.
+    #[test]
+    fn round103_idr_ibc_apply_threads_cu_qp_into_residual_scaling() {
+        // Two 4×4 monochrome pictures with identical left-half source,
+        // reconstructed with the same residual levels at QP 22 vs QP 40.
+        let mk_pic = || {
+            let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
+            for j in 0..4 {
+                for i in 0..4 {
+                    pic.y[j * 8 + i] = 100; // uniform left-half source
+                }
+            }
+            pic
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: true,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        let mvd = MotionVector { x: -4, y: 0 };
+        // A single non-zero DC level so the residual magnitude scales
+        // with QP. cbf_luma = 1.
+        let mut levels = vec![0i32; 16];
+        levels[0] = 5;
+        let run = |qp: i32| -> Vec<u8> {
+            let mut pic = mk_pic();
+            let mut side_info = SideInfoGrid::new(8, 4);
+            apply_ibc_branch_predict_and_reconstruct(
+                &mut pic,
+                &mut side_info,
+                &walk,
+                &decode,
+                4,
+                0,
+                2,
+                2,
+                TreeType::DualTreeLuma,
+                mvd,
+                1,
+                &levels,
+                qp,
+            )
+            .unwrap();
+            (0..4)
+                .flat_map(|j| (0..4).map(move |i| (j, i)))
+                .map(|(j, i)| pic.y[j * 8 + (4 + i)])
+                .collect()
+        };
+        let recon_lo = run(22);
+        let recon_hi = run(40);
+        assert_ne!(
+            recon_lo, recon_hi,
+            "per-CU QP must change the IBC residual reconstruction"
+        );
+        // The higher QP scales the same DC level to a larger residual, so
+        // the QP-40 reconstruction deviates further from the predictor
+        // (uniform 100) than the QP-22 one.
+        let dev = |r: &[u8]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
+        assert!(
+            dev(&recon_hi) > dev(&recon_lo),
+            "higher QP → larger residual deviation from the predictor"
+        );
+    }
+
+    /// Round 103: same as the IDR-side check but for the non-IDR
+    /// `apply_inter_ibc_branch_predict_and_reconstruct` helper, which
+    /// gained the same `cu_qp` parameter. Two QPs over an identical
+    /// non-zero luma residual must produce different reconstructions.
+    #[test]
+    fn round103_inter_ibc_apply_threads_cu_qp_into_residual_scaling() {
+        let mk_pic = || {
+            let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
+            for j in 0..4 {
+                for i in 0..4 {
+                    pic.y[j * 8 + i] = 100;
+                }
+            }
+            pic
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            cu_qp_delta_enabled: true,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        let mvd = MotionVector { x: -4, y: 0 };
+        let mut levels = vec![0i32; 16];
+        levels[0] = 5;
+        let empty_c: Vec<i32> = Vec::new();
+        let run = |qp: i32| -> Vec<u8> {
+            let mut pic = mk_pic();
+            let mut side_info = SideInfoGrid::new(8, 4);
+            let mut hmvp = crate::hmvp::HmvpCandList::new();
+            apply_inter_ibc_branch_predict_and_reconstruct(
+                &mut pic,
+                &mut side_info,
+                &mut hmvp,
+                &walk,
+                &decode,
+                4,
+                0,
+                2,
+                2,
+                mvd,
+                1,
+                &levels,
+                0,
+                &empty_c,
+                0,
+                &empty_c,
+                qp,
+            )
+            .unwrap();
+            (0..4)
+                .flat_map(|j| (0..4).map(move |i| (j, i)))
+                .map(|(j, i)| pic.y[j * 8 + (4 + i)])
+                .collect()
+        };
+        let recon_lo = run(22);
+        let recon_hi = run(40);
+        assert_ne!(
+            recon_lo, recon_hi,
+            "per-CU QP must change the inter IBC residual reconstruction"
+        );
+        let dev = |r: &[u8]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
+        assert!(
+            dev(&recon_hi) > dev(&recon_lo),
+            "higher QP → larger residual deviation from the predictor"
+        );
+    }
+
     /// Round 95: when `sps_ibc_flag = 1` but the CU size exceeds
     /// `log2_max_ibc_cand_size`, the §7.4.5 size gate suppresses
     /// `ibc_flag` emission. The non-IDR walker must therefore proceed
@@ -4681,6 +4969,7 @@ mod tests {
             &zero_chroma,
             0,
             &zero_chroma,
+            decode.slice_qp.clamp(0, 51),
         )
         .unwrap();
         for j in 0..4 {
@@ -4753,6 +5042,7 @@ mod tests {
             &zero_chroma,
             0,
             &zero_chroma,
+            decode.slice_qp.clamp(0, 51),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -4830,6 +5120,7 @@ mod tests {
             &zero_c,
             0,
             &zero_c,
+            decode.slice_qp.clamp(0, 51),
         )
         .unwrap();
         // Verify the right-half luma matches the left-half pattern.

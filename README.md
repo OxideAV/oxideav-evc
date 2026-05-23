@@ -7,6 +7,33 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-103 status
+
+Round 103 extends the §7.3.8.5 `cu_qp_delta` wiring to the **two IBC
+branches**. Round 100 wired the element into the regular (non-IBC)
+inter `coding_unit()` path, but the IDR-side `decode_ibc_branch` and
+the non-IDR `decode_inter_ibc_branch` still hard-coded
+`cu_qp = slice_qp`. The §7.3.8.5 line 3073 presence condition is
+mode-independent, so a MODE_IBC CU now reads `cu_qp_delta_abs` (U
+binarization, ctxInc 0 per Table 95 / Table 78 init) + the bypass
+`cu_qp_delta_sign_flag` right after the cbf bins and before the
+residual, applies eq. 148 clamped to `[0, 51]`, and threads the
+derived per-CU QP into the residual scaling via a new `cu_qp` parameter
+on both `apply_*_ibc_branch_predict_and_reconstruct` helpers. The
+IDR-path `SliceDecodeStats` gains a `cu_qp_delta_abs_bins` counter
+(mirroring the inter-side one) that the intra single-tree path now also
+increments. 284 unit tests pass (was 280): engine-level isolation of
+the new read (single all-regular U "0" bin), the eq. 148
+signed-magnitude + clamp arithmetic, and two direct-call helper checks
+that a fixed non-zero residual reconstructs differently at QP 22 vs
+QP 40 (the full-slice non-skip CBF path is still blocked by the
+test-only encoder's `encode_bypass` defer bug). With this round all
+four `transform_unit()` entry points (intra single-tree, regular inter,
+IDR IBC, non-IDR IBC) decode per-CU `cu_qp_delta`. Suggested
+workspace-README row delta: EVC now decodes per-CU `cu_qp_delta` on
+every Baseline `transform_unit()` path including both IBC branches
+(lacks: Main-profile toolset — BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-100 status
 
 Round 100 wires the §7.3.8.5 `cu_qp_delta` syntax into the **non-skip

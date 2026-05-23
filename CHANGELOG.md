@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+### Round 103 — IBC-branch `cu_qp_delta` wiring (§7.3.8.5)
+
+#### Added
+- `decode_ibc_branch` (`src/slice_data.rs`, IDR path): the IBC
+  `transform_unit()` now decodes the §7.3.8.5 `cu_qp_delta_abs` /
+  `cu_qp_delta_sign_flag` syntax elements after the (inferred-1)
+  `cbf_luma` and before the luma residual, instead of hard-coding
+  `cu_qp = slice_qp`. The §7.3.8.5 line 3073 presence condition is
+  mode-independent, so a MODE_IBC CU reads the element exactly as the
+  intra single-tree (round-3) and regular-inter (round-100) paths.
+  Under Baseline's `sps_dquant_flag == 0` the guard collapses to
+  `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`; the IBC
+  DUAL_TREE_LUMA branch infers `cbf_luma = 1` with no chroma cbf, so
+  the condition reduces to `cu_qp_delta_enabled_flag`.
+  `cu_qp_delta_abs` is U-binarized with ctxInc 0 (Table 95) under
+  Table 78 init; `cu_qp_delta_sign_flag` is bypass-coded for a
+  non-zero magnitude. The derived QP (eq. 148, clamped to `[0, 51]`)
+  is threaded into `apply_ibc_branch_predict_and_reconstruct` via a
+  new `cu_qp` parameter that drives `scale_and_inverse_transform`.
+- `decode_inter_ibc_branch` (`src/slice_data.rs`, non-IDR P/B path):
+  symmetric wiring after the single-tree `cbf_luma` / `cbf_cb` /
+  `cbf_cr` bins. The resolved per-CU QP is threaded into
+  `apply_inter_ibc_branch_predict_and_reconstruct` via a new `cu_qp`
+  parameter.
+- `SliceDecodeStats::cu_qp_delta_abs_bins`: new counter mirroring the
+  inter-side `InterDecodeStats` tracker. Incremented once per IDR-path
+  CU (intra single-tree or IBC) that satisfies the §7.3.8.5 presence
+  condition. The pre-existing intra `decode_transform_unit` read now
+  increments it too (it previously decoded the element with no
+  counter).
+
+#### Tests
+- 284 pass (was 280). 4 new tests:
+  - `round103_idr_ibc_branch_cu_qp_delta_abs_zero_is_single_u_bin`:
+    engine-level isolation of the exact prefix the IDR IBC branch reads
+    (cbf_luma inferred 1 → no bin; `cu_qp_delta_abs = 0` decodes as a
+    single all-regular U "0" terminator with no sign bit). Robust
+    against the test-only encoder's `encode_bypass` defer bug.
+  - `round103_ibc_cu_qp_delta_signed_magnitude_and_clamp`: eq. 148
+    signed-magnitude derivation + `[0, 51]` clamp over the sign and
+    saturation corners.
+  - `round103_idr_ibc_apply_threads_cu_qp_into_residual_scaling`:
+    direct call of `apply_ibc_branch_predict_and_reconstruct` with a
+    fixed non-zero DC residual at QP 22 vs QP 40 — the reconstructions
+    differ and the higher QP deviates further from the predictor,
+    proving the threaded `cu_qp` drives the §8.7.3 scaling.
+  - `round103_inter_ibc_apply_threads_cu_qp_into_residual_scaling`:
+    same verification for the non-IDR
+    `apply_inter_ibc_branch_predict_and_reconstruct` helper.
+
+#### Notes
+- A full-slice non-skip CABAC fixture driving `cu_qp_delta` end-to-end
+  through either IBC branch is still blocked by the test-only
+  `CabacEncoder::encode_bypass` defer bug on the residual
+  `coeff_sign_flag` (round-90/95/100 notes). Coverage therefore splits
+  between engine-level read isolation and direct-call helper checks,
+  exactly as round 100 did. With this round, all four
+  `transform_unit()` entry points (intra single-tree, regular inter,
+  IDR IBC, non-IDR IBC) decode per-CU `cu_qp_delta`.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
+  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec
+  evcdec consulted; no web access.
+
 ### Round 100 — non-IDR (P/B) inter-CU `cu_qp_delta` wiring (§7.3.8.5)
 
 #### Added
