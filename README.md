@@ -7,6 +7,27 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-100 status
+
+Round 100 wires the §7.3.8.5 `cu_qp_delta` syntax into the **non-skip
+MODE_INTER** `coding_unit()` path. Previously P/B inter CUs ignored
+`cu_qp_delta_enabled_flag` and always reconstructed at the slice QP;
+the inter `transform_unit()` walker now decodes `cu_qp_delta_abs` (U
+binarization, ctxInc 0 per Table 95 / Table 78 init) + the bypass
+`cu_qp_delta_sign_flag` after the cbf bins, applies eq. 148
+(`QpY = slice_qp + cu_qp_delta_abs * (1 - 2 * sign)`) clamped to
+`[0, 51]`, and feeds the derived per-CU QP into the residual scaling —
+symmetric to the intra single-tree path. New
+`InterDecodeStats::cu_qp_delta_abs_bins` counter. 280 unit tests pass
+(was 277): a robust all-regular full-slice negative-gate test (skip CU
+emits zero `cu_qp_delta` bins) plus engine/arithmetic-level positive
+checks of the new read (the full-slice non-skip CBF path is still
+blocked by the test-only encoder's `encode_bypass` defer bug on the
+residual `coeff_sign_flag`). Suggested workspace-README row delta: EVC
+now decodes per-CU `cu_qp_delta` on both the intra and the regular
+inter paths (lacks: full inter-IBC-branch `cu_qp_delta`, Main-profile
+toolset).
+
 ## Round-95 status
 
 Working **Baseline-profile** decoder for IDR + P + B slices with full

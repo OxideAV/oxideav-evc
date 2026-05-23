@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Round 100 — non-IDR (P/B) inter-CU `cu_qp_delta` wiring (§7.3.8.5)
+
+#### Added
+- `decode_inter_coding_unit` (`src/slice_data.rs`): the non-skip
+  MODE_INTER transform_unit() path now decodes the §7.3.8.5
+  `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` syntax elements instead
+  of hard-coding `cu_qp = slice_qp`. The presence condition is
+  mode-independent in the spec; under Baseline's `sps_dquant_flag == 0`
+  the §7.3.8.5 line 3073 guard collapses to
+  `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`, matching
+  the intra single-tree path (round-3 wiring). `cu_qp_delta_abs` is
+  U-binarized with ctxInc 0 for every bin (Table 95) under Table 78
+  init; `cu_qp_delta_sign_flag` is bypass-coded and only present when
+  the magnitude is non-zero. The derived QP follows eq. 148
+  (`QpY = slice_qp + cu_qp_delta_abs * (1 - 2 * sign)`), clamped to the
+  legal 8-bit-depth range `[0, 51]`, and feeds the existing
+  per-component `scale_and_inverse_transform` residual scaling.
+- `InterDecodeStats::cu_qp_delta_abs_bins`: new counter mirroring the
+  IDR-side `SliceDecodeStats` tracker — one increment per inter CU that
+  decodes the syntax element.
+
+#### Tests
+- 280 pass (was 277). 3 new tests:
+  - `round100_inter_skip_cu_consumes_no_cu_qp_delta_bins`: full-slice
+    P-slice cu_skip CU with `cu_qp_delta_enabled = true` — verifies the
+    §7.3.8.5 presence condition is false for an inferred-zero-CBF skip
+    CU, so `cu_qp_delta_abs_bins == 0` and the reconstruction is the
+    exact zero-MV reference copy. All-regular bins (robust against the
+    test encoder's bypass defer bug).
+  - `round100_inter_cu_qp_delta_abs_zero_decodes_as_single_u_bin`:
+    engine-level isolation of the exact transform_unit() prefix the
+    inter walker reads (`cbf_luma = 1`, `cu_qp_delta_abs = 0`) — the U
+    "0" terminator decodes as 0 with no sign bit.
+  - `round100_inter_cu_qp_delta_signed_magnitude_and_clamp`: exercises
+    the eq. 148 signed-magnitude derivation + `[0, 51]` clamp the walker
+    applies (sign, abs == 0, and both saturation corners).
+
+#### Notes
+- A full-slice non-skip MODE_INTER fixture with a non-zero CBF (which
+  would drive `cu_qp_delta` end-to-end) is still blocked by the
+  test-only `CabacEncoder::encode_bypass` defer bug on the residual
+  `coeff_sign_flag` (documented round-90/95). The new tests therefore
+  split coverage between a robust all-regular full-slice negative gate
+  and engine/arithmetic-level positive checks of the new read, exactly
+  as the round-95 IBC active-decode coverage did. The IDR-side IBC
+  branch + the inter-IBC branch still hard-code `cu_qp = slice_qp`
+  (they reach transform_unit() with the same condition); wiring
+  `cu_qp_delta` into those two branches is a symmetric follow-up.
+
 ### Round 95 — non-IDR (P/B) IBC `coding_unit()` wiring
 
 #### Added

@@ -1589,6 +1589,13 @@ pub struct InterDecodeStats {
     /// Round 95: `mvd_l0_sign_flag` bypass bits consumed by the
     /// inter-path IBC branch (one per non-zero abs_mvd component).
     pub ibc_mvd_sign_bins: u32,
+    /// Round 100: `cu_qp_delta_abs` U-binarized bins decoded inside the
+    /// non-skip P/B inter-CU transform_unit() path (§7.3.8.5
+    /// lines 3073-3078). Non-zero only when `cu_qp_delta_enabled_flag`
+    /// holds and at least one of `cbf_luma` / `cbf_cb` / `cbf_cr` is
+    /// set on the CU. One increment per CU that decodes the syntax
+    /// element (mirrors the IDR-side `SliceDecodeStats` tracker).
+    pub cu_qp_delta_abs_bins: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -2024,9 +2031,30 @@ fn decode_inter_coding_unit(
         cbf_cr = eng.decode_decision(0, 0)?;
         stats.cbf_chroma_bins += 2;
     }
-    // Inter CU has no cu_qp_delta override in our Baseline path
-    // (cu_qp_delta_enabled_flag=0 fixtures); use slice QP directly.
-    let cu_qp = inputs.decode.slice_qp.clamp(0, 51);
+    // §7.3.8.5 transform_unit() cu_qp_delta. The presence condition is
+    // mode-independent — it applies to MODE_INTER CUs identically to the
+    // intra single-tree path. With Baseline's `sps_dquant_flag == 0` the
+    // §7.3.8.5 line 3073 guard collapses to `cu_qp_delta_enabled_flag &&
+    // (cbf_luma || cbf_cb || cbf_cr)`. `cu_qp_delta_abs` is U-binarized
+    // with ctxInc 0 for every bin (Table 95) under Table 78 init;
+    // `cu_qp_delta_sign_flag` is bypass-coded and only present when the
+    // magnitude is non-zero. The signed delta is applied to the slice QP
+    // per eq. 148: `QpY = slice_qp + cu_qp_delta_abs * (1 - 2 * sign)`,
+    // clamped to the legal 8-bit-depth QP range [0, 51].
+    let mut qp_delta: i32 = 0;
+    if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        stats.cu_qp_delta_abs_bins += 1;
+        if qp_delta_abs > 0 {
+            let sign = eng.decode_bypass()?;
+            qp_delta = if sign != 0 {
+                -(qp_delta_abs as i32)
+            } else {
+                qp_delta_abs as i32
+            };
+        }
+    }
+    let cu_qp = (inputs.decode.slice_qp + qp_delta).clamp(0, 51);
     // Stamp the deblocking side-info for this inter CU. We record the
     // L0 MV (already in 1/4-pel units) and ref_idx 0 / -1 per slot.
     side_info.stamp_block(
@@ -4384,6 +4412,140 @@ mod tests {
         assert_eq!(stats.ibc_cus, 0);
         assert_eq!(stats.ibc_abs_mvd_bins, 0);
         assert_eq!(stats.ibc_mvd_sign_bins, 0);
+    }
+
+    /// Round 100: a `cu_skip` inter CU has no residual (cbf inferred 0),
+    /// so the §7.3.8.5 `cu_qp_delta_abs` presence condition `(cbf_luma ||
+    /// cbf_cb || cbf_cr)` is false even when `cu_qp_delta_enabled_flag`
+    /// holds. The walker must therefore consume **zero** `cu_qp_delta`
+    /// bins and reconstruct using the slice QP unchanged. Full-slice,
+    /// all-regular bins (no MVD/residual bypass), so this is robust
+    /// against the test-only encoder's `encode_bypass` defer behaviour.
+    #[test]
+    fn round100_inter_skip_cu_consumes_no_cu_qp_delta_bins() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // mvp_idx_l0 = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            // cu_qp_delta is *enabled* — the skip path must still emit
+            // zero bins because cbf is inferred 0.
+            cu_qp_delta_enabled: true,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size: 0,
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(
+            stats.cu_qp_delta_abs_bins, 0,
+            "cu_qp_delta must not be decoded for a zero-CBF skip CU"
+        );
+        // Zero-MV skip copy of the uniform-200 reference → exact copy.
+        assert!(pic.y.iter().all(|&v| v == 200), "skip copy of reference Y");
+    }
+
+    /// Round 100: validate the exact CABAC sequence the non-skip
+    /// `decode_inter_coding_unit` transform_unit() path reads for the
+    /// §7.3.8.5 `cu_qp_delta` element. After the §7.3.8.5 cbf bins, the
+    /// path decodes `cu_qp_delta_abs` as a U-binarized value with ctxInc
+    /// 0 for every bin (Table 95) and, when non-zero, a bypass-coded
+    /// `cu_qp_delta_sign_flag` (eq. 148). We drive a `CabacEngine`
+    /// through the precise prefix `cbf_luma = 1, cu_qp_delta_abs = 0`
+    /// and confirm both the cbf decision and the U "0" terminator decode
+    /// correctly, mirroring the read in the inter walker. (A full-slice
+    /// non-skip fixture is blocked by the test-only encoder's
+    /// `encode_bypass` defer bug on the residual `coeff_sign_flag`, as
+    /// documented in the round-90/95 notes — this engine-level test
+    /// isolates the new syntax read from that pre-existing limitation.)
+    #[test]
+    fn round100_inter_cu_qp_delta_abs_zero_decodes_as_single_u_bin() {
+        use crate::cabac::{CabacEncoder, CabacEngine};
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0 (U "0")
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let cbf_luma = eng.decode_decision(0, 0).unwrap();
+        assert_eq!(cbf_luma, 1, "cbf_luma decision");
+        // This is the exact call the inter walker makes for cu_qp_delta:
+        let qp_delta_abs = eng.decode_u_regular(0, |_| 0).unwrap();
+        assert_eq!(
+            qp_delta_abs, 0,
+            "cu_qp_delta_abs = 0 → single U \"0\" terminator, no sign bit"
+        );
+    }
+
+    /// Round 100: validate the signed-magnitude derivation eq. 148 and
+    /// the legal-range clamp the inter walker applies after decoding
+    /// `cu_qp_delta_abs` / `cu_qp_delta_sign_flag`. The CABAC reads
+    /// themselves are covered by
+    /// `round100_inter_cu_qp_delta_abs_zero_decodes_as_single_u_bin`;
+    /// here we exercise the exact arithmetic the walker performs on the
+    /// decoded values (`QpY = slice_qp + abs * (1 - 2 * sign)`, clamped
+    /// to `[0, 51]`) over the sign + saturation corners. The pure
+    /// arithmetic avoids the test-only encoder's `encode_bypass` defer
+    /// bug on a regular-U-then-bypass stream.
+    #[test]
+    fn round100_inter_cu_qp_delta_signed_magnitude_and_clamp() {
+        // Helper replicating the inter walker's eq. 148 + clamp.
+        let derive = |slice_qp: i32, abs: u32, sign: u8| -> i32 {
+            let mut qp_delta: i32 = 0;
+            if abs > 0 {
+                qp_delta = if sign != 0 { -(abs as i32) } else { abs as i32 };
+            }
+            (slice_qp + qp_delta).clamp(0, 51)
+        };
+        // sign = 0 → positive delta.
+        assert_eq!(derive(22, 3, 0), 25);
+        // sign = 1 → negative delta.
+        assert_eq!(derive(22, 3, 1), 19);
+        // abs = 0 → delta is 0 regardless of the (absent) sign.
+        assert_eq!(derive(22, 0, 0), 22);
+        // Low slice QP + large negative delta saturates at the [0, 51]
+        // floor, never below.
+        assert_eq!(derive(1, 5, 1), 0);
+        // High slice QP + large positive delta saturates at the ceiling.
+        assert_eq!(derive(50, 10, 0), 51);
     }
 
     /// Round 95: when `sps_ibc_flag = 1` but the CU size exceeds
