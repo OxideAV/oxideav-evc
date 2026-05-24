@@ -76,6 +76,7 @@
 //! every module is spec-only.
 
 pub mod alf;
+pub mod alf_tables;
 pub mod aps;
 pub mod bitreader;
 pub mod cabac;

@@ -5623,7 +5623,9 @@ mod tests {
         // that maps a uniform-128 plane to a fixed 2; only the left CTB
         // (32×32) changes, the right stays grey.
         let mut filter = crate::alf::AlfLumaFilter { coef: [0; 13] };
-        filter.coef[12] = 256; // (256 + 64) >> 7 = 2
+        // Round-120 spec scale: out = clip((coef[12] * V + 256) >> 9).
+        // For V = 128 and coef[12] = 8: (8*128 + 256) >> 9 = 1280 >> 9 = 2.
+        filter.coef[12] = 8;
         crate::alf::apply_alf_luma_masked(&mut pic, &filter, map, 8);
         let stride = pic.y_stride();
         for row in 0..32usize {

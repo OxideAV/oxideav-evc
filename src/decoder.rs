@@ -672,7 +672,23 @@ impl EvcDecoder {
         let bd_c = sps.bit_depth_c();
         if sps.sps_alf_flag {
             if let Some(ref alf_data) = self.alf_aps {
-                if alf_map.any_luma_on() || chroma_cb_enabled || chroma_cr_enabled {
+                if alf_map.any_luma_on() {
+                    // Round-120: classified per-sample luma apply (§8.8.4.2
+                    // + §8.8.4.3 + §8.9.4) drives the filter selection from
+                    // the per-CTB classification rather than always using
+                    // filter set 0.
+                    alf::apply_alf_luma_classified_masked(pic, alf_data, alf_map, bd_y);
+                    if pic.chroma_format_idc != 0 {
+                        if chroma_cb_enabled {
+                            alf::apply_alf_chroma(pic, &alf_data.chroma_filters[0], 1, bd_c);
+                        }
+                        if chroma_cr_enabled {
+                            alf::apply_alf_chroma(pic, &alf_data.chroma_filters[0], 2, bd_c);
+                        }
+                    }
+                } else if chroma_cb_enabled || chroma_cr_enabled {
+                    // No luma CTUs flagged but chroma is enabled: only chroma
+                    // apply (matches §8.9 lines 18099-18116 / round-113 wiring).
                     alf::apply_alf_with_map(
                         pic,
                         alf_data,
@@ -683,6 +699,9 @@ impl EvcDecoder {
                         bd_c,
                     );
                 } else {
+                    // Minimal-header IDR path (no per-CTU map threaded):
+                    // preserve round-11 behaviour and apply the whole-plane
+                    // filter (now spec-scaled per §8.8.4.2 eq. 1287).
                     alf::apply_alf(pic, alf_data, bd_y, bd_c);
                 }
             }

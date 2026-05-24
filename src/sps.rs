@@ -516,6 +516,44 @@ pub(crate) mod tests {
             }
         }
 
+        /// Encode value as k-th order unsigned Exp-Golomb (§9.2). Inverse of
+        /// `BitReader::uek`. For `k == 0` this is identical to `ue`.
+        pub fn uek(&mut self, k: u32, value: u32) {
+            // Find smallest M with v <= ((1 << (M + 1)) - 1) << k - 1, i.e.
+            // (v >> k) < (1 << M) (with adjustment for the +1 prefix).
+            // Equivalent: M = floor(log2((v >> k) + 1)).
+            let mut m: u32 = 0;
+            // (1 << (m + 1) - 1) << k is the smallest value not representable at M=m.
+            // i.e. need: v < ((1 << (m + 1)) - 1) << k? No: the reader does
+            //   base = ((1 << zeros) - 1) << k, value = base + suffix,
+            //   with `suffix` taking `zeros + k` bits (max = (1<<(zeros+k))-1).
+            // So values in [base, base + (1<<(m+k)) - 1] are encoded at M=m.
+            // base(m+1) = ((1<<(m+1))-1) << k > base(m) + (1<<(m+k)) - 1 by 2^k > 0.
+            // Pick smallest M s.t. v - base(M) < (1 << (M+k)).
+            loop {
+                let base = ((1u64 << m).wrapping_sub(1)) << k;
+                let max_suffix = 1u64 << (m + k);
+                if (value as u64) < base + max_suffix {
+                    let suffix = (value as u64) - base;
+                    for _ in 0..m {
+                        self.write_bit(0);
+                    }
+                    self.write_bit(1);
+                    let total = m + k;
+                    if total > 0 {
+                        for i in (0..total).rev() {
+                            self.write_bit(((suffix >> i) & 1) as u8);
+                        }
+                    }
+                    return;
+                }
+                m += 1;
+                if m > 32 {
+                    panic!("uek encode overflow: value={value} k={k}");
+                }
+            }
+        }
+
         pub fn bit_position(&self) -> u32 {
             self.bit_pos
         }

@@ -7,6 +7,57 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-120 status
+
+Round 120 closes the documented round-117 follow-up by landing the
+**spec-faithful §7.3.5 `alf_data()` parser + the §8.9.4 `AlfCoeffL`
+class-to-filter derivation (eq. 96-104) + the §8.8.4.2 classified per-CTB
+luma apply (eq. 1281-1288)**. Until now `parse_alf_data` consumed a
+simplified u(6) abs + u(1) sign payload, and the apply applied
+`luma_filters[0]` uniformly across every flagged CTB. The new parser
+handles the full §7.3.5 syntax — `alf_luma_type_flag` (eq. 90/91
+`coefPosMap`), `alf_luma_num_filters_signalled_minus1`,
+`alf_luma_coeff_delta_idx[ ]` (u(v) with `Ceil(Log2(NumSignalledFilter))`),
+`alf_luma_fixed_filter_usage_pattern` (uek(v), k=0) +
+`alf_luma_fixed_filter_usage_flag[ ]` + `alf_luma_fixed_filter_set_idx[ ]`
+(u(4)), `alf_luma_coeff_delta_flag` + `alf_luma_coeff_delta_prediction_flag`,
+`alf_luma_min_eg_order_minus1` (ue) + `alf_luma_eg_order_increase_flag[ ]`
+(eq. 92/93 `expGoOrderY` chain), `alf_luma_coeff_flag[ ]`, and per-tap
+`alf_luma_coeff_delta_abs[ ][ ]` (uek(v) with order picked by eq.
+`golombOrderIdxY[ ]`) + `alf_luma_coeff_delta_sign_flag[ ][ ]`. Chroma
+mirrors the uek(v) signalling per §7.3.5 second half (eq. 109/110 instead
+of the round-11 mis-scaled DC). The new `derive_alf_coeff_l` then
+assembles all 25 per-class `AlfCoeffL[ filtIdx ][ 0..12 ]` arrays per
+eq. 96-104: starts from the 64-row [`alf_tables::ALF_FIX_FILT_COEFF`] (eq.
+102, transcribed verbatim) using [`alf_tables::ALF_CLASS_TO_FILT_MAP`] (eq.
+103) when `alf_luma_fixed_filter_usage_flag[ filtIdx ] == 1`, adds the
+per-class delta `filterCoefficients[ alf_luma_coeff_delta_idx[ filtIdx ] ][
+coefPosMap[ j ] − 1 ]` for every `coefPosMap[ j ] > 0` (eq. 100), and
+computes position 12 per eq. 104. The new
+`apply_alf_luma_classified` / `apply_alf_luma_classified_masked` close
+the §8.8.4.2 loop: for every sample of every flagged CTB, the round-117
+`derive_alf_classification` picks `filtIdx[ x ][ y ]` + `transposeIdx`,
+the `AlfCoeffL[ filtIdx ][ ]` row is permuted per eq. 1282-1285, and the
+sum is reduced per eq. 1286/1287 (the centre tap multiplies
+`recPicture[ x, y ]`, scaled by `(sum + 256) >> 9` — the spec's exact
+scaling, not the round-11 `(sum + 64) >> 7` approximation). The decoder
+threads this through `apply_post_filters` so masked-luma ALF now uses the
+classified path; the minimal-header IDR (all-off map) falls back to the
+whole-plane `apply_alf` (now also spec-scaled). 321 unit tests pass (was
+309): full §7.3.5 syntax round-trip with the new `BitEmitter::uek` writer
+(`alf_luma_coeff_delta_idx`, fixed-filter pattern 0/1/2,
+`alf_luma_coeff_delta_prediction_flag` cumulative-sum check, multi-EG-order
+chain, chroma EG progression), eq. 96-104 derivation against the spec
+tables (pattern-1 every-class fixed-filter seed reproduces
+[`alf_tables::ALF_FIX_FILT_COEFF`] under [`alf_tables::ALF_CLASS_TO_FILT_MAP`]),
+eq. 104 DC invariant verified on a multi-class config, classified apply
+on uniform / vertical-edge / partial-edge-CTB / two-CTB-mask pictures, and
+the spec tables' dimensions / spot-checked entries. Suggested workspace-
+README row delta: EVC now decodes the full §7.3.5 `alf_data()` and derives
+the §8.9.4 per-class `AlfCoeffL` + applies the §8.8.4.2 classified luma
+filter per CTB (lacks: per-CTU ALF filter-set selection §8.9.6,
+Main-profile toolset — BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-117 status
 
 Round 117 lands the §8.8.4.3 **ALF transpose + classification filter-index

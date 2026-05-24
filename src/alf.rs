@@ -53,17 +53,39 @@
 //!   the 25 spec filter classes — eq. 1319/1320) and `transposeIdx` (0..3 —
 //!   eq. 1317/1318) from the local horizontal / vertical / diagonal activity
 //!   (eq. 1289-1316). [`transpose_luma_coeffs`] applies the eq. 1282-1285
-//!   coefficient permutation a sample's `transposeIdx` selects. These are
-//!   pure, syntax-free building blocks; wiring the classified per-sample
-//!   filter selection into the §8.8.4.2 apply additionally needs the full
-//!   §8.9.4 `AlfCoeffL[ ][ filtIdx ][ ]` derivation (eq. 96-104 +
-//!   `alf_luma_coeff_delta_idx`), which the round-11 simplified `alf_data()`
-//!   parser does not yet capture — tracked as a follow-up.
+//!   coefficient permutation a sample's `transposeIdx` selects.
+//! * The §7.3.5 **spec-faithful `alf_data()` parser + §8.9.4 `AlfCoeffL`
+//!   derivation** (round 120): [`parse_alf_data`] consumes the full §7.3.5
+//!   syntax — `alf_luma_type_flag` + `coefPosMap` (eq. 90/91),
+//!   `alf_luma_coeff_delta_idx[ ]` (u(v) per eq. just below the table),
+//!   `alf_luma_fixed_filter_usage_pattern` (uek(v)) +
+//!   `alf_luma_fixed_filter_usage_flag[ ]` + `alf_luma_fixed_filter_set_idx[ ]`,
+//!   `alf_luma_coeff_delta_flag` + `alf_luma_coeff_delta_prediction_flag`,
+//!   `alf_luma_{min,eg_order_increase}_*` (eq. 92/93/94/95 for
+//!   `expGoOrderY[ ]`), per-class `alf_luma_coeff_flag[ ]`, then per-tap
+//!   `alf_luma_coeff_delta_abs[ ][ ]` (uek(v) with order picked by eq.
+//!   golombOrderIdxY) + `alf_luma_coeff_delta_sign_flag[ ][ ]`. Chroma path
+//!   mirrors the luma uek(v) signalling per §7.3.5 second half.
+//!   [`derive_alf_coeff_l`] then assembles the 25 per-class
+//!   `AlfCoeffL[ filtIdx ][ 0..12 ]` arrays per eq. 96-104: starts from the
+//!   fixed-filter row [`crate::alf_tables::ALF_FIX_FILT_COEFF`] (selected via
+//!   [`crate::alf_tables::ALF_CLASS_TO_FILT_MAP`] when
+//!   `alf_luma_fixed_filter_usage_flag[ filtIdx ] == 1`) or zero (eq. 98/99),
+//!   adds the per-position delta from
+//!   `filterCoefficients[ alf_luma_coeff_delta_idx[ filtIdx ] ][ coefPosMap[ j ] − 1 ]`
+//!   for every j with `coefPosMap[ j ] > 0` (eq. 100), and computes
+//!   position 12 (DC offset) per eq. 104. The decoder now caches the
+//!   derived per-class coefficients and the per-sample
+//!   [`derive_alf_classification`] selects which class's `AlfCoeffL` row
+//!   applies — closing the §8.8.4.2 / §8.9.4 wiring loop. Per-CTU
+//!   ALF filter-set selection (§8.9.6) and the Main-profile toolset
+//!   (BTT/ADMVP/EIPD/ATS/AMVR/affine) remain as documented follow-ups.
 //!
 //! All clause and equation numbers refer to **ISO/IEC 23094-1:2020(E)**.
 
 use oxideav_core::{Error, Result};
 
+use crate::alf_tables::{ALF_CLASS_TO_FILT_MAP, ALF_FIX_FILT_COEFF};
 use crate::bitreader::BitReader;
 use crate::picture::YuvPicture;
 
@@ -119,17 +141,47 @@ impl Default for AlfChromaFilter {
 }
 
 /// All filter data decoded from a single ALF APS payload.
+///
+/// The struct carries both the §7.3.5 parsed syntax elements (`luma_*`
+/// fields) and the §8.9.4 derived per-class luma filters (`luma_filters`)
+/// so callers can either consult `luma_filters[filtIdx]` directly (the
+/// post-derivation form ready for §8.9.4.1 eq. 1263) or re-run
+/// [`derive_alf_coeff_l`] with a different APS pool when needed.
 #[derive(Clone, Debug)]
 pub struct AlfData {
     /// Whether luma filters were signalled in this APS.
     pub luma_filter_signal: bool,
     /// Whether chroma filters were signalled.
     pub chroma_filter_signal: bool,
-    /// Number of luma filter sets (1..=25).
+    /// `alf_luma_type_flag` (§7.3.5). When 0: `NumAlfCoefs = 7`, when 1:
+    /// `NumAlfCoefs = 13`. The Baseline / Main-profile pure pixel pipeline
+    /// uses the 13-tap form (eq. 1265-style 7×7 diamond) as the only one
+    /// currently applied; the round-120 parser stores the flag for
+    /// completeness.
+    pub luma_type_flag: bool,
+    /// Number of signalled luma filter sets `NumSignalledFilter` =
+    /// `alf_luma_num_filters_signalled_minus1 + 1`, in 1..=25.
+    pub num_signalled_luma_filters: usize,
+    /// `alf_luma_coeff_delta_idx[ i ]` for `i = 0..24`, the class-to-
+    /// signalled-filter mapping (eq. 100). When
+    /// `num_signalled_luma_filters == 1` the spec infers every entry as 0.
+    pub alf_luma_coeff_delta_idx: [u8; ALF_MAX_LUMA_FILTERS],
+    /// `alf_luma_fixed_filter_usage_flag[ filtIdx ]` resolved per class
+    /// (eq. 98/99 select).
+    pub alf_luma_fixed_filter_usage_flag: [bool; ALF_MAX_LUMA_FILTERS],
+    /// `alf_luma_fixed_filter_set_idx[ filtIdx ]` per class, in 0..=15.
+    /// Read only when the usage flag is 1 (eq. 98).
+    pub alf_luma_fixed_filter_set_idx: [u8; ALF_MAX_LUMA_FILTERS],
+    /// Number of luma filter classes that have non-trivial output (always
+    /// `NumAlfFilters = 25` for the derived form, kept for compatibility
+    /// with the legacy round-11 callers that selected `luma_filters[0]`).
     pub num_luma_filters: usize,
-    /// Luma filter sets; only slots `0..num_luma_filters` are valid.
+    /// `AlfCoeffL[ filtIdx ][ 0..12 ]` for `filtIdx = 0..24` per §8.9.4
+    /// eq. 96-104. Position 12 carries the eq. 104 DC offset.
     pub luma_filters: [AlfLumaFilter; ALF_MAX_LUMA_FILTERS],
-    /// Number of chroma alternate filters (1..=4).
+    /// Number of chroma alternate filters (1..=4). EVC v1 (§7.3.5) always
+    /// signals a single chroma filter; the field stays for forward
+    /// compatibility with the future per-CTU `alf_ctb_chroma_alt_idx` work.
     pub num_chroma_alts: usize,
     /// Chroma alternate filters; only slots `0..num_chroma_alts` are valid.
     pub chroma_filters: [AlfChromaFilter; ALF_MAX_CHROMA_ALTS],
@@ -140,6 +192,11 @@ impl Default for AlfData {
         Self {
             luma_filter_signal: false,
             chroma_filter_signal: false,
+            luma_type_flag: true,
+            num_signalled_luma_filters: 1,
+            alf_luma_coeff_delta_idx: [0; ALF_MAX_LUMA_FILTERS],
+            alf_luma_fixed_filter_usage_flag: [false; ALF_MAX_LUMA_FILTERS],
+            alf_luma_fixed_filter_set_idx: [0; ALF_MAX_LUMA_FILTERS],
             num_luma_filters: 1,
             luma_filters: [AlfLumaFilter::default(); ALF_MAX_LUMA_FILTERS],
             num_chroma_alts: 1,
@@ -148,48 +205,90 @@ impl Default for AlfData {
     }
 }
 
+/// §7.3.5 `coefPosMap[ ]` for `alf_luma_type_flag == 0` (eq. 90).
+/// 7-tap "small" luma filter: position 0 is the central DC tap, indices
+/// 1..6 carry the six spatial taps (mapped to `filterCoefficients[*]`).
+const COEF_POS_MAP_7: [usize; 13] = [0, 0, 1, 0, 0, 2, 3, 4, 0, 0, 5, 6, 7];
+
+/// §7.3.5 `coefPosMap[ ]` for `alf_luma_type_flag == 1` (eq. 91).
+/// 13-tap "large" luma filter — direct 1:1 mapping, all positions live.
+const COEF_POS_MAP_13: [usize; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+
+/// §7.3.5 `golombOrderIdxY[ ]` (eq. 94) — selects which `expGoOrderY[ ]`
+/// entry parses each of the 12 luma coefficient deltas.
+const GOLOMB_ORDER_IDX_Y: [usize; 12] = [0, 0, 1, 0, 0, 1, 2, 1, 0, 0, 1, 2];
+
+/// §7.3.5 (chroma) `golombOrderIdxC[ ]` — only 6 entries because chroma
+/// signals 6 abs deltas (the 7th is derived). The spec text just below the
+/// chroma table mirrors the luma `golombOrderIdxY` shape; for 5×5 chroma
+/// the index pattern is `[0, 0, 1, 0, 0, 1]` (same prefix as luma).
+const GOLOMB_ORDER_IDX_C: [usize; 6] = [0, 0, 1, 0, 0, 1];
+
+/// `LumaMaxGolombIdx` per §7.3.5 — `alf_luma_type_flag == 0` → 2, else 3.
+#[inline]
+fn luma_max_golomb_idx(type_flag: bool) -> usize {
+    if type_flag {
+        3
+    } else {
+        2
+    }
+}
+
+/// `ChromaMaxGolombIdx` per §7.3.5 — fixed at 2.
+const CHROMA_MAX_GOLOMB_IDX: usize = 2;
+
 /// Parse an `alf_data()` payload from the given byte slice.
 ///
 /// The payload begins at bit offset 8 within the APS RBSP (the 1-byte APS
 /// header covers `adaptation_parameter_set_id` and `aps_params_type`). The
 /// caller passes the APS payload bytes starting immediately after that header.
 ///
-/// Per §7.3.5 the payload for `aps_params_type == 0`:
+/// Round-120 implements the **full §7.3.5 syntax** plus the §8.9.4
+/// derivation (eq. 96-104), populating `luma_filters[ filtIdx ]` directly
+/// for `filtIdx = 0..24`. The flow:
 ///
 /// ```text
 /// alf_data() {
-///   alf_luma_filter_signal_flag          u(1)
-///   alf_chroma_filter_signal_flag        u(1)
+///   alf_luma_filter_signal_flag                              u(1)
+///   alf_chroma_filter_signal_flag                            u(1)
 ///   if (alf_luma_filter_signal_flag) {
-///     new_filter_flag[0]                 u(1)
-///     if (new_filter_flag[0]) {
-///       alf_luma_num_filters_signalled_minus1    ue(v)   // 0..24
-///       for each filter {
-///         alf_luma_coeff_flag[i]         u(1)
-///         if (alf_luma_coeff_flag[i]) {
-///           for k in 0..12 {
-///             alf_luma_coeff_abs[i][k]   u(6)
-///             if (alf_luma_coeff_abs[i][k] != 0) {
-///               alf_luma_coeff_sign[i][k]  u(1)
-///             }
-///           }
-///         }
-///       }
-///     }
+///     alf_luma_num_filters_signalled_minus1                  ue(v)   // 0..24
+///     alf_luma_type_flag                                     u(1)
+///     if (alf_luma_num_filters_signalled_minus1 > 0)
+///       for i in 0..25
+///         alf_luma_coeff_delta_idx[i]                        u(v)
+///     alf_luma_fixed_filter_usage_pattern                    uek(v) k=0
+///     if (pattern == 2)
+///       for i in 0..25
+///         alf_luma_fixed_filter_usage_flag[i]                u(1)
+///     if (pattern > 0)
+///       for i in 0..25
+///         if (alf_luma_fixed_filter_usage_flag[i])
+///           alf_luma_fixed_filter_set_idx[i]                 u(4)
+///     alf_luma_coeff_delta_flag                              u(1)
+///     if (!alf_luma_coeff_delta_flag && minus1 > 0)
+///       alf_luma_coeff_delta_prediction_flag                 u(1)
+///     alf_luma_min_eg_order_minus1                           ue(v)
+///     for i in 0..LumaMaxGolombIdx
+///       alf_luma_eg_order_increase_flag[i]                   u(1)
+///     if (alf_luma_coeff_delta_flag)
+///       for i in 0..NumSignalledFilter
+///         alf_luma_coeff_flag[i]                             u(1)
+///     for i in 0..NumSignalledFilter
+///       if (alf_luma_coeff_flag[i])
+///         for j in 0..12
+///           alf_luma_coeff_delta_abs[i][j]                   uek(v)
+///           if (alf_luma_coeff_delta_abs[i][j])
+///             alf_luma_coeff_delta_sign_flag[i][j]           u(1)
 ///   }
 ///   if (alf_chroma_filter_signal_flag) {
-///     new_filter_flag[1]                 u(1)
-///     if (new_filter_flag[1]) {
-///       alf_chroma_num_alt_filters_minus1  ue(v)  // 0..3
-///       for each alt {
-///         for k in 0..6 {
-///           alf_chroma_coeff_abs[a][k]   u(6)
-///           if (alf_chroma_coeff_abs[a][k] != 0) {
-///             alf_chroma_coeff_sign[a][k]  u(1)
-///           }
-///         }
-///       }
-///     }
+///     alf_chroma_min_eg_order_minus1                         ue(v)
+///     for i in 0..ChromaMaxGolombIdx
+///       alf_chroma_eg_order_increase_flag[i]                 u(1)
+///     for j in 0..6
+///       alf_chroma_coeff_abs[j]                              uek(v)
+///       if (alf_chroma_coeff_abs[j])
+///         alf_chroma_coeff_sign_flag[j]                      u(1)
 ///   }
 /// }
 /// ```
@@ -206,71 +305,251 @@ pub fn parse_alf_data(payload: &[u8]) -> Result<AlfData> {
     data.chroma_filter_signal = chroma_signal;
 
     if luma_signal {
-        let new_filter = br.u1()? != 0;
-        if new_filter {
-            let n_minus1 = br.ue()?;
-            if n_minus1 >= ALF_MAX_LUMA_FILTERS as u32 {
-                return Err(Error::invalid(format!(
-                    "evc alf: alf_luma_num_filters_signalled_minus1 {n_minus1} > {}",
-                    ALF_MAX_LUMA_FILTERS - 1
-                )));
-            }
-            let n = (n_minus1 + 1) as usize;
-            data.num_luma_filters = n;
-            for i in 0..n {
-                let coeff_flag = br.u1()? != 0;
-                if coeff_flag {
-                    let mut coef = [0i16; ALF_LUMA_NUM_COEF];
-                    let mut sum_abs: i32 = 0;
-                    for slot in coef.iter_mut().take(12) {
-                        let abs_val = br.u(6)? as i32;
-                        let sign_val = if abs_val != 0 { br.u1()? } else { 0 };
-                        let c = if sign_val != 0 { -abs_val } else { abs_val };
-                        *slot = c as i16;
-                        sum_abs += abs_val;
-                    }
-                    // DC offset: 128 − 2 × Σ|c[0..11]| (§8.9.4.1 eq. 1264).
-                    let dc = (128 - 2 * sum_abs).clamp(-128, 127);
-                    coef[12] = dc as i16;
-                    data.luma_filters[i] = AlfLumaFilter { coef };
+        // --- Class count + filter type --------------------------------
+        let n_minus1 = br.ue()?;
+        if n_minus1 >= ALF_MAX_LUMA_FILTERS as u32 {
+            return Err(Error::invalid(format!(
+                "evc alf: alf_luma_num_filters_signalled_minus1 {n_minus1} > {}",
+                ALF_MAX_LUMA_FILTERS - 1
+            )));
+        }
+        let num_signalled = (n_minus1 + 1) as usize; // NumSignalledFilter
+        data.num_signalled_luma_filters = num_signalled;
+        data.num_luma_filters = ALF_MAX_LUMA_FILTERS; // Eq. 1320 always yields 0..24
+
+        let type_flag = br.u1()? != 0;
+        data.luma_type_flag = type_flag;
+        let coef_pos_map: &[usize; ALF_LUMA_NUM_COEF] = if type_flag {
+            &COEF_POS_MAP_13
+        } else {
+            &COEF_POS_MAP_7
+        };
+
+        // --- alf_luma_coeff_delta_idx[ ] ------------------------------
+        if num_signalled > 1 {
+            let bits = ceil_log2(num_signalled as u32);
+            for i in 0..ALF_MAX_LUMA_FILTERS {
+                let v = br.u(bits)? as usize;
+                if v >= num_signalled {
+                    return Err(Error::invalid(format!(
+                        "evc alf: alf_luma_coeff_delta_idx[{i}] {v} >= NumSignalledFilter {num_signalled}"
+                    )));
                 }
-                // When coeff_flag == 0, all-zero taps → filter[i] stays at
-                // default (identity: DC offset 64, all others 0).
+                data.alf_luma_coeff_delta_idx[i] = v as u8;
+            }
+        } else {
+            // Inferred to 0.
+            for slot in data.alf_luma_coeff_delta_idx.iter_mut() {
+                *slot = 0;
             }
         }
+
+        // --- Fixed filter pattern + flags ------------------------------
+        let fixed_pattern = br.uek(0)?; // k=0 per §7.3.5
+        if fixed_pattern > 2 {
+            return Err(Error::invalid(format!(
+                "evc alf: alf_luma_fixed_filter_usage_pattern {fixed_pattern} out of range 0..2"
+            )));
+        }
+        if fixed_pattern == 2 {
+            for i in 0..ALF_MAX_LUMA_FILTERS {
+                data.alf_luma_fixed_filter_usage_flag[i] = br.u1()? != 0;
+            }
+        } else if fixed_pattern == 1 {
+            for slot in data.alf_luma_fixed_filter_usage_flag.iter_mut() {
+                *slot = true;
+            }
+        } // pattern == 0 → all false (default).
+        if fixed_pattern > 0 {
+            for i in 0..ALF_MAX_LUMA_FILTERS {
+                if data.alf_luma_fixed_filter_usage_flag[i] {
+                    let idx = br.u(4)?;
+                    if idx > 15 {
+                        return Err(Error::invalid(format!(
+                            "evc alf: alf_luma_fixed_filter_set_idx[{i}] {idx} > 15"
+                        )));
+                    }
+                    data.alf_luma_fixed_filter_set_idx[i] = idx as u8;
+                }
+            }
+        }
+
+        // --- coeff_delta_flag + coeff_delta_prediction_flag -----------
+        let coeff_delta_flag = br.u1()? != 0;
+        let coeff_delta_prediction_flag = if !coeff_delta_flag && num_signalled > 1 {
+            br.u1()? != 0
+        } else {
+            false
+        };
+
+        // --- expGoOrderY[ ] -------------------------------------------
+        let min_eg_order_minus1 = br.ue()?;
+        if min_eg_order_minus1 > 6 {
+            return Err(Error::invalid(format!(
+                "evc alf: alf_luma_min_eg_order_minus1 {min_eg_order_minus1} > 6"
+            )));
+        }
+        let mut k_min = min_eg_order_minus1 + 1;
+        let max_idx_y = luma_max_golomb_idx(type_flag);
+        let mut exp_go_order_y = [0u32; 3]; // upper bound LumaMaxGolombIdx ≤ 3
+        for slot in exp_go_order_y.iter_mut().take(max_idx_y) {
+            let inc = br.u1()?;
+            *slot = k_min + inc;
+            k_min = *slot;
+        }
+
+        // --- alf_luma_coeff_flag[ i ] ---------------------------------
+        let mut coeff_flag = [true; ALF_MAX_LUMA_FILTERS];
+        if coeff_delta_flag {
+            for slot in coeff_flag.iter_mut().take(num_signalled) {
+                *slot = br.u1()? != 0;
+            }
+        }
+
+        // --- alf_luma_coeff_delta_abs / sign --------------------------
+        // filterCoefficients[ i ][ j ] for i in 0..num_signalled, j in 0..NumAlfCoefs-1
+        let n_coefs = if type_flag { 12 } else { 6 };
+        let mut filter_coefficients = vec![[0i16; 12]; num_signalled];
+        for i in 0..num_signalled {
+            if !coeff_flag[i] {
+                continue;
+            }
+            for j in 0..n_coefs {
+                let order_idx = GOLOMB_ORDER_IDX_Y[j].min(max_idx_y - 1);
+                let k = exp_go_order_y[order_idx];
+                let abs_val = br.uek(k)? as i32;
+                let sign = if abs_val != 0 { br.u1()? } else { 1 };
+                // Per §7.3.5 the sign convention is the same as luma later: sign==0 → negative, ==1 → positive
+                let c = if sign == 0 { -abs_val } else { abs_val };
+                filter_coefficients[i][j] = c as i16;
+            }
+        }
+        // Eq. 97: cumulative-sum prediction across i.
+        if coeff_delta_prediction_flag {
+            for i in 1..num_signalled {
+                let prev_row = filter_coefficients[i - 1];
+                for (j, prev) in prev_row.iter().enumerate().take(n_coefs) {
+                    filter_coefficients[i][j] = filter_coefficients[i][j].saturating_add(*prev);
+                }
+            }
+        }
+
+        // --- §8.9.4 derivation eq. 96-104 (data.luma_filters[ filtIdx ]) ---
+        derive_alf_coeff_l(&mut data, &filter_coefficients, coef_pos_map, type_flag);
     }
 
     if chroma_signal {
-        let new_filter = br.u1()? != 0;
-        if new_filter {
-            let n_minus1 = br.ue()?;
-            if n_minus1 >= ALF_MAX_CHROMA_ALTS as u32 {
-                return Err(Error::invalid(format!(
-                    "evc alf: alf_chroma_num_alt_filters_minus1 {n_minus1} > {}",
-                    ALF_MAX_CHROMA_ALTS - 1
-                )));
-            }
-            let n = (n_minus1 + 1) as usize;
-            data.num_chroma_alts = n;
-            for a in 0..n {
-                let mut coef = [0i16; ALF_CHROMA_NUM_COEF];
-                let mut sum_abs: i32 = 0;
-                for slot in coef.iter_mut().take(6) {
-                    let abs_val = br.u(6)? as i32;
-                    let sign_val = if abs_val != 0 { br.u1()? } else { 0 };
-                    let c = if sign_val != 0 { -abs_val } else { abs_val };
-                    *slot = c as i16;
-                    sum_abs += abs_val;
-                }
-                // DC offset: 128 − 2 × Σ|c[0..5]| (eq. 1292).
-                let dc = (128 - 2 * sum_abs).clamp(-128, 127);
-                coef[6] = dc as i16;
-                data.chroma_filters[a] = AlfChromaFilter { coef };
-            }
+        // --- expGoOrderC[ ] -------------------------------------------
+        let min_eg_order_minus1 = br.ue()?;
+        if min_eg_order_minus1 > 6 {
+            return Err(Error::invalid(format!(
+                "evc alf: alf_chroma_min_eg_order_minus1 {min_eg_order_minus1} > 6"
+            )));
         }
+        let mut k_min = min_eg_order_minus1 + 1;
+        let mut exp_go_order_c = [0u32; CHROMA_MAX_GOLOMB_IDX];
+        for slot in exp_go_order_c.iter_mut() {
+            let inc = br.u1()?;
+            *slot = k_min + inc;
+            k_min = *slot;
+        }
+
+        // --- Single chroma alternate (EVC v1) -------------------------
+        // §7.3.5 second half does not signal `num_chroma_alts`; the
+        // syntax is a flat loop over j = 0..5 yielding one chroma filter
+        // (§8.9.4.2 eq. 109 / 110).
+        data.num_chroma_alts = 1;
+        let mut coef = [0i16; ALF_CHROMA_NUM_COEF];
+        let mut sum2: i32 = 0;
+        for (j, slot) in coef.iter_mut().enumerate().take(6) {
+            let order_idx = GOLOMB_ORDER_IDX_C[j].min(CHROMA_MAX_GOLOMB_IDX - 1);
+            let k = exp_go_order_c[order_idx];
+            let abs_val = br.uek(k)? as i32;
+            let sign = if abs_val != 0 { br.u1()? } else { 1 };
+            // §7.3.5 / eq. 109: sign == 0 → negative, sign == 1 → positive.
+            let c = if sign == 0 { -abs_val } else { abs_val };
+            *slot = c as i16;
+            sum2 += c << 1;
+        }
+        // Eq. 110: AlfCoeffC[ 6 ] = 512 − Σ AlfCoeffC[ k ] << 1.
+        let dc = (512 - sum2).clamp(-1024, 1023);
+        coef[6] = dc as i16;
+        data.chroma_filters[0] = AlfChromaFilter { coef };
     }
 
     Ok(data)
+}
+
+/// `Ceil(Log2(n))` for n >= 1. Returns 0 only when n == 1 (one-element
+/// table needs 0 bits to address).
+#[inline]
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
+}
+
+/// Derive `AlfCoeffL[ filtIdx ][ 0..12 ]` for every class (§8.9.4 eq.
+/// 96-104), writing the result into `data.luma_filters[ filtIdx ]`.
+///
+/// * eq. 98: if `alf_luma_fixed_filter_usage_flag[ filtIdx ] == 1`, seed
+///   `outCoef[ filtIdx ][ j ]` from
+///   `AlfFixFiltCoeff[ AlfClassToFiltMap[ filtIdx ][ set_idx ] ][ j ]`.
+/// * eq. 99: otherwise zero.
+/// * eq. 100: for every `j` with `coefPosMap[ j ] > 0`, add the per-class
+///   delta `filterCoefficients[ alf_luma_coeff_delta_idx[ filtIdx ] ][ coefPosMap[ j ] − 1 ]`.
+/// * eq. 101: `AlfCoeffL[ ][ j ] = outCoef[ j ]`.
+/// * eq. 104: position 12 = `512 − Σ_{k=0..11} AlfCoeffL[ ][ k ] << 1`.
+///
+/// `filter_coefficients` has shape `[NumSignalledFilter][12]`.
+fn derive_alf_coeff_l(
+    data: &mut AlfData,
+    filter_coefficients: &[[i16; 12]],
+    coef_pos_map: &[usize; ALF_LUMA_NUM_COEF],
+    type_flag: bool,
+) {
+    for (filt_idx, class_row) in ALF_CLASS_TO_FILT_MAP
+        .iter()
+        .enumerate()
+        .take(ALF_MAX_LUMA_FILTERS)
+    {
+        let mut out_coef = [0i32; ALF_LUMA_NUM_COEF];
+        // eq. 98 / 99 seed.
+        if data.alf_luma_fixed_filter_usage_flag[filt_idx] {
+            let set_idx = data.alf_luma_fixed_filter_set_idx[filt_idx] as usize;
+            let fix_row = class_row[set_idx] as usize;
+            for (j, slot) in out_coef.iter_mut().enumerate().take(12) {
+                *slot = ALF_FIX_FILT_COEFF[fix_row][j] as i32;
+            }
+        }
+        // eq. 100 — add per-class deltas at coefPosMap positions.
+        let signalled = data.alf_luma_coeff_delta_idx[filt_idx] as usize;
+        if signalled < filter_coefficients.len() {
+            for (j, &pos) in coef_pos_map.iter().enumerate().take(12) {
+                if pos > 0 {
+                    let delta = filter_coefficients[signalled][pos - 1] as i32;
+                    out_coef[j] += delta;
+                }
+            }
+        }
+        // eq. 101 — clamp to spec range −2^9 .. 2^9 - 1 for j = 0..11.
+        let mut coef = [0i16; ALF_LUMA_NUM_COEF];
+        for (j, slot) in coef.iter_mut().enumerate().take(12) {
+            *slot = out_coef[j].clamp(-512, 511) as i16;
+        }
+        // eq. 104 — position 12 = 512 − 2 × Σ coef[0..11].
+        let sum2: i32 = coef.iter().take(12).map(|c| (*c as i32) << 1).sum();
+        let dc = (512 - sum2).clamp(-1024, 1023);
+        coef[12] = dc as i16;
+        data.luma_filters[filt_idx] = AlfLumaFilter { coef };
+        // For the 7-tap form some `coefPosMap` entries are 0 (no spatial
+        // contribution); eq. 99 ensures those slots stay at the fixed-filter
+        // seed (or 0 if no fixed filter), so no special handling is needed
+        // beyond the eq. 100 guard above.
+        let _ = type_flag; // currently unused outside parser
+    }
 }
 
 // =====================================================================
@@ -336,24 +615,19 @@ static LUMA_TAPS_SYM: [(i32, i32); 12] = [
 static CHROMA_TAPS: [(i32, i32); 6] = [(-2, 0), (-1, -1), (-1, 0), (0, -2), (0, -1), (1, -1)];
 static CHROMA_TAPS_SYM: [(i32, i32); 6] = [(2, 0), (1, 1), (1, 0), (0, 2), (0, 1), (-1, 1)];
 
-/// Apply the ALF luma filter to the entire Y plane, writing results back
-/// in-place. To avoid data-dependency from simultaneous read+write of the
-/// same buffer, we clone the input plane first.
+/// Apply the ALF luma filter to the entire Y plane per §8.8.4.2 eq.
+/// 1286-1288 (whole-plane, no per-sample classification). Writes results
+/// back in-place against a pre-filter snapshot.
 ///
-/// The filter equation (eq. 1263) for each (x, y):
-///
-/// ```text
-/// filtered = Clip3(0, (1<<bd)-1,
-///     c[12] + Σ_{k=0}^{11} c[k] * (s[tap[k]] + s[tap_sym[k]]))
-///   >> 7
-/// ```
-///
-/// where `s[...]` reads from the pre-filter copy.
+/// Round-120 update: now uses the spec scaling (sum + 256) >> 9 with
+/// `coef[12]` multiplying the centre sample (`recPicture[x, y]`) rather
+/// than the legacy `(sum + 64) >> 7` constant-DC approximation. Filter
+/// coefficients are expected in the §8.9.4 eq. 101 / eq. 104 range —
+/// i.e. those returned by [`parse_alf_data`].
 pub fn apply_alf_luma(pic: &mut YuvPicture, filter: &AlfLumaFilter, bit_depth: u32) {
     let w = pic.width as usize;
     let h = pic.height as usize;
     let stride = pic.y_stride();
-    // Clone the pre-filter luma.
     let src = pic.y.clone();
     let max_val = ((1u32 << bit_depth) - 1) as i32;
 
@@ -362,7 +636,7 @@ pub fn apply_alf_luma(pic: &mut YuvPicture, filter: &AlfLumaFilter, bit_depth: u
             let x = col as i32;
             let y = row as i32;
             let coef = &filter.coef;
-            let mut acc: i32 = coef[12] as i32;
+            let mut sum: i32 = 0;
             for k in 0..12 {
                 let (dy0, dx0) = LUMA_TAPS[k];
                 let (dy1, dx1) = LUMA_TAPS_SYM[k];
@@ -376,26 +650,20 @@ pub fn apply_alf_luma(pic: &mut YuvPicture, filter: &AlfLumaFilter, bit_depth: u
                     let yc = (y + dy1).clamp(0, h as i32 - 1) as usize;
                     src[yc * stride + xc] as i32
                 };
-                acc += coef[k] as i32 * (s0 + s1);
+                sum += coef[k] as i32 * (s0 + s1);
             }
-            // DC offset is c[12]; the sum accumulates samples weighted by
-            // c[0..11] × 2. Per eq. 1263 the final output is
-            // Clip3(0, maxVal, (acc + 64) >> 7).
-            let out = ((acc + 64) >> 7).clamp(0, max_val);
+            // Eq. 1286: filterCoeff[12] * recPicture[x, y].
+            sum += coef[12] as i32 * src[row * stride + col] as i32;
+            // Eq. 1287/1288: (sum + 256) >> 9, clipped to bit-depth.
+            let out = ((sum + 256) >> 9).clamp(0, max_val);
             pic.y[row * stride + col] = out as u8;
         }
     }
 }
 
 /// Apply the ALF chroma filter to one chroma plane (`c_idx` 1 = Cb, 2 = Cr).
-/// Same approach as luma: snapshot the source, then write filtered values.
-///
-/// Equation (eq. 1290):
-///
-/// ```text
-/// filtered = Clip3(0, (1<<bd)-1,
-///     c[6] + Σ_{k=0}^{5} c[k] * (s[tap[k]] + s[tap_sym[k]])) >> 7
-/// ```
+/// Round-120 uses the spec scaling per §8.8.4.4: `(sum + 256) >> 9` with
+/// `coef[6]` (`AlfCoeffC[6]` per eq. 110) multiplying the centre sample.
 pub fn apply_alf_chroma(
     pic: &mut YuvPicture,
     filter: &AlfChromaFilter,
@@ -424,7 +692,7 @@ pub fn apply_alf_chroma(
             let x = col as i32;
             let y = row as i32;
             let coef = &filter.coef;
-            let mut acc: i32 = coef[6] as i32;
+            let mut sum: i32 = 0;
             for k in 0..6 {
                 let (dy0, dx0) = CHROMA_TAPS[k];
                 let (dy1, dx1) = CHROMA_TAPS_SYM[k];
@@ -438,9 +706,10 @@ pub fn apply_alf_chroma(
                     let yc = (y + dy1).clamp(0, ch as i32 - 1) as usize;
                     plane[yc * stride + xc] as i32
                 };
-                acc += coef[k] as i32 * (s0 + s1);
+                sum += coef[k] as i32 * (s0 + s1);
             }
-            let out = ((acc + 64) >> 7).clamp(0, max_val);
+            sum += coef[6] as i32 * plane[row * stride + col] as i32;
+            let out = ((sum + 256) >> 9).clamp(0, max_val);
             dst[row * stride + col] = out as u8;
         }
     }
@@ -566,7 +835,7 @@ pub fn apply_alf_luma_masked(
                 for col in x0..x1 {
                     let x = col as i32;
                     let y = row as i32;
-                    let mut acc: i32 = coef[12] as i32;
+                    let mut sum: i32 = 0;
                     for k in 0..12 {
                         let (dy0, dx0) = LUMA_TAPS[k];
                         let (dy1, dx1) = LUMA_TAPS_SYM[k];
@@ -580,9 +849,10 @@ pub fn apply_alf_luma_masked(
                             let yc = (y + dy1).clamp(0, h as i32 - 1) as usize;
                             src[yc * stride + xc] as i32
                         };
-                        acc += coef[k] as i32 * (s0 + s1);
+                        sum += coef[k] as i32 * (s0 + s1);
                     }
-                    let out = ((acc + 64) >> 7).clamp(0, max_val);
+                    sum += coef[12] as i32 * src[row * stride + col] as i32;
+                    let out = ((sum + 256) >> 9).clamp(0, max_val);
                     pic.y[row * stride + col] = out as u8;
                 }
             }
@@ -847,6 +1117,121 @@ pub fn derive_alf_classification(
     }
 }
 
+/// Apply the §8.8.4.2 spec luma filtering loop (eq. 1281-1288) to a single
+/// coding tree block at `(x_ctb, y_ctb)` of size `blk_width × blk_height`,
+/// driving the per-sample filter selection from the `AlfCoeffL[ filtIdx ]`
+/// derivation in `alf.luma_filters` and from the per-sample `filtIdx` /
+/// `transposeIdx` arrays in `classification`. Writes results into `pic.y`
+/// against a snapshot of the pre-ALF plane.
+///
+/// This is the closed-loop §8.9.4 + §8.8.4.2 + §8.8.4.3 wiring round-120
+/// adds: until now the apply used `alf.luma_filters[0]` uniformly across
+/// the whole CTB and ignored the per-sample classification. The new path
+/// (1) selects `f[ j ] = AlfCoeffL[ filtIdx[x][y] ][ j ]` per eq. 1281,
+/// (2) permutes to `filterCoeff[ ]` per `transposeIdx` per eq. 1282-1285,
+/// (3) accumulates `sum` per eq. 1286 (north/south arm symmetric pairs +
+/// `coef[12] * recPicture[x, y]`), and (4) clips per eq. 1287/1288.
+///
+/// `bit_depth` is `BitDepthY`. The picture-edge clamp on the tap reads
+/// matches the §8.8.4.5 boundary-padding process.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_alf_luma_classified(
+    pic: &mut YuvPicture,
+    alf: &AlfData,
+    classification: &AlfClassification,
+    x_ctb: usize,
+    y_ctb: usize,
+    bit_depth: u32,
+) {
+    let w = pic.width as usize;
+    let h = pic.height as usize;
+    let stride = pic.y_stride();
+    let src = pic.y.clone();
+    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let blk_w = classification.blk_width;
+    let blk_h = classification.blk_height;
+
+    for y in 0..blk_h {
+        for x in 0..blk_w {
+            let px = x_ctb + x;
+            let py = y_ctb + y;
+            if px >= w || py >= h {
+                continue;
+            }
+            let filt_idx = classification.filt_idx_at(x, y) as usize;
+            let transpose_idx = classification.transpose_idx_at(x, y);
+            // Eq. 1281: f[j] = AlfCoeffL[ apsId ][ filtIdx[ x ][ y ] ][ j ].
+            let f = alf.luma_filters[filt_idx].coef;
+            // Eq. 1282-1285: per-transpose permutation.
+            let coef = transpose_luma_coeffs(&f, transpose_idx);
+
+            // Eq. 1286: sum = Σ filterCoeff[k] * (north + south) +
+            //                 filterCoeff[12] * recPicture[x, y].
+            let mut sum: i32 = 0;
+            for k in 0..12 {
+                let (dy0, dx0) = LUMA_TAPS[k];
+                let (dy1, dx1) = LUMA_TAPS_SYM[k];
+                let s0 = {
+                    let xc = (px as i32 + dx0).clamp(0, w as i32 - 1) as usize;
+                    let yc = (py as i32 + dy0).clamp(0, h as i32 - 1) as usize;
+                    src[yc * stride + xc] as i32
+                };
+                let s1 = {
+                    let xc = (px as i32 + dx1).clamp(0, w as i32 - 1) as usize;
+                    let yc = (py as i32 + dy1).clamp(0, h as i32 - 1) as usize;
+                    src[yc * stride + xc] as i32
+                };
+                sum += coef[k] as i32 * (s0 + s1);
+            }
+            sum += coef[12] as i32 * src[py * stride + px] as i32;
+            // Eq. 1287/1288: clip ((sum + 256) >> 9).
+            let out = ((sum + 256) >> 9).clamp(0, max_val);
+            pic.y[py * stride + px] = out as u8;
+        }
+    }
+}
+
+/// Apply the per-sample classified §8.8.4.2 luma filter to every CTB whose
+/// `alf_ctb_flag` is 1 in `map`, deriving the §8.8.4.3 classification per
+/// CTB and looking up the §8.9.4-derived per-class filter from `alf`.
+///
+/// Snapshots the whole plane up front so a filtered CTB's edge taps still
+/// read unfiltered neighbours, mirroring [`apply_alf_luma_masked`].
+pub fn apply_alf_luma_classified_masked(
+    pic: &mut YuvPicture,
+    alf: &AlfData,
+    map: &AlfCtbMap,
+    bit_depth: u32,
+) {
+    let w = pic.width as usize;
+    let h = pic.height as usize;
+    let ctb_size = 1usize << map.ctb_log2_size_y;
+    for ry in 0..map.ctbs_high as usize {
+        for rx in 0..map.ctbs_wide as usize {
+            let idx = ry * map.ctbs_wide as usize + rx;
+            if !map.luma.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let x_ctb = rx * ctb_size;
+            let y_ctb = ry * ctb_size;
+            let bw = (x_ctb + ctb_size).min(w) - x_ctb;
+            let bh = (y_ctb + ctb_size).min(h) - y_ctb;
+            let cls = derive_alf_classification(
+                &pic.y,
+                pic.y_stride(),
+                w,
+                h,
+                x_ctb,
+                y_ctb,
+                bw,
+                bh,
+                bit_depth,
+            );
+            apply_alf_luma_classified(pic, alf, &cls, x_ctb, y_ctb, bit_depth);
+        }
+    }
+}
+
 /// Apply the §8.8.4.2 transpose permutation (eq. 1282-1285) to a 13-tap luma
 /// filter `f[0..12]`, selecting the arrangement that the sample's
 /// `transposeIdx` requests. `transpose_idx == 0` returns `f` unchanged
@@ -882,22 +1267,103 @@ mod tests {
     use super::*;
     use crate::sps::tests::BitEmitter;
 
-    fn emit_minimal_alf_data(luma_signal: bool, chroma_signal: bool) -> Vec<u8> {
+    /// Emit a spec-faithful §7.3.5 ALF APS payload for `num_signalled` luma
+    /// filter classes. Each per-tap value is encoded as uek(v) with the
+    /// shared `expGoOrderY` derived from `eg_min` + `eg_inc[ ]`.
+    ///
+    /// `tap_values[ i ][ j ]` is the desired signed value of
+    /// `filterCoefficients[ i ][ j ]` for `i = 0..num_signalled` and
+    /// `j = 0..n_coefs − 1`. The emitter uses `alf_luma_coeff_delta_flag = 0`
+    /// (so all classes are signalled with `alf_luma_coeff_flag = 1` inferred)
+    /// and `alf_luma_fixed_filter_usage_pattern = 0`, plus
+    /// `alf_luma_coeff_delta_idx = identity` when num_signalled == 25
+    /// (otherwise inferred to 0).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_spec_alf_data(
+        luma_signal: bool,
+        type_flag: bool,
+        num_signalled: usize,
+        tap_values: &[Vec<i32>],
+        chroma_signal: bool,
+        chroma_taps: &[i32; 6],
+        chroma_eg_min: u32,
+        chroma_eg_inc: [u32; 2],
+        luma_eg_min: u32,
+        luma_eg_inc: &[u32], // length = LumaMaxGolombIdx
+    ) -> Vec<u8> {
         let mut e = BitEmitter::new();
         e.u(1, if luma_signal { 1 } else { 0 });
         e.u(1, if chroma_signal { 1 } else { 0 });
         if luma_signal {
-            e.u(1, 1); // new_filter_flag[0]
-            e.ue(0); // num_filters_minus1 → 1 filter
-                     // filter 0: coeff_flag = 0 (all-zero → identity)
+            assert!((1..=25).contains(&num_signalled));
+            e.ue((num_signalled - 1) as u32);
+            e.u(1, if type_flag { 1 } else { 0 });
+            if num_signalled > 1 {
+                // alf_luma_coeff_delta_idx[0..25] — identity (i → i.min(num−1)).
+                let bits = ceil_log2(num_signalled as u32);
+                for i in 0..25 {
+                    let v = (i as u32).min((num_signalled - 1) as u32);
+                    e.u(bits, v);
+                }
+            }
+            // alf_luma_fixed_filter_usage_pattern = 0 (uek(v) k=0).
+            e.uek(0, 0);
+            // coeff_delta_flag = 0 (so all coeff_flag[i] are inferred 1).
             e.u(1, 0);
+            // coeff_delta_prediction_flag = 0 when minus1 > 0, else not signalled.
+            if num_signalled > 1 {
+                e.u(1, 0);
+            }
+            // alf_luma_min_eg_order_minus1 + per-idx increase flags.
+            assert!(luma_eg_min <= 6);
+            e.ue(luma_eg_min);
+            assert_eq!(luma_eg_inc.len(), luma_max_golomb_idx(type_flag));
+            for &inc in luma_eg_inc.iter() {
+                e.u(1, inc);
+            }
+            // Compute the actual expGoOrderY chain to encode tap values.
+            let max_idx_y = luma_max_golomb_idx(type_flag);
+            let mut exp_go_order_y = [0u32; 3];
+            let mut k_min = luma_eg_min + 1;
+            for (i, slot) in exp_go_order_y.iter_mut().take(max_idx_y).enumerate() {
+                *slot = k_min + luma_eg_inc[i];
+                k_min = *slot;
+            }
+            let n_coefs = if type_flag { 12 } else { 6 };
+            for row in tap_values.iter().take(num_signalled) {
+                for j in 0..n_coefs {
+                    let order_idx = GOLOMB_ORDER_IDX_Y[j].min(max_idx_y - 1);
+                    let k = exp_go_order_y[order_idx];
+                    let v = row[j];
+                    let abs_val = v.unsigned_abs();
+                    e.uek(k, abs_val);
+                    if abs_val != 0 {
+                        // sign convention: 0 → negative, 1 → positive (per parser).
+                        e.u(1, if v >= 0 { 1 } else { 0 });
+                    }
+                }
+            }
         }
         if chroma_signal {
-            e.u(1, 1); // new_filter_flag[1]
-            e.ue(0); // num_alts_minus1 → 1 alt
-                     // alt 0: all-zero coefficients
-            for _ in 0..6 {
-                e.u(6, 0); // abs = 0 → no sign bit
+            e.ue(chroma_eg_min);
+            for &inc in chroma_eg_inc.iter() {
+                e.u(1, inc);
+            }
+            // Recompute the chroma EG chain.
+            let mut k_min = chroma_eg_min + 1;
+            let mut exp_go_order_c = [0u32; CHROMA_MAX_GOLOMB_IDX];
+            for (i, slot) in exp_go_order_c.iter_mut().enumerate() {
+                *slot = k_min + chroma_eg_inc[i];
+                k_min = *slot;
+            }
+            for (j, &v) in chroma_taps.iter().enumerate().take(6) {
+                let order_idx = GOLOMB_ORDER_IDX_C[j].min(CHROMA_MAX_GOLOMB_IDX - 1);
+                let k = exp_go_order_c[order_idx];
+                let abs_val = v.unsigned_abs();
+                e.uek(k, abs_val);
+                if abs_val != 0 {
+                    e.u(1, if v >= 0 { 1 } else { 0 });
+                }
             }
         }
         e.finish_with_trailing_bits();
@@ -906,67 +1372,77 @@ mod tests {
 
     #[test]
     fn parse_alf_data_luma_only_identity() {
-        let payload = emit_minimal_alf_data(true, false);
+        // One signalled class, all taps 0 → fixed-filter contribution 0
+        // (pattern 0) + zero deltas → every AlfCoeffL[ filtIdx ] is all-zero
+        // spatial taps with DC offset = 512 (eq. 104).
+        let taps = vec![vec![0i32; 12]];
+        let payload = emit_spec_alf_data(
+            true,
+            true,
+            1,
+            &taps,
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0, 0],
+        );
         let alf = parse_alf_data(&payload).unwrap();
         assert!(alf.luma_filter_signal);
         assert!(!alf.chroma_filter_signal);
-        assert_eq!(alf.num_luma_filters, 1);
-        // Identity filter: all taps 0, DC=64 (from default since coeff_flag=0)
-        // Wait: when coeff_flag=0, the filter stays at the AlfLumaFilter::default().
-        // default has coef[12]=64. But our round-11 `coeff_flag=0` path doesn't write coef[12]=64.
-        // Actually the spec says: if coeff_flag=0, the filter is all-zero which is not
-        // the spec's "no modification" — let's check the spec again.
-        // §7.3.5: "If alf_luma_coeff_flag[i] is equal to 0, each alf_luma_coeff_abs[i][k] is inferred to be 0."
-        // So all-zero means DC = 128 - 0 = 128, not 64. Let's compute: sum_abs=0 → dc=128.
-        // Our default has dc=64 but the spec infers dc=128 when coeff_flag=0.
-        // However per eq. 1263 the filter is: Clip((128 + Σ c[k]*(...)) >> 7)
-        // = Clip(128 >> 7) = Clip(1). That would output 1 for every pixel — clearly wrong.
-        // Re-reading §8.9.4.1 eq. 1264: dc = 128 - 2*Σ|c[0..11]|
-        // With all c[k]=0, dc=128. Then filtered = (128 + 0) >> 7 = 1.
-        // That seems like it preserves a value of 128/2. But the output pixel would be 1.
-        // Actually looking more carefully at the spec:
-        // eq. 1263: filtSamp = Clip3(0, (1<<bdY)-1, Σ_{k=0..11} c[k]*(s0+s1) + c[12])
-        //                     followed by filtSamp = (filtSamp + 64) >> 7
-        // So with all c[k]=0 and c[12]=128: filtSamp = 128, then (128 + 64) >> 7 = 1. Bad.
-        // This suggests coeff_flag=0 is NOT the identity — it's a broken filter.
-        // More likely: the APS identity filter has coeff_flag=1 with all abs=0 set.
-        // OR: the actual alf_data says these filters are per-picture, not resettable to identity.
-        // The spec handles this via alf_ctb_flag=0 disabling the filter per CTU.
-        // When coeff_flag=0, the filter is all-zero → dc = 128 → badly scaled output.
-        // This test just checks that parsing succeeds.
-        assert!(alf.luma_filters[0].coef[12] != 0); // DC offset is not zero
+        assert_eq!(alf.num_signalled_luma_filters, 1);
+        assert!(alf.luma_type_flag);
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            for j in 0..12 {
+                assert_eq!(
+                    alf.luma_filters[filt_idx].coef[j], 0,
+                    "tap {j} of class {filt_idx} must be zero (no fixed, no delta)"
+                );
+            }
+            // eq. 104: DC = 512 − 0 = 512.
+            assert_eq!(alf.luma_filters[filt_idx].coef[12], 512);
+        }
     }
 
     #[test]
     fn parse_alf_data_luma_with_coeffs() {
-        let mut e = BitEmitter::new();
-        e.u(1, 1); // luma_signal
-        e.u(1, 0); // no chroma
-        e.u(1, 1); // new_filter_flag[0]
-        e.ue(0); // 1 filter
-        e.u(1, 1); // coeff_flag[0] = 1 (explicit coefficients)
-                   // Set coef[0] = +3: abs=3, sign=0 (positive)
-        e.u(6, 3);
-        e.u(1, 0); // sign = 0 → positive
-                   // remaining 11 taps: abs=0
-        for _ in 0..11 {
-            e.u(6, 0);
-        }
-        e.finish_with_trailing_bits();
-        let payload = e.into_bytes();
+        // Single signalled class with tap 0 = +3. Every class maps to this
+        // single filter (alf_luma_coeff_delta_idx inferred 0), so every
+        // AlfCoeffL[ filtIdx ][ 0 ] = 3 and DC = 512 − 2 × 3 = 506.
+        let mut taps = vec![0i32; 12];
+        taps[0] = 3;
+        let payload = emit_spec_alf_data(
+            true,
+            true,
+            1,
+            &[taps],
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0, 0],
+        );
         let alf = parse_alf_data(&payload).unwrap();
-        assert_eq!(alf.luma_filters[0].coef[0], 3);
-        // DC offset: 128 - 2*3 = 122
-        assert_eq!(alf.luma_filters[0].coef[12], 122);
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            assert_eq!(alf.luma_filters[filt_idx].coef[0], 3);
+            assert_eq!(alf.luma_filters[filt_idx].coef[12], 506);
+        }
     }
 
     #[test]
     fn parse_alf_data_chroma_only() {
-        let payload = emit_minimal_alf_data(false, true);
+        let payload = emit_spec_alf_data(false, true, 0, &[], true, &[0; 6], 0, [0; 2], 0, &[]);
         let alf = parse_alf_data(&payload).unwrap();
         assert!(!alf.luma_filter_signal);
         assert!(alf.chroma_filter_signal);
         assert_eq!(alf.num_chroma_alts, 1);
+        // All-zero chroma taps → DC = 512 − 0 = 512 (eq. 110).
+        assert_eq!(alf.chroma_filters[0].coef[6], 512);
+        for j in 0..6 {
+            assert_eq!(alf.chroma_filters[0].coef[j], 0);
+        }
     }
 
     #[test]
@@ -979,57 +1455,43 @@ mod tests {
         let mut e = BitEmitter::new();
         e.u(1, 1); // luma_signal
         e.u(1, 0);
-        e.u(1, 1); // new_filter_flag
-        e.ue(25); // 26 filters — out of range (max 25)
+        e.ue(25); // num_signalled_minus1 = 25 → 26 filters (out of range)
         e.finish_with_trailing_bits();
         assert!(parse_alf_data(&e.into_bytes()).is_err());
     }
 
     #[test]
     fn alf_luma_filter_dc_is_identity_on_uniform_picture() {
-        // Build a 16×16 grey picture, apply an all-zero luma filter (dc=128).
-        // After filtering: each pixel = (128 + 64) >> 7 = 1, which is not
-        // identity. But with coef explicitly set to passthrough values,
-        // output should match input for a flat signal if the DC term is 64.
-        // We test: a filter with dc=64 applied to a grey picture stays grey.
+        // Round-120 spec semantics (eq. 1286/1287):
+        //   sum = coef[12] * recPicture[x,y] + Σ coef[k] * (s0 + s1)
+        //   out = clip3(0, max, (sum + 256) >> 9)
+        //
+        // On a flat picture filled with value V and all spatial taps 0,
+        // the "approximate identity" filter has coef[12] = 512 because
+        // (512 * V + 256) >> 9 ≈ V (exact when V is small / clipped).
         let mut pic = crate::picture::YuvPicture::new(16, 16, 1, 8).unwrap();
-        // Fill Y with 100.
         for v in pic.y.iter_mut() {
             *v = 100;
         }
-        // Manually construct a filter with all spatial taps = 0 and dc = 64.
-        // eq. 1263: (64 + 0) >> 7 = 0. Hmm, (64+64)/128 = 1.
-        // Actually: the accumulator starts at dc = coef[12], then adds the
-        // spatial convolution. After that it does (acc + 64) >> 7.
-        // For a flat image, all tap pairs are equal: s0 = s1 = 100.
-        // acc = dc + Σ c[k]*(100+100) = dc + 200*Σ c[k].
-        // For Σ c[k]=0 (all spatial zero) and dc=64: acc=64. (64+64)/128 = 1.
-        // For dc = 128: (128+64)/128 = 1 (after >>7). Still 1.
-        // For a "true identity" we'd need: (sample*128 + 64) >> 7 = sample.
-        // This requires the filter to reconstruct the original sample exactly.
-        // The ALF is not a no-op filter by design — it's a smoothing filter.
-        // The test just verifies the filter applies without panicking.
         let filter = AlfLumaFilter {
-            coef: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64],
+            coef: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 512],
         };
         apply_alf_luma(&mut pic, &filter, 8);
-        // With dc=64 and all spatial taps=0, all pixels become (64+64)>>7 = 1.
-        // Just check the filter ran without error (no assertion on exact values
-        // since ALF is a lossy filter). All output values are valid u8 by
-        // construction (clipped in the filter).
-        let _ = &pic.y; // verify buffer is still accessible
+        // (512 * 100 + 256) >> 9 = (51200 + 256) >> 9 = 51456 >> 9 = 100.
+        for v in pic.y.iter() {
+            assert_eq!(*v, 100, "DC = 512 must be the spec identity");
+        }
     }
 
     #[test]
     fn alf_luma_filter_sum_check() {
-        // A filter with coef[k]=0 for k<12 and coef[12]=128 applied to an
-        // all-100 picture should output (128+64)>>7 = 1 uniformly.
+        // All-zero filter (every coef incl. centre is 0) maps every sample
+        // to (0 + 256) >> 9 = 0.
         let mut pic = crate::picture::YuvPicture::new(8, 8, 0, 8).unwrap();
         for v in pic.y.iter_mut() {
             *v = 100;
         }
         let filter = AlfLumaFilter { coef: [0; 13] };
-        // coef[12] = 0 → acc = 0. output = (0+64)>>7 = 0.
         apply_alf_luma(&mut pic, &filter, 8);
         for v in pic.y.iter() {
             assert_eq!(*v, 0);
@@ -1038,15 +1500,17 @@ mod tests {
 
     #[test]
     fn alf_chroma_filter_applies_without_panic() {
+        // Round-120: spec scale (sum + 256) >> 9 with coef[6] multiplying
+        // the centre sample. For V = 128 and coef = [0,0,0,0,0,0,4]:
+        // (4 * 128 + 256) >> 9 = 768 >> 9 = 1.
         let mut pic = crate::picture::YuvPicture::new(16, 16, 1, 8).unwrap();
         for v in pic.cb.iter_mut() {
             *v = 128;
         }
         let filter = AlfChromaFilter {
-            coef: [0, 0, 0, 0, 0, 0, 64],
+            coef: [0, 0, 0, 0, 0, 0, 4],
         };
         apply_alf_chroma(&mut pic, &filter, 1, 8);
-        // (64+64)>>7 = 1 for every pixel.
         for v in pic.cb.iter() {
             assert_eq!(*v, 1);
         }
@@ -1072,36 +1536,39 @@ mod tests {
 
     #[test]
     fn parse_alf_negative_coeff_sign() {
-        let mut e = BitEmitter::new();
-        e.u(1, 1); // luma_signal
-        e.u(1, 0);
-        e.u(1, 1); // new_filter_flag
-        e.ue(0); // 1 filter
-        e.u(1, 1); // coeff_flag
-                   // coef[0] = -5: abs=5, sign=1
-        e.u(6, 5);
-        e.u(1, 1);
-        // rest = 0
-        for _ in 0..11 {
-            e.u(6, 0);
-        }
-        e.finish_with_trailing_bits();
-        let alf = parse_alf_data(&e.into_bytes()).unwrap();
+        // tap 0 = -5: sign bit = 0 (negative), abs = 5.
+        let mut taps = vec![0i32; 12];
+        taps[0] = -5;
+        let payload = emit_spec_alf_data(
+            true,
+            true,
+            1,
+            &[taps],
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0, 0],
+        );
+        let alf = parse_alf_data(&payload).unwrap();
         assert_eq!(alf.luma_filters[0].coef[0], -5);
-        // DC: 128 - 2*5 = 118
-        assert_eq!(alf.luma_filters[0].coef[12], 118);
+        // eq. 104: DC = 512 − 2*(-5) = 522.
+        assert_eq!(alf.luma_filters[0].coef[12], 522);
     }
 
     // =================================================================
     // Round 113: per-CTB ALF apply-masking (§8.9 / §7.3.8.2).
     // =================================================================
 
-    /// A constant filter that maps every sample (under boundary clamping on
-    /// a uniform plane) to a fixed value: coef[12] = 256, all taps 0 →
-    /// output = (256 + 64) >> 7 = 2. Distinct from the reconstructed fill.
+    /// A "spec-scaled" const filter that maps every uniform-V luma sample
+    /// to a fixed output. With round-120 semantics (eq. 1286/1287):
+    ///   out = clip((coef[12] * V + 256) >> 9).
+    /// For V = 100 and coef[12] = 10 → (1000 + 256) >> 9 = 1256 >> 9 = 2.
+    /// Distinct from the reconstructed fill value (100).
     fn const_filter_to_two() -> AlfLumaFilter {
         let mut coef = [0i16; ALF_LUMA_NUM_COEF];
-        coef[12] = 256;
+        coef[12] = 10;
         AlfLumaFilter { coef }
     }
 
@@ -1232,8 +1699,9 @@ mod tests {
             num_chroma_alts: 1,
             ..AlfData::default()
         };
-        // coef[6] = 64 → (64 + 64) >> 7 = 1 for a uniform plane.
-        alf.chroma_filters[0].coef = [0, 0, 0, 0, 0, 0, 64];
+        // Spec eq. 1286-style chroma: coef[6] = 4, V = 128 →
+        // (4 * 128 + 256) >> 9 = 768 >> 9 = 1 for a uniform plane.
+        alf.chroma_filters[0].coef = [0, 0, 0, 0, 0, 0, 4];
         let map = AlfCtbMap::new(16, 16, 5);
         apply_alf_with_map(&mut pic, &alf, &map, true, false, 8, 8);
         assert!(pic.cb.iter().all(|&v| v == 1), "Cb filtered (enabled)");
@@ -1511,5 +1979,420 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =================================================================
+    // Round 120: §7.3.5 spec-faithful parser + §8.9.4 AlfCoeffL +
+    // §8.8.4.2 classified apply wiring.
+    // =================================================================
+
+    #[test]
+    fn ceil_log2_boundary_values() {
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+        assert_eq!(ceil_log2(3), 2);
+        assert_eq!(ceil_log2(4), 2);
+        assert_eq!(ceil_log2(5), 3);
+        assert_eq!(ceil_log2(8), 3);
+        assert_eq!(ceil_log2(25), 5);
+    }
+
+    #[test]
+    fn round120_parse_uses_alf_luma_type_flag_seven_tap() {
+        // alf_luma_type_flag == 0 → NumAlfCoefs = 7, only 6 deltas signalled
+        // and coefPosMap = COEF_POS_MAP_7. With one signalled class, no
+        // fixed filter, all deltas 0: every AlfCoeffL[ filtIdx ] is all-zero
+        // spatial taps with DC = 512.
+        let payload = emit_spec_alf_data(
+            true,
+            false, // type_flag = 0 → 7-tap
+            1,
+            &[vec![0i32; 12]],
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0], // LumaMaxGolombIdx = 2
+        );
+        let alf = parse_alf_data(&payload).unwrap();
+        assert!(!alf.luma_type_flag);
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            for j in 0..12 {
+                assert_eq!(alf.luma_filters[filt_idx].coef[j], 0);
+            }
+            assert_eq!(alf.luma_filters[filt_idx].coef[12], 512);
+        }
+    }
+
+    #[test]
+    fn round120_alf_luma_coeff_delta_idx_routes_classes_to_filters() {
+        // 2 signalled filters, alf_luma_coeff_delta_idx identity-mapped
+        // i.e. class 0 → filter 0, class 1 → filter 1, classes 2..24 → filter
+        // 1 (clamped). Filter 0 has tap 0 = 7; filter 1 has tap 0 = -3.
+        let mut taps0 = vec![0i32; 12];
+        taps0[0] = 7;
+        let mut taps1 = vec![0i32; 12];
+        taps1[0] = -3;
+        let payload = emit_spec_alf_data(
+            true,
+            true,
+            2,
+            &[taps0, taps1],
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0, 0],
+        );
+        let alf = parse_alf_data(&payload).unwrap();
+        assert_eq!(alf.num_signalled_luma_filters, 2);
+        assert_eq!(alf.alf_luma_coeff_delta_idx[0], 0);
+        assert_eq!(alf.alf_luma_coeff_delta_idx[1], 1);
+        // Identity mapping in the emitter clamps to (num_signalled - 1) = 1
+        // for filt_idx >= 2.
+        assert_eq!(alf.alf_luma_coeff_delta_idx[2], 1);
+        // Class 0 → filter 0: AlfCoeffL[0][0] = 7, DC = 512 − 14 = 498.
+        assert_eq!(alf.luma_filters[0].coef[0], 7);
+        assert_eq!(alf.luma_filters[0].coef[12], 498);
+        // Class 1 → filter 1: AlfCoeffL[1][0] = -3, DC = 512 − (−6) = 518.
+        assert_eq!(alf.luma_filters[1].coef[0], -3);
+        assert_eq!(alf.luma_filters[1].coef[12], 518);
+    }
+
+    #[test]
+    fn round120_fixed_filter_pattern1_seeds_every_class() {
+        // alf_luma_fixed_filter_usage_pattern = 1 means every class uses
+        // the fixed filter. With set_idx = 0 for every class and no
+        // signalled deltas, AlfCoeffL[ filtIdx ][ j ] equals
+        // ALF_FIX_FILT_COEFF[ AlfClassToFiltMap[ filtIdx ][ 0 ] ][ j ].
+        let mut e = BitEmitter::new();
+        e.u(1, 1); // luma_signal
+        e.u(1, 0); // no chroma
+        e.ue(0); // num_signalled_minus1 = 0 → 1 filter
+        e.u(1, 1); // type_flag = 1
+                   // num_signalled == 1, so alf_luma_coeff_delta_idx loop is skipped.
+        e.uek(0, 1); // fixed_filter_usage_pattern = 1
+                     // Every class flagged on automatically; need set_idx per class.
+        for _ in 0..25 {
+            e.u(4, 0);
+        }
+        e.u(1, 0); // coeff_delta_flag = 0
+                   // num_signalled == 1 ⇒ no coeff_delta_prediction_flag.
+        e.ue(0); // alf_luma_min_eg_order_minus1 = 0 ⇒ kMin = 1
+        for _ in 0..3 {
+            e.u(1, 0);
+        }
+        // coeff_flag[0] inferred 1; 12 abs values, all 0 ⇒ uek(1) zero = "10".
+        for _ in 0..12 {
+            // uek(k=1) of 0 is "1" + 1-bit suffix "0" = bits "10". No sign.
+            e.u(2, 0b10);
+        }
+        e.finish_with_trailing_bits();
+        let alf = parse_alf_data(&e.into_bytes()).unwrap();
+        for (filt_idx, class_row) in ALF_CLASS_TO_FILT_MAP
+            .iter()
+            .enumerate()
+            .take(NUM_ALF_FILTERS)
+        {
+            assert!(alf.alf_luma_fixed_filter_usage_flag[filt_idx]);
+            assert_eq!(alf.alf_luma_fixed_filter_set_idx[filt_idx], 0);
+            // Eq. 98: outCoef[ filtIdx ][ j ] = ALF_FIX_FILT_COEFF[ map[filtIdx][0] ][ j ].
+            let fix_row = class_row[0] as usize;
+            for (j, &expected) in ALF_FIX_FILT_COEFF[fix_row].iter().enumerate().take(12) {
+                assert_eq!(
+                    alf.luma_filters[filt_idx].coef[j], expected,
+                    "class {filt_idx} tap {j}"
+                );
+            }
+            // Eq. 104 DC.
+            let sum2: i32 = (0..12)
+                .map(|j| (alf.luma_filters[filt_idx].coef[j] as i32) << 1)
+                .sum();
+            assert_eq!(alf.luma_filters[filt_idx].coef[12] as i32, 512 - sum2);
+        }
+    }
+
+    #[test]
+    fn round120_coeff_delta_prediction_chains_deltas_across_filters() {
+        // 3 signalled filters, with delta_prediction_flag = 1 (cumulative).
+        // emit_spec_alf_data hard-codes prediction_flag = 0, so we build the
+        // payload by hand.
+        let mut e = BitEmitter::new();
+        e.u(1, 1); // luma_signal
+        e.u(1, 0); // no chroma
+        e.ue(2); // num_signalled - 1 = 2 → 3 filters
+        e.u(1, 1); // type_flag = 1
+                   // alf_luma_coeff_delta_idx[ 0..24 ] — Ceil(Log2(3)) = 2 bits, identity-clamped.
+        for i in 0..25 {
+            e.u(2, (i as u32).min(2));
+        }
+        e.uek(0, 0); // fixed_filter_usage_pattern = 0
+        e.u(1, 0); // coeff_delta_flag = 0
+        e.u(1, 1); // coeff_delta_prediction_flag = 1
+        e.ue(0); // alf_luma_min_eg_order_minus1 = 0 ⇒ kMin = 1
+        for _ in 0..3 {
+            e.u(1, 0); // expGoOrder all kMin = 1
+        }
+        // 3 filters × 12 taps each — set tap 0 to (5, 0, -2) per-filter and rest = 0.
+        // After eq. 97 cumulative: filter 0 = 5, filter 1 = 5+0 = 5, filter 2 = 5+(-2) = 3.
+        // Each value via uek(1): 5 → bits "001110" (zeros=2, suffix 3 bits "110")
+        //   wait reader: zeros=2, k=1, total_suffix=3, value = ((1<<2)-1)<<1 + suffix = 6+suffix.
+        //   so 5 needs base + suffix = ((1<<1)-1)<<1 = 2 with suffix at zeros=1: 5 = 2 + suffix(suffix bits=2) → suffix=3.
+        //   bits: "0" "1" "11" = "0111".
+        // 0 via uek(1): "1" "0" = "10". -2 via abs=2 + sign 0:
+        //   2 = ((1<<1)-1)<<1 + suffix? with zeros=1: 2 + suffix(2 bits), suffix=0 → "0" "1" "00" = "0100".
+        // Use helper instead.
+        let emit_uek = |e: &mut BitEmitter, k: u32, v: u32| e.uek(k, v);
+        for filter_idx in 0..3 {
+            let tap0 = match filter_idx {
+                0 => 5i32,
+                1 => 0i32,
+                _ => -2i32,
+            };
+            let abs_val = tap0.unsigned_abs();
+            emit_uek(&mut e, 1, abs_val);
+            if abs_val != 0 {
+                e.u(1, if tap0 >= 0 { 1 } else { 0 });
+            }
+            for _ in 1..12 {
+                emit_uek(&mut e, 1, 0);
+            }
+        }
+        e.finish_with_trailing_bits();
+        let alf = parse_alf_data(&e.into_bytes()).unwrap();
+        // After eq. 97 cumulative-sum prediction:
+        //   filter 0 unchanged = 5
+        //   filter 1 += filter 0 = 0 + 5 = 5
+        //   filter 2 += filter 1 = -2 + 5 = 3
+        // Then AlfCoeffL[ filt_idx ][ 0 ] takes the routed filter:
+        //   filt 0 → filter 0 (tap0=5);
+        //   filt 1 → filter 1 (tap0=5);
+        //   filt 2..24 → filter 2 (tap0=3, clamped at emit-time).
+        assert_eq!(alf.luma_filters[0].coef[0], 5);
+        assert_eq!(alf.luma_filters[1].coef[0], 5);
+        assert_eq!(alf.luma_filters[2].coef[0], 3);
+    }
+
+    #[test]
+    fn round120_derive_alf_coeff_l_eq104_dc_property() {
+        // Eq. 104 invariant: for every parsed AlfData, AlfCoeffL[ ][ 12 ]
+        // must equal 512 − 2 × Σ AlfCoeffL[ ][ 0..11 ]. Verify on a
+        // randomly-chosen multi-class config.
+        let mut taps = vec![0i32; 12];
+        taps[3] = 8;
+        taps[7] = -4;
+        taps[11] = 2;
+        let payload = emit_spec_alf_data(
+            true,
+            true,
+            1,
+            &[taps],
+            false,
+            &[0; 6],
+            0,
+            [0; 2],
+            0,
+            &[0, 0, 0],
+        );
+        let alf = parse_alf_data(&payload).unwrap();
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            let sum2: i32 = (0..12)
+                .map(|j| (alf.luma_filters[filt_idx].coef[j] as i32) << 1)
+                .sum();
+            assert_eq!(alf.luma_filters[filt_idx].coef[12] as i32, 512 - sum2);
+        }
+    }
+
+    #[test]
+    fn round120_chroma_eg_chain_progresses() {
+        // The chroma path's expGoOrderC chain starts at kMin = min+1 and
+        // monotonically increases per the increase flag. With min = 1 and
+        // increments [1, 0]: kMin → 2, then exp[0] = 2+1 = 3, exp[1] = 3+0 = 3.
+        // For chroma coeffs all 0, parsing must succeed.
+        let payload = emit_spec_alf_data(false, true, 0, &[], true, &[0; 6], 1, [1, 0], 0, &[]);
+        let alf = parse_alf_data(&payload).unwrap();
+        assert!(alf.chroma_filter_signal);
+        for j in 0..6 {
+            assert_eq!(alf.chroma_filters[0].coef[j], 0);
+        }
+        assert_eq!(alf.chroma_filters[0].coef[6], 512);
+    }
+
+    #[test]
+    fn round120_apply_alf_luma_classified_uniform_plane() {
+        // On a flat plane every sample classifies the same way (filtIdx = 0,
+        // transposeIdx = 3 — see classification_flat_block_is_class_zero).
+        // Build an AlfData with AlfCoeffL[0] = identity-DC and verify
+        // apply_alf_luma_classified produces the spec identity.
+        let mut pic = crate::picture::YuvPicture::new(16, 16, 1, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        let mut alf = AlfData {
+            luma_filter_signal: true,
+            num_luma_filters: NUM_ALF_FILTERS,
+            ..AlfData::default()
+        };
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            alf.luma_filters[filt_idx].coef = [0; 13];
+            alf.luma_filters[filt_idx].coef[12] = 512;
+        }
+        let cls = derive_alf_classification(&pic.y, pic.y_stride(), 16, 16, 0, 0, 16, 16, 8);
+        apply_alf_luma_classified(&mut pic, &alf, &cls, 0, 0, 8);
+        for v in pic.y.iter() {
+            assert_eq!(*v, 100, "(512 * 100 + 256) >> 9 = 100");
+        }
+    }
+
+    #[test]
+    fn round120_apply_alf_luma_classified_routes_per_class() {
+        // Build a vertical-edge picture so different rows / columns will
+        // classify into different filtIdx values. Assign one AlfCoeffL row
+        // with a non-trivial DC and verify samples in that class change
+        // while samples in other classes use their own (here all-zero) row.
+        let w = 32usize;
+        let h = 32usize;
+        let mut pic = crate::picture::YuvPicture::new(w as u32, h as u32, 0, 8).unwrap();
+        let stride = pic.y_stride();
+        for y in 0..h {
+            for x in 0..w {
+                pic.y[y * stride + x] = if x < 16 { 60 } else { 180 };
+            }
+        }
+        let cls = derive_alf_classification(&pic.y, pic.y_stride(), w, h, 0, 0, w, h, 8);
+        // Pick the class assigned at (0, 0) and give it a non-zero DC.
+        let chosen_class = cls.filt_idx_at(0, 0) as usize;
+        let mut alf = AlfData {
+            luma_filter_signal: true,
+            num_luma_filters: NUM_ALF_FILTERS,
+            ..AlfData::default()
+        };
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            alf.luma_filters[filt_idx].coef = [0; 13];
+        }
+        // Identity-DC for the chosen class; every other class stays at 0.
+        alf.luma_filters[chosen_class].coef[12] = 512;
+        let pre = pic.y.clone();
+        apply_alf_luma_classified(&mut pic, &alf, &cls, 0, 0, 8);
+        // Samples in the chosen class are unchanged (identity DC).
+        // Samples in other classes go to 0 (zero filter).
+        let mut at_least_one_chosen = false;
+        let mut at_least_one_other = false;
+        for y in 0..h {
+            for x in 0..w {
+                let cur = cls.filt_idx_at(x, y) as usize;
+                if cur == chosen_class {
+                    assert_eq!(pic.y[y * stride + x], pre[y * stride + x]);
+                    at_least_one_chosen = true;
+                } else {
+                    assert_eq!(pic.y[y * stride + x], 0);
+                    at_least_one_other = true;
+                }
+            }
+        }
+        assert!(
+            at_least_one_chosen && at_least_one_other,
+            "vertical edge should split classes"
+        );
+    }
+
+    #[test]
+    fn round120_apply_alf_luma_classified_masked_respects_ctb_flag() {
+        // 64×32 picture, two 32×32 CTBs. Only the left CTB has alf_ctb_flag = 1.
+        // The classified+masked apply must filter the left CTB and leave the
+        // right one untouched. Use an identity-DC AlfCoeffL for every class so
+        // the filtered output equals the input on a flat plane.
+        let mut pic = crate::picture::YuvPicture::new(64, 32, 0, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        let mut map = AlfCtbMap::new(64, 32, 5);
+        map.set(0, true, false, false);
+        map.set(1, false, false, false);
+        let mut alf = AlfData {
+            luma_filter_signal: true,
+            num_luma_filters: NUM_ALF_FILTERS,
+            ..AlfData::default()
+        };
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            alf.luma_filters[filt_idx].coef = [0; 13];
+            alf.luma_filters[filt_idx].coef[12] = 512;
+        }
+        let pre = pic.y.clone();
+        apply_alf_luma_classified_masked(&mut pic, &alf, &map, 8);
+        let stride = pic.y_stride();
+        // The flat plane reproduces under the identity-DC filter, so values
+        // are unchanged even where the filter ran. To make a behavioural
+        // assertion: switch one CTB to a zero filter and verify it nukes
+        // the left CTB while the right one stays at 100.
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            alf.luma_filters[filt_idx].coef[12] = 0;
+        }
+        // Restore the pre-filter plane (since the identity run didn't move it).
+        pic.y.copy_from_slice(&pre);
+        apply_alf_luma_classified_masked(&mut pic, &alf, &map, 8);
+        for row in 0..32usize {
+            for col in 0..32usize {
+                assert_eq!(pic.y[row * stride + col], 0, "left CTB zeroed");
+            }
+            for col in 32..64usize {
+                assert_eq!(pic.y[row * stride + col], 100, "right CTB unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn round120_apply_alf_luma_classified_clamps_partial_edge_ctb() {
+        // 40×40 picture, 2×2 CTBs at CtbLog2SizeY = 5. Top-left CTB is full
+        // 32×32, bottom-right is 8×8 (partial edge). Flag only the partial
+        // CTB. The classified+masked apply must only touch the 8×8 in-pic
+        // region.
+        let mut pic = crate::picture::YuvPicture::new(40, 40, 0, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 77;
+        }
+        let mut map = AlfCtbMap::new(40, 40, 5);
+        map.set(3, true, false, false);
+        let mut alf = AlfData {
+            luma_filter_signal: true,
+            num_luma_filters: NUM_ALF_FILTERS,
+            ..AlfData::default()
+        };
+        // Every class → zero filter so the affected region becomes 0.
+        for filt_idx in 0..NUM_ALF_FILTERS {
+            alf.luma_filters[filt_idx].coef = [0; 13];
+        }
+        apply_alf_luma_classified_masked(&mut pic, &alf, &map, 8);
+        let stride = pic.y_stride();
+        for row in 0..40usize {
+            for col in 0..40usize {
+                let expected = if row >= 32 && col >= 32 { 0 } else { 77 };
+                assert_eq!(pic.y[row * stride + col], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn round120_fixed_filter_table_dimensions_match_spec() {
+        // Sanity check on the embedded spec tables.
+        assert_eq!(ALF_FIX_FILT_COEFF.len(), 64);
+        for row in ALF_FIX_FILT_COEFF.iter() {
+            assert_eq!(row.len(), 12);
+        }
+        assert_eq!(ALF_CLASS_TO_FILT_MAP.len(), 25);
+        for row in ALF_CLASS_TO_FILT_MAP.iter() {
+            assert_eq!(row.len(), 16);
+            for &v in row.iter() {
+                assert!(v < 64);
+            }
+        }
+        // Spot-check a couple of spec entries.
+        assert_eq!(ALF_FIX_FILT_COEFF[0][0], 0);
+        assert_eq!(ALF_FIX_FILT_COEFF[0][11], 30);
+        assert_eq!(ALF_FIX_FILT_COEFF[63][6], 16);
+        assert_eq!(ALF_CLASS_TO_FILT_MAP[0][15], 63);
+        assert_eq!(ALF_CLASS_TO_FILT_MAP[24][0], 8);
     }
 }

@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### Round 120 — Spec-faithful §7.3.5 alf_data() parser + §8.9.4 AlfCoeffL + §8.8.4.2 classified luma apply
+
+#### Added
+- `alf_tables.rs`: ISO/IEC 23094-1 §8.9.4 eq. 102 (`ALF_FIX_FILT_COEFF`, 64 fixed
+  12-tap luma filter sets) and eq. 103 (`ALF_CLASS_TO_FILT_MAP`, 25×16
+  class-to-filter mapping) transcribed verbatim from the spec PDF.
+- `alf.rs::derive_alf_coeff_l`: §8.9.4 eq. 96-104 derivation. For every class
+  `filtIdx = 0..24`, seeds `outCoef[ ]` from `ALF_FIX_FILT_COEFF[
+  ALF_CLASS_TO_FILT_MAP[ filtIdx ][ alf_luma_fixed_filter_set_idx[ filtIdx ] ]
+  ]` per eq. 98 when the fixed-filter usage flag is 1 (eq. 99 zero otherwise),
+  adds the per-class delta `filterCoefficients[ alf_luma_coeff_delta_idx[
+  filtIdx ] ][ coefPosMap[ j ] − 1 ]` for every j with `coefPosMap[ j ] > 0`
+  (eq. 100), and computes position 12 per eq. 104 (`512 − Σ << 1`).
+- `alf.rs::apply_alf_luma_classified` / `apply_alf_luma_classified_masked`:
+  §8.8.4.2 eq. 1281-1288 per-sample luma apply. For every sample of every
+  flagged CTB selects `f[ j ] = AlfCoeffL[ filtIdx[ x ][ y ] ][ j ]` from the
+  per-CTB classification (round-117 `derive_alf_classification`), permutes via
+  `transpose_luma_coeffs` per eq. 1282-1285, accumulates `sum = Σ
+  filterCoeff[ k ] * (north + south) + filterCoeff[ 12 ] * recPicture[ x, y ]`
+  per eq. 1286, then `((sum + 256) >> 9).clamp(0, max)` per eq. 1287/1288.
+- `AlfData` fields: `luma_type_flag` (§7.3.5),
+  `num_signalled_luma_filters`, `alf_luma_coeff_delta_idx[25]`,
+  `alf_luma_fixed_filter_usage_flag[25]`, `alf_luma_fixed_filter_set_idx[25]`.
+- `sps::tests::BitEmitter::uek(k, value)`: spec-aligned uek(v) writer used by
+  the new ALF tests for round-tripping the §7.3.5 syntax through the parser.
+- 12 new unit tests (321 total, was 309) — exercising the §7.3.5 syntax
+  (7-tap vs 13-tap `alf_luma_type_flag`, `alf_luma_coeff_delta_idx` routing,
+  `alf_luma_fixed_filter_usage_pattern == 1` every-class fixed-filter seed,
+  `alf_luma_coeff_delta_prediction_flag` cumulative-sum prediction across
+  signalled filters, eq. 104 DC invariant, chroma EG progression), the
+  classified apply (uniform-plane identity, per-class routing on a
+  vertical edge, CTB-mask gating, partial-edge-CTB clamp), and dimension /
+  spot-check of `ALF_FIX_FILT_COEFF` / `ALF_CLASS_TO_FILT_MAP`.
+
+#### Changed
+- `parse_alf_data`: replaces the round-11 simplified u(6)/u(1) signalling with
+  the full §7.3.5 syntax driven by uek(v) deltas and the §8.9.4 derivation.
+- `apply_alf_luma` / `apply_alf_luma_masked` / `apply_alf_chroma`: now apply
+  eq. 1286/1287 (spec scaling `(sum + 256) >> 9` with `coef[12]` /
+  `coef[6]` multiplying the centre sample) instead of the round-11
+  `(sum + 64) >> 7` constant-DC approximation. Coefficient ranges now match
+  the spec — `-512..511` for spatial taps, `-1024..1023` for the centre.
+- `decoder::apply_post_filters`: masked-luma ALF now invokes
+  `apply_alf_luma_classified_masked` (§8.8.4.2 per-sample filter selection)
+  in place of the round-113 whole-set-0 fallback. Chroma path unchanged.
+
 ### Round 117 — ALF transpose + classification filter-index derivation (§8.8.4.3)
 
 #### Added
