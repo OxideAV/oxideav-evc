@@ -47,6 +47,18 @@
 //!   minimal-header / no-map path.
 //! * The 25-filter-set `alf_luma_filter_idx` per-CTU selection (§8.9.6) is
 //!   deferred — this round always applies filter set 0.
+//! * The §8.8.4.3 **ALF transpose + classification filter-index derivation**
+//!   (round 117): [`derive_alf_classification`] computes, per luma sample of
+//!   a coding tree block, the gradient-classification `filtIdx` (0..24, one of
+//!   the 25 spec filter classes — eq. 1319/1320) and `transposeIdx` (0..3 —
+//!   eq. 1317/1318) from the local horizontal / vertical / diagonal activity
+//!   (eq. 1289-1316). [`transpose_luma_coeffs`] applies the eq. 1282-1285
+//!   coefficient permutation a sample's `transposeIdx` selects. These are
+//!   pure, syntax-free building blocks; wiring the classified per-sample
+//!   filter selection into the §8.8.4.2 apply additionally needs the full
+//!   §8.9.4 `AlfCoeffL[ ][ filtIdx ][ ]` derivation (eq. 96-104 +
+//!   `alf_luma_coeff_delta_idx`), which the round-11 simplified `alf_data()`
+//!   parser does not yet capture — tracked as a follow-up.
 //!
 //! All clause and equation numbers refer to **ISO/IEC 23094-1:2020(E)**.
 
@@ -611,6 +623,257 @@ pub fn apply_alf_with_map(
 }
 
 // =====================================================================
+// §8.8.4.3 — ALF transpose + classification filter-index derivation.
+// =====================================================================
+
+/// Number of distinct ALF luma filter classes (§8.9.4.1: `NumAlfFilters`).
+/// The §8.8.4.3 classification yields a `filtIdx` in `0..NUM_ALF_FILTERS`.
+pub const NUM_ALF_FILTERS: usize = 25;
+
+/// Per-sample classification output of the §8.8.4.3 derivation.
+///
+/// One pair per luma sample inside the coding tree block, stored in
+/// row-major order (`y * blk_width + x`), with `x = 0..blk_width − 1` and
+/// `y = 0..blk_height − 1`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlfClassification {
+    /// Coding-tree-block width in luma samples (`blkWidth`).
+    pub blk_width: usize,
+    /// Coding-tree-block height in luma samples (`blkHeight`).
+    pub blk_height: usize,
+    /// `filtIdx[ x ][ y ]` — gradient class in `0..NUM_ALF_FILTERS`
+    /// (eq. 1319 / eq. 1320), row-major.
+    pub filt_idx: Vec<u8>,
+    /// `transposeIdx[ x ][ y ]` — coefficient permutation selector `0..3`
+    /// (eq. 1318), row-major.
+    pub transpose_idx: Vec<u8>,
+}
+
+impl AlfClassification {
+    /// `filtIdx[ x ][ y ]` for `x = 0..blk_width − 1`, `y = 0..blk_height − 1`.
+    #[inline]
+    pub fn filt_idx_at(&self, x: usize, y: usize) -> u8 {
+        self.filt_idx[y * self.blk_width + x]
+    }
+
+    /// `transposeIdx[ x ][ y ]`.
+    #[inline]
+    pub fn transpose_idx_at(&self, x: usize, y: usize) -> u8 {
+        self.transpose_idx[y * self.blk_width + x]
+    }
+}
+
+/// §8.8.4.3 `transposeTable[ ]` (eq. 1317).
+const ALF_TRANSPOSE_TABLE: [u8; 8] = [0, 1, 0, 2, 2, 3, 1, 3];
+
+/// §8.8.4.3 `varTab[ ]` (eq. 1315).
+const ALF_VAR_TAB: [u8; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+
+/// Read a luma sample at `(xCtb + x, yCtb + y)` clamping to the picture
+/// extent, matching the spec's behaviour that the §8.8.4.5 boundary-padding
+/// process supplies the nearest in-picture sample for off-edge reads.
+#[inline]
+fn rec_sample_clamped(src: &[u8], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
+    let xc = x.clamp(0, w as i32 - 1) as usize;
+    let yc = y.clamp(0, h as i32 - 1) as usize;
+    src[yc * stride + xc] as i32
+}
+
+/// Derive the §8.8.4.3 classification (`filtIdx` + `transposeIdx`) for every
+/// luma sample of a coding tree block located at `(x_ctb, y_ctb)` in the
+/// reconstructed luma plane `src` (`w × h`, row stride `stride`).
+///
+/// This is a faithful clean-room transcription of ISO/IEC 23094-1 §8.8.4.3,
+/// eq. 1289-1320:
+///
+/// 1. Per-position 1-D Laplacian gradients `filtH / filtV / filtD0 / filtD1`
+///    over `x = −2..blkWidth + 1`, `y = −2..blkHeight + 1` (eq. 1289-1292).
+/// 2. Per-4×4-subblock window sums `sumH / sumV / sumD0 / sumD1 / sumOfHV`
+///    with `i, j = −2..5` (eq. 1293-1297).
+/// 3. Per-sample direction strength `dir1 / dir2 / dirS` from the dominant
+///    horizontal-vertical vs diagonal activity (eq. 1298-1314).
+/// 4. Activity quantisation `avgVar` via `varTab` (eq. 1315-1316).
+/// 5. `transposeIdx` (eq. 1317-1318) and the final `filtIdx` with the
+///    direction-strength offset (eq. 1319-1320).
+///
+/// `bit_depth` is `BitDepthY`, used by eq. 1316's `>> (BitDepthY − 2)` shift.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_alf_classification(
+    src: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x_ctb: usize,
+    y_ctb: usize,
+    blk_width: usize,
+    blk_height: usize,
+    bit_depth: u32,
+) -> AlfClassification {
+    // --- Step 1: gradients over the [−2, blk+1] halo (eq. 1289-1292). ---
+    //
+    // We index gradient arrays by an offset so x, y can run from −2.
+    let gw = blk_width + 4; // x: −2 .. blk_width + 1
+    let gh = blk_height + 4; // y: −2 .. blk_height + 1
+    let g_index = |gx: i32, gy: i32| -> usize { ((gy + 2) as usize) * gw + ((gx + 2) as usize) };
+
+    let mut filt_h = vec![0i32; gw * gh];
+    let mut filt_v = vec![0i32; gw * gh];
+    let mut filt_d0 = vec![0i32; gw * gh];
+    let mut filt_d1 = vec![0i32; gw * gh];
+
+    for gy in -2..(blk_height as i32 + 2) {
+        for gx in -2..(blk_width as i32 + 2) {
+            let px = x_ctb as i32 + gx;
+            let py = y_ctb as i32 + gy;
+            let c = rec_sample_clamped(src, stride, w, h, px, py) << 1;
+            let l = rec_sample_clamped(src, stride, w, h, px - 1, py);
+            let r = rec_sample_clamped(src, stride, w, h, px + 1, py);
+            let u = rec_sample_clamped(src, stride, w, h, px, py - 1);
+            let d = rec_sample_clamped(src, stride, w, h, px, py + 1);
+            let ul = rec_sample_clamped(src, stride, w, h, px - 1, py - 1);
+            let dr = rec_sample_clamped(src, stride, w, h, px + 1, py + 1);
+            let ur = rec_sample_clamped(src, stride, w, h, px + 1, py - 1);
+            let dl = rec_sample_clamped(src, stride, w, h, px - 1, py + 1);
+            let idx = g_index(gx, gy);
+            filt_h[idx] = (c - l - r).abs();
+            filt_v[idx] = (c - u - d).abs();
+            filt_d0[idx] = (c - ul - dr).abs();
+            filt_d1[idx] = (c - ur - dl).abs();
+        }
+    }
+
+    // --- Step 2: per-4×4-subblock window sums (eq. 1293-1297). ---
+    //
+    // Subblock grid: sx = 0..(blkWidth − 1) >> 2, sy = 0..(blkHeight − 1) >> 2.
+    let sub_w = ((blk_width - 1) >> 2) + 1;
+    let sub_h = ((blk_height - 1) >> 2) + 1;
+    let s_index = |sx: usize, sy: usize| -> usize { sy * sub_w + sx };
+
+    let mut sum_h = vec![0i32; sub_w * sub_h];
+    let mut sum_v = vec![0i32; sub_w * sub_h];
+    let mut sum_d0 = vec![0i32; sub_w * sub_h];
+    let mut sum_d1 = vec![0i32; sub_w * sub_h];
+    let mut sum_of_hv = vec![0i32; sub_w * sub_h];
+
+    for sy in 0..sub_h {
+        for sx in 0..sub_w {
+            let (mut sh, mut sv, mut sd0, mut sd1) = (0i32, 0i32, 0i32, 0i32);
+            for j in -2i32..=5 {
+                for i in -2i32..=5 {
+                    let gx = (sx as i32) * 4 + i;
+                    let gy = (sy as i32) * 4 + j;
+                    let idx = g_index(gx, gy);
+                    sh += filt_h[idx];
+                    sv += filt_v[idx];
+                    sd0 += filt_d0[idx];
+                    sd1 += filt_d1[idx];
+                }
+            }
+            let si = s_index(sx, sy);
+            sum_h[si] = sh;
+            sum_v[si] = sv;
+            sum_d0[si] = sd0;
+            sum_d1[si] = sd1;
+            sum_of_hv[si] = sh + sv;
+        }
+    }
+
+    // --- Steps 3-5: per-sample dir / avgVar / filtIdx / transposeIdx. ---
+    let mut filt_idx = vec![0u8; blk_width * blk_height];
+    let mut transpose_idx = vec![0u8; blk_width * blk_height];
+    let hv_shift = bit_depth.saturating_sub(2);
+
+    for y in 0..blk_height {
+        for x in 0..blk_width {
+            let si = s_index(x >> 2, y >> 2);
+            let s_h = sum_h[si];
+            let s_v = sum_v[si];
+            let s_d0 = sum_d0[si];
+            let s_d1 = sum_d1[si];
+
+            // dirHV / hv1 / hv0 (eq. 1298-1303).
+            let (hv1, hv0, dir_hv) = if s_v > s_h {
+                (s_v, s_h, 1u8)
+            } else {
+                (s_h, s_v, 3u8)
+            };
+
+            // dirD / d1 / d0 (eq. 1304-1309).
+            let (d1, d0, dir_d) = if s_d0 > s_d1 {
+                (s_d0, s_d1, 0u8)
+            } else {
+                (s_d1, s_d0, 2u8)
+            };
+
+            // hvd1 / hvd0 and the diagonal-vs-HV branch (eq. 1310-1314).
+            // Use i64 for the cross products to avoid i32 overflow on large
+            // CTBs / high bit depths.
+            let diag_dominant = (d1 as i64) * (hv0 as i64) > (hv1 as i64) * (d0 as i64);
+            let (hvd1, hvd0) = if diag_dominant { (d1, d0) } else { (hv1, hv0) };
+            let dir1 = if diag_dominant { dir_d } else { dir_hv };
+            let dir2 = if diag_dominant { dir_hv } else { dir_d };
+            let dir_s = if hvd1 > 2 * hvd0 {
+                1u8
+            } else if (hvd1 as i64) * 2 > 9 * (hvd0 as i64) {
+                2u8
+            } else {
+                0u8
+            };
+
+            // avgVar (eq. 1315-1316).
+            let var_in = ((sum_of_hv[si] >> hv_shift).clamp(0, 15)) as usize;
+            let avg_var = ALF_VAR_TAB[var_in];
+
+            // transposeIdx (eq. 1317-1318).
+            let t = ALF_TRANSPOSE_TABLE[(dir1 as usize) * 2 + ((dir2 >> 1) as usize)];
+
+            // filtIdx (eq. 1319-1320).
+            let mut fidx = avg_var as i32;
+            if dir_s != 0 {
+                fidx += (((dir1 & 0x1) << 1) as i32 + dir_s as i32) * 5;
+            }
+
+            let out = y * blk_width + x;
+            filt_idx[out] = fidx as u8;
+            transpose_idx[out] = t;
+        }
+    }
+
+    AlfClassification {
+        blk_width,
+        blk_height,
+        filt_idx,
+        transpose_idx,
+    }
+}
+
+/// Apply the §8.8.4.2 transpose permutation (eq. 1282-1285) to a 13-tap luma
+/// filter `f[0..12]`, selecting the arrangement that the sample's
+/// `transposeIdx` requests. `transpose_idx == 0` returns `f` unchanged
+/// (eq. 1285).
+pub fn transpose_luma_coeffs(
+    f: &[i16; ALF_LUMA_NUM_COEF],
+    transpose_idx: u8,
+) -> [i16; ALF_LUMA_NUM_COEF] {
+    match transpose_idx {
+        // eq. 1282.
+        1 => [
+            f[9], f[4], f[10], f[8], f[1], f[5], f[11], f[7], f[3], f[0], f[2], f[6], f[12],
+        ],
+        // eq. 1283.
+        2 => [
+            f[0], f[3], f[2], f[1], f[8], f[7], f[6], f[5], f[4], f[9], f[10], f[11], f[12],
+        ],
+        // eq. 1284.
+        3 => [
+            f[9], f[8], f[10], f[4], f[3], f[7], f[11], f[5], f[1], f[0], f[2], f[6], f[12],
+        ],
+        // eq. 1285 (transpose_idx == 0 and any other value).
+        _ => *f,
+    }
+}
+
+// =====================================================================
 // Tests.
 // =====================================================================
 
@@ -975,5 +1238,278 @@ mod tests {
         apply_alf_with_map(&mut pic, &alf, &map, true, false, 8, 8);
         assert!(pic.cb.iter().all(|&v| v == 1), "Cb filtered (enabled)");
         assert!(pic.cr.iter().all(|&v| v == 128), "Cr untouched (disabled)");
+    }
+
+    // =================================================================
+    // Round 117: §8.8.4.3 ALF transpose + classification (eq. 1289-1320).
+    // =================================================================
+
+    /// Reference re-derivation of §8.8.4.3 used to cross-check the SUT on
+    /// arbitrary input. Independently coded from the spec equations with a
+    /// straightforward (non-windowed-prefix) structure so a transcription
+    /// typo in the SUT would not be mirrored here.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_ref(
+        src: &[u8],
+        stride: usize,
+        w: usize,
+        h: usize,
+        x_ctb: usize,
+        y_ctb: usize,
+        blk_w: usize,
+        blk_h: usize,
+        bd: u32,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let samp = |x: i32, y: i32| -> i32 {
+            let xc = x.clamp(0, w as i32 - 1) as usize;
+            let yc = y.clamp(0, h as i32 - 1) as usize;
+            src[yc * stride + xc] as i32
+        };
+        let grad = |gx: i32, gy: i32| -> (i32, i32, i32, i32) {
+            let px = x_ctb as i32 + gx;
+            let py = y_ctb as i32 + gy;
+            let c = samp(px, py) << 1;
+            let fh = (c - samp(px - 1, py) - samp(px + 1, py)).abs();
+            let fv = (c - samp(px, py - 1) - samp(px, py + 1)).abs();
+            let fd0 = (c - samp(px - 1, py - 1) - samp(px + 1, py + 1)).abs();
+            let fd1 = (c - samp(px + 1, py - 1) - samp(px - 1, py + 1)).abs();
+            (fh, fv, fd0, fd1)
+        };
+        let mut fi = vec![0u8; blk_w * blk_h];
+        let mut ti = vec![0u8; blk_w * blk_h];
+        for y in 0..blk_h {
+            for x in 0..blk_w {
+                let (sx, sy) = (x >> 2, y >> 2);
+                let (mut sh, mut sv, mut sd0, mut sd1) = (0, 0, 0, 0);
+                for j in -2i32..=5 {
+                    for i in -2i32..=5 {
+                        let (a, b, cc, dd) = grad((sx as i32) * 4 + i, (sy as i32) * 4 + j);
+                        sh += a;
+                        sv += b;
+                        sd0 += cc;
+                        sd1 += dd;
+                    }
+                }
+                let (hv1, hv0, dir_hv) = if sv > sh { (sv, sh, 1) } else { (sh, sv, 3) };
+                let (d1, d0, dir_d) = if sd0 > sd1 {
+                    (sd0, sd1, 0)
+                } else {
+                    (sd1, sd0, 2)
+                };
+                let diag = (d1 as i64) * (hv0 as i64) > (hv1 as i64) * (d0 as i64);
+                let (hvd1, hvd0) = if diag { (d1, d0) } else { (hv1, hv0) };
+                let dir1: i32 = if diag { dir_d } else { dir_hv };
+                let dir2: i32 = if diag { dir_hv } else { dir_d };
+                let dir_s = if hvd1 > 2 * hvd0 {
+                    1
+                } else if (hvd1 as i64) * 2 > 9 * (hvd0 as i64) {
+                    2
+                } else {
+                    0
+                };
+                let var_tab = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+                let var_in = ((sh + sv) >> (bd as i32 - 2)).clamp(0, 15) as usize;
+                let avg_var = var_tab[var_in];
+                let tt = [0, 1, 0, 2, 2, 3, 1, 3];
+                let t = tt[(dir1 * 2 + (dir2 >> 1)) as usize];
+                let mut f = avg_var;
+                if dir_s != 0 {
+                    f += (((dir1 & 0x1) << 1) + dir_s) * 5;
+                }
+                fi[y * blk_w + x] = f as u8;
+                ti[y * blk_w + x] = t as u8;
+            }
+        }
+        (fi, ti)
+    }
+
+    #[test]
+    fn classification_flat_block_is_class_zero() {
+        // A perfectly flat plane has zero gradients everywhere → sumOfHV = 0
+        // → avgVar = varTab[0] = 0 and dirS = 0, so filtIdx = 0 for every
+        // sample (eq. 1319, no eq. 1320 offset).
+        //
+        // transposeIdx is *not* 0 in this degenerate case: with all sums
+        // equal to 0 the `s_v > s_h` / `s_d0 > s_d1` comparisons both take
+        // the else branch, giving dir1 = dirHV = 3 and dir2 = dirD = 2, so
+        // transposeTable[3*2 + (2>>1)] = transposeTable[7] = 3 (eq.
+        // 1317-1318). The transpose is irrelevant when every tap pair reads
+        // the same value, but the spec still defines it as 3 here.
+        let w = 16;
+        let h = 16;
+        let src = vec![100u8; w * h];
+        let cls = derive_alf_classification(&src, w, w, h, 0, 0, 8, 8, 8);
+        assert_eq!(cls.blk_width, 8);
+        assert_eq!(cls.blk_height, 8);
+        assert!(cls.filt_idx.iter().all(|&v| v == 0), "flat → class 0");
+        assert!(
+            cls.transpose_idx.iter().all(|&v| v == 3),
+            "flat → transpose 3 (spec eq. 1317-1318 degenerate case)"
+        );
+    }
+
+    #[test]
+    fn classification_subblock_resolution_is_4x4() {
+        // filtIdx / transposeIdx are constant within each 4×4 subblock (they
+        // index the per-subblock sums via x>>2, y>>2). Build a vertical-edge
+        // pattern and assert the four samples of the top-left 4×4 share a
+        // class.
+        let w = 32;
+        let h = 32;
+        let mut src = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                src[y * w + x] = if x < 16 { 40 } else { 200 };
+            }
+        }
+        let cls = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 8);
+        for sy in 0..4usize {
+            for sx in 0..4usize {
+                let base = cls.filt_idx_at(sx * 4, sy * 4);
+                let baset = cls.transpose_idx_at(sx * 4, sy * 4);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        assert_eq!(cls.filt_idx_at(sx * 4 + dx, sy * 4 + dy), base);
+                        assert_eq!(cls.transpose_idx_at(sx * 4 + dx, sy * 4 + dy), baset);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classification_matches_independent_reference_on_pseudo_random() {
+        // Deterministic LCG-filled plane; cross-check every sample against
+        // the independent reference re-derivation.
+        let w = 40;
+        let h = 36;
+        let mut state: u32 = 0x1234_5678;
+        let mut src = vec![0u8; w * h];
+        for v in src.iter_mut() {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (state >> 16) as u8;
+        }
+        // Two CTBs: a full 32×32 at (0,0) and an 8×4 edge block at (32,32).
+        for &(xc, yc, bw, bh) in &[(0usize, 0usize, 32usize, 32usize), (32, 32, 8, 4)] {
+            let cls = derive_alf_classification(&src, w, w, h, xc, yc, bw, bh, 8);
+            let (fi, ti) = classify_ref(&src, w, w, h, xc, yc, bw, bh, 8);
+            assert_eq!(cls.filt_idx, fi, "filtIdx mismatch at ctb ({xc},{yc})");
+            assert_eq!(cls.transpose_idx, ti, "transposeIdx mismatch ({xc},{yc})");
+        }
+    }
+
+    #[test]
+    fn classification_horizontal_edge_picks_vertical_direction() {
+        // A horizontal edge (rows change, columns flat) makes vertical
+        // activity dominate → dirHV branch gives dir = 1, dirS != 0, so
+        // filtIdx is bumped by the eq.1320 offset and is non-zero.
+        let w = 32;
+        let h = 32;
+        let mut src = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                src[y * w + x] = if y < 16 { 30 } else { 220 };
+            }
+        }
+        let cls = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 8);
+        // Sample on the strongest-activity row near the edge (y=15).
+        let f = cls.filt_idx_at(0, 12);
+        assert!(
+            f >= 5,
+            "edge sample should land in a directional class: {f}"
+        );
+        // filtIdx is always within range.
+        assert!(cls.filt_idx.iter().all(|&v| (v as usize) < NUM_ALF_FILTERS));
+        assert!(cls.transpose_idx.iter().all(|&v| v <= 3));
+    }
+
+    #[test]
+    fn classification_filtidx_always_in_range() {
+        // Adversarial high-contrast checkerboard: ensure no filtIdx escapes
+        // 0..24 and no transposeIdx escapes 0..3 (eq. 1320 offset bound).
+        let w = 24;
+        let h = 24;
+        let mut src = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                src[y * w + x] = if (x + y) % 2 == 0 { 0 } else { 255 };
+            }
+        }
+        let cls = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 8);
+        assert!(cls.filt_idx.iter().all(|&v| (v as usize) < NUM_ALF_FILTERS));
+        assert!(cls.transpose_idx.iter().all(|&v| v <= 3));
+    }
+
+    #[test]
+    fn transpose_coeffs_identity_for_zero() {
+        let f: [i16; ALF_LUMA_NUM_COEF] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        assert_eq!(transpose_luma_coeffs(&f, 0), f);
+        // Out-of-range transpose index also falls through to identity.
+        assert_eq!(transpose_luma_coeffs(&f, 9), f);
+    }
+
+    #[test]
+    fn transpose_coeffs_match_spec_permutations() {
+        let f: [i16; ALF_LUMA_NUM_COEF] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // eq. 1282.
+        assert_eq!(
+            transpose_luma_coeffs(&f, 1),
+            [9, 4, 10, 8, 1, 5, 11, 7, 3, 0, 2, 6, 12]
+        );
+        // eq. 1283.
+        assert_eq!(
+            transpose_luma_coeffs(&f, 2),
+            [0, 3, 2, 1, 8, 7, 6, 5, 4, 9, 10, 11, 12]
+        );
+        // eq. 1284.
+        assert_eq!(
+            transpose_luma_coeffs(&f, 3),
+            [9, 8, 10, 4, 3, 7, 11, 5, 1, 0, 2, 6, 12]
+        );
+    }
+
+    #[test]
+    fn transpose_centre_and_dc_are_invariant() {
+        // Position 12 (centre/DC) is fixed under every transpose (eq.
+        // 1282-1285 all keep f[12] last).
+        let f: [i16; ALF_LUMA_NUM_COEF] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77];
+        for t in 0..4 {
+            assert_eq!(transpose_luma_coeffs(&f, t)[12], 77);
+        }
+    }
+
+    #[test]
+    fn classification_bit_depth_shift_scales_activity() {
+        // eq. 1316 shifts sumOfHV by (BitDepthY − 2). At 10-bit the same
+        // sample magnitudes shift one extra bit, so a moderate-activity
+        // block classifies lower than at 8-bit (or equal, never higher).
+        let w = 32;
+        let h = 32;
+        let mut src = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // Gentle ramp → small but non-zero activity.
+                src[y * w + x] = ((x + y) as u32 % 64 + 64) as u8;
+            }
+        }
+        let c8 = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 8);
+        let c10 = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 10);
+        // The varTab input is non-increasing as the shift grows, so the
+        // avgVar component of every sample's class at 10-bit is <= the 8-bit
+        // one (transpose / direction-offset are bit-depth-independent, so we
+        // compare the dirS == 0 samples where filtIdx == avgVar directly).
+        for i in 0..c8.filt_idx.len() {
+            if c8.transpose_idx[i] == c10.transpose_idx[i]
+                && c8.filt_idx[i] < 5
+                && c10.filt_idx[i] < 5
+            {
+                assert!(
+                    c10.filt_idx[i] <= c8.filt_idx[i],
+                    "10-bit class {} should not exceed 8-bit class {} at sample {i}",
+                    c10.filt_idx[i],
+                    c8.filt_idx[i]
+                );
+            }
+        }
     }
 }

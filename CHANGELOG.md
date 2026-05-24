@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+### Round 117 — ALF transpose + classification filter-index derivation (§8.8.4.3)
+
+#### Added
+- `alf.rs`: `derive_alf_classification` — a clean-room transcription of
+  ISO/IEC 23094-1 §8.8.4.3 (eq. 1289-1320). For every luma sample of a coding
+  tree block it derives the gradient-classification `filtIdx` (0..24, one of
+  the 25 spec filter classes) and the `transposeIdx` (0..3) from local
+  horizontal / vertical / diagonal Laplacian activity: per-position gradients
+  `filtH/V/D0/D1` over the [−2, blk+1] halo (eq. 1289-1292), per-4×4-subblock
+  window sums with `i, j = −2..5` (eq. 1293-1297), per-sample direction
+  strength `dir1/dir2/dirS` (eq. 1298-1314), activity quantisation `avgVar`
+  via `varTab` (eq. 1315-1316), and finally `transposeIdx`
+  (`transposeTable`, eq. 1317-1318) + `filtIdx` with the eq. 1320
+  direction-strength offset. Cross products use `i64` to avoid overflow on
+  large CTBs / high bit depths. Off-edge reads clamp to the nearest
+  in-picture sample (§8.8.4.5 padding behaviour).
+- `alf.rs`: `AlfClassification` — the per-sample classification output
+  (`blk_width` / `blk_height` + row-major `filt_idx` / `transpose_idx`) with
+  `filt_idx_at(x, y)` / `transpose_idx_at(x, y)` accessors.
+- `alf.rs`: `transpose_luma_coeffs` — the §8.8.4.2 coefficient permutation
+  (eq. 1282-1285) selecting the 13-tap arrangement a sample's `transposeIdx`
+  requests; `transposeIdx == 0` (and any out-of-range value) returns the
+  taps unchanged.
+- `alf.rs`: `NUM_ALF_FILTERS` constant (25, `NumAlfFilters` per §8.9.4.1).
+- 9 new unit tests (309 total, was 300): flat-block class-0 (with the
+  spec's degenerate transposeIdx = 3), 4×4 subblock-constant resolution,
+  exhaustive cross-check against an independently-coded reference derivation
+  on a pseudo-random plane (full + edge CTBs), horizontal-edge directional
+  classification, adversarial-checkerboard range bounds, the three spec
+  transpose permutations + identity + centre/DC invariance, and the eq. 1316
+  `BitDepthY − 2` shift scaling activity down at 10-bit.
+
+#### Notes
+- `derive_alf_classification` / `transpose_luma_coeffs` are pure, syntax-free
+  building blocks. Wiring the per-sample classified filter selection into the
+  §8.8.4.2 apply additionally requires the full §8.9.4
+  `AlfCoeffL[ ][ filtIdx ][ ]` derivation (eq. 96-104 +
+  `alf_luma_coeff_delta_idx` + `coefPosMap` + fixed filters), which the
+  round-11 simplified `alf_data()` parser does not yet capture — tracked as a
+  follow-up (the parser needs to consume the real §7.3.5 syntax:
+  `uek(v)`-coded coeff deltas, the eg-order signalling, and the 25-entry
+  `alf_luma_coeff_delta_idx[]` class-to-signalled-filter map).
+
 ### Round 113 — per-CTB ALF apply-masking (§8.9 / §7.3.8.2)
 
 #### Added

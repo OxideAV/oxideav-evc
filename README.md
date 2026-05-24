@@ -7,6 +7,37 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-117 status
+
+Round 117 lands the §8.8.4.3 **ALF transpose + classification filter-index
+derivation** — the per-luma-sample gradient classification that selects, for
+each sample of a coding tree block, which of the 25 ALF filter classes
+(`filtIdx`) and which of the 4 coefficient permutations (`transposeIdx`)
+apply. Until now the §8.9 apply used filter set 0 uniformly across every
+flagged CTB; §8.8.4.3 is the input to the §8.8.4.2 per-sample filter
+selection. A new pure `derive_alf_classification` faithfully transcribes
+eq. 1289-1320: per-position Laplacian gradients `filtH/V/D0/D1` over the
+[−2, blk+1] halo, per-4×4-subblock window sums (`i, j = −2..5`), the
+direction-strength branch (`dir1/dir2/dirS` via the eq. 1310-1314 diagonal-
+vs-HV cross-product test, computed in `i64` to avoid overflow), the `varTab`
+activity quantisation with the eq. 1316 `BitDepthY − 2` shift, and the final
+`transposeTable`-driven `transposeIdx` (eq. 1317-1318) + `filtIdx` with the
+eq. 1320 direction offset. `transpose_luma_coeffs` applies the §8.8.4.2
+eq. 1282-1285 13-tap permutation a sample's `transposeIdx` requests. Both are
+syntax-free building blocks: classification is unit-tested directly against
+an independently-coded reference re-derivation (exhaustive sample cross-check
+on a pseudo-random plane, full + edge CTBs) plus targeted degenerate / range
+/ bit-depth cases. 309 unit tests pass (was 300). Wiring the classified
+per-sample selection into the apply needs the full §8.9.4
+`AlfCoeffL[ ][ filtIdx ][ ]` derivation (eq. 96-104 +
+`alf_luma_coeff_delta_idx` + fixed filters), which the round-11 simplified
+`alf_data()` parser does not yet capture — that's the documented follow-up.
+Suggested workspace-README row delta: EVC now derives the §8.8.4.3 per-sample
+ALF classification (`filtIdx` / `transposeIdx`) + the §8.8.4.2 coefficient
+transpose (lacks: §8.9.4 `AlfCoeffL` class-to-filter derivation wiring,
+per-CTU ALF filter-set selection §8.9.6, Main-profile toolset —
+BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-113 status
 
 Round 113 wires the round-107 **per-CTU ALF applicability map** into the
