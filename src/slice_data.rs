@@ -817,7 +817,7 @@ impl Default for SliceDecodeInputs {
 /// Stats from [`decode_baseline_idr_slice`]. A superset of
 /// [`SliceWalkStats`] for testability — coding_units, residual coeff
 /// counts, etc.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SliceDecodeStats {
     pub ctus: u32,
     pub split_cu_flag_bins: u32,
@@ -849,6 +849,12 @@ pub struct SliceDecodeStats {
     /// (§7.3.8.2). Zero unless the slice signals an ALF applicability
     /// map.
     pub alf_ctb: AlfCtbStats,
+    /// Round 113: the resolved per-CTU `alf_ctb_*` applicability map
+    /// (§7.3.8.2 → §8.9). Carries one triplet per CTU so the post-filter
+    /// pass can mask the ALF apply per coding tree block. Always populated
+    /// (sized to the picture); every entry is the present-or-inferred
+    /// on/off state for that CTU.
+    pub alf_ctb_map: crate::alf::AlfCtbMap,
 }
 
 /// Decode a Baseline-profile IDR slice into a freshly-allocated
@@ -895,7 +901,14 @@ pub fn decode_baseline_idr_slice(
         decode.bit_depth_luma,
     )?;
     let mut eng = CabacEngine::new(rbsp)?;
-    let mut stats = SliceDecodeStats::default();
+    let mut stats = SliceDecodeStats {
+        alf_ctb_map: crate::alf::AlfCtbMap::new(
+            walk.pic_width,
+            walk.pic_height,
+            walk.ctb_log2_size_y,
+        ),
+        ..Default::default()
+    };
     let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
     let n_ctus = walk
         .pic_width_in_ctus()
@@ -913,7 +926,12 @@ pub fn decode_baseline_idr_slice(
         let x_ctb = (ctu_idx % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
         let y_ctb = (ctu_idx / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
         // §7.3.8.2: per-CTU ALF applicability map before split_unit().
-        let _alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+        // §8.9: record the resolved flags so the post-filter pass can mask
+        // the ALF apply per coding tree block.
+        let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+        stats
+            .alf_ctb_map
+            .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
         decode_split_unit(
             &mut eng,
             &mut pic,
@@ -1715,7 +1733,7 @@ impl<'a, 'b> InterDecodeInputs<'a, 'b> {
 }
 
 /// Stats from [`decode_baseline_inter_slice`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterDecodeStats {
     pub ctus: u32,
     pub split_cu_flag_bins: u32,
@@ -1770,6 +1788,10 @@ pub struct InterDecodeStats {
     /// (§7.3.8.2). Zero unless the inter slice signals an ALF
     /// applicability map.
     pub alf_ctb: AlfCtbStats,
+    /// Round 113: the resolved per-CTU `alf_ctb_*` applicability map
+    /// (§7.3.8.2 → §8.9), sized to the picture; one triplet per CTU so the
+    /// post-filter pass can mask the ALF apply per coding tree block.
+    pub alf_ctb_map: crate::alf::AlfCtbMap,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -1838,7 +1860,14 @@ pub fn decode_baseline_inter_slice(
         decode.bit_depth_luma,
     )?;
     let mut eng = CabacEngine::new(rbsp)?;
-    let mut stats = InterDecodeStats::default();
+    let mut stats = InterDecodeStats {
+        alf_ctb_map: crate::alf::AlfCtbMap::new(
+            walk.pic_width,
+            walk.pic_height,
+            walk.ctb_log2_size_y,
+        ),
+        ..Default::default()
+    };
     let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
     // §8.5.2.7 / §7.3.8.2: HMVP candidate list lives per-CTU-row and
     // resets at the left boundary of each row. The list is consulted by
@@ -1861,7 +1890,11 @@ pub fn decode_baseline_inter_slice(
             hmvp.reset();
         }
         // §7.3.8.2: per-CTU ALF applicability map before split_unit().
-        let _alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+        // §8.9: record the resolved flags for per-CTB ALF apply-masking.
+        let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+        stats
+            .alf_ctb_map
+            .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
         decode_inter_split_unit(
             &mut eng,
             &mut pic,
@@ -5502,5 +5535,104 @@ mod tests {
         assert_eq!(stats.alf_ctb.luma_on_ctus, 0);
         assert_eq!(stats.split_cu_flag_bins, 1);
         assert_eq!(stats.cbf_luma_bins, 4);
+    }
+
+    /// Round 113: the IDR decode now threads the decoded per-CTU ALF map
+    /// into `stats.alf_ctb_map` so the §8.9 post-filter can mask per CTB.
+    /// Single 32×32 CTB with the luma map signalled and coded 1 → the map
+    /// records exactly one CTU, luma on.
+    #[test]
+    fn round113_idr_decode_populates_alf_ctb_map() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // alf_ctb_flag = 1 (luma on)
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode
+            enc.encode_decision(0, 0, 0); // cbf_luma
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            slice_alf_enabled_flag: true,
+            slice_alf_map_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (_pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        let map = &stats.alf_ctb_map;
+        assert_eq!(map.ctbs_wide, 1);
+        assert_eq!(map.ctbs_high, 1);
+        assert_eq!(map.luma.len(), 1);
+        assert!(map.luma[0], "CTU 0 luma alf_ctb_flag recorded on");
+        assert!(map.any_luma_on());
+    }
+
+    /// Round 113: a 64×32 IDR with two CTBs where the first is coded ALF-on
+    /// and the second ALF-off. The decoded map carries the per-CTU split,
+    /// then the §8.9 masked apply filters only the left CTB. Proves the
+    /// decode→map→apply wiring end to end.
+    #[test]
+    fn round113_idr_two_ctb_map_drives_masked_alf_apply() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // CTU 0: alf_ctb_flag = 1, then a single 32×32 leaf
+        // (min_cb_log2 = 5 ⇒ no split_cu_flag at the CTB).
+        enc.encode_decision(0, 0, 1); // alf_ctb_flag = 1
+        enc.encode_decision(0, 0, 0); // intra_pred_mode
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // CTU 1: alf_ctb_flag = 0, then its single leaf.
+        enc.encode_decision(0, 0, 0); // alf_ctb_flag = 0
+        enc.encode_decision(0, 0, 0); // intra_pred_mode
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 5,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0,
+            slice_alf_enabled_flag: true,
+            slice_alf_map_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (mut pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        let map = &stats.alf_ctb_map;
+        assert_eq!(map.ctbs_wide, 2);
+        assert!(map.luma[0], "left CTB ALF on");
+        assert!(!map.luma[1], "right CTB ALF off");
+        assert_eq!(stats.alf_ctb.luma_bins, 2, "two alf_ctb_flag bins");
+        assert_eq!(stats.alf_ctb.luma_on_ctus, 1);
+
+        // §8.9: feed the decoded map into the masked apply with a filter
+        // that maps a uniform-128 plane to a fixed 2; only the left CTB
+        // (32×32) changes, the right stays grey.
+        let mut filter = crate::alf::AlfLumaFilter { coef: [0; 13] };
+        filter.coef[12] = 256; // (256 + 64) >> 7 = 2
+        crate::alf::apply_alf_luma_masked(&mut pic, &filter, map, 8);
+        let stride = pic.y_stride();
+        for row in 0..32usize {
+            for col in 0..32usize {
+                assert_eq!(pic.y[row * stride + col], 2, "left CTB filtered");
+            }
+            for col in 32..64usize {
+                assert_eq!(pic.y[row * stride + col], 128, "right CTB untouched");
+            }
+        }
     }
 }

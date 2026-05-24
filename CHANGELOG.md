@@ -2,6 +2,67 @@
 
 ## [Unreleased]
 
+### Round 113 — per-CTB ALF apply-masking (§8.9 / §7.3.8.2)
+
+#### Added
+- `alf.rs`: `AlfCtbMap` — the resolved per-CTU `alf_ctb_*` applicability
+  decoded by `coding_tree_unit()` (§7.3.8.2), one triplet per CTU in raster
+  order plus `CtbLog2SizeY` / `PicWidthInCtbsY` / `PicHeightInCtbsY`. Carries
+  the present-or-inferred on/off state used by the §8.9 apply.
+- `alf.rs`: `apply_alf_luma_masked` implements the §8.9 luma loop (lines
+  18059-18074): for each CTU at `(rx, ry)`, the coding tree block luma type
+  filtering is invoked **only when `alf_ctb_flag[rx][ry]` is 1**. The
+  §8.9 `blkWidth` / `blkHeight` picture-edge clamp falls out of intersecting
+  the per-CTB write range with the picture extent; CTBs whose flag is 0 keep
+  their reconstructed (pre-ALF) samples, matching the spec's "init
+  alfPicture to recPicture, overwrite filtered CTBs" semantics. The filter
+  reads from a whole-plane pre-filter snapshot so a filtered CTB's edge
+  samples still tap unfiltered neighbours.
+- `alf.rs`: `apply_alf_with_map` — map-driven entry point. Masks the luma
+  apply per CTB; for `ChromaArrayType` 1..2 (Baseline 4:2:0/4:2:2) the chroma
+  plane is filtered as a whole only when the slice-level
+  `sliceChromaAlfEnabledFlag` / `sliceChroma2AlfEnabledFlag` holds (the
+  §7.3.8.2 per-CTB chroma map flags are inferred 0 in that case).
+- `slice_data.rs`: the IDR + inter CTU loops now record each CTU's resolved
+  `AlfCtbFlags` into a new `alf_ctb_map: AlfCtbMap` on `SliceDecodeStats` /
+  `InterDecodeStats` (both lose their `Copy` derive — no call site relied on
+  it). The round-107 `let _alf = ...` discards become `map.set(...)`.
+- `decoder.rs`: `decode_non_idr` returns a new `NonIdrDecodeResult` carrying
+  the picture, POC, the decoded `alf_ctb_map`, and the slice-level chroma ALF
+  enables. `apply_post_filters` consults the map: when at least one luma CTB
+  is on (or chroma is enabled) it uses `apply_alf_with_map`; an all-off map
+  (the minimal-header IDR path that doesn't thread the slice ALF enables)
+  falls back to the whole-plane `apply_alf`, preserving round-11 behaviour.
+
+#### Tests
+- 300 pass (was 292). 8 new tests:
+  - `alf::masked_luma_apply_only_touches_flagged_ctbs`: two-CTB picture,
+    left on / right off ⇒ only the left CTB is filtered.
+  - `alf::masked_luma_apply_clamps_at_picture_edge`: a partial bottom-right
+    CTB filters only its in-picture 8×8 region (§8.9 blkWidth/blkHeight).
+  - `alf::masked_apply_all_off_map_leaves_picture_unchanged`.
+  - `alf::apply_alf_with_map_matches_whole_plane_when_all_on`: an all-on map
+    reproduces the whole-plane `apply_alf` bit-for-bit.
+  - `alf::apply_alf_with_map_chroma_gated_by_slice_enable`: Cb enabled /
+    Cr disabled ⇒ only Cb filtered.
+  - `alf::alf_ctb_map_new_sizes_to_ctb_grid`: ceil-div CTB grid sizing.
+  - `slice_data::round113_idr_decode_populates_alf_ctb_map`: the IDR decode
+    threads the decoded per-CTU flag into `stats.alf_ctb_map`.
+  - `slice_data::round113_idr_two_ctb_map_drives_masked_alf_apply`:
+    end-to-end decode of a 64×32 IDR with the left CTB coded ALF-on and the
+    right ALF-off, then the masked apply filters only the left CTB.
+
+#### Notes
+- This round wires the round-107 decoded ALF applicability map into the §8.9
+  apply (the documented round-107 follow-up: previously `apply_alf` filtered
+  whole planes regardless of the per-CTB flags). Still deferred: the
+  per-CTU 25-filter-set selection (`alf_luma_filter_idx`, §8.9.6) — filter
+  set 0 is always applied — and the §8.8.4.3 ALF transpose / filter-index
+  classification (the apply uses the fixed diamond tap layout).
+- Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
+  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec evcdec
+  consulted; no web access.
+
 ### Round 107 — `coding_tree_unit()` ALF applicability map (§7.3.8.2)
 
 #### Added

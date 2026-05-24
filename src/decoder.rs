@@ -60,6 +60,18 @@ struct DpbEntry {
     output_emitted: bool,
 }
 
+/// Result of decoding one non-IDR (P/B) slice. Round 113 threads the
+/// §7.3.8.2 per-CTU ALF applicability map (plus the slice-level chroma ALF
+/// enables) out of the decode so the §8.9 post-filter pass can mask the
+/// luma ALF apply per coding tree block.
+struct NonIdrDecodeResult {
+    pic: YuvPicture,
+    poc: i32,
+    alf_ctb_map: alf::AlfCtbMap,
+    chroma_cb_enabled: bool,
+    chroma_cr_enabled: bool,
+}
+
 /// Build the round-3 decoder for the registry.
 pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(EvcDecoder::new()))
@@ -204,11 +216,14 @@ impl Decoder for EvcDecoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("evc decoder: IDR slice before PPS"))?
                         .clone();
-                    let (mut pic, _stats) = crate::decode_idr_slice(&sps, &pps, nal.rbsp())?;
+                    let (mut pic, stats) = crate::decode_idr_slice(&sps, &pps, nal.rbsp())?;
                     // §8.3.1: IDR resets POC to 0, flushes the DPB.
                     self.dpb_flush();
-                    // Round-11: ALF + DRA post-filter pass.
-                    self.apply_post_filters(&mut pic, &sps);
+                    // Round-11: ALF + DRA post-filter pass. Round 113: the
+                    // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply. The
+                    // minimal-header IDR path produces an all-off map, so this
+                    // falls back to the whole-plane apply (unchanged behaviour).
+                    self.apply_post_filters(&mut pic, &sps, &stats.alf_ctb_map, false, false);
                     let entry = DpbEntry {
                         pic,
                         poc: 0,
@@ -232,9 +247,22 @@ impl Decoder for EvcDecoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("evc decoder: NonIDR slice before PPS"))?
                         .clone();
-                    let (mut pic, poc) = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
-                    // Round-11: ALF + DRA post-filter pass.
-                    self.apply_post_filters(&mut pic, &sps);
+                    let NonIdrDecodeResult {
+                        mut pic,
+                        poc,
+                        alf_ctb_map,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                    } = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
+                    // Round-11: ALF + DRA post-filter pass. Round 113: the
+                    // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply.
+                    self.apply_post_filters(
+                        &mut pic,
+                        &sps,
+                        &alf_ctb_map,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                    );
                     let entry = DpbEntry {
                         pic,
                         poc,
@@ -352,7 +380,7 @@ impl EvcDecoder {
         sps: &Sps,
         pps: &Pps,
         slice_nal_rbsp: &[u8],
-    ) -> Result<(YuvPicture, i32)> {
+    ) -> Result<NonIdrDecodeResult> {
         if sps.sps_btt_flag
             || sps.sps_suco_flag
             || sps.sps_admvp_flag
@@ -531,7 +559,7 @@ impl EvcDecoder {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
         };
-        let (pic, _stats) =
+        let (pic, stats) =
             crate::slice_data::decode_baseline_inter_slice(slice_data_bytes, inputs)?;
 
         // Update §8.3.1 prev-LSB tracker for the next non-IDR slice.
@@ -542,7 +570,16 @@ impl EvcDecoder {
             self.prev_poc_lsb = lsb;
         }
 
-        Ok((pic, poc))
+        Ok(NonIdrDecodeResult {
+            pic,
+            poc,
+            alf_ctb_map: stats.alf_ctb_map,
+            // §8.9 chroma path (ChromaArrayType 1..2): the plane is filtered
+            // when the slice-level chroma ALF enable is set (the per-CTB
+            // chroma map flags are inferred 0 in the Baseline 4:2:0 case).
+            chroma_cb_enabled: header.slice_chroma_alf_enabled_flag,
+            chroma_cr_enabled: header.slice_chroma2_alf_enabled_flag,
+        })
     }
 
     /// Resolve the slice's RPL for list `list_x` (0 or 1) into a concrete
@@ -616,12 +653,38 @@ impl EvcDecoder {
     /// a decoded picture if the corresponding APS has been cached and the
     /// SPS flags indicate they are active. This is called after deblocking
     /// for every IDR and non-IDR slice.
-    fn apply_post_filters(&self, pic: &mut YuvPicture, sps: &Sps) {
+    ///
+    /// Round 113: when the slice decoded a per-CTU `alf_ctb_*` applicability
+    /// map (§7.3.8.2) that turns at least one luma CTB on, the §8.9 luma
+    /// apply is masked per coding tree block via [`alf::apply_alf_with_map`].
+    /// An all-off map (the minimal-header IDR path that doesn't thread the
+    /// slice ALF enables) falls back to the whole-plane [`alf::apply_alf`],
+    /// preserving the round-11 behaviour.
+    fn apply_post_filters(
+        &self,
+        pic: &mut YuvPicture,
+        sps: &Sps,
+        alf_map: &alf::AlfCtbMap,
+        chroma_cb_enabled: bool,
+        chroma_cr_enabled: bool,
+    ) {
         let bd_y = sps.bit_depth_y();
         let bd_c = sps.bit_depth_c();
         if sps.sps_alf_flag {
             if let Some(ref alf_data) = self.alf_aps {
-                alf::apply_alf(pic, alf_data, bd_y, bd_c);
+                if alf_map.any_luma_on() || chroma_cb_enabled || chroma_cr_enabled {
+                    alf::apply_alf_with_map(
+                        pic,
+                        alf_data,
+                        alf_map,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                        bd_y,
+                        bd_c,
+                    );
+                } else {
+                    alf::apply_alf(pic, alf_data, bd_y, bd_c);
+                }
             }
         }
         if sps.sps_dra_flag {

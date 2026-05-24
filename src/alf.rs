@@ -38,9 +38,13 @@
 //! * Full APS payload parsing (replaces the round-1 raw-byte capture).
 //! * Luma + chroma filter tap-pass applied uniformly across the full picture
 //!   after deblocking when `sps_alf_flag == 1 && slice_alf_enabled_flag`.
-//! * Per-CTU `alf_ctb_flag` is deferred — the in-slice CTU-level flag
-//!   requires CABAC decoding of `coding_tree_unit()` and threading a per-CTU
-//!   grid through the pipeline. For now, the filter is applied to every CTU.
+//! * Per-CTU `alf_ctb_flag` masking (round 113): `coding_tree_unit()`
+//!   (§7.3.8.2) decodes the per-CTU applicability map into an [`AlfCtbMap`];
+//!   [`apply_alf_with_map`] / [`apply_alf_luma_masked`] then filter only the
+//!   luma coding tree blocks whose `alf_ctb_flag` is 1 per the §8.9 loop
+//!   (lines 18059-18074), with the `blkWidth` / `blkHeight` picture-edge
+//!   clamp. The whole-plane [`apply_alf`] entry is retained for the
+//!   minimal-header / no-map path.
 //! * The 25-filter-set `alf_luma_filter_idx` per-CTU selection (§8.9.6) is
 //!   deferred — this round always applies filter set 0.
 //!
@@ -447,6 +451,166 @@ pub fn apply_alf(pic: &mut YuvPicture, alf: &AlfData, bit_depth_luma: u32, bit_d
 }
 
 // =====================================================================
+// Per-CTB ALF applicability map (§8.9 / §7.3.8.2).
+// =====================================================================
+
+/// Resolved per-CTU `alf_ctb_*` applicability decoded by
+/// `coding_tree_unit()` (§7.3.8.2). One triplet per CTU in raster scan
+/// order (`rx + ry * ctbs_wide`), carrying the resolved (present-or-
+/// inferred) luma / Cb / Cr on/off state used by the §8.9 apply to
+/// decide which coding tree blocks receive the filter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlfCtbMap {
+    /// `CtbLog2SizeY` — luma CTB side length is `1 << ctb_log2_size_y`.
+    pub ctb_log2_size_y: u32,
+    /// `PicWidthInCtbsY`.
+    pub ctbs_wide: u32,
+    /// `PicHeightInCtbsY`.
+    pub ctbs_high: u32,
+    /// Per-CTU luma `alf_ctb_flag` (raster order, length
+    /// `ctbs_wide * ctbs_high`).
+    pub luma: Vec<bool>,
+    /// Per-CTU Cb `alf_ctb_chroma_flag`.
+    pub chroma_cb: Vec<bool>,
+    /// Per-CTU Cr `alf_ctb_chroma2_flag`.
+    pub chroma_cr: Vec<bool>,
+}
+
+impl AlfCtbMap {
+    /// Allocate an all-off map sized to a picture of `pic_width × pic_height`
+    /// luma samples at `ctb_log2_size_y`.
+    pub fn new(pic_width: u32, pic_height: u32, ctb_log2_size_y: u32) -> Self {
+        let ctb_size = 1u32 << ctb_log2_size_y;
+        let ctbs_wide = pic_width.div_ceil(ctb_size).max(1);
+        let ctbs_high = pic_height.div_ceil(ctb_size).max(1);
+        let n = (ctbs_wide as usize) * (ctbs_high as usize);
+        Self {
+            ctb_log2_size_y,
+            ctbs_wide,
+            ctbs_high,
+            luma: vec![false; n],
+            chroma_cb: vec![false; n],
+            chroma_cr: vec![false; n],
+        }
+    }
+
+    /// Record the resolved flags for the CTU at raster index `idx`.
+    pub fn set(&mut self, idx: usize, luma: bool, chroma_cb: bool, chroma_cr: bool) {
+        if idx < self.luma.len() {
+            self.luma[idx] = luma;
+            self.chroma_cb[idx] = chroma_cb;
+            self.chroma_cr[idx] = chroma_cr;
+        }
+    }
+
+    /// True when at least one CTU has its luma `alf_ctb_flag` set — i.e.
+    /// the masked luma apply would touch at least one CTB.
+    pub fn any_luma_on(&self) -> bool {
+        self.luma.iter().any(|&b| b)
+    }
+}
+
+/// Apply the luma ALF filter only to coding tree blocks whose
+/// `alf_ctb_flag[ rx ][ ry ]` is 1, per the §8.9 loop (lines 18059-18074).
+///
+/// Like [`apply_alf_luma`], the filter reads from a pre-filter snapshot of
+/// the whole plane (so a CTB at the boundary of a filtered region still
+/// reads its neighbours' unfiltered values — matching the spec, whose
+/// `recPicture` input is the reconstructed array prior to ALF). The §8.9
+/// `blkWidth` / `blkHeight` boundary clamp falls out naturally: the
+/// per-CTB write range is intersected with the picture extent, so a CTB
+/// that overruns the right / bottom edge only filters its in-picture
+/// samples.
+///
+/// Samples in CTBs whose flag is 0 are left at their reconstructed value
+/// (the spec initialises `alfPicture` to `recPicture` and only overwrites
+/// filtered CTBs).
+pub fn apply_alf_luma_masked(
+    pic: &mut YuvPicture,
+    filter: &AlfLumaFilter,
+    map: &AlfCtbMap,
+    bit_depth: u32,
+) {
+    let w = pic.width as usize;
+    let h = pic.height as usize;
+    let stride = pic.y_stride();
+    let src = pic.y.clone();
+    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let ctb_size = 1usize << map.ctb_log2_size_y;
+    let coef = &filter.coef;
+
+    for ry in 0..map.ctbs_high as usize {
+        for rx in 0..map.ctbs_wide as usize {
+            let idx = ry * map.ctbs_wide as usize + rx;
+            if !map.luma.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            // §8.9: blkWidth / blkHeight clamp to the picture edge.
+            let x0 = rx * ctb_size;
+            let y0 = ry * ctb_size;
+            let x1 = (x0 + ctb_size).min(w);
+            let y1 = (y0 + ctb_size).min(h);
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    let x = col as i32;
+                    let y = row as i32;
+                    let mut acc: i32 = coef[12] as i32;
+                    for k in 0..12 {
+                        let (dy0, dx0) = LUMA_TAPS[k];
+                        let (dy1, dx1) = LUMA_TAPS_SYM[k];
+                        let s0 = {
+                            let xc = (x + dx0).clamp(0, w as i32 - 1) as usize;
+                            let yc = (y + dy0).clamp(0, h as i32 - 1) as usize;
+                            src[yc * stride + xc] as i32
+                        };
+                        let s1 = {
+                            let xc = (x + dx1).clamp(0, w as i32 - 1) as usize;
+                            let yc = (y + dy1).clamp(0, h as i32 - 1) as usize;
+                            src[yc * stride + xc] as i32
+                        };
+                        acc += coef[k] as i32 * (s0 + s1);
+                    }
+                    let out = ((acc + 64) >> 7).clamp(0, max_val);
+                    pic.y[row * stride + col] = out as u8;
+                }
+            }
+        }
+    }
+}
+
+/// ALF apply driven by a decoded per-CTU applicability map (§8.9).
+///
+/// The luma filter is masked per [`apply_alf_luma_masked`]. Chroma follows
+/// the §8.9 lines 18099-18116 path for `ChromaArrayType` 1..2: when
+/// `sliceChromaAlfEnabledFlag` / `sliceChroma2AlfEnabledFlag` holds the
+/// chroma plane is filtered as a whole (there is no per-CTB chroma flag in
+/// the 4:2:0 / 4:2:2 case — `slice_alf_chroma_idc > 0` enables the plane and
+/// the §7.3.8.2 chroma map flags are inferred 0). The caller decides whether
+/// chroma is enabled via `chroma_cb_enabled` / `chroma_cr_enabled` (the
+/// slice-level enables resolved by the header parser).
+pub fn apply_alf_with_map(
+    pic: &mut YuvPicture,
+    alf: &AlfData,
+    map: &AlfCtbMap,
+    chroma_cb_enabled: bool,
+    chroma_cr_enabled: bool,
+    bit_depth_luma: u32,
+    bit_depth_chroma: u32,
+) {
+    if alf.luma_filter_signal && alf.num_luma_filters > 0 {
+        apply_alf_luma_masked(pic, &alf.luma_filters[0], map, bit_depth_luma);
+    }
+    if alf.chroma_filter_signal && alf.num_chroma_alts > 0 && pic.chroma_format_idc != 0 {
+        if chroma_cb_enabled {
+            apply_alf_chroma(pic, &alf.chroma_filters[0], 1, bit_depth_chroma);
+        }
+        if chroma_cr_enabled {
+            apply_alf_chroma(pic, &alf.chroma_filters[0], 2, bit_depth_chroma);
+        }
+    }
+}
+
+// =====================================================================
 // Tests.
 // =====================================================================
 
@@ -663,5 +827,153 @@ mod tests {
         assert_eq!(alf.luma_filters[0].coef[0], -5);
         // DC: 128 - 2*5 = 118
         assert_eq!(alf.luma_filters[0].coef[12], 118);
+    }
+
+    // =================================================================
+    // Round 113: per-CTB ALF apply-masking (§8.9 / §7.3.8.2).
+    // =================================================================
+
+    /// A constant filter that maps every sample (under boundary clamping on
+    /// a uniform plane) to a fixed value: coef[12] = 256, all taps 0 →
+    /// output = (256 + 64) >> 7 = 2. Distinct from the reconstructed fill.
+    fn const_filter_to_two() -> AlfLumaFilter {
+        let mut coef = [0i16; ALF_LUMA_NUM_COEF];
+        coef[12] = 256;
+        AlfLumaFilter { coef }
+    }
+
+    #[test]
+    fn alf_ctb_map_new_sizes_to_ctb_grid() {
+        // 96×64 picture at CtbLog2SizeY = 5 (32×32 CTBs) → 3 wide × 2 high.
+        let map = AlfCtbMap::new(96, 64, 5);
+        assert_eq!(map.ctbs_wide, 3);
+        assert_eq!(map.ctbs_high, 2);
+        assert_eq!(map.luma.len(), 6);
+        assert!(!map.any_luma_on());
+        // A partial CTB at the edge still counts as one CTB column / row.
+        let map2 = AlfCtbMap::new(40, 33, 5);
+        assert_eq!(map2.ctbs_wide, 2);
+        assert_eq!(map2.ctbs_high, 2);
+    }
+
+    #[test]
+    fn masked_luma_apply_only_touches_flagged_ctbs() {
+        // 64×32 picture, CtbLog2SizeY = 5 → two 32×32 CTBs side by side.
+        let mut pic = crate::picture::YuvPicture::new(64, 32, 0, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        let mut map = AlfCtbMap::new(64, 32, 5);
+        // CTU 0 (left) on, CTU 1 (right) off.
+        map.set(0, true, false, false);
+        map.set(1, false, false, false);
+        let filter = const_filter_to_two();
+        apply_alf_luma_masked(&mut pic, &filter, &map, 8);
+        let stride = pic.y_stride();
+        // Left CTB filtered to 2; right CTB unchanged at 100.
+        for row in 0..32usize {
+            for col in 0..32usize {
+                assert_eq!(pic.y[row * stride + col], 2, "left CTB filtered");
+            }
+            for col in 32..64usize {
+                assert_eq!(pic.y[row * stride + col], 100, "right CTB untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn masked_luma_apply_clamps_at_picture_edge() {
+        // 40×40 picture, CtbLog2SizeY = 5 → 2×2 CTB grid but only the
+        // top-left CTB is full 32×32; the others are partial. Flag the
+        // bottom-right CTB on: it covers luma (32..40, 32..40) = 8×8.
+        let mut pic = crate::picture::YuvPicture::new(40, 40, 0, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        let mut map = AlfCtbMap::new(40, 40, 5);
+        // raster idx 3 = (rx=1, ry=1) bottom-right partial CTB.
+        map.set(3, true, false, false);
+        let filter = const_filter_to_two();
+        apply_alf_luma_masked(&mut pic, &filter, &map, 8);
+        let stride = pic.y_stride();
+        // Only samples in (32..40, 32..40) change; the rest stay 100.
+        for row in 0..40usize {
+            for col in 0..40usize {
+                let expected = if row >= 32 && col >= 32 { 2 } else { 100 };
+                assert_eq!(pic.y[row * stride + col], expected, "row={row} col={col}");
+            }
+        }
+    }
+
+    #[test]
+    fn masked_apply_all_off_map_leaves_picture_unchanged() {
+        let mut pic = crate::picture::YuvPicture::new(64, 32, 0, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 77;
+        }
+        let map = AlfCtbMap::new(64, 32, 5); // all off
+        let filter = const_filter_to_two();
+        apply_alf_luma_masked(&mut pic, &filter, &map, 8);
+        for v in pic.y.iter() {
+            assert_eq!(*v, 77);
+        }
+    }
+
+    #[test]
+    fn apply_alf_with_map_matches_whole_plane_when_all_on() {
+        // With every luma CTB flagged on, the masked apply must produce the
+        // identical result to the whole-plane apply_alf path.
+        let make = || {
+            let mut pic = crate::picture::YuvPicture::new(64, 32, 0, 8).unwrap();
+            for (i, v) in pic.y.iter_mut().enumerate() {
+                *v = (i % 200) as u8;
+            }
+            pic
+        };
+        let mut pic_map = make();
+        let mut pic_whole = make();
+        let mut alf = AlfData {
+            luma_filter_signal: true,
+            chroma_filter_signal: false,
+            num_luma_filters: 1,
+            ..AlfData::default()
+        };
+        // A non-trivial filter so the two paths actually do work.
+        alf.luma_filters[0].coef[0] = 4;
+        alf.luma_filters[0].coef[12] = 60;
+
+        let mut map = AlfCtbMap::new(64, 32, 5);
+        for i in 0..map.luma.len() {
+            map.set(i, true, false, false);
+        }
+        apply_alf_with_map(&mut pic_map, &alf, &map, false, false, 8, 8);
+        apply_alf(&mut pic_whole, &alf, 8, 8);
+        assert_eq!(pic_map.y, pic_whole.y, "masked-all-on == whole-plane");
+    }
+
+    #[test]
+    fn apply_alf_with_map_chroma_gated_by_slice_enable() {
+        // ChromaArrayType 1 (4:2:0): the per-CTB chroma map flags are
+        // inferred 0, so chroma is filtered as a whole plane only when the
+        // slice-level enable is passed. Cb enabled, Cr disabled.
+        let mut pic = crate::picture::YuvPicture::new(16, 16, 1, 8).unwrap();
+        for v in pic.cb.iter_mut() {
+            *v = 128;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 128;
+        }
+        let mut alf = AlfData {
+            luma_filter_signal: false,
+            chroma_filter_signal: true,
+            num_chroma_alts: 1,
+            ..AlfData::default()
+        };
+        // coef[6] = 64 → (64 + 64) >> 7 = 1 for a uniform plane.
+        alf.chroma_filters[0].coef = [0, 0, 0, 0, 0, 0, 64];
+        let map = AlfCtbMap::new(16, 16, 5);
+        apply_alf_with_map(&mut pic, &alf, &map, true, false, 8, 8);
+        assert!(pic.cb.iter().all(|&v| v == 1), "Cb filtered (enabled)");
+        assert!(pic.cr.iter().all(|&v| v == 128), "Cr untouched (disabled)");
     }
 }

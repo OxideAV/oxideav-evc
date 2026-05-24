@@ -7,6 +7,34 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-113 status
+
+Round 113 wires the round-107 **per-CTU ALF applicability map** into the
+**§8.9 apply** — the documented round-107 follow-up. Until now `apply_alf`
+filtered whole planes regardless of the per-CTB `alf_ctb_flag`; the §8.9
+luma loop (lines 18059-18074) actually invokes the coding-tree-block luma
+filtering process *only* for CTBs whose `alf_ctb_flag[rx][ry]` is 1. A new
+`AlfCtbMap` records the resolved (present-or-inferred) per-CTU triplet during
+the IDR + inter CTU loops; `apply_alf_luma_masked` filters only the flagged
+luma CTBs, with the §8.9 `blkWidth` / `blkHeight` picture-edge clamp and a
+whole-plane pre-filter snapshot so a filtered CTB's edge taps still read
+unfiltered neighbours. `apply_alf_with_map` adds the §8.9 chroma path for
+`ChromaArrayType` 1..2 (the plane is filtered when the slice-level chroma
+enable holds; the per-CTB chroma map flags are inferred 0 in Baseline
+4:2:0). The decoder threads the map (and the chroma enables) out of
+`decode_non_idr` via a new `NonIdrDecodeResult` and into `apply_post_filters`;
+an all-off map (the minimal-header IDR path) falls back to the whole-plane
+apply, so existing behaviour is preserved. `SliceDecodeStats` /
+`InterDecodeStats` gain an `alf_ctb_map` field (both drop their `Copy`
+derive). 300 unit tests pass (was 292): masked apply touches only flagged
+CTBs, clamps a partial edge CTB, an all-on map reproduces the whole-plane
+result bit-for-bit, chroma is gated by the slice enable, and an end-to-end
+64×32 IDR with one CTB on / one off filters only the flagged CTB. Suggested
+workspace-README row delta: EVC now masks the §8.9 ALF luma apply per coding
+tree block by the decoded §7.3.8.2 map (lacks: per-CTU ALF filter-set
+selection §8.9.6 / ALF classification §8.8.4.3, Main-profile toolset —
+BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-107 status
 
 Round 107 lands the §7.3.8.2 `coding_tree_unit()` **adaptive-loop-filter
