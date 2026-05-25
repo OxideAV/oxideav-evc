@@ -7,6 +7,41 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-126 status
+
+Round 126 lands the **multi-APS cache indexed by
+`adaptation_parameter_set_id`** — the routing layer the spec-mandated
+§7.3.4 `slice_alf_luma_aps_id` / `slice_alf_chroma_aps_id` /
+`slice_alf_chroma2_aps_id` + PPS `pic_dra_aps_id` reference but every
+prior round collapsed to a single `Option<AlfData>` / `Option<DraData>`
+slot. Both `EvcDecoder::alf_aps` and `dra_aps` are now 32-slot arrays
+indexed by the 5-bit APS id; `send_packet`'s APS branch writes the
+parsed payload into the cache slot named by the NAL's
+`adaptation_parameter_set_id` (overwriting on update — the spec's
+update-by-id semantics), and `apply_post_filters` pulls each plane's
+ALF data from the slot the slice references. The slice header parser
+now surfaces all three APS ids (formerly `_` discards). `SliceHeader`
+gains `slice_alf_luma_aps_id` / `slice_alf_chroma_aps_id` /
+`slice_alf_chroma2_aps_id`, each `Option<u8>` exactly when the §7.4.5
+gating signals it. ChromaArrayType==3 slices with
+`slice_alf_chroma_idc == 3` can now apply different ALF data to the Cb
+and Cr planes (Cb / Cr fallback chain: explicit chroma APS id → joint
+chroma APS id → luma APS, per §7.4.5's same-APS inference). A back-compat
+fallback to the most-recently-stored APS keeps the minimal-header IDR
+fixture path (which doesn't decode a slice header and therefore can't
+surface an id) working unchanged. A new `PostFilterInputs` struct
+bundles the seven §8.9 + §8.10 inputs so the call site stays under the
+`clippy::too_many_arguments` lint. 326 unit tests pass (was 321) — 5
+new ones cover the three slice APS ids on a 4:4:4 slice, the no-ALF
+unset case, two-distinct-ALF-APS resolution by slice id + last-stored
+fallback, the DRA mirror of the same, and an APS NAL parse populating
+its declared cache slot without touching others. Suggested
+workspace-README row delta: EVC now routes ALF + DRA APS lookups
+through the slice's / PPS's `aps_id` rather than the most-recently
+parsed APS (lacks: per-CTU ALF filter-set selection §8.9.6 picking
+between multiple APS sets within one slice, Main-profile toolset —
+BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-120 status
 
 Round 120 closes the documented round-117 follow-up by landing the

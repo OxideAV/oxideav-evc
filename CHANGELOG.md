@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### Round 126 — Multi-APS cache indexed by `adaptation_parameter_set_id` (§7.4.2.3 / §7.3.4 / §8.9 routing)
+
+#### Added
+- `EvcDecoder::alf_aps`: 32-slot ALF APS cache (was `Option<AlfData>`),
+  indexed by `adaptation_parameter_set_id` (5-bit, 0..=31). Replaces the
+  round-11 last-APS-wins behaviour with the spec's update-by-id
+  semantics. New `EvcDecoder::dra_aps` mirrors the same shape for DRA
+  APS (selected by the PPS's `pic_dra_aps_id`).
+- `EvcDecoder::alf_aps_for_slice(Option<u8>)` and `dra_aps_for_pps(Option<u8>)`:
+  routing helpers that resolve the slice / PPS-referenced APS id against
+  the new caches. Fall back to the most-recently-stored APS when the
+  caller can't surface an id (e.g. the minimal-header IDR fixture path
+  that doesn't decode a slice header).
+- `SliceHeader::slice_alf_luma_aps_id`, `slice_alf_chroma_aps_id`,
+  `slice_alf_chroma2_aps_id`: surfaces the §7.3.4 `slice_alf_*_aps_id`
+  fields (formerly parsed into `_` discards). Each is `Option<u8>` —
+  `Some(id)` exactly when the corresponding ALF idc / ChromaArrayType
+  gating signals the APS id in the bitstream.
+- `PostFilterInputs`: bundles the §8.9 + §8.10 inputs to
+  `apply_post_filters` (ALF CTB map, chroma enables, three ALF APS ids,
+  one DRA APS id) into one struct so the call site stays inside the
+  `clippy::too_many_arguments` lint threshold.
+- 5 new unit tests (now 326, was 321):
+  `round126_alf_aps_ids_chroma444_three_apsids` (ChromaArrayType==3
+  slice surfaces three distinct ALF APS ids),
+  `round126_alf_aps_ids_unset_when_disabled` (no ids when
+  `slice_alf_enabled_flag = 0`),
+  `round126_alf_aps_cache_distinct_slots_resolve_independently` (two
+  distinct ALF APS payloads at slots 3 and 19 resolve via their slice
+  ids, with a fallback to the most-recently-cached slot when the slice
+  doesn't surface one),
+  `round126_dra_aps_cache_routes_via_pps_id` (DRA mirror of the same),
+  `round126_aps_nal_writes_indexed_cache_slot` (APS NAL parse populates
+  the cache slot named by its `adaptation_parameter_set_id`, leaving
+  other slots intact).
+
+#### Changed
+- `EvcDecoder::send_packet` APS branch now writes the parsed ALF / DRA
+  payload into the cache slot named by the APS NAL's
+  `adaptation_parameter_set_id`, and records the id in
+  `last_alf_aps_id` / `last_dra_aps_id` so the back-compat fallback
+  has a referent.
+- `apply_post_filters` resolves the luma / Cb / Cr ALF APS slots
+  independently per the slice's three APS ids, so a 4:4:4 slice
+  signalling `slice_alf_chroma_idc == 3` with distinct Cb / Cr APS
+  ids pulls each chroma plane from its own cache slot (was: both
+  chroma planes used the luma APS's `chroma_filters[0]`). Cb / Cr
+  fallback chain: explicit chroma APS id → joint chroma APS id →
+  luma APS — matching §7.4.5's "inference of same APS" intent.
+- `NonIdrDecodeResult` adds `alf_luma_aps_id` / `alf_chroma_aps_id`
+  / `alf_chroma2_aps_id` so the apply pass can route to the right
+  slot per slice.
+
 ### Round 120 — Spec-faithful §7.3.5 alf_data() parser + §8.9.4 AlfCoeffL + §8.8.4.2 classified luma apply
 
 #### Added

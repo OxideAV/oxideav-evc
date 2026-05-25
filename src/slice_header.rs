@@ -110,6 +110,22 @@ pub struct SliceHeader {
     /// `ChromaArrayType == 3 && sliceChroma2AlfEnabledFlag`; inferred 0
     /// otherwise. Gates `alf_ctb_chroma2_flag` (line 2630).
     pub slice_alf_chroma2_map_flag: bool,
+    /// `slice_alf_luma_aps_id` (§7.3.4, 5-bit), present only when
+    /// `sps_alf_flag && slice_alf_enabled_flag`. Selects the ALF APS
+    /// (`adaptation_parameter_set_id` 0..=31) the §8.9 luma path consults.
+    /// Round 126: surfaces the spec-mandated APS handle so the decoder can
+    /// route slice-by-slice to the right cached APS instead of relying on
+    /// the most-recently-parsed one.
+    pub slice_alf_luma_aps_id: Option<u8>,
+    /// `slice_alf_chroma_aps_id` (§7.3.4, 5-bit), present only when the
+    /// ChromaArrayType / `slice_alf_chroma_idc` gating signals one. Used
+    /// to route the Cb plane's ALF (and the joint-component Cb branch of
+    /// `slice_alf_chroma_idc == 3` on ChromaArrayType 1..2).
+    pub slice_alf_chroma_aps_id: Option<u8>,
+    /// `slice_alf_chroma2_aps_id` (§7.3.4, 5-bit), present only on
+    /// ChromaArrayType == 3 when `slice_alf_chroma_idc ∈ {2, 3}`. Routes
+    /// the Cr plane's ALF when the slice signals it independently of Cb.
+    pub slice_alf_chroma2_aps_id: Option<u8>,
     pub slice_pic_order_cnt_lsb: u32,
     pub num_ref_idx_active_override_flag: bool,
     pub num_ref_idx_active_minus1: [u32; 2],
@@ -227,16 +243,19 @@ fn parse_from_bitreader(
     let mut slice_alf_chroma_idc = 0u32;
     let mut slice_alf_chroma_map_flag = false;
     let mut slice_alf_chroma2_map_flag = false;
+    let mut slice_alf_luma_aps_id: Option<u8> = None;
+    let mut slice_alf_chroma_aps_id: Option<u8> = None;
+    let mut slice_alf_chroma2_aps_id: Option<u8> = None;
     if ctx.sps_alf_flag {
         slice_alf_enabled_flag = br.u1()? != 0;
         if slice_alf_enabled_flag {
-            let _slice_alf_luma_aps_id = br.u(5)?;
+            slice_alf_luma_aps_id = Some(br.u(5)? as u8);
             slice_alf_map_flag = br.u1()? != 0;
             slice_alf_chroma_idc = br.u(2)?;
             if (ctx.chroma_array_type == 1 || ctx.chroma_array_type == 2)
                 && slice_alf_chroma_idc > 0
             {
-                let _slice_alf_chroma_aps_id = br.u(5)?;
+                slice_alf_chroma_aps_id = Some(br.u(5)? as u8);
             }
         }
         // §7.4.5: when ChromaArrayType == 0, slice_alf_chroma_idc shall
@@ -249,12 +268,12 @@ fn parse_from_bitreader(
             }
             // §7.4.5 derived: sliceChromaAlfEnabledFlag set for idc 1/3.
             if slice_alf_chroma_idc == 1 || slice_alf_chroma_idc == 3 {
-                let _slice_alf_chroma_aps_id = br.u(5)?;
+                slice_alf_chroma_aps_id = Some(br.u(5)? as u8);
                 slice_alf_chroma_map_flag = br.u1()? != 0;
             }
             // §7.4.5 derived: sliceChroma2AlfEnabledFlag set for idc 2/3.
             if slice_alf_chroma_idc == 2 || slice_alf_chroma_idc == 3 {
-                let _slice_alf_chroma2_aps_id = br.u(5)?;
+                slice_alf_chroma2_aps_id = Some(br.u(5)? as u8);
                 slice_alf_chroma2_map_flag = br.u1()? != 0;
             }
         }
@@ -412,6 +431,9 @@ fn parse_from_bitreader(
         slice_chroma2_alf_enabled_flag,
         slice_alf_chroma_map_flag,
         slice_alf_chroma2_map_flag,
+        slice_alf_luma_aps_id,
+        slice_alf_chroma_aps_id,
+        slice_alf_chroma2_aps_id,
         slice_pic_order_cnt_lsb,
         num_ref_idx_active_override_flag,
         num_ref_idx_active_minus1,
@@ -510,9 +532,95 @@ mod tests {
         // ChromaArrayType != 3 ⇒ chroma map flags inferred 0.
         assert!(!sh.slice_alf_chroma_map_flag);
         assert!(!sh.slice_alf_chroma2_map_flag);
+        // Round 126: APS ids are surfaced. Luma id is the u(5) field
+        // following slice_alf_enabled_flag; chroma id is the joint id
+        // signalled when ChromaArrayType ∈ {1, 2} and idc > 0. ChromaArray-
+        // Type ≠ 3 so the second chroma APS id stays unset.
+        assert_eq!(sh.slice_alf_luma_aps_id, Some(7));
+        assert_eq!(sh.slice_alf_chroma_aps_id, Some(4));
+        assert!(sh.slice_alf_chroma2_aps_id.is_none());
         // Trailing fields still parse, proving bit alignment held.
         assert!(sh.slice_deblocking_filter_flag);
         assert_eq!(sh.slice_qp, 26);
+    }
+
+    /// Round 126 — ChromaArrayType == 3 with `slice_alf_chroma_idc = 3`
+    /// signals BOTH a Cb APS id and a Cr APS id (independent of the luma
+    /// id), and BOTH per-component chroma map flags. The parser surfaces
+    /// all three APS ids so the decoder can route to three distinct ALF
+    /// APS slots on a 4:4:4 slice.
+    #[test]
+    fn round126_alf_aps_ids_chroma444_three_apsids() {
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: true,
+            sps_alf_flag: true,
+            chroma_array_type: 3,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.ue(2); // slice_type = I
+        e.u(1, 0); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_alf_enabled_flag
+        e.u(5, 11); // slice_alf_luma_aps_id
+        e.u(1, 0); // slice_alf_map_flag
+        e.u(2, 3); // slice_alf_chroma_idc = 3 (both Cb and Cr)
+                   // §7.4.5: on ChromaArrayType != 3 the chroma APS id is
+                   // signalled inside the enabled-flag block. On ChromaArrayType
+                   // == 3 it is signalled per-component below instead, so the
+                   // enabled-flag-block chroma id read is SKIPPED in this path.
+                   //
+                   // The ChromaArrayType == 3 fork re-reads (in this case
+                   // re-skips) chroma_idc, then reads chroma map flags + APS
+                   // ids per component.
+        e.u(5, 13); // slice_alf_chroma_aps_id  (idc ∈ {1, 3} → Cb path)
+        e.u(1, 1); // slice_alf_chroma_map_flag
+        e.u(5, 17); // slice_alf_chroma2_aps_id (idc ∈ {2, 3} → Cr path)
+        e.u(1, 0); // slice_alf_chroma2_map_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0);
+        e.ue(0);
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &ctx).unwrap();
+        assert_eq!(sh.slice_alf_luma_aps_id, Some(11));
+        assert_eq!(sh.slice_alf_chroma_aps_id, Some(13));
+        assert_eq!(sh.slice_alf_chroma2_aps_id, Some(17));
+        assert!(sh.slice_alf_chroma_map_flag);
+        assert!(!sh.slice_alf_chroma2_map_flag);
+        // Trailing fields still align.
+        assert!(sh.slice_deblocking_filter_flag);
+        assert_eq!(sh.slice_qp, 26);
+    }
+
+    /// Round 126 — When `slice_alf_enabled_flag = 0` (and ChromaArrayType
+    /// != 3) no APS id is signalled and every `slice_alf_*_aps_id`
+    /// surfaces as `None`. This is the path every non-ALF Baseline IDR
+    /// takes today.
+    #[test]
+    fn round126_alf_aps_ids_unset_when_disabled() {
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: true,
+            sps_alf_flag: true,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.ue(2); // I
+        e.u(1, 0); // no_output_of_prior_pics_flag
+        e.u(1, 0); // slice_alf_enabled_flag = 0
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 28);
+        e.ue(0);
+        e.ue(0);
+        e.finish_with_trailing_bits();
+        let sh = parse(&e.into_bytes(), NalUnitType::Idr, &ctx).unwrap();
+        assert!(!sh.slice_alf_enabled_flag);
+        assert!(sh.slice_alf_luma_aps_id.is_none());
+        assert!(sh.slice_alf_chroma_aps_id.is_none());
+        assert!(sh.slice_alf_chroma2_aps_id.is_none());
     }
 
     /// `slice_alf_chroma_idc = 0` derives both chroma enable flags off,

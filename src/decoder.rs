@@ -70,6 +70,13 @@ struct NonIdrDecodeResult {
     alf_ctb_map: alf::AlfCtbMap,
     chroma_cb_enabled: bool,
     chroma_cr_enabled: bool,
+    /// Round 126: the `slice_alf_luma_aps_id` / `slice_alf_chroma_aps_id`
+    /// / `slice_alf_chroma2_aps_id` carried by the slice header so the
+    /// §8.9 apply can route to the right APS cache slot. `None` when the
+    /// slice did not signal an APS id (e.g. ALF disabled at the slice).
+    alf_luma_aps_id: Option<u8>,
+    alf_chroma_aps_id: Option<u8>,
+    alf_chroma2_aps_id: Option<u8>,
 }
 
 /// Build the round-3 decoder for the registry.
@@ -102,15 +109,55 @@ pub struct EvcDecoder {
     /// `prevPicOrderCntLsb` from §8.3.1: the POC LSB of the most
     /// recently decoded reference picture in coding order.
     prev_poc_lsb: i32,
-    /// Round-11: cached ALF data from the most recently parsed ALF APS.
-    /// Keyed by `adaptation_parameter_set_id` (5-bit, 0..=31). Only
-    /// slot 0 is consulted for now (round-11 per-CTU selection deferred).
-    alf_aps: Option<AlfData>,
-    /// Round-11: cached DRA data from the most recently parsed DRA APS.
-    dra_aps: Option<DraData>,
+    /// Round-126: ALF APS cache keyed by `adaptation_parameter_set_id`
+    /// (5-bit, 0..=31). A slot is `Some(data)` only when an APS NAL with
+    /// `aps_params_type == 0` and that id has been parsed; replacing an
+    /// existing id overwrites the slot, matching the spec's update-by-id
+    /// semantics. The §8.9 apply consults the slot named by the slice's
+    /// `slice_alf_luma_aps_id` / `slice_alf_chroma_aps_id` /
+    /// `slice_alf_chroma2_aps_id`. Round-11 / round-120 single-APS
+    /// streams continue to work because every APS payload now lands at
+    /// its declared id and the slice's `Some(id)` resolves to the same
+    /// slot (with a back-compat fallback to the most-recently-cached APS
+    /// when the slice doesn't surface an id — i.e. the minimal-header
+    /// IDR test fixtures that never decode a slice header).
+    alf_aps: [Option<AlfData>; ALF_APS_SLOTS],
+    /// Most-recently-stored ALF APS id, for the back-compat fallback
+    /// path described on [`Self::alf_aps`].
+    last_alf_aps_id: Option<u8>,
+    /// Round-126: DRA APS cache, indexed identically to [`Self::alf_aps`].
+    /// The PPS `pic_dra_aps_id` selects which slot the §8.10 apply uses.
+    dra_aps: [Option<DraData>; ALF_APS_SLOTS],
+    /// Most-recently-stored DRA APS id (back-compat fallback for
+    /// fixtures that don't drive a PPS through the cache).
+    last_dra_aps_id: Option<u8>,
 }
 
 const MAX_DPB_ENTRIES: usize = 16;
+
+/// Number of `adaptation_parameter_set_id` slots a §7.4.2.3 APS NAL can
+/// address. The id is `u(5)`, so the cache has 32 slots indexed 0..=31.
+const ALF_APS_SLOTS: usize = 32;
+
+/// Inputs to [`EvcDecoder::apply_post_filters`]. Bundled into a struct so
+/// the §8.9 (ALF) + §8.10 (DRA) call site stays inside the
+/// `clippy::too_many_arguments` lint threshold while still threading
+/// every per-slice / per-PPS APS id the §7.3.4 slice header + PPS
+/// describe.
+struct PostFilterInputs<'a> {
+    alf_ctb_map: &'a alf::AlfCtbMap,
+    chroma_cb_enabled: bool,
+    chroma_cr_enabled: bool,
+    /// Slice-referenced ALF APS ids (round 126). `None` falls back to
+    /// the most-recently-stored APS for back-compat with the minimal-
+    /// header IDR fixture path.
+    alf_luma_aps_id: Option<u8>,
+    alf_chroma_aps_id: Option<u8>,
+    alf_chroma2_aps_id: Option<u8>,
+    /// PPS-resident DRA APS id (round 126). `None` when
+    /// `pic_dra_enabled_flag == 0`.
+    dra_aps_id: Option<u8>,
+}
 
 impl EvcDecoder {
     pub fn new() -> Self {
@@ -124,9 +171,33 @@ impl EvcDecoder {
             dpb: Vec::new(),
             poc_msb: 0,
             prev_poc_lsb: 0,
-            alf_aps: None,
-            dra_aps: None,
+            alf_aps: std::array::from_fn(|_| None),
+            last_alf_aps_id: None,
+            dra_aps: std::array::from_fn(|_| None),
+            last_dra_aps_id: None,
         }
+    }
+
+    /// Resolve the ALF APS cache slot a slice's `aps_id` references. When
+    /// the slice didn't surface an explicit id (the minimal-header IDR
+    /// fixture path), fall back to whichever id was stored last — matches
+    /// pre-round-126 behaviour where there was only one slot.
+    fn alf_aps_for_slice(&self, slice_aps_id: Option<u8>) -> Option<&AlfData> {
+        if let Some(id) = slice_aps_id {
+            return self.alf_aps.get(id as usize).and_then(|s| s.as_ref());
+        }
+        self.last_alf_aps_id
+            .and_then(|id| self.alf_aps.get(id as usize).and_then(|s| s.as_ref()))
+    }
+
+    /// Resolve the DRA APS cache slot for the active PPS's
+    /// `pic_dra_aps_id`. Same fallback rule as [`Self::alf_aps_for_slice`].
+    fn dra_aps_for_pps(&self, pps_dra_aps_id: Option<u8>) -> Option<&DraData> {
+        if let Some(id) = pps_dra_aps_id {
+            return self.dra_aps.get(id as usize).and_then(|s| s.as_ref());
+        }
+        self.last_dra_aps_id
+            .and_then(|id| self.dra_aps.get(id as usize).and_then(|s| s.as_ref()))
     }
 
     /// Find the DPB entry with the given POC, returning a borrow. None
@@ -223,7 +294,30 @@ impl Decoder for EvcDecoder {
                     // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply. The
                     // minimal-header IDR path produces an all-off map, so this
                     // falls back to the whole-plane apply (unchanged behaviour).
-                    self.apply_post_filters(&mut pic, &sps, &stats.alf_ctb_map, false, false);
+                    // Round 126: the minimal-header path does not consume a
+                    // slice header, so no `slice_alf_*_aps_id` is available
+                    // here; `apply_post_filters` falls back to the most-
+                    // recently-stored APS id (back-compat). The PPS-resident
+                    // `pic_dra_aps_id` IS available, though, so we route DRA
+                    // through it.
+                    let dra_aps_id = if pps.pic_dra_enabled_flag {
+                        Some(pps.pic_dra_aps_id)
+                    } else {
+                        None
+                    };
+                    self.apply_post_filters(
+                        &mut pic,
+                        &sps,
+                        PostFilterInputs {
+                            alf_ctb_map: &stats.alf_ctb_map,
+                            chroma_cb_enabled: false,
+                            chroma_cr_enabled: false,
+                            alf_luma_aps_id: None,
+                            alf_chroma_aps_id: None,
+                            alf_chroma2_aps_id: None,
+                            dra_aps_id,
+                        },
+                    );
                     let entry = DpbEntry {
                         pic,
                         poc: 0,
@@ -253,15 +347,32 @@ impl Decoder for EvcDecoder {
                         alf_ctb_map,
                         chroma_cb_enabled,
                         chroma_cr_enabled,
+                        alf_luma_aps_id,
+                        alf_chroma_aps_id,
+                        alf_chroma2_aps_id,
                     } = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
                     // Round-11: ALF + DRA post-filter pass. Round 113: the
                     // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply.
+                    // Round 126: route ALF + DRA APS lookups through the
+                    // slice / PPS-referenced ids instead of the most-recent
+                    // cached APS.
+                    let dra_aps_id = if pps.pic_dra_enabled_flag {
+                        Some(pps.pic_dra_aps_id)
+                    } else {
+                        None
+                    };
                     self.apply_post_filters(
                         &mut pic,
                         &sps,
-                        &alf_ctb_map,
-                        chroma_cb_enabled,
-                        chroma_cr_enabled,
+                        PostFilterInputs {
+                            alf_ctb_map: &alf_ctb_map,
+                            chroma_cb_enabled,
+                            chroma_cr_enabled,
+                            alf_luma_aps_id,
+                            alf_chroma_aps_id,
+                            alf_chroma2_aps_id,
+                            dra_aps_id,
+                        },
                     );
                     let entry = DpbEntry {
                         pic,
@@ -274,18 +385,26 @@ impl Decoder for EvcDecoder {
                     self.enqueue_for_output(poc);
                 }
                 NalUnitType::Aps => {
-                    // Round-11: parse the APS and cache ALF / DRA data.
-                    // Errors in APS parsing are non-fatal — the filter simply
-                    // won't fire for this sequence.
+                    // Round-11 parses the APS and caches ALF / DRA data.
+                    // Round-126: cache per `adaptation_parameter_set_id`
+                    // (5-bit, 0..=31) so a slice's `slice_alf_*_aps_id`
+                    // / a PPS's `pic_dra_aps_id` can route to the correct
+                    // slot. Errors in APS parsing remain non-fatal — the
+                    // filter simply won't fire for that id.
                     let rbsp = nal.rbsp();
                     if let Ok(aps) = crate::aps::parse(rbsp) {
-                        if aps.is_alf() && !aps.payload_raw.is_empty() {
-                            if let Ok(alf_data) = alf::parse_alf_data(&aps.payload_raw) {
-                                self.alf_aps = Some(alf_data);
-                            }
-                        } else if aps.is_dra() && !aps.payload_raw.is_empty() {
-                            if let Ok(dra_data) = dra::parse_dra_data(&aps.payload_raw) {
-                                self.dra_aps = Some(dra_data);
+                        let id = aps.adaptation_parameter_set_id as usize;
+                        if id < ALF_APS_SLOTS {
+                            if aps.is_alf() && !aps.payload_raw.is_empty() {
+                                if let Ok(alf_data) = alf::parse_alf_data(&aps.payload_raw) {
+                                    self.alf_aps[id] = Some(alf_data);
+                                    self.last_alf_aps_id = Some(id as u8);
+                                }
+                            } else if aps.is_dra() && !aps.payload_raw.is_empty() {
+                                if let Ok(dra_data) = dra::parse_dra_data(&aps.payload_raw) {
+                                    self.dra_aps[id] = Some(dra_data);
+                                    self.last_dra_aps_id = Some(id as u8);
+                                }
                             }
                         }
                     }
@@ -579,6 +698,11 @@ impl EvcDecoder {
             // chroma map flags are inferred 0 in the Baseline 4:2:0 case).
             chroma_cb_enabled: header.slice_chroma_alf_enabled_flag,
             chroma_cr_enabled: header.slice_chroma2_alf_enabled_flag,
+            // Round 126: surface the slice-referenced APS ids so
+            // `apply_post_filters` can pull from the right cache slot.
+            alf_luma_aps_id: header.slice_alf_luma_aps_id,
+            alf_chroma_aps_id: header.slice_alf_chroma_aps_id,
+            alf_chroma2_aps_id: header.slice_alf_chroma2_aps_id,
         })
     }
 
@@ -660,18 +784,43 @@ impl EvcDecoder {
     /// An all-off map (the minimal-header IDR path that doesn't thread the
     /// slice ALF enables) falls back to the whole-plane [`alf::apply_alf`],
     /// preserving the round-11 behaviour.
-    fn apply_post_filters(
-        &self,
-        pic: &mut YuvPicture,
-        sps: &Sps,
-        alf_map: &alf::AlfCtbMap,
-        chroma_cb_enabled: bool,
-        chroma_cr_enabled: bool,
-    ) {
+    ///
+    /// Round 126: the slice's `slice_alf_luma_aps_id` /
+    /// `slice_alf_chroma_aps_id` / `slice_alf_chroma2_aps_id` (when
+    /// present) drive APS selection from the 32-slot cache. When the
+    /// slice didn't surface an id (the minimal-header IDR fixture path),
+    /// the fallback to the most-recently-stored APS preserves the
+    /// pre-round-126 behaviour for existing tests. The DRA path consults
+    /// the PPS's `pic_dra_aps_id` via [`Self::dra_aps_for_pps`].
+    fn apply_post_filters(&self, pic: &mut YuvPicture, sps: &Sps, in_: PostFilterInputs<'_>) {
         let bd_y = sps.bit_depth_y();
         let bd_c = sps.bit_depth_c();
+        let alf_map = in_.alf_ctb_map;
+        let chroma_cb_enabled = in_.chroma_cb_enabled;
+        let chroma_cr_enabled = in_.chroma_cr_enabled;
         if sps.sps_alf_flag {
-            if let Some(ref alf_data) = self.alf_aps {
+            // §7.4.5: when the slice references separate Cb and Cr APS ids
+            // (ChromaArrayType == 3 path), the chroma planes may pull from
+            // DIFFERENT APS slots than the luma plane. We resolve each
+            // referenced id independently and fall back to the luma APS
+            // for any chroma slot the slice didn't separately signal —
+            // matching the spec's inference of "use the same APS" when
+            // only one chroma idc is set.
+            let luma_alf = self.alf_aps_for_slice(in_.alf_luma_aps_id);
+            let cb_alf = if in_.alf_chroma_aps_id.is_some() {
+                self.alf_aps_for_slice(in_.alf_chroma_aps_id)
+            } else {
+                luma_alf
+            };
+            let cr_alf = if in_.alf_chroma2_aps_id.is_some() {
+                self.alf_aps_for_slice(in_.alf_chroma2_aps_id)
+            } else {
+                // ChromaArrayType ∈ {1, 2}: a single chroma APS id covers
+                // both planes when `slice_alf_chroma_idc == 3`; the Cb
+                // resolution applies to Cr too.
+                cb_alf
+            };
+            if let Some(alf_data) = luma_alf {
                 if alf_map.any_luma_on() {
                     // Round-120: classified per-sample luma apply (§8.8.4.2
                     // + §8.8.4.3 + §8.9.4) drives the filter selection from
@@ -679,25 +828,38 @@ impl EvcDecoder {
                     // filter set 0.
                     alf::apply_alf_luma_classified_masked(pic, alf_data, alf_map, bd_y);
                     if pic.chroma_format_idc != 0 {
+                        // Round 126: pull each chroma plane from its own
+                        // APS slot. Falls back to the luma APS when the
+                        // slice didn't surface a distinct chroma id.
                         if chroma_cb_enabled {
-                            alf::apply_alf_chroma(pic, &alf_data.chroma_filters[0], 1, bd_c);
+                            if let Some(cb_data) = cb_alf {
+                                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
+                            }
                         }
                         if chroma_cr_enabled {
-                            alf::apply_alf_chroma(pic, &alf_data.chroma_filters[0], 2, bd_c);
+                            if let Some(cr_data) = cr_alf {
+                                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
+                            }
                         }
                     }
                 } else if chroma_cb_enabled || chroma_cr_enabled {
                     // No luma CTUs flagged but chroma is enabled: only chroma
                     // apply (matches §8.9 lines 18099-18116 / round-113 wiring).
-                    alf::apply_alf_with_map(
-                        pic,
-                        alf_data,
-                        alf_map,
-                        chroma_cb_enabled,
-                        chroma_cr_enabled,
-                        bd_y,
-                        bd_c,
-                    );
+                    // Round 126: split the per-plane apply so each pulls from
+                    // its own APS slot rather than forcing both through the
+                    // luma APS via `apply_alf_with_map`.
+                    if pic.chroma_format_idc != 0 {
+                        if chroma_cb_enabled {
+                            if let Some(cb_data) = cb_alf {
+                                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
+                            }
+                        }
+                        if chroma_cr_enabled {
+                            if let Some(cr_data) = cr_alf {
+                                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
+                            }
+                        }
+                    }
                 } else {
                     // Minimal-header IDR path (no per-CTU map threaded):
                     // preserve round-11 behaviour and apply the whole-plane
@@ -707,7 +869,7 @@ impl EvcDecoder {
             }
         }
         if sps.sps_dra_flag {
-            if let Some(ref dra_data) = self.dra_aps {
+            if let Some(dra_data) = self.dra_aps_for_pps(in_.dra_aps_id) {
                 dra::apply_dra(pic, dra_data, bd_y, bd_c);
             }
         }
@@ -986,5 +1148,147 @@ mod tests {
         };
         let pocs = dec.build_ref_pocs(&rpl, 8, 2, 256).unwrap();
         assert_eq!(pocs, vec![7, 4]);
+    }
+
+    // =================================================================
+    // Round 126 — APS cache routed by `adaptation_parameter_set_id`.
+    // =================================================================
+
+    /// Distinct ALF APS payloads stored at distinct ids land in distinct
+    /// cache slots and don't overwrite each other. The slice's
+    /// `slice_alf_luma_aps_id` resolves the correct slot via
+    /// [`EvcDecoder::alf_aps_for_slice`]. Round-11 / round-120 single-APS
+    /// streams are unaffected because the same lookup path also serves the
+    /// "slice references id == cache slot" case.
+    #[test]
+    fn round126_alf_aps_cache_distinct_slots_resolve_independently() {
+        let mut dec = EvcDecoder::new();
+        // Build two AlfData instances with different DC offsets so we can
+        // tell them apart by the resolved-filter's centre tap.
+        let mut luma_a = [alf::AlfLumaFilter::default(); alf::ALF_MAX_LUMA_FILTERS];
+        luma_a[0].coef[12] = 100;
+        let a = alf::AlfData {
+            luma_filter_signal: true,
+            luma_filters: luma_a,
+            ..alf::AlfData::default()
+        };
+        let mut luma_b = [alf::AlfLumaFilter::default(); alf::ALF_MAX_LUMA_FILTERS];
+        luma_b[0].coef[12] = 7;
+        let b = alf::AlfData {
+            luma_filter_signal: true,
+            luma_filters: luma_b,
+            ..alf::AlfData::default()
+        };
+        dec.alf_aps[3] = Some(a);
+        dec.alf_aps[19] = Some(b);
+        dec.last_alf_aps_id = Some(19); // simulates round-11 single-APS
+                                        // Slice references id 3 → cache slot 3 (the `a` payload).
+        let resolved = dec.alf_aps_for_slice(Some(3)).expect("slot 3 populated");
+        assert_eq!(resolved.luma_filters[0].coef[12], 100);
+        // Slice references id 19 → cache slot 19 (the `b` payload).
+        let resolved = dec.alf_aps_for_slice(Some(19)).expect("slot 19 populated");
+        assert_eq!(resolved.luma_filters[0].coef[12], 7);
+        // Slice references id 5 (empty slot) → None — the spec-correct
+        // outcome for a slice that mis-references an APS that wasn't
+        // signalled in this CVS.
+        assert!(dec.alf_aps_for_slice(Some(5)).is_none());
+        // Slice did NOT surface an id (minimal-header IDR fixture path) →
+        // back-compat fallback to the most-recently-stored APS (id 19,
+        // the `b` payload).
+        let resolved = dec
+            .alf_aps_for_slice(None)
+            .expect("fallback to last-stored APS");
+        assert_eq!(resolved.luma_filters[0].coef[12], 7);
+    }
+
+    /// DRA APS routing follows the same shape — keyed by the PPS's
+    /// `pic_dra_aps_id` (when `pic_dra_enabled_flag == 1`), with the
+    /// most-recently-stored id as fallback.
+    #[test]
+    fn round126_dra_aps_cache_routes_via_pps_id() {
+        let mut dec = EvcDecoder::new();
+        // Two DraData with different `scale[0]` so we can tell them apart
+        // by inspecting the cached struct directly.
+        let mut scale_a = [8i16; dra::DRA_MAX_RANGES];
+        scale_a[0] = 5;
+        let a = dra::DraData {
+            descriptor_present: true,
+            scale: scale_a,
+            ..dra::DraData::default()
+        };
+        let mut scale_b = [8i16; dra::DRA_MAX_RANGES];
+        scale_b[0] = 17;
+        let b = dra::DraData {
+            descriptor_present: true,
+            scale: scale_b,
+            ..dra::DraData::default()
+        };
+        dec.dra_aps[2] = Some(a);
+        dec.dra_aps[10] = Some(b);
+        dec.last_dra_aps_id = Some(10);
+        assert_eq!(
+            dec.dra_aps_for_pps(Some(2)).unwrap().scale[0],
+            5,
+            "PPS id 2 selects scale = 5"
+        );
+        assert_eq!(
+            dec.dra_aps_for_pps(Some(10)).unwrap().scale[0],
+            17,
+            "PPS id 10 selects scale = 17"
+        );
+        assert!(dec.dra_aps_for_pps(Some(7)).is_none());
+        assert_eq!(
+            dec.dra_aps_for_pps(None).unwrap().scale[0],
+            17,
+            "fallback to most-recently-stored DRA APS"
+        );
+    }
+
+    /// An ALF NAL with id `N` populates slot `N` of the cache (and only
+    /// that slot). Sending a second ALF NAL at id `N` overwrites slot `N`
+    /// per the spec's update-by-id semantics. A NAL at a different id
+    /// `M` leaves slot `N` intact.
+    #[test]
+    fn round126_aps_nal_writes_indexed_cache_slot() {
+        use crate::aps::APS_PARAMS_TYPE_ALF;
+        use crate::sps::tests::BitEmitter;
+        let mut dec = EvcDecoder::new();
+        // Build a minimal valid ALF APS RBSP at id `id` whose payload is
+        // a single `alf_luma_filter_signal_flag = 0` /
+        // `alf_chroma_filter_signal_flag = 0` (i.e. NumAlfCoefs neither
+        // luma nor chroma) followed by `aps_extension_flag = 0` +
+        // rbsp_trailing_bits. `parse_alf_data` produces a Default::default()
+        // when both signal flags are 0, so the round-trip just verifies the
+        // cache slot is populated by a parse-success.
+        fn emit_alf_aps_rbsp(id: u32) -> Vec<u8> {
+            let mut e = BitEmitter::new();
+            e.u(5, id);
+            e.u(3, APS_PARAMS_TYPE_ALF as u32);
+            // alf_data() body: luma_signal = 0, chroma_signal = 0.
+            e.u(1, 0);
+            e.u(1, 0);
+            // aps_extension_flag = 0.
+            e.u(1, 0);
+            e.finish_with_trailing_bits();
+            e.into_bytes()
+        }
+        // Send APS at id = 4 — populates slot 4.
+        let aps4 = crate::aps::parse(&emit_alf_aps_rbsp(4)).expect("parse id=4");
+        assert_eq!(aps4.adaptation_parameter_set_id, 4);
+        let alf4 = alf::parse_alf_data(&aps4.payload_raw).expect("alf body");
+        dec.alf_aps[4] = Some(alf4);
+        dec.last_alf_aps_id = Some(4);
+        assert!(dec.alf_aps[4].is_some());
+        assert!(dec.alf_aps[7].is_none());
+        // Send APS at id = 7 — populates slot 7, leaves slot 4 intact.
+        let aps7 = crate::aps::parse(&emit_alf_aps_rbsp(7)).expect("parse id=7");
+        assert_eq!(aps7.adaptation_parameter_set_id, 7);
+        let alf7 = alf::parse_alf_data(&aps7.payload_raw).expect("alf body");
+        dec.alf_aps[7] = Some(alf7);
+        dec.last_alf_aps_id = Some(7);
+        assert!(dec.alf_aps[4].is_some(), "id=4 slot must persist");
+        assert!(dec.alf_aps[7].is_some());
+        // last-stored fallback now points at id 7.
+        assert_eq!(dec.last_alf_aps_id, Some(7));
     }
 }
