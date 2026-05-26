@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### Round 145 — §8.8.4.4 per-CTB chroma type filtering + eq. 1321 tap-geometry fix
+
+#### Added
+- `alf::apply_alf_chroma_masked`: per-CTB chroma type filtering process
+  (§8.8.4.4 eq. 1321-1323), gated per-CTU by the `alf_ctb_chroma_flag` /
+  `alf_ctb_chroma2_flag` side of the round-113 `AlfCtbMap`. The
+  `ChromaArrayType == 3` path (where the per-CTB chroma map flags are
+  decoded out of the bitstream) now drives the chroma apply per CTB
+  instead of the round-126 whole-plane fallback. Mirrors
+  `apply_alf_luma_masked`: pre-filter snapshot read, picture-edge clamp
+  via `blkWidth / SubWidthC` / `blkHeight / SubHeightC` (§8.8.4.1 lines
+  18105-18107).
+- `EvcDecoder::apply_chroma_alf_masked_or_whole_plane` helper
+  (`decoder.rs`, free fn): when the slice surfaced a non-empty
+  `alf_ctb_chroma*` plane in the map, routes to
+  `apply_alf_chroma_masked`; otherwise falls back to the whole-plane
+  `apply_alf_chroma` (the `ChromaArrayType ∈ {1, 2}` path where the
+  per-CTB chroma flags are always inferred 0). Threaded through both
+  the luma-on and luma-off branches of `apply_post_filters`.
+- 5 new unit tests (now 331, was 326): eq. 1321 tap correctness on a
+  planted gradient via an independently-coded reference (catches
+  tap-position permutations), per-CTB masked apply reproduces
+  whole-plane apply bit-for-bit when every CTU is flagged, per-CTB
+  apply touches only flagged CTUs and leaves the other plane
+  untouched, partial-CTU edge clamp (24×24 4:2:0 → 12×12 chroma plane
+  with a 4-column-wide right chroma CTU), and monochrome
+  (`chroma_format_idc = 0`) is a no-op.
+
+#### Fixed
+- `alf::CHROMA_TAPS` / `CHROMA_TAPS_SYM`: round-11 had taps 3, 4, 5
+  permuted vs §8.8.4.4 eq. 1321. The previous layout multiplied
+  `coef[3]` (which the spec assigns to the `rec[x ∓ 1, y ± 1]`
+  diagonal pair) against the `rec[x ± 2, y]` horizontal pair instead;
+  similarly `coef[4]` was mapped to the `rec[x ± 1, y]` pair and
+  `coef[5]` to the diagonal pair. No existing unit test exercised
+  non-DC chroma coefficients, so this had been silent. Corrected in
+  the same commit; the round-145 eq. 1321 reference test exhaustively
+  pins the geometry going forward.
+
 ### Round 126 — Multi-APS cache indexed by `adaptation_parameter_set_id` (§7.4.2.3 / §7.3.4 / §8.9 routing)
 
 #### Added

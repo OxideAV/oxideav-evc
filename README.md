@@ -7,6 +7,49 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-145 status
+
+Round 145 lands the **§8.8.4.4 per-CTB chroma type filtering process**
+— the chroma half of round-113's per-CTB ALF mechanism, and the
+documented round-126 follow-up for ALF coverage. Until now
+`apply_post_filters` ran the chroma apply over each chroma plane as a
+whole regardless of the per-CTU map; §8.8.4.1 (lines 18079-18089)
+actually invokes the §8.8.4.4 coding-tree-block chroma type filtering
+process per CTB, gated on `alf_ctb_chroma_flag[ rx ][ ry ]` (Cb) and
+`alf_ctb_chroma2_flag[ rx ][ ry ]` (Cr) on the
+`ChromaArrayType == 3` path. A new `apply_alf_chroma_masked` mirrors
+`apply_alf_luma_masked`: it walks the per-CTU map, converts the luma
+CTB origin and size to chroma coordinates via
+`x_ctb_c = (rx << CtbLog2SizeY) / SubWidthC`,
+`blkW_c = (CtbSizeY / SubWidthC) min (PicWidthC − x_ctb_c)` per
+§8.8.4.1 lines 18105-18107, applies the §8.8.4.4 eq. 1321 7-coefficient
+stencil with picture-edge clamping, and writes per-CTB results
+against a whole-plane pre-filter snapshot so a filtered CTB at the
+edge of a flagged region still reads neighbours at their unfiltered
+values. A new `apply_chroma_alf_masked_or_whole_plane` helper in
+`decoder.rs` routes per-CTB when the chroma map has any flag set and
+falls back to the round-126 whole-plane `apply_alf_chroma` otherwise
+(the `ChromaArrayType ∈ {1, 2}` path where per-CTB chroma flags are
+inferred 0). Round 145 also **corrects a round-11 chroma tap-geometry
+bug**: `CHROMA_TAPS` / `CHROMA_TAPS_SYM` had positions 3, 4, 5
+permuted vs eq. 1321 — `coef[3]` (the spec's diagonal pair at
+`rec[x ∓ 1, y ± 1]`) was multiplying the horizontal `rec[x ± 2, y]`
+pair instead, and similarly for 4 and 5. No prior test exercised
+non-DC chroma coefficients so the bug was silent; the round-145 eq.
+1321 reference cross-check now pins the geometry exhaustively. 331
+unit tests pass (was 326) — 5 new cover the corrected eq. 1321 stencil
+against an independently-coded reference on a synthetic gradient
+plane, the per-CTB masked apply reproducing whole-plane apply
+bit-for-bit when every CTU is flagged, the per-CTB apply filtering
+only flagged CTUs (and leaving the other plane untouched on a 4:4:4
+fixture), a partial-CTU edge clamp on a 24×24 4:2:0 picture
+(12×12 chroma plane, 4-column-wide right chroma CTU), and the
+monochrome no-op. Suggested workspace-README row delta: EVC now
+applies the §8.8.4.4 per-CTB chroma type filter under
+`ChromaArrayType == 3` (driven by the round-113 chroma map) and
+corrects the eq. 1321 chroma tap geometry (lacks: Main-profile
+toolset — BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-126 status
 
 Round 126 lands the **multi-APS cache indexed by

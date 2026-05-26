@@ -827,39 +827,30 @@ impl EvcDecoder {
                     // the per-CTB classification rather than always using
                     // filter set 0.
                     alf::apply_alf_luma_classified_masked(pic, alf_data, alf_map, bd_y);
-                    if pic.chroma_format_idc != 0 {
-                        // Round 126: pull each chroma plane from its own
-                        // APS slot. Falls back to the luma APS when the
-                        // slice didn't surface a distinct chroma id.
-                        if chroma_cb_enabled {
-                            if let Some(cb_data) = cb_alf {
-                                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
-                            }
-                        }
-                        if chroma_cr_enabled {
-                            if let Some(cr_data) = cr_alf {
-                                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
-                            }
-                        }
-                    }
+                    apply_chroma_alf_masked_or_whole_plane(
+                        pic,
+                        alf_map,
+                        cb_alf,
+                        cr_alf,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                        bd_c,
+                    );
                 } else if chroma_cb_enabled || chroma_cr_enabled {
                     // No luma CTUs flagged but chroma is enabled: only chroma
                     // apply (matches §8.9 lines 18099-18116 / round-113 wiring).
                     // Round 126: split the per-plane apply so each pulls from
                     // its own APS slot rather than forcing both through the
                     // luma APS via `apply_alf_with_map`.
-                    if pic.chroma_format_idc != 0 {
-                        if chroma_cb_enabled {
-                            if let Some(cb_data) = cb_alf {
-                                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
-                            }
-                        }
-                        if chroma_cr_enabled {
-                            if let Some(cr_data) = cr_alf {
-                                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
-                            }
-                        }
-                    }
+                    apply_chroma_alf_masked_or_whole_plane(
+                        pic,
+                        alf_map,
+                        cb_alf,
+                        cr_alf,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                        bd_c,
+                    );
                 } else {
                     // Minimal-header IDR path (no per-CTU map threaded):
                     // preserve round-11 behaviour and apply the whole-plane
@@ -935,6 +926,54 @@ impl EvcDecoder {
             )));
         }
         Ok(out)
+    }
+}
+
+/// Run the §8.8.4.4 chroma type filtering process per coding tree block.
+///
+/// Round 145 closes round-113's chroma half: when the slice decoded a
+/// per-CTU `alf_ctb_chroma_flag` / `alf_ctb_chroma2_flag` (the
+/// `ChromaArrayType == 3` path), the chroma apply now walks the per-CTB
+/// map via [`alf::apply_alf_chroma_masked`] instead of the
+/// round-126 whole-plane fallback. When the chroma map is all-off but
+/// the slice-level chroma enable is set (the `ChromaArrayType ∈ {1, 2}`
+/// path, where the per-CTB flags are inferred 0 and never override the
+/// slice enable), the whole-plane [`alf::apply_alf_chroma`] is invoked —
+/// matching §8.9 lines 18099-18116.
+#[allow(clippy::too_many_arguments)]
+fn apply_chroma_alf_masked_or_whole_plane(
+    pic: &mut crate::picture::YuvPicture,
+    alf_map: &alf::AlfCtbMap,
+    cb_alf: Option<&alf::AlfData>,
+    cr_alf: Option<&alf::AlfData>,
+    chroma_cb_enabled: bool,
+    chroma_cr_enabled: bool,
+    bd_c: u32,
+) {
+    if pic.chroma_format_idc == 0 {
+        return;
+    }
+    let cb_map_on = alf_map.chroma_cb.iter().any(|&b| b);
+    let cr_map_on = alf_map.chroma_cr.iter().any(|&b| b);
+    if chroma_cb_enabled {
+        if let Some(cb_data) = cb_alf {
+            if cb_map_on {
+                // §8.8.4.4 per-CTB Cb apply, gated by alf_ctb_chroma_flag.
+                alf::apply_alf_chroma_masked(pic, &cb_data.chroma_filters[0], alf_map, 1, bd_c);
+            } else {
+                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
+            }
+        }
+    }
+    if chroma_cr_enabled {
+        if let Some(cr_data) = cr_alf {
+            if cr_map_on {
+                // §8.8.4.4 per-CTB Cr apply, gated by alf_ctb_chroma2_flag.
+                alf::apply_alf_chroma_masked(pic, &cr_data.chroma_filters[0], alf_map, 2, bd_c);
+            } else {
+                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
+            }
+        }
     }
 }
 

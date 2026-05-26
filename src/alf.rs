@@ -610,10 +610,27 @@ static LUMA_TAPS_SYM: [(i32, i32); 12] = [
     (-1, 0),
 ];
 
-/// 5×5 diamond chroma tap offsets per §8.9.4.2 eq. 1290. The chroma filter
-/// has 7 coefficients: 6 spatial pairs (north arm) + 1 DC offset.
-static CHROMA_TAPS: [(i32, i32); 6] = [(-2, 0), (-1, -1), (-1, 0), (0, -2), (0, -1), (1, -1)];
-static CHROMA_TAPS_SYM: [(i32, i32); 6] = [(2, 0), (1, 1), (1, 0), (0, 2), (0, 1), (-1, 1)];
+/// 5×5 diamond chroma tap offsets per §8.8.4.4 eq. 1321. The chroma filter
+/// has 7 coefficients arranged on a 5×5 cross / X-cross diamond: 6 spatial
+/// pairs followed by the DC offset (`coef[6]`, derived per eq. 110).
+///
+/// Round 145 corrects the round-11 ordering for taps 3-5 — the previous
+/// table mapped coef[3] / coef[4] / coef[5] to the wrong geometric
+/// positions vs. eq. 1321. The per-tap reads listed by eq. 1321 are:
+///
+/// | k | first read       | symmetric read   |
+/// |---|------------------|------------------|
+/// | 0 | rec[x  , y − 2]  | rec[x  , y + 2]  |
+/// | 1 | rec[x − 1, y − 1]| rec[x + 1, y + 1]|
+/// | 2 | rec[x  , y − 1]  | rec[x  , y + 1]  |
+/// | 3 | rec[x + 1, y − 1]| rec[x − 1, y + 1]|
+/// | 4 | rec[x − 2, y]    | rec[x + 2, y]    |
+/// | 5 | rec[x − 1, y]    | rec[x + 1, y]    |
+///
+/// `CHROMA_TAPS[k]` is the `(dy, dx)` of the first read; `CHROMA_TAPS_SYM[k]`
+/// is its eq. 1321 symmetric partner.
+static CHROMA_TAPS: [(i32, i32); 6] = [(-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1)];
+static CHROMA_TAPS_SYM: [(i32, i32); 6] = [(2, 0), (1, 1), (1, 0), (1, -1), (0, 2), (0, 1)];
 
 /// Apply the ALF luma filter to the entire Y plane per §8.8.4.2 eq.
 /// 1286-1288 (whole-plane, no per-sample classification). Writes results
@@ -857,6 +874,132 @@ pub fn apply_alf_luma_masked(
                 }
             }
         }
+    }
+}
+
+/// Apply the §8.8.4.4 **coding-tree-block chroma type filtering process**
+/// to either the Cb or Cr plane, gated per-CTU by the §7.3.8.2 chroma
+/// applicability map.
+///
+/// Round 145 closes the chroma half of round-113's per-CTB apply
+/// mechanism. Until now `apply_alf_chroma` filtered the entire chroma
+/// plane uniformly; the spec invocation in §8.8.4.1 lines 18079-18089 is
+/// per coding tree block, gated on `alf_ctb_chroma_flag[ rx ][ ry ]` /
+/// `alf_ctb_chroma2_flag[ rx ][ ry ]` (the `ChromaArrayType == 3` path).
+///
+/// Per CTU, the chroma CTB is located at
+/// `( ( rx << CtbLog2SizeY ) / SubWidthC, ( ry << CtbLog2SizeY ) / SubHeightC )`
+/// with size `( blkWidth / SubWidthC, blkHeight / SubHeightC )` — the
+/// §8.8.4.1 chroma-CTB derivation (lines 18105-18107). `c_idx` selects the
+/// plane (1 = Cb, 2 = Cr) and also picks which side of `map` (`chroma_cb`
+/// vs `chroma_cr`) gates the per-CTB application.
+///
+/// As with [`apply_alf_luma_masked`], the per-CTB writes read from a
+/// pre-filter snapshot of the whole plane, so a filtered CTB at the edge of
+/// a flagged region still reads its neighbours at their unfiltered values
+/// (matching the spec's `recPicture` input which is the array prior to
+/// ALF). The §8.8.4.4 derivation already clips to picture extent via the
+/// edge clamp, so a CTB that overruns the right / bottom edge only filters
+/// its in-picture samples.
+///
+/// Equation 1321 reads coefficients in geometric order — `coef[0]` is the
+/// outer vertical pair, `coef[6]` the centre DC — matching the
+/// [`CHROMA_TAPS`] / [`CHROMA_TAPS_SYM`] layout corrected in round 145.
+pub fn apply_alf_chroma_masked(
+    pic: &mut YuvPicture,
+    filter: &AlfChromaFilter,
+    map: &AlfCtbMap,
+    c_idx: usize,
+    bit_depth: u32,
+) {
+    debug_assert!(c_idx == 1 || c_idx == 2, "c_idx must be 1 (Cb) or 2 (Cr)");
+    if pic.chroma_format_idc == 0 {
+        return;
+    }
+    let (sub_w, sub_h) = chroma_sub_sampling(pic.chroma_format_idc);
+    let (cw, ch) = chroma_plane_dims(pic.width, pic.height, pic.chroma_format_idc);
+    let stride = pic.c_stride();
+    let snapshot = if c_idx == 1 {
+        pic.cb.clone()
+    } else {
+        pic.cr.clone()
+    };
+    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let dst = if c_idx == 1 { &mut pic.cb } else { &mut pic.cr };
+    let ctb_size = 1usize << map.ctb_log2_size_y;
+    let coef = &filter.coef;
+    let plane_flags = if c_idx == 1 {
+        &map.chroma_cb
+    } else {
+        &map.chroma_cr
+    };
+
+    for ry in 0..map.ctbs_high as usize {
+        for rx in 0..map.ctbs_wide as usize {
+            let idx = ry * map.ctbs_wide as usize + rx;
+            if !plane_flags.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            // §8.8.4.1 lines 18105-18107: luma → chroma CTB coordinates +
+            // dims via SubWidthC / SubHeightC. The CTU origin is on the
+            // chroma grid because CTB size is a power of two ≥ chroma
+            // subsampling (4:2:0 / 4:2:2 → ctb_size is even).
+            let x_ctb_c = (rx * ctb_size) / sub_w;
+            let y_ctb_c = (ry * ctb_size) / sub_h;
+            let blk_w_c = (ctb_size / sub_w).min(cw.saturating_sub(x_ctb_c));
+            let blk_h_c = (ctb_size / sub_h).min(ch.saturating_sub(y_ctb_c));
+            for row in 0..blk_h_c {
+                for col in 0..blk_w_c {
+                    let cx = x_ctb_c + col;
+                    let cy = y_ctb_c + row;
+                    let x = cx as i32;
+                    let y = cy as i32;
+                    let mut sum: i32 = 0;
+                    for k in 0..6 {
+                        let (dy0, dx0) = CHROMA_TAPS[k];
+                        let (dy1, dx1) = CHROMA_TAPS_SYM[k];
+                        let s0 = {
+                            let xc = (x + dx0).clamp(0, cw as i32 - 1) as usize;
+                            let yc = (y + dy0).clamp(0, ch as i32 - 1) as usize;
+                            snapshot[yc * stride + xc] as i32
+                        };
+                        let s1 = {
+                            let xc = (x + dx1).clamp(0, cw as i32 - 1) as usize;
+                            let yc = (y + dy1).clamp(0, ch as i32 - 1) as usize;
+                            snapshot[yc * stride + xc] as i32
+                        };
+                        sum += coef[k] as i32 * (s0 + s1);
+                    }
+                    sum += coef[6] as i32 * snapshot[cy * stride + cx] as i32;
+                    let out = ((sum + 256) >> 9).clamp(0, max_val);
+                    dst[cy * stride + cx] = out as u8;
+                }
+            }
+        }
+    }
+}
+
+/// (SubWidthC, SubHeightC) per ChromaArrayType for chroma-sub-sample math.
+/// Mirrors the §6.2 picture-format Table 2 mapping; ChromaArrayType 0
+/// (monochrome) is caller-gated and returns the harmless (1, 1).
+#[inline]
+fn chroma_sub_sampling(chroma_format_idc: u32) -> (usize, usize) {
+    match chroma_format_idc {
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => (1, 1),
+    }
+}
+
+/// Chroma plane dimensions in samples per `chroma_format_idc`.
+#[inline]
+fn chroma_plane_dims(width: u32, height: u32, chroma_format_idc: u32) -> (usize, usize) {
+    match chroma_format_idc {
+        1 => (width.div_ceil(2) as usize, height.div_ceil(2) as usize),
+        2 => (width.div_ceil(2) as usize, height as usize),
+        3 => (width as usize, height as usize),
+        _ => (0, 0),
     }
 }
 
@@ -2394,5 +2537,209 @@ mod tests {
         assert_eq!(ALF_FIX_FILT_COEFF[63][6], 16);
         assert_eq!(ALF_CLASS_TO_FILT_MAP[0][15], 63);
         assert_eq!(ALF_CLASS_TO_FILT_MAP[24][0], 8);
+    }
+
+    // =================================================================
+    // Round 145: §8.8.4.4 per-CTB chroma type filtering (eq. 1321-1323)
+    //            + eq. 1321 tap-geometry verification.
+    // =================================================================
+
+    /// Compute the eq. 1321 weighted sum at chroma sample (x, y) with
+    /// edge clamping over a plane of (cw, ch) dimensions. Independently
+    /// transcribed from the spec equation; mirrors what
+    /// [`apply_alf_chroma`] / [`apply_alf_chroma_masked`] should produce.
+    fn eq_1321_ref(
+        plane: &[u8],
+        stride: usize,
+        cw: usize,
+        ch: usize,
+        x: i32,
+        y: i32,
+        coef: &[i16; 7],
+    ) -> i32 {
+        let read = |xx: i32, yy: i32| -> i32 {
+            let xc = xx.clamp(0, cw as i32 - 1) as usize;
+            let yc = yy.clamp(0, ch as i32 - 1) as usize;
+            plane[yc * stride + xc] as i32
+        };
+        let s = coef[0] as i32 * (read(x, y + 2) + read(x, y - 2))
+            + coef[1] as i32 * (read(x + 1, y + 1) + read(x - 1, y - 1))
+            + coef[2] as i32 * (read(x, y + 1) + read(x, y - 1))
+            + coef[3] as i32 * (read(x - 1, y + 1) + read(x + 1, y - 1))
+            + coef[4] as i32 * (read(x + 2, y) + read(x - 2, y))
+            + coef[5] as i32 * (read(x + 1, y) + read(x - 1, y))
+            + coef[6] as i32 * read(x, y);
+        (s + 256) >> 9
+    }
+
+    #[test]
+    fn round145_apply_alf_chroma_matches_eq_1321_on_synthetic_plane() {
+        // Plant a deterministic gradient in Cb; verify apply_alf_chroma's
+        // output matches an independent eq. 1321 evaluation sample-by-sample.
+        // This catches the round-11 tap-geometry permutation that was fixed
+        // in round 145 (coef[3] / coef[4] / coef[5] had been wired to the
+        // wrong geometric positions).
+        let mut pic = crate::picture::YuvPicture::new(16, 16, 1, 8).unwrap();
+        let stride = pic.c_stride();
+        let cw = stride;
+        let ch = pic.cb.len() / stride;
+        for y in 0..ch {
+            for x in 0..cw {
+                pic.cb[y * stride + x] = ((x * 7 + y * 11 + 50) % 200 + 20) as u8;
+            }
+        }
+        // Non-trivial coefficients spread across all six spatial taps —
+        // these exercise the eq. 1321 tap-position ordering.
+        let coef: [i16; 7] = [5, -3, 4, -2, 6, -7, 64];
+        let filter = AlfChromaFilter { coef };
+        let pre = pic.cb.clone();
+        apply_alf_chroma(&mut pic, &filter, 1, 8);
+        // Independent re-derivation must match every sample.
+        for y in 0..ch {
+            for x in 0..cw {
+                let want =
+                    eq_1321_ref(&pre, stride, cw, ch, x as i32, y as i32, &coef).clamp(0, 255);
+                assert_eq!(
+                    pic.cb[y * stride + x] as i32,
+                    want,
+                    "eq.1321 mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round145_apply_alf_chroma_masked_matches_whole_plane_when_all_ctus_on() {
+        // 32×32 picture, four 16×16 CTBs (CtbLog2SizeY = 4). All four
+        // chroma CTBs flagged → per-CTB apply must reproduce whole-plane
+        // apply bit-for-bit for both Cb and Cr (eq. 1321-1323 + edge clamp).
+        let mut pic_a = crate::picture::YuvPicture::new(32, 32, 3, 8).unwrap();
+        let mut pic_b = pic_a.clone();
+        let stride = pic_a.c_stride();
+        let cw = stride;
+        let ch = pic_a.cb.len() / stride;
+        // Fill Cb / Cr with two different deterministic patterns.
+        for y in 0..ch {
+            for x in 0..cw {
+                pic_a.cb[y * stride + x] = ((x * 3 + y * 5 + 40) % 220 + 10) as u8;
+                pic_a.cr[y * stride + x] = ((x * 5 + y * 3 + 100) % 180 + 30) as u8;
+            }
+        }
+        pic_b.cb.copy_from_slice(&pic_a.cb);
+        pic_b.cr.copy_from_slice(&pic_a.cr);
+        let filter = AlfChromaFilter {
+            coef: [3, -2, 5, -1, 4, -3, 64],
+        };
+        // Map: all CTUs on for both chroma flags.
+        let mut map = AlfCtbMap::new(32, 32, 4);
+        for i in 0..(map.ctbs_wide * map.ctbs_high) as usize {
+            map.set(i, true, true, true);
+        }
+        // pic_a uses the whole-plane apply, pic_b the per-CTB masked apply.
+        apply_alf_chroma(&mut pic_a, &filter, 1, 8);
+        apply_alf_chroma(&mut pic_a, &filter, 2, 8);
+        apply_alf_chroma_masked(&mut pic_b, &filter, &map, 1, 8);
+        apply_alf_chroma_masked(&mut pic_b, &filter, &map, 2, 8);
+        assert_eq!(pic_a.cb, pic_b.cb, "Cb whole vs masked");
+        assert_eq!(pic_a.cr, pic_b.cr, "Cr whole vs masked");
+    }
+
+    #[test]
+    fn round145_apply_alf_chroma_masked_only_touches_flagged_ctus() {
+        // 32×16 picture in 4:4:4 (so chroma matches luma dims), CtbLog2Size
+        // = 4 → two 16×16 chroma CTBs. Flag only the left chroma_cb CTU and
+        // verify only the left half of Cb moves, while Cr and the right
+        // half of Cb stay at their initial values.
+        let mut pic = crate::picture::YuvPicture::new(32, 16, 3, 8).unwrap();
+        let stride = pic.c_stride();
+        let cw = stride;
+        let ch = pic.cb.len() / stride;
+        assert_eq!(cw, 32);
+        assert_eq!(ch, 16);
+        for v in pic.cb.iter_mut() {
+            *v = 80;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 200;
+        }
+        let mut map = AlfCtbMap::new(32, 16, 4);
+        // Left chroma CTU has Cb on, right chroma CTU has everything off.
+        map.set(0, false, true, false);
+        map.set(1, false, false, false);
+        // Zero filter → output becomes (256 >> 9).clamp = 0 for flagged
+        // samples; non-flagged samples stay at their input value.
+        let filter = AlfChromaFilter {
+            coef: [0, 0, 0, 0, 0, 0, 0],
+        };
+        apply_alf_chroma_masked(&mut pic, &filter, &map, 1, 8);
+        // Cr is not gated by the Cb plane flags — call separately with
+        // a map whose Cr flags are all off.
+        apply_alf_chroma_masked(&mut pic, &filter, &map, 2, 8);
+        for y in 0..ch {
+            for x in 0..cw {
+                let cb_expect = if x < 16 { 0 } else { 80 };
+                assert_eq!(pic.cb[y * stride + x], cb_expect, "Cb ({x},{y})");
+                // Cr map is all-off → Cr untouched everywhere.
+                assert_eq!(pic.cr[y * stride + x], 200, "Cr ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn round145_apply_alf_chroma_masked_edge_clamp_partial_ctu() {
+        // 24×24 picture in 4:2:0 → 12×12 chroma plane. CtbLog2SizeY = 4
+        // (luma CTU = 16) → chroma CTU stride = 8. ctbs_wide = 2 (luma),
+        // each chroma CTU = 8 wide → the right chroma CTU starts at x=8
+        // and only spans 4 columns (clipped by cw=12). Verify the apply
+        // doesn't write past column 11 and the unflagged right-edge area
+        // outside the flagged CTU stays at the initial value.
+        let mut pic = crate::picture::YuvPicture::new(24, 24, 1, 8).unwrap();
+        let stride = pic.c_stride();
+        let cw = stride;
+        let ch = pic.cb.len() / stride;
+        assert_eq!(cw, 12);
+        assert_eq!(ch, 12);
+        for v in pic.cb.iter_mut() {
+            *v = 50;
+        }
+        // Flag only the right CTU (clipped to 4 chroma columns).
+        let mut map = AlfCtbMap::new(24, 24, 4);
+        // ctbs_wide = ceil(24/16) = 2, ctbs_high = 2 → 4 CTUs total.
+        assert_eq!(map.ctbs_wide, 2);
+        assert_eq!(map.ctbs_high, 2);
+        map.set(0, false, false, false);
+        map.set(1, false, true, false); // top-right Cb CTU
+        map.set(2, false, false, false);
+        map.set(3, false, true, false); // bottom-right Cb CTU
+        let filter = AlfChromaFilter {
+            coef: [0, 0, 0, 0, 0, 0, 0],
+        };
+        apply_alf_chroma_masked(&mut pic, &filter, &map, 1, 8);
+        // Left columns 0..8 untouched (no flag), right columns 8..12 zeroed.
+        for y in 0..ch {
+            for x in 0..cw {
+                let want = if x < 8 { 50 } else { 0 };
+                assert_eq!(pic.cb[y * stride + x], want, "({x},{y})");
+            }
+        }
+        // Sanity: no out-of-bounds write happened (sample at the last
+        // column / row of the plane still in [0, 255]).
+        assert_eq!(pic.cb[(ch - 1) * stride + (cw - 1)], 0);
+    }
+
+    #[test]
+    fn round145_apply_alf_chroma_masked_skips_when_monochrome() {
+        // chroma_format_idc = 0 → masked chroma apply is a no-op.
+        let mut pic = crate::picture::YuvPicture::new(16, 16, 0, 8).unwrap();
+        let filter = AlfChromaFilter {
+            coef: [0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut map = AlfCtbMap::new(16, 16, 4);
+        map.set(0, false, true, true);
+        // Empty cb/cr; the call must not panic on empty plane access.
+        apply_alf_chroma_masked(&mut pic, &filter, &map, 1, 8);
+        apply_alf_chroma_masked(&mut pic, &filter, &map, 2, 8);
+        assert!(pic.cb.is_empty());
+        assert!(pic.cr.is_empty());
     }
 }
