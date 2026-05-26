@@ -7,6 +7,44 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-148 status
+
+Round 148 lands the **§8.9.5 piecewise-function range-index identification
+helper** (`find_range_idx`, eq. 1383 verbatim) and rewires `apply_dra` so
+the chroma offset is applied **per chroma sample** using the segment of
+the **co-located pre-DRA luma sample** — rather than the round-11
+simplification of "use segment 0's `chroma_qp_offset` uniformly across
+every Cb/Cr sample". Per ISO/IEC 23094-1:2020(E) §8.9.2, the §8.9.4 chroma
+DRA process takes `decPictureL[ x * SubWidthC, y * SubHeightC ]` (the
+decoded, **pre-mapping** luma sample at the co-located position) as one of
+its inputs — so `apply_dra` now snapshots the pre-DRA luma plane before
+the in-place LUT rewrite, then for each (x, y) chroma sample reads the
+matching luma value, runs it through §8.9.5 (range-found-then-break with
+the final `Min(rangeIdx, numRanges − 1)` clamp) against a new
+`build_ranges_array` helper that appends `1 << bit_depth` as the top
+sentinel (since the round-11 `DraData::range_l` table only stores
+`num_ranges` lower boundaries, not the §8.9.5-required `num_ranges + 1`),
+and adds the parsed `dra_chroma_qp_offset[ rangeIdx ]` to the chroma
+sample with the existing `[0, (1 << bit_depth_c) − 1]` clip. Supports
+4:2:0, 4:2:2, 4:4:4 via the per-format `SubWidthC` / `SubHeightC`
+sub-sampling factors. 339 unit tests pass (was 331) — 8 new cover: eq.
+1383 three-range walk including boundary + above-top fall-through, single
+range always-zero, zero ranges no-op, ranges-array top-sentinel synthesis
+for 8-bit + 10-bit luma, per-sample chroma offset uses co-located luma's
+segment (3-segment 8×8 4:4:4 with x-varying luma values giving distinct
+chroma offsets per column), the pre-DRA-vs-post-DRA snapshot check (a
+post-DRA luma value that would re-classify into a sentinel-offset segment
+fails the test if the chroma lookup wrongly reads post-DRA luma), 4:2:0
+subsampled-luma alignment (chroma row y reads luma row 2y), and the upper
+clip (`+60` over `chroma = 250` → `255` cap). The full §8.9.6 chromaScale
+derivation (eq. 1384-1385 with `OutOffsetsC` / `OutScalesC` from §8.9.7 +
+§8.9.8) is still parked pending the §7.3.6-faithful APS parser rewrite.
+Suggested workspace-README row delta: EVC now applies the chroma DRA
+offset per-sample using §8.9.5 to look up the co-located pre-DRA luma's
+segment (lacks: full §8.9.6 / §8.9.7 / §8.9.8 chromaScale derivation with
+QP-shifted invChromaScales, Main-profile toolset — BTT/ADMVP/EIPD/ATS/
+AMVR/affine).
+
 ## Round-145 status
 
 Round 145 lands the **§8.8.4.4 per-CTB chroma type filtering process**

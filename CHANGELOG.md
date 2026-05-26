@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### Round 148 — §8.9.5 range-idx helper + per-sample co-located-luma chroma DRA offset
+
+#### Added
+- `dra::find_range_idx`: spec-faithful transcription of ISO/IEC
+  23094-1:2020(E) §8.9.5 (page 305) eq. 1383 — the piecewise-function
+  range-index identification process used by every §8.9.3 / §8.9.4 /
+  §8.9.6 chroma scale lookup. Pure function: walks `rangesArray` from
+  the bottom, returns the first `rangeIdx` whose upper boundary the
+  input sample falls below; falls through to `numRanges − 1` for any
+  input ≥ the top boundary, exactly matching the spec's `rangeFound`
+  fallback + final `Min(rangeIdx, numRanges − 1)` clamp.
+- `dra::build_ranges_array`: synthesises the §8.9.5-compatible
+  `rangesArray` (`num_ranges + 1` entries) from the round-11
+  `DraData::range_l` table (which stores `num_ranges` lower boundaries
+  only) by appending `1 << bit_depth` as the top sentinel so the
+  last-segment fall-through matches the spec.
+
+#### Changed
+- `dra::apply_dra` now applies the chroma offset **per chroma sample**
+  rather than uniformly using segment 0's offset. Per §8.9.2 the
+  §8.9.4 chroma DRA process takes `decPictureL[ x * SubWidthC, y *
+  SubHeightC ]` (i.e. the **pre-DRA** decoded luma at the co-located
+  position) as input; `apply_dra` now snapshots the pre-DRA luma plane
+  before in-place LUT rewriting, then for each (x, y) chroma sample
+  looks up the co-located luma's range index via §8.9.5 and applies
+  the parsed `dra_chroma_qp_offset[ rangeIdx ]` (still a round-11
+  simplification of the full §8.9.6 + §8.9.7 + §8.9.8 derivation
+  chain, but no longer collapsed to segment 0). Supports 4:2:0, 4:2:2,
+  4:4:4 via the per-format `SubWidthC` / `SubHeightC` mapping. Picture
+  edges clamp the luma coordinate to `[0, luma_w − 1]` /
+  `[0, luma_h − 1]` for the residual sub-sampled chroma rows / cols
+  that overhang.
+
+#### Tests
+- 8 new unit tests (now 339, was 331): §8.9.5 eq. 1383 three-range
+  walk (boundary + below-top + above-top fall-through), single-range
+  always-zero, zero-ranges no-op, ranges-array top-sentinel synthesis
+  for 8-bit + 10-bit, per-sample chroma offset uses co-located luma's
+  segment (3-segment 8×8 4:4:4 with x-varying luma → distinct chroma
+  offsets per column), the snapshot-correctness check (post-DRA luma
+  re-classified into a sentinel-offset segment fails the test if the
+  chroma lookup wrongly reads post-DRA luma), 4:2:0 subsampled-luma
+  alignment (chroma row y reads luma row 2y), and the upper clip
+  (`+60` over `chroma = 250` → `255` cap).
+
+#### Spec-faithfulness notes
+- The full §8.9.6 `chromaScale = OutOffsetsC[ apsId ][ cIdx ][ rangeIdx ]
+  + ( OutScalesC[ ... ] * incValue + ( 1 << 9 ) ) >> 10` (eq. 1384-1385)
+  with `OutScalesC` / `OutOffsetsC` derived per §8.9.7 + §8.9.8 from
+  `invChromaScales` + `OutRangesL` is **still parked** pending the
+  §7.3.6-faithful APS parser rewrite (the round-11 parser uses an
+  approximate Q8.3 scale + 8-bit chroma-offset layout rather than the
+  §7.3.6 `dra_global_offset` + `dra_scale_value` u(v) numBitsDraScale
+  layout). Round 148 only lands the §8.9.5 helper + the co-located-
+  luma per-sample chroma offset; the full chroma-scale derivation is a
+  documented follow-up.
+
 ### Round 145 — §8.8.4.4 per-CTB chroma type filtering + eq. 1321 tap-geometry fix
 
 #### Added

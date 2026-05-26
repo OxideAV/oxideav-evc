@@ -228,6 +228,67 @@ fn find_segment(dra: &DraData, v: i32) -> usize {
     0
 }
 
+/// §8.9.5 — Identification of the range index of piecewise function.
+///
+/// Verbatim transcription of eq. 1383 (ISO/IEC 23094-1:2020(E) page 305):
+///
+/// ```text
+/// rangeFound = 0
+/// for( rangeIdx = 0; rangeIdx < numRanges; rangeIdx+ + )
+///     if( inputSample < rangesArray[ rangeIdx + 1 ] )
+///     {
+///          rangeFound = 1                                   (1383)
+///          break
+///     }
+/// rangeIdx = ( rangeFound = = 1 ) ? rangeIdx : numRanges – 1
+/// rangeIdx = Min( rangeIdx, numRanges – 1 )
+/// ```
+///
+/// `ranges_array` holds `num_ranges + 1` boundaries — entries 0..num_ranges
+/// inclusive — so `ranges_array[rangeIdx + 1]` is always in-bounds for
+/// `rangeIdx ∈ [0, numRanges − 1]`. Callers that have only `num_ranges`
+/// boundaries (e.g. the round-11 `range_l[]` table) should pass a synthetic
+/// upper sentinel as the final entry (e.g. `1 << bit_depth`) so the
+/// last-segment fall-through matches the spec's behaviour.
+///
+/// Returns a value in `[0, num_ranges − 1]`. Defined as a saturating no-op
+/// when `num_ranges == 0` (returns 0 — there is no valid range, so the
+/// caller is expected to short-circuit before calling).
+pub fn find_range_idx(input_sample: i32, ranges_array: &[i32], num_ranges: usize) -> usize {
+    if num_ranges == 0 {
+        return 0;
+    }
+    debug_assert!(
+        ranges_array.len() > num_ranges,
+        "ranges_array must have num_ranges + 1 boundaries (got {} for num_ranges {num_ranges})",
+        ranges_array.len()
+    );
+    for range_idx in 0..num_ranges {
+        if input_sample < ranges_array[range_idx + 1] {
+            return range_idx.min(num_ranges - 1);
+        }
+    }
+    num_ranges - 1
+}
+
+/// Build the §8.9.5-ready `rangesArray` of `num_ranges + 1` boundaries from
+/// a [`DraData`] for a given luma bit depth.
+///
+/// The round-11 [`DraData::range_l`] table stores `num_ranges` lower
+/// boundaries (one per segment); §8.9.5's `rangesArray` is one entry longer
+/// so that the loop's `inputSample < rangesArray[rangeIdx + 1]` test is
+/// in-bounds for `rangeIdx = numRanges − 1`. The synthesised top boundary
+/// is `1 << bit_depth` (sample space upper bound) so the last segment
+/// absorbs every value ≥ `range_l[num_ranges − 1]`.
+pub fn build_ranges_array(dra: &DraData, bit_depth: u32) -> Vec<i32> {
+    let mut out = Vec::with_capacity(dra.num_ranges + 1);
+    for i in 0..dra.num_ranges {
+        out.push(dra.range_l[i] as i32);
+    }
+    out.push(1i32 << bit_depth);
+    out
+}
+
 /// Derive the chroma offset for the given DRA segment (§8.10.3).
 ///
 /// The spec derives the chroma offset from the segment that contains the
@@ -242,25 +303,127 @@ pub fn chroma_offset_for_segment(dra: &DraData, seg: usize) -> i32 {
 }
 
 /// Apply the DRA luma LUT to every Y sample of the picture in-place,
-/// and apply the chroma offset to every Cb + Cr sample.
+/// and apply the per-segment chroma offset to every Cb + Cr sample.
+///
+/// Per §8.9.2, the chroma DRA process takes the **decoded** (pre-DRA) luma
+/// sample at `decPictureL[ x * SubWidthC, y * SubHeightC ]` as one of its
+/// inputs (along with the chroma sample). The chroma sample's segment
+/// index is therefore derived from the co-located luma sample's value
+/// **before** the luma DRA mapping has run, so we must snapshot the
+/// pre-DRA luma plane before rewriting it in-place. This is the spec
+/// behaviour described by §8.9.4 calling §8.9.6 with `lumaSample =
+/// decPictureL[ ... ]`.
+///
+/// The chroma offset itself is the round-11 simplification of §8.9.6: each
+/// chroma sample is offset by the parsed `dra_chroma_qp_offset` of the
+/// segment that the co-located luma sample falls into (looked up via the
+/// spec-faithful §8.9.5 [`find_range_idx`] helper rather than the
+/// round-11 segment-0 uniform shift). The full §8.9.6 `chromaScale`
+/// derivation (eq. 1384-1385 with `OutOffsetsC` / `OutScalesC` /
+/// `OutRangesC` from §8.9.7 + §8.9.8) is still parked pending the
+/// §7.3.6-faithful APS parser rewrite.
 pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_depth_chroma: u32) {
     if !dra.descriptor_present {
         return;
     }
+
+    // Snapshot the pre-DRA luma plane: §8.9.4 inputs require decPictureL
+    // (the decoded, pre-mapping luma) as the segment-index source.
+    let pre_dra_luma: Option<Vec<u8>> = if pic.chroma_format_idc != 0 {
+        Some(pic.y.clone())
+    } else {
+        None
+    };
+
     let lut = build_luma_lut(dra, bit_depth_luma);
     for v in pic.y.iter_mut() {
         *v = lut[*v as usize];
     }
+
     if pic.chroma_format_idc != 0 {
+        let pre_y = pre_dra_luma.expect("snapshot taken when chroma is present");
         let max_c = ((1u32 << bit_depth_chroma) - 1) as i32;
-        let c_off = chroma_offset_for_segment(dra, 0);
-        for v in pic.cb.iter_mut() {
-            *v = (*v as i32 + c_off).clamp(0, max_c) as u8;
-        }
-        for v in pic.cr.iter_mut() {
-            *v = (*v as i32 + c_off).clamp(0, max_c) as u8;
+        let ranges = build_ranges_array(dra, bit_depth_luma);
+        let num_ranges = dra.num_ranges;
+        let (sub_w, sub_h) = chroma_subsampling(pic.chroma_format_idc);
+        let (cw, ch) = chroma_plane_dims(pic.width, pic.height, pic.chroma_format_idc);
+
+        apply_chroma_plane_offset(
+            &mut pic.cb,
+            &pre_y,
+            pic.width as usize,
+            pic.height as usize,
+            cw,
+            ch,
+            sub_w,
+            sub_h,
+            dra,
+            &ranges,
+            num_ranges,
+            max_c,
+        );
+        apply_chroma_plane_offset(
+            &mut pic.cr,
+            &pre_y,
+            pic.width as usize,
+            pic.height as usize,
+            cw,
+            ch,
+            sub_w,
+            sub_h,
+            dra,
+            &ranges,
+            num_ranges,
+            max_c,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_chroma_plane_offset(
+    plane: &mut [u8],
+    pre_y: &[u8],
+    luma_w: usize,
+    luma_h: usize,
+    chroma_w: usize,
+    chroma_h: usize,
+    sub_w: usize,
+    sub_h: usize,
+    dra: &DraData,
+    ranges: &[i32],
+    num_ranges: usize,
+    max_c: i32,
+) {
+    debug_assert_eq!(plane.len(), chroma_w * chroma_h);
+    for y in 0..chroma_h {
+        let luma_y = (y * sub_h).min(luma_h.saturating_sub(1));
+        let row_off_luma = luma_y * luma_w;
+        let row_off_chroma = y * chroma_w;
+        for x in 0..chroma_w {
+            let luma_x = (x * sub_w).min(luma_w.saturating_sub(1));
+            let luma_sample = pre_y[row_off_luma + luma_x] as i32;
+            let seg = find_range_idx(luma_sample, ranges, num_ranges);
+            let c_off = dra.chroma_qp_offset[seg] as i32;
+            let v = plane[row_off_chroma + x] as i32;
+            plane[row_off_chroma + x] = (v + c_off).clamp(0, max_c) as u8;
         }
     }
+}
+
+fn chroma_subsampling(chroma_format_idc: u32) -> (usize, usize) {
+    match chroma_format_idc {
+        1 => (2, 2), // 4:2:0
+        2 => (2, 1), // 4:2:2
+        3 => (1, 1), // 4:4:4
+        _ => (1, 1),
+    }
+}
+
+fn chroma_plane_dims(width: u32, height: u32, chroma_format_idc: u32) -> (usize, usize) {
+    let (sw, sh) = chroma_subsampling(chroma_format_idc);
+    let cw = (width as usize).div_ceil(sw);
+    let ch = (height as usize).div_ceil(sh);
+    (cw, ch)
 }
 
 // =====================================================================
@@ -461,5 +624,263 @@ mod tests {
         assert_eq!(find_segment(&dra, 191), 1);
         assert_eq!(find_segment(&dra, 192), 2);
         assert_eq!(find_segment(&dra, 255), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 148 — §8.9.5 range-idx helper + per-sample chroma offset.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round148_find_range_idx_eq1383_three_ranges() {
+        // ranges_array = [0, 64, 192, 256]; num_ranges = 3.
+        // Per eq. 1383:
+        //   input <  64  → idx 0
+        //   input < 192  → idx 1
+        //   otherwise    → idx 2 (clamped to num_ranges − 1)
+        let ranges = [0i32, 64, 192, 256];
+        assert_eq!(find_range_idx(0, &ranges, 3), 0);
+        assert_eq!(find_range_idx(63, &ranges, 3), 0);
+        assert_eq!(find_range_idx(64, &ranges, 3), 1);
+        assert_eq!(find_range_idx(191, &ranges, 3), 1);
+        assert_eq!(find_range_idx(192, &ranges, 3), 2);
+        assert_eq!(find_range_idx(255, &ranges, 3), 2);
+        // Above the top boundary: range-not-found ⇒ clamped to numRanges − 1.
+        assert_eq!(find_range_idx(1000, &ranges, 3), 2);
+    }
+
+    #[test]
+    fn round148_find_range_idx_single_range_always_zero() {
+        let ranges = [0i32, 256];
+        for v in (0..256).step_by(17) {
+            assert_eq!(find_range_idx(v, &ranges, 1), 0);
+        }
+        // Even above the top boundary.
+        assert_eq!(find_range_idx(999, &ranges, 1), 0);
+    }
+
+    #[test]
+    fn round148_find_range_idx_zero_ranges_returns_zero() {
+        assert_eq!(find_range_idx(42, &[], 0), 0);
+    }
+
+    #[test]
+    fn round148_build_ranges_array_appends_top_sentinel() {
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 3,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 64;
+        dra.range_l[2] = 192;
+        let arr = build_ranges_array(&dra, 8);
+        assert_eq!(arr, vec![0, 64, 192, 256]);
+        // 10-bit top sentinel = 1024.
+        let arr10 = build_ranges_array(&dra, 10);
+        assert_eq!(arr10, vec![0, 64, 192, 1024]);
+    }
+
+    #[test]
+    fn round148_apply_dra_chroma_offset_uses_colocated_luma_segment() {
+        // Three luma segments: [0, 64), [64, 192), [192, 255].
+        // Per-segment chroma offsets: seg 0 = +5, seg 1 = +10, seg 2 = +15.
+        // Build an 8×8 4:4:4 picture so each chroma sample directly maps
+        // to a luma sample at the same (x, y) (SubWidthC = SubHeightC = 1).
+        let mut pic = crate::picture::YuvPicture::new(8, 8, 3, 8).unwrap();
+        // Fill luma so column x maps to segment ⌊x/3⌋ (cols 0..2 → seg 0,
+        // cols 3..5 → seg 1, cols 6..7 → seg 2). Use luma values 0 / 128 / 192.
+        for y in 0..8 {
+            for x in 0..8 {
+                let seg = if x < 3 {
+                    0
+                } else if x < 6 {
+                    1
+                } else {
+                    2
+                };
+                let luma_val = match seg {
+                    0 => 0u8,
+                    1 => 128u8,
+                    _ => 192u8,
+                };
+                pic.y[y * 8 + x] = luma_val;
+            }
+        }
+        // Fill chroma planes with a known base value.
+        for v in pic.cb.iter_mut() {
+            *v = 100;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 100;
+        }
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 3,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 64;
+        dra.range_l[2] = 192;
+        // Identity luma scales so the LUT doesn't perturb luma values.
+        dra.scale[0] = 8;
+        dra.scale[1] = 8;
+        dra.scale[2] = 8;
+        dra.chroma_qp_offset[0] = 5;
+        dra.chroma_qp_offset[1] = 10;
+        dra.chroma_qp_offset[2] = 15;
+        apply_dra(&mut pic, &dra, 8, 8);
+        // Verify per-sample chroma offset uses the *co-located* luma's
+        // segment, not segment 0 uniformly.
+        for y in 0..8 {
+            for x in 0..8 {
+                let expect_off = if x < 3 {
+                    5
+                } else if x < 6 {
+                    10
+                } else {
+                    15
+                };
+                assert_eq!(
+                    pic.cb[y * 8 + x],
+                    (100 + expect_off) as u8,
+                    "Cb at ({x},{y}) wrong segment offset"
+                );
+                assert_eq!(
+                    pic.cr[y * 8 + x],
+                    (100 + expect_off) as u8,
+                    "Cr at ({x},{y}) wrong segment offset"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round148_apply_dra_uses_pre_dra_luma_for_chroma_segment_lookup() {
+        // Build a 4:4:4 8×8 picture with luma values that fall in segment 1
+        // (luma 100, with range boundaries [0, 64, 192)).
+        // The luma LUT is configured with scale 2.0 so post-DRA luma = 200,
+        // which would re-classify into segment 2 if the chroma lookup
+        // (incorrectly) read post-DRA luma instead of pre-DRA.
+        // Segment 1 offset = 7; segment 2 offset = 99 (sentinel for failure).
+        let mut pic = crate::picture::YuvPicture::new(4, 4, 3, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        for v in pic.cb.iter_mut() {
+            *v = 50;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 50;
+        }
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 2,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 192;
+        // Scale 2.0 in seg 0 (Q8.3 = 16) → luma 100 → 200.
+        dra.scale[0] = 16;
+        dra.scale[1] = 8;
+        // If chroma lookup uses *pre-DRA* luma (100 → seg 0), expect +7.
+        // If it (wrongly) uses *post-DRA* luma (200 → seg 1), would get +99.
+        dra.chroma_qp_offset[0] = 7;
+        dra.chroma_qp_offset[1] = 99;
+        apply_dra(&mut pic, &dra, 8, 8);
+        // Sanity: luma was mapped 100 → 200.
+        assert_eq!(pic.y[0], 200);
+        // Chroma offset must reflect pre-DRA luma's segment (0 → +7).
+        for v in pic.cb.iter() {
+            assert_eq!(*v, 57, "Cb must use pre-DRA luma segment (got {v})");
+        }
+        for v in pic.cr.iter() {
+            assert_eq!(*v, 57, "Cr must use pre-DRA luma segment (got {v})");
+        }
+    }
+
+    #[test]
+    fn round148_apply_dra_chroma_offset_420_uses_subsampled_luma() {
+        // 4:2:0 picture: chroma sample (x, y) reads luma (x*2, y*2).
+        // 8×8 luma plane, 4×4 chroma. Configure luma so the upper-left
+        // 4×4 luma quadrant is in segment 0 and the lower-right 4×4 is
+        // in segment 1; chroma should pick up the matching offsets at
+        // the subsampled positions.
+        let mut pic = crate::picture::YuvPicture::new(8, 8, 1, 8).unwrap();
+        // luma upper half = 0 (seg 0); lower half = 128 (seg 1).
+        for y in 0..8 {
+            for x in 0..8 {
+                pic.y[y * 8 + x] = if y < 4 { 0 } else { 128 };
+            }
+        }
+        for v in pic.cb.iter_mut() {
+            *v = 60;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 60;
+        }
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 2,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 64;
+        dra.scale[0] = 8;
+        dra.scale[1] = 8;
+        dra.chroma_qp_offset[0] = 3;
+        dra.chroma_qp_offset[1] = 9;
+        apply_dra(&mut pic, &dra, 8, 8);
+        // Chroma is 4×4 — rows 0,1 read luma rows 0,2 (both seg 0 → +3);
+        // rows 2,3 read luma rows 4,6 (both seg 1 → +9).
+        for y in 0..4 {
+            for x in 0..4 {
+                let expect = if y < 2 { 63u8 } else { 69u8 };
+                assert_eq!(
+                    pic.cb[y * 4 + x],
+                    expect,
+                    "Cb chroma at ({x},{y}) expected {expect}"
+                );
+                assert_eq!(
+                    pic.cr[y * 4 + x],
+                    expect,
+                    "Cr chroma at ({x},{y}) expected {expect}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round148_apply_dra_clips_chroma_offset() {
+        // Co-located luma is 200 → falls into a segment with offset +60;
+        // chroma starts at 250 → 250 + 60 = 310 → clamped to 255.
+        let mut pic = crate::picture::YuvPicture::new(4, 4, 3, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 200;
+        }
+        for v in pic.cb.iter_mut() {
+            *v = 250;
+        }
+        for v in pic.cr.iter_mut() {
+            *v = 250;
+        }
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 2,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 192;
+        dra.scale[0] = 8;
+        dra.scale[1] = 8;
+        // Segment 1 covers [192, 255]; offset = +60.
+        dra.chroma_qp_offset[0] = 0;
+        dra.chroma_qp_offset[1] = 60;
+        apply_dra(&mut pic, &dra, 8, 8);
+        for v in pic.cb.iter() {
+            assert_eq!(*v, 255, "Cb should clip to 255");
+        }
+        for v in pic.cr.iter() {
+            assert_eq!(*v, 255, "Cr should clip to 255");
+        }
     }
 }
