@@ -320,8 +320,10 @@ pub fn chroma_offset_for_segment(dra: &DraData, seg: usize) -> i32 {
 /// spec-faithful §8.9.5 [`find_range_idx`] helper rather than the
 /// round-11 segment-0 uniform shift). The full §8.9.6 `chromaScale`
 /// derivation (eq. 1384-1385 with `OutOffsetsC` / `OutScalesC` /
-/// `OutRangesC` from §8.9.7 + §8.9.8) is still parked pending the
-/// §7.3.6-faithful APS parser rewrite.
+/// `OutRangesC` from §8.9.7 + §8.9.8) is now unblocked by the round-151
+/// [`parse_dra_syntax`] + [`derive_dra_state`] pair (below) — a
+/// follow-up round will retire this round-11 routine in favour of the
+/// spec-faithful state.
 pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_depth_chroma: u32) {
     if !dra.descriptor_present {
         return;
@@ -424,6 +426,414 @@ fn chroma_plane_dims(width: u32, height: u32, chroma_format_idc: u32) -> (usize,
     let cw = (width as usize).div_ceil(sw);
     let ch = (height as usize).div_ceil(sh);
     (cw, ch)
+}
+
+// =====================================================================
+// Round 151 — §7.3.6-faithful `dra_data()` parser + §7.4.7 derived state.
+// =====================================================================
+//
+// The round-11 [`DraData`] / [`parse_dra_data`] above predate any reading of
+// §7.3.6 and don't match the spec wire format (they made up a
+// `dra_descriptor_present_flag` + `dra_range_l[]` / `dra_chroma_qp_offset[]`
+// shape that no real EVC DRA APS payload follows). They stay in tree
+// untouched for now because [`apply_dra`] + the round-148 §8.9.5 per-sample
+// chroma-offset path consume them, but a follow-up round (priority #3) will
+// retire them in favour of the spec-faithful pair introduced here:
+//
+//   * [`DraSyntax`] — every raw bit `dra_data()` writes per §7.3.6 (table
+//     on page 42 of ISO/IEC 23094-1:2020(E)):
+//       dra_descriptor1                u(4)
+//       dra_descriptor2                u(4)
+//       dra_number_ranges_minus1       ue(v)
+//       dra_equal_ranges_flag          u(1)
+//       dra_global_offset              u(10)
+//       if (dra_equal_ranges_flag)
+//           dra_delta_range[0]         u(10)
+//       else
+//           for j in 0..=num_ranges_minus1
+//               dra_delta_range[j]     u(10)
+//       for j in 0..=num_ranges_minus1
+//           dra_scale_value[j]         u(numBitsDraScale)
+//       dra_cb_scale_value             u(numBitsDraScale)
+//       dra_cr_scale_value             u(numBitsDraScale)
+//       dra_table_idx                  ue(v)
+//
+//   * [`DraDerived`] — every per-APS derived variable §7.4.7 mandates from
+//     those bits, including `numBitsDraScale` (eq. 111), `InDraRange[]`
+//     (eq. 112-114), `DraJoinedScaleFlag` (the `dra_table_idx == 58`
+//     branch), `numOutRangesL`, `OutRangesL[]` (eq. 115-116 then re-shifted
+//     per eq. 122), and the §8.9.3 luma-mapping inputs `InvLumaScales[]`
+//     (eq. 117-119) and `DraOffsets[]` (eq. 120-121).
+//
+// All numeric ranges + bitstream-conformance constraints in §7.4.7 are
+// enforced at parse time (descriptor1 ∈ [0, 15], descriptor2 ∈ [0, 15],
+// numBitsDraScale > 0, dra_number_ranges_minus1 ∈ [0, 31], InDraRange[j]
+// in [0, (1 << BitDepthY) − 1], dra_scale_value[j] ≠ 0 and
+// < (4 << dra_descriptor2), dra_table_idx ∈ [0, 58]); a violating
+// bitstream is rejected with [`Error::Invalid`] instead of being silently
+// truncated.
+
+/// Number of DRA ranges supported by §7.3.6 — `dra_number_ranges_minus1`
+/// is in `[0, 31]` so the maximum is 32 segments.
+pub const DRA_MAX_RANGES_V2: usize = 32;
+
+/// Spec-faithful `dra_data()` payload (§7.3.6) — every raw bit the parser
+/// reads, before §7.4.7 derivation. Companion [`DraDerived`] holds the
+/// derived state.
+#[derive(Clone, Debug)]
+pub struct DraSyntax {
+    /// `dra_descriptor1` — integer-part precision of the DRA scale values.
+    /// Spec restricts this to 4 in the current version (§7.4.7).
+    pub dra_descriptor1: u8,
+    /// `dra_descriptor2` — fractional-part precision of the DRA scale
+    /// values, also reused as the post-shift right-shift in eq. 121/122.
+    /// Spec restricts this to 9 in the current version (§7.4.7).
+    pub dra_descriptor2: u8,
+    /// `dra_number_ranges_minus1` — number of DRA ranges minus 1, in
+    /// `[0, 31]`.
+    pub dra_number_ranges_minus1: u8,
+    /// `dra_equal_ranges_flag` — when 1, all ranges share the size
+    /// `dra_delta_range[0]`; otherwise each range gets its own delta.
+    pub dra_equal_ranges_flag: bool,
+    /// `dra_global_offset` — `InDraRange[0]` (pre-shift by
+    /// `Max(0, BitDepthY − 10)`), in `[1, Min(1023, (1 << BitDepthY) − 1)]`.
+    pub dra_global_offset: u16,
+    /// `dra_delta_range[j]` — per-range deltas (only the first
+    /// `dra_number_ranges_minus1 + 1` are valid; only entry 0 is read
+    /// when `dra_equal_ranges_flag` is 1).
+    pub dra_delta_range: [u16; DRA_MAX_RANGES_V2],
+    /// `dra_scale_value[j]` — per-range luma scale, `numBitsDraScale` bits
+    /// wide, in `[1, (4 << dra_descriptor2) − 1]`.
+    pub dra_scale_value: [u16; DRA_MAX_RANGES_V2],
+    /// `dra_cb_scale_value` — chroma Cb scale (`numBitsDraScale` bits).
+    pub dra_cb_scale_value: u16,
+    /// `dra_cr_scale_value` — chroma Cr scale (`numBitsDraScale` bits).
+    pub dra_cr_scale_value: u16,
+    /// `dra_table_idx` — `[0, 58]`; index 58 selects the dual-scale chroma
+    /// path (`DraJoinedScaleFlag = 0`), other values select a chroma QP
+    /// table entry from `ChromaQpTable` (`DraJoinedScaleFlag = 1`).
+    pub dra_table_idx: u8,
+}
+
+/// `numBitsDraScale + 1`-bit max width capped at `u16`. The spec restricts
+/// `dra_descriptor1 = 4` + `dra_descriptor2 = 9` → 13 bits; the +1 leaves
+/// room for any future widening.
+const NUM_BITS_DRA_SCALE_MAX: u32 = 16;
+
+/// §7.4.7 derived per-APS state — every variable the spec defines from the
+/// parsed [`DraSyntax`] bits, for downstream §8.9.3 (luma mapping) and
+/// §8.9.6 / §8.9.7 / §8.9.8 (chroma mapping) consumption.
+#[derive(Clone, Debug)]
+pub struct DraDerived {
+    /// `numBitsDraScale = dra_descriptor1 + dra_descriptor2` (eq. 111).
+    pub num_bits_dra_scale: u32,
+    /// Number of luma ranges = `dra_number_ranges_minus1 + 1`. Also equal
+    /// to `numOutRangesL` (§7.4.7 page 86).
+    pub num_ranges: usize,
+    /// `DraJoinedScaleFlag` — 0 when `dra_table_idx == 58`, 1 otherwise.
+    /// Controls the §8.9.8 (dual-scale) vs §8.9.7 (table-driven) chroma
+    /// scale derivation path.
+    pub joined_scale_flag: bool,
+    /// `InDraRange[j]` for `j` in `0..=num_ranges` (so `num_ranges + 1`
+    /// entries). Derived per eq. 112-114; serves as the §8.9.5
+    /// `rangesArray` input on the luma side. Wider type than the
+    /// 10-bit `dra_global_offset` because the eq. 112 pre-shift by
+    /// `Max(0, BitDepthY − 10)` can grow it to (1 << BitDepthY) − 1.
+    pub in_dra_range: [u32; DRA_MAX_RANGES_V2 + 1],
+    /// `OutRangesL[apsId][i]` for `i` in `0..=num_ranges` — output-side
+    /// range boundaries. `OutRangesL[0] = 0`; subsequent entries derive
+    /// from eq. 115-116 then re-shift per eq. 122.
+    pub out_ranges_l: [i64; DRA_MAX_RANGES_V2 + 1],
+    /// `InvLumaScales[apsId][i]` for `i` in `1..=dra_number_ranges_minus1`
+    /// per eq. 118-119. Entries 0 and `num_ranges - 0` (the upper tail)
+    /// are left at zero — the spec's §8.9.3 invocation uses
+    /// `rangeIdx ∈ [0, numRanges − 1]` and the spec-derivation loop only
+    /// fills `[1, num_ranges_minus1]`. Round-151 follow-up: confirm with
+    /// docs whether entry 0 is meant to be implicitly filled (the §8.9.3
+    /// mapping reads it for `rangeIdx == 0`).
+    pub inv_luma_scales: [i64; DRA_MAX_RANGES_V2],
+    /// `DraOffsets[apsId][i]` for `i` in `1..=dra_number_ranges_minus1`
+    /// per eq. 120-121.
+    pub dra_offsets: [i64; DRA_MAX_RANGES_V2],
+}
+
+impl DraDerived {
+    /// Zero-initialised derived state for a single-range identity DRA.
+    fn empty() -> Self {
+        Self {
+            num_bits_dra_scale: 0,
+            num_ranges: 0,
+            joined_scale_flag: false,
+            in_dra_range: [0u32; DRA_MAX_RANGES_V2 + 1],
+            out_ranges_l: [0i64; DRA_MAX_RANGES_V2 + 1],
+            inv_luma_scales: [0i64; DRA_MAX_RANGES_V2],
+            dra_offsets: [0i64; DRA_MAX_RANGES_V2],
+        }
+    }
+}
+
+/// Parse a §7.3.6 `dra_data()` payload and derive every §7.4.7 variable
+/// from it.
+///
+/// * `payload` — APS RBSP after the 1-byte `aps_params_type` /
+///   `adaptation_parameter_set_id` header (matches the existing
+///   [`parse_dra_data`] contract).
+/// * `bit_depth_y` — `BitDepthY` from the active SPS, required for the
+///   `Max(0, BitDepthY − 10)` pre-shift in eq. 112 + the bitstream
+///   conformance check on `InDraRange[j]`.
+///
+/// On success, returns `(DraSyntax, DraDerived)` — the syntax half lets a
+/// re-encoder reproduce the bitstream verbatim; the derived half is the
+/// shape §8.9.3 / §8.9.6 / §8.9.7 / §8.9.8 need.
+pub fn parse_dra_syntax(payload: &[u8], bit_depth_y: u32) -> Result<(DraSyntax, DraDerived)> {
+    if payload.is_empty() {
+        return Err(Error::invalid("evc dra: empty DRA APS payload"));
+    }
+    if !(8..=16).contains(&bit_depth_y) {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_y must be in [8, 16] (per SPS §7.4.3.1)",
+        ));
+    }
+    let mut br = BitReader::new(payload);
+
+    // -- §7.3.6 dra_data() ------------------------------------------------
+    let dra_descriptor1 = br.u(4)? as u8;
+    let dra_descriptor2 = br.u(4)? as u8;
+
+    // §7.4.7 / eq. 111: numBitsDraScale = dra_descriptor1 + dra_descriptor2.
+    // Bitstream conformance: must be > 0.
+    let num_bits_dra_scale = dra_descriptor1 as u32 + dra_descriptor2 as u32;
+    if num_bits_dra_scale == 0 {
+        return Err(Error::invalid(
+            "evc dra: numBitsDraScale (= dra_descriptor1 + dra_descriptor2) must be > 0",
+        ));
+    }
+    if num_bits_dra_scale > NUM_BITS_DRA_SCALE_MAX {
+        return Err(Error::invalid(
+            "evc dra: numBitsDraScale exceeds 16 bits (parser cap)",
+        ));
+    }
+
+    let dra_number_ranges_minus1_u32 = br.ue()?;
+    if dra_number_ranges_minus1_u32 > 31 {
+        return Err(Error::invalid(
+            "evc dra: dra_number_ranges_minus1 out of range [0, 31]",
+        ));
+    }
+    let dra_number_ranges_minus1 = dra_number_ranges_minus1_u32 as u8;
+    let num_ranges = dra_number_ranges_minus1 as usize + 1;
+
+    let dra_equal_ranges_flag = br.u1()? != 0;
+
+    let dra_global_offset_u32 = br.u(10)?;
+    // §7.4.7: dra_global_offset ∈ [1, Min(1023, (1 << BitDepthY) − 1)].
+    let upper = (1u32 << bit_depth_y).saturating_sub(1).min(1023);
+    if dra_global_offset_u32 == 0 || dra_global_offset_u32 > upper {
+        return Err(Error::invalid(
+            "evc dra: dra_global_offset out of range [1, Min(1023, (1<<BitDepthY) − 1)]",
+        ));
+    }
+    let dra_global_offset = dra_global_offset_u32 as u16;
+
+    // dra_delta_range[]: 1 entry when equal_ranges_flag, num_ranges entries
+    // otherwise (j in 0..=dra_number_ranges_minus1).
+    let mut dra_delta_range = [0u16; DRA_MAX_RANGES_V2];
+    if dra_equal_ranges_flag {
+        let v = br.u(10)?;
+        if v == 0 || v > upper {
+            return Err(Error::invalid(
+                "evc dra: dra_delta_range[0] out of range [1, Min(1023, (1<<BitDepthY) − 1)]",
+            ));
+        }
+        dra_delta_range[0] = v as u16;
+    } else {
+        for slot in dra_delta_range.iter_mut().take(num_ranges) {
+            let v = br.u(10)?;
+            if v == 0 || v > upper {
+                return Err(Error::invalid("evc dra: dra_delta_range[j] out of range"));
+            }
+            *slot = v as u16;
+        }
+    }
+
+    // dra_scale_value[j] for j in 0..=dra_number_ranges_minus1.
+    let scale_upper = if dra_descriptor2 >= 30 {
+        u32::MAX // safety against overflow on weird future descriptor2
+    } else {
+        4u32 << dra_descriptor2
+    };
+    let mut dra_scale_value = [0u16; DRA_MAX_RANGES_V2];
+    for slot in dra_scale_value.iter_mut().take(num_ranges) {
+        let v = br.u(num_bits_dra_scale)?;
+        if v == 0 || v >= scale_upper {
+            return Err(Error::invalid(
+                "evc dra: dra_scale_value[j] must be in [1, (4 << dra_descriptor2) − 1]",
+            ));
+        }
+        *slot = v as u16;
+    }
+
+    let dra_cb_scale_value_u32 = br.u(num_bits_dra_scale)?;
+    if dra_cb_scale_value_u32 == 0 || dra_cb_scale_value_u32 >= scale_upper {
+        return Err(Error::invalid(
+            "evc dra: dra_cb_scale_value must be in [1, (4 << dra_descriptor2) − 1]",
+        ));
+    }
+    let dra_cb_scale_value = dra_cb_scale_value_u32 as u16;
+
+    let dra_cr_scale_value_u32 = br.u(num_bits_dra_scale)?;
+    if dra_cr_scale_value_u32 == 0 || dra_cr_scale_value_u32 >= scale_upper {
+        return Err(Error::invalid(
+            "evc dra: dra_cr_scale_value must be in [1, (4 << dra_descriptor2) − 1]",
+        ));
+    }
+    let dra_cr_scale_value = dra_cr_scale_value_u32 as u16;
+
+    let dra_table_idx_u32 = br.ue()?;
+    if dra_table_idx_u32 > 58 {
+        return Err(Error::invalid(
+            "evc dra: dra_table_idx out of range [0, 58]",
+        ));
+    }
+    let dra_table_idx = dra_table_idx_u32 as u8;
+
+    let syntax = DraSyntax {
+        dra_descriptor1,
+        dra_descriptor2,
+        dra_number_ranges_minus1,
+        dra_equal_ranges_flag,
+        dra_global_offset,
+        dra_delta_range,
+        dra_scale_value,
+        dra_cb_scale_value,
+        dra_cr_scale_value,
+        dra_table_idx,
+    };
+
+    // -- §7.4.7 derivation ----------------------------------------------
+    let derived = derive_dra_state(&syntax, bit_depth_y)?;
+    Ok((syntax, derived))
+}
+
+/// Apply the §7.4.7 derivation rules (eq. 111-122 + the `DraJoinedScaleFlag`
+/// branch) to a parsed [`DraSyntax`].
+///
+/// Surfaced as a separate function so a re-encoder can derive state from
+/// a hand-constructed [`DraSyntax`] without round-tripping through the
+/// byte parser.
+pub fn derive_dra_state(syntax: &DraSyntax, bit_depth_y: u32) -> Result<DraDerived> {
+    if !(8..=16).contains(&bit_depth_y) {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_y must be in [8, 16] (per SPS §7.4.3.1)",
+        ));
+    }
+    let mut d = DraDerived::empty();
+    d.num_bits_dra_scale = syntax.dra_descriptor1 as u32 + syntax.dra_descriptor2 as u32;
+    d.num_ranges = syntax.dra_number_ranges_minus1 as usize + 1;
+    // §7.4.7 page 85: dra_table_idx == 58 ⇒ DraJoinedScaleFlag = 0, else 1.
+    d.joined_scale_flag = syntax.dra_table_idx != 58;
+
+    // eq. 112: InDraRange[0] = dra_global_offset << Max(0, BitDepthY − 10).
+    let shift = bit_depth_y.saturating_sub(10);
+    let max_in_range = (1u32 << bit_depth_y).saturating_sub(1);
+    let in0 = (syntax.dra_global_offset as u32) << shift;
+    if in0 > max_in_range {
+        return Err(Error::invalid(
+            "evc dra: InDraRange[0] exceeds (1 << BitDepthY) − 1",
+        ));
+    }
+    d.in_dra_range[0] = in0;
+
+    // eq. 113-114: for j in 1..=num_ranges_minus1+1.
+    for j in 1..=d.num_ranges {
+        let delta_range = if syntax.dra_equal_ranges_flag {
+            syntax.dra_delta_range[0]
+        } else {
+            // dra_delta_range[j − 1]
+            syntax.dra_delta_range[j - 1]
+        };
+        let prev = d.in_dra_range[j - 1];
+        let add = (delta_range as u32) << shift;
+        let next = prev
+            .checked_add(add)
+            .ok_or_else(|| Error::invalid("evc dra: InDraRange[j] arithmetic overflowed u32"))?;
+        if next > max_in_range {
+            return Err(Error::invalid(
+                "evc dra: InDraRange[j] exceeds (1 << BitDepthY) − 1",
+            ));
+        }
+        d.in_dra_range[j] = next;
+    }
+
+    // §7.4.7 page 86: OutRangesL[0] = 0; for i in 0..numOutRangesL,
+    // outDelta = dra_scale_value[i − 1] * (InDraRange[i] − InDraRange[i − 1])
+    // (eq. 115); OutRangesL[i] = OutRangesL[i − 1] + outDelta (eq. 116).
+    //
+    // The spec text says "for i in the range of 0 to numOutRangesL,
+    // inclusive" but eq. 115 references `dra_scale_value[i − 1]` and
+    // `InDraRange[i] − InDraRange[i − 1]`, so the recursion clearly starts
+    // at i = 1 (with the i = 0 entry pinned at 0 by the previous sentence).
+    // We iterate i in 1..=num_ranges so we end up with `num_ranges + 1`
+    // entries, matching `numOutRangesL + 1` boundaries the §8.9.5 helper
+    // wants.
+    d.out_ranges_l[0] = 0;
+    for i in 1..=d.num_ranges {
+        let dscale = syntax.dra_scale_value[i - 1] as i64;
+        let drange = d.in_dra_range[i] as i64 - d.in_dra_range[i - 1] as i64;
+        let out_delta = dscale * drange;
+        d.out_ranges_l[i] = d.out_ranges_l[i - 1] + out_delta;
+    }
+
+    // eq. 117-121: InvLumaScales[i] + DraOffsets[i] for
+    // i in 1..=dra_number_ranges_minus1.
+    //
+    // invScalePrec is the spec constant 18 (eq. 117). The eq. 121 right
+    // shift uses dra_descriptor2 — undefined for dra_descriptor2 == 0
+    // (1 << (dra_descriptor2 − 1) underflows). §7.4.7 restricts
+    // dra_descriptor2 to 9 in the current spec version and numBitsDraScale
+    // must be > 0; we still guard against dra_descriptor2 == 0 here in case
+    // a future descriptor1 = 15 / descriptor2 = 0 payload appears, by
+    // skipping the eq. 121 normalisation (it's a no-op when the shift is 0).
+    const INV_SCALE_PREC: u32 = 18;
+    let d2 = syntax.dra_descriptor2 as u32;
+    for i in 1..d.num_ranges {
+        let dsv = syntax.dra_scale_value[i] as i64;
+        // eq. 118: invScale = ((1 << 18) + (dsv >> 1)) / dsv.
+        let inv_scale = ((1i64 << INV_SCALE_PREC) + (dsv >> 1)) / dsv;
+        d.inv_luma_scales[i] = inv_scale;
+
+        // eq. 120: diffVal = OutRangesL[i + 1] * invScale.
+        // We have num_ranges + 1 entries in out_ranges_l so i + 1 is in
+        // bounds for i ∈ [1, num_ranges − 1].
+        let diff_val = d.out_ranges_l[i + 1] * inv_scale;
+
+        // eq. 121: DraOffsets[i] = ((InDraRange[i+1] << invScalePrec)
+        //                            − diffVal + (1 << (d2 − 1))) >> d2.
+        let term1 = (d.in_dra_range[i + 1] as i64) << INV_SCALE_PREC;
+        let dra_off = if d2 == 0 {
+            term1 - diff_val
+        } else {
+            (term1 - diff_val + (1i64 << (d2 - 1))) >> d2
+        };
+        d.dra_offsets[i] = dra_off;
+    }
+
+    // eq. 122: OutRangesL[i] = (OutRangesL[i] + (1 << (d2 − 1))) >> d2.
+    // Applied after eq. 120 so the diffVal multiplication used the
+    // pre-normalisation value (spec page 86 lists the eq. 122 step *after*
+    // the InvLumaScales / DraOffsets block).
+    if d2 != 0 {
+        for i in 0..=d.num_ranges {
+            d.out_ranges_l[i] = (d.out_ranges_l[i] + (1i64 << (d2 - 1))) >> d2;
+        }
+    }
+
+    Ok(derived_ok(d))
+}
+
+#[inline]
+fn derived_ok(d: DraDerived) -> DraDerived {
+    d
 }
 
 // =====================================================================
@@ -882,5 +1292,349 @@ mod tests {
         for v in pic.cr.iter() {
             assert_eq!(*v, 255, "Cr should clip to 255");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 151 — §7.3.6-faithful dra_data() parser + §7.4.7 derivation.
+    // -----------------------------------------------------------------
+    //
+    // These exercise the new spec-faithful pair (`parse_dra_syntax` +
+    // `derive_dra_state`), independent of the legacy `DraData` /
+    // `parse_dra_data` / `apply_dra` chain above. They are written so a
+    // follow-up round wiring §8.9.3 (luma inverse mapping) and §8.9.6
+    // (chroma scale derivation) can build directly on `DraDerived`'s
+    // `OutRangesL` / `InvLumaScales` / `DraOffsets` / `InDraRange` fields.
+
+    /// Emit a minimal §7.3.6 `dra_data()` payload with current-spec defaults
+    /// (`dra_descriptor1 = 4`, `dra_descriptor2 = 9`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dra_syntax_minimal(
+        num_ranges_minus1: u32,
+        equal_ranges_flag: bool,
+        global_offset: u32,
+        delta_ranges: &[u32],
+        scale_values: &[u32],
+        cb_scale: u32,
+        cr_scale: u32,
+        table_idx: u32,
+    ) -> Vec<u8> {
+        let mut e = BitEmitter::new();
+        e.u(4, 4); // dra_descriptor1 = 4 (spec-restricted)
+        e.u(4, 9); // dra_descriptor2 = 9 (spec-restricted)
+        e.ue(num_ranges_minus1); // dra_number_ranges_minus1
+        e.u(1, if equal_ranges_flag { 1 } else { 0 });
+        e.u(10, global_offset);
+        if equal_ranges_flag {
+            e.u(10, delta_ranges[0]);
+        } else {
+            for d in delta_ranges.iter().take(num_ranges_minus1 as usize + 1) {
+                e.u(10, *d);
+            }
+        }
+        // numBitsDraScale = 4 + 9 = 13.
+        for s in scale_values.iter().take(num_ranges_minus1 as usize + 1) {
+            e.u(13, *s);
+        }
+        e.u(13, cb_scale);
+        e.u(13, cr_scale);
+        e.ue(table_idx);
+        e.finish_with_trailing_bits();
+        e.into_bytes()
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_minimal_single_range() {
+        // Single range, equal_ranges_flag = 1, scale 512 (= 1.0 in Q4.9),
+        // chroma scales also 512, table_idx 58 (DraJoinedScaleFlag = 0).
+        let payload = emit_dra_syntax_minimal(
+            0,    // num_ranges_minus1 = 0 ⇒ 1 range
+            true, // equal_ranges_flag
+            1,    // global_offset = 1 (must be ≥ 1)
+            &[1],
+            &[512],
+            512,
+            512,
+            58,
+        );
+        let (syn, der) = parse_dra_syntax(&payload, 10).unwrap();
+        assert_eq!(syn.dra_descriptor1, 4);
+        assert_eq!(syn.dra_descriptor2, 9);
+        assert_eq!(syn.dra_number_ranges_minus1, 0);
+        assert!(syn.dra_equal_ranges_flag);
+        assert_eq!(syn.dra_global_offset, 1);
+        assert_eq!(syn.dra_delta_range[0], 1);
+        assert_eq!(syn.dra_scale_value[0], 512);
+        assert_eq!(syn.dra_cb_scale_value, 512);
+        assert_eq!(syn.dra_cr_scale_value, 512);
+        assert_eq!(syn.dra_table_idx, 58);
+        assert_eq!(der.num_bits_dra_scale, 13);
+        assert_eq!(der.num_ranges, 1);
+        // dra_table_idx == 58 ⇒ DraJoinedScaleFlag = 0 (spec page 86).
+        assert!(!der.joined_scale_flag);
+        // BitDepthY = 10 ⇒ shift = 0 ⇒ InDraRange[0] = 1.
+        assert_eq!(der.in_dra_range[0], 1);
+        // InDraRange[1] = 1 + 1 = 2.
+        assert_eq!(der.in_dra_range[1], 2);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_table_idx_zero_sets_joined_flag() {
+        let payload = emit_dra_syntax_minimal(
+            0,
+            true,
+            1,
+            &[1],
+            &[512],
+            512,
+            512,
+            0, // table_idx != 58 ⇒ DraJoinedScaleFlag = 1
+        );
+        let (_, der) = parse_dra_syntax(&payload, 10).unwrap();
+        assert!(der.joined_scale_flag);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_equal_ranges_distributes_delta() {
+        // 4 equal-sized ranges, delta = 100; global_offset = 50.
+        // InDraRange = [50, 150, 250, 350, 450] (BitDepthY = 10 → no shift).
+        let payload = emit_dra_syntax_minimal(
+            3, // 4 ranges
+            true,
+            50,
+            &[100],
+            &[512, 512, 512, 512],
+            512,
+            512,
+            58,
+        );
+        let (_, der) = parse_dra_syntax(&payload, 10).unwrap();
+        assert_eq!(der.num_ranges, 4);
+        assert_eq!(der.in_dra_range[0], 50);
+        assert_eq!(der.in_dra_range[1], 150);
+        assert_eq!(der.in_dra_range[2], 250);
+        assert_eq!(der.in_dra_range[3], 350);
+        assert_eq!(der.in_dra_range[4], 450);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_unequal_ranges_uses_per_range_delta() {
+        // 3 ranges with deltas 64, 128, 256; global_offset = 16.
+        // InDraRange = [16, 80, 208, 464].
+        let payload = emit_dra_syntax_minimal(
+            2,
+            false,
+            16,
+            &[64, 128, 256],
+            &[512, 512, 512],
+            512,
+            512,
+            58,
+        );
+        let (_, der) = parse_dra_syntax(&payload, 10).unwrap();
+        assert_eq!(der.num_ranges, 3);
+        assert_eq!(der.in_dra_range[0], 16);
+        assert_eq!(der.in_dra_range[1], 80);
+        assert_eq!(der.in_dra_range[2], 208);
+        assert_eq!(der.in_dra_range[3], 464);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_bit_depth_8_shift_is_zero() {
+        // BitDepthY = 8 ⇒ Max(0, 8 − 10) = 0 (saturating), so InDraRange
+        // values are read unshifted as well — global_offset 1 + delta 1
+        // ⇒ InDraRange = [1, 2].
+        let payload = emit_dra_syntax_minimal(0, true, 1, &[1], &[512], 512, 512, 58);
+        let (_, der) = parse_dra_syntax(&payload, 8).unwrap();
+        assert_eq!(der.in_dra_range[0], 1);
+        assert_eq!(der.in_dra_range[1], 2);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_bit_depth_12_applies_shift_by_2() {
+        // BitDepthY = 12 ⇒ Max(0, 12 − 10) = 2; global_offset 1 shifted
+        // by 2 ⇒ InDraRange[0] = 4, +(1 << 2) = 8 for InDraRange[1].
+        let payload = emit_dra_syntax_minimal(0, true, 1, &[1], &[512], 512, 512, 58);
+        let (_, der) = parse_dra_syntax(&payload, 12).unwrap();
+        assert_eq!(der.in_dra_range[0], 4);
+        assert_eq!(der.in_dra_range[1], 8);
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_empty_payload() {
+        assert!(parse_dra_syntax(&[], 10).is_err());
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_zero_scale_value() {
+        // dra_scale_value[0] = 0 violates §7.4.7's "shall not be equal to 0".
+        let payload = emit_dra_syntax_minimal(0, true, 1, &[1], &[0], 512, 512, 58);
+        let err = parse_dra_syntax(&payload, 10).unwrap_err();
+        assert!(
+            format!("{err}").contains("dra_scale_value"),
+            "expected dra_scale_value error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_overlarge_scale_value() {
+        // dra_scale_value[0] must be < (4 << dra_descriptor2) = 4 << 9 =
+        // 2048. Try 2048 exactly (rejected — strictly less).
+        let payload = emit_dra_syntax_minimal(0, true, 1, &[1], &[2048], 512, 512, 58);
+        let err = parse_dra_syntax(&payload, 10).unwrap_err();
+        assert!(
+            format!("{err}").contains("dra_scale_value"),
+            "expected dra_scale_value error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_zero_global_offset() {
+        // global_offset = 0 violates §7.4.7's "[1, Min(1023, …)]".
+        let payload = emit_dra_syntax_minimal(0, true, 0, &[1], &[512], 512, 512, 58);
+        let err = parse_dra_syntax(&payload, 10).unwrap_err();
+        assert!(
+            format!("{err}").contains("dra_global_offset"),
+            "expected dra_global_offset error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_overlarge_table_idx() {
+        // dra_table_idx must be ≤ 58 — try 59.
+        let payload = emit_dra_syntax_minimal(0, true, 1, &[1], &[512], 512, 512, 59);
+        let err = parse_dra_syntax(&payload, 10).unwrap_err();
+        assert!(
+            format!("{err}").contains("dra_table_idx"),
+            "expected dra_table_idx error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_overlarge_num_ranges() {
+        // dra_number_ranges_minus1 must be ≤ 31 — try 32.
+        let mut e = BitEmitter::new();
+        e.u(4, 4);
+        e.u(4, 9);
+        e.ue(32); // out of range
+        e.finish_with_trailing_bits();
+        let payload = e.into_bytes();
+        let err = parse_dra_syntax(&payload, 10).unwrap_err();
+        assert!(
+            format!("{err}").contains("dra_number_ranges_minus1"),
+            "expected dra_number_ranges_minus1 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_parse_dra_syntax_rejects_in_dra_range_overflow() {
+        // BitDepthY = 8 ⇒ shift = 0, max InDraRange = 255.
+        // global_offset 200 + delta 100 ⇒ InDraRange[1] = 300 > 255.
+        let payload = emit_dra_syntax_minimal(0, true, 200, &[100], &[512], 512, 512, 58);
+        let err = parse_dra_syntax(&payload, 8).unwrap_err();
+        assert!(
+            format!("{err}").contains("InDraRange"),
+            "expected InDraRange overflow error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn round151_derive_dra_state_out_ranges_recursion_identity_scale() {
+        // 3 equal-sized ranges, scale = 512 (= 1.0 in Q4.9), so each
+        // outDelta = 512 * 100 = 51200, and OutRangesL post eq. 122
+        // (>> 9, rounded) ≈ 100 per step ⇒ [0, 100, 200, 300].
+        let syn = DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 2, // 3 ranges
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 50,
+            dra_delta_range: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 100;
+                a
+            },
+            dra_scale_value: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 512;
+                a[1] = 512;
+                a[2] = 512;
+                a
+            },
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            dra_table_idx: 58,
+        };
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert_eq!(der.num_ranges, 3);
+        assert_eq!(der.in_dra_range[0], 50);
+        assert_eq!(der.in_dra_range[3], 350);
+        // OutRangesL post eq. 122: each outDelta is 51200, divided by 512
+        // (= 1 << 9) with eq. 122's +(1 << 8) rounding ⇒ exactly 100 per
+        // step. Final values: 0, 100, 200, 300.
+        assert_eq!(der.out_ranges_l[0], 0);
+        assert_eq!(der.out_ranges_l[1], 100);
+        assert_eq!(der.out_ranges_l[2], 200);
+        assert_eq!(der.out_ranges_l[3], 300);
+    }
+
+    #[test]
+    fn round151_derive_dra_state_inv_luma_scale_eq118_identity() {
+        // Single non-trivial range: with dra_scale_value = 512 (1.0 in
+        // Q4.9), eq. 118's invScale = ((1 << 18) + 256) / 512 = 512.5 →
+        // 512 (integer division).
+        let syn = DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 1, // 2 ranges
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 16,
+            dra_delta_range: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 64;
+                a
+            },
+            dra_scale_value: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 512;
+                a[1] = 512;
+                a
+            },
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            dra_table_idx: 58,
+        };
+        let der = derive_dra_state(&syn, 10).unwrap();
+        // eq. 118: invScale = ((1 << 18) + (512 >> 1)) / 512
+        //                   = (262144 + 256) / 512 = 262400 / 512 = 512.
+        assert_eq!(der.inv_luma_scales[1], 512);
+    }
+
+    #[test]
+    fn round151_derive_dra_state_inv_luma_scale_eq118_doubled() {
+        // dra_scale_value = 256 (= 0.5 in Q4.9) → eq. 118: invScale ≈ 1024.
+        let syn = DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 1,
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 16,
+            dra_delta_range: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 64;
+                a
+            },
+            dra_scale_value: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 256;
+                a[1] = 256;
+                a
+            },
+            dra_cb_scale_value: 256,
+            dra_cr_scale_value: 256,
+            dra_table_idx: 58,
+        };
+        let der = derive_dra_state(&syn, 10).unwrap();
+        // (262144 + 128) / 256 = 1024.5 → 1024.
+        assert_eq!(der.inv_luma_scales[1], 1024);
     }
 }

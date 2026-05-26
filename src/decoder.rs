@@ -30,7 +30,7 @@ use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::alf::{self, AlfData};
-use crate::dra::{self, DraData};
+use crate::dra::{self, DraData, DraDerived, DraSyntax};
 use crate::inter::RefPictureView;
 use crate::nal::{iter_length_prefixed, NalUnitType};
 use crate::picture::YuvPicture;
@@ -131,6 +131,13 @@ pub struct EvcDecoder {
     /// Most-recently-stored DRA APS id (back-compat fallback for
     /// fixtures that don't drive a PPS through the cache).
     last_dra_aps_id: Option<u8>,
+    /// Round-151: §7.3.6-faithful DRA APS cache, populated in parallel
+    /// with [`Self::dra_aps`] from the new `parse_dra_syntax` (the
+    /// legacy `parse_dra_data` is preserved for round-148 `apply_dra`
+    /// chroma-offset compatibility). A follow-up round will route
+    /// §8.9.3 luma mapping + §8.9.6 chroma scale derivation through
+    /// this cache and retire the legacy one.
+    dra_syntax_aps: [Option<(DraSyntax, DraDerived)>; ALF_APS_SLOTS],
 }
 
 const MAX_DPB_ENTRIES: usize = 16;
@@ -175,6 +182,7 @@ impl EvcDecoder {
             last_alf_aps_id: None,
             dra_aps: std::array::from_fn(|_| None),
             last_dra_aps_id: None,
+            dra_syntax_aps: std::array::from_fn(|_| None),
         }
     }
 
@@ -404,6 +412,19 @@ impl Decoder for EvcDecoder {
                                 if let Ok(dra_data) = dra::parse_dra_data(&aps.payload_raw) {
                                     self.dra_aps[id] = Some(dra_data);
                                     self.last_dra_aps_id = Some(id as u8);
+                                }
+                                // Round 151: also run the §7.3.6-faithful
+                                // parser into the parallel cache. Needs
+                                // BitDepthY from the active SPS — skip
+                                // gracefully when none has been parsed
+                                // yet (the legacy fixture path never
+                                // exercises the spec-faithful parser).
+                                if let Some(sps) = self.sps.as_ref() {
+                                    let bd_y = sps.bit_depth_y();
+                                    if let Ok(pair) = dra::parse_dra_syntax(&aps.payload_raw, bd_y)
+                                    {
+                                        self.dra_syntax_aps[id] = Some(pair);
+                                    }
                                 }
                             }
                         }
@@ -1329,5 +1350,49 @@ mod tests {
         assert!(dec.alf_aps[7].is_some());
         // last-stored fallback now points at id 7.
         assert_eq!(dec.last_alf_aps_id, Some(7));
+    }
+
+    /// Round 151: the new spec-faithful DRA APS cache slot stores a
+    /// `(DraSyntax, DraDerived)` pair indexed by APS id, parallel to
+    /// the legacy `dra_aps[id]: Option<DraData>` slot, so a follow-up
+    /// round wiring §8.9.3 luma mapping + §8.9.6 chroma scale
+    /// derivation can read directly from the spec-faithful state.
+    /// Verified here by hand-storing a derived pair and round-tripping
+    /// its `dra_descriptor1` / `num_bits_dra_scale` / `joined_scale_flag`
+    /// fields out of the cache.
+    #[test]
+    fn round151_dra_syntax_aps_cache_holds_spec_faithful_pair() {
+        use crate::dra::{derive_dra_state, DraSyntax, DRA_MAX_RANGES_V2};
+        let mut dec = EvcDecoder::new();
+        let syn = DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 0,
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 1,
+            dra_delta_range: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 1;
+                a
+            },
+            dra_scale_value: {
+                let mut a = [0u16; DRA_MAX_RANGES_V2];
+                a[0] = 512;
+                a
+            },
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            dra_table_idx: 58,
+        };
+        let der = derive_dra_state(&syn, 10).unwrap();
+        dec.dra_syntax_aps[5] = Some((syn, der));
+        let (got_syn, got_der) = dec.dra_syntax_aps[5].as_ref().expect("slot 5 populated");
+        assert_eq!(got_syn.dra_descriptor1, 4);
+        assert_eq!(got_syn.dra_descriptor2, 9);
+        assert_eq!(got_der.num_bits_dra_scale, 13);
+        // dra_table_idx == 58 ⇒ DraJoinedScaleFlag = 0.
+        assert!(!got_der.joined_scale_flag);
+        // Slot 6 (untouched) must remain unpopulated.
+        assert!(dec.dra_syntax_aps[6].is_none());
     }
 }

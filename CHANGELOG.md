@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+### Round 151 — §7.3.6-faithful `dra_data()` parser + §7.4.7 derivation
+
+#### Added
+- `dra::DraSyntax`: every raw bit `dra_data()` writes per ISO/IEC
+  23094-1:2020(E) §7.3.6 (page 42) — `dra_descriptor1` u(4),
+  `dra_descriptor2` u(4), `dra_number_ranges_minus1` ue(v),
+  `dra_equal_ranges_flag` u(1), `dra_global_offset` u(10),
+  `dra_delta_range[]` u(10), `dra_scale_value[]` u(numBitsDraScale),
+  `dra_cb_scale_value` / `dra_cr_scale_value` u(numBitsDraScale),
+  `dra_table_idx` ue(v).
+- `dra::DraDerived`: per-APS state §7.4.7 mandates from the parsed
+  bits — `num_bits_dra_scale` (eq. 111), `joined_scale_flag` (the
+  `dra_table_idx == 58` branch), `in_dra_range[0..=num_ranges]`
+  (eq. 112-114), `out_ranges_l[0..=num_ranges]` (eq. 115-116 then
+  re-shifted per eq. 122), `inv_luma_scales[]` (eq. 117-119), and
+  `dra_offsets[]` (eq. 120-121). Sized for `num_ranges` up to 32,
+  matching the spec ceiling on `dra_number_ranges_minus1`.
+- `dra::parse_dra_syntax(payload, bit_depth_y)`: §7.3.6 bitstream
+  parser that also invokes §7.4.7 derivation. Rejects every §7.4.7
+  bitstream-conformance violation with `Error::Invalid` (zero
+  `numBitsDraScale`, `dra_number_ranges_minus1 > 31`,
+  `dra_global_offset` outside `[1, Min(1023, (1<<BitDepthY) − 1)]`,
+  `dra_scale_value` outside `[1, (4 << dra_descriptor2) − 1]`,
+  `dra_table_idx > 58`, and `InDraRange[j] > (1 << BitDepthY) − 1`).
+- `dra::derive_dra_state(syntax, bit_depth_y)`: standalone §7.4.7
+  derivation — surfaced so a re-encoder can compute the derived
+  state from a hand-constructed `DraSyntax` without round-tripping
+  through the byte parser.
+- `EvcDecoder::dra_syntax_aps`: 32-slot parallel cache (indexed by
+  `adaptation_parameter_set_id`) of the new `(DraSyntax, DraDerived)`
+  pair. Populated by the `send_packet` APS branch whenever an SPS
+  has been parsed (so `BitDepthY` is known) — the legacy
+  `dra::parse_dra_data` / `dra_aps[]` cache stays populated in
+  parallel for round-148 `apply_dra` chroma-offset compatibility.
+
+#### Tests
+- 16 new `dra.rs` unit tests cover minimal-payload round-trip,
+  `joined_scale_flag` polarity, equal-ranges delta distribution,
+  unequal-ranges per-range delta, `BitDepthY ∈ {8, 10, 12}` shift
+  arithmetic for `InDraRange[]`, every §7.4.7 conformance rejection
+  path (empty payload, zero/overlarge scale_value, zero
+  global_offset, overlarge table_idx, overlarge num_ranges_minus1,
+  InDraRange overflow), `OutRangesL[]` post-eq.-122 recursion with
+  identity Q4.9 scale, and `InvLumaScales[]` eq.-118 with identity
+  + halved input scales.
+- 1 new `decoder.rs` test verifies the parallel `dra_syntax_aps` cache
+  slot stores a `(DraSyntax, DraDerived)` pair and round-trips its
+  `dra_descriptor1` / `num_bits_dra_scale` / `joined_scale_flag`
+  fields.
+
+#### Notes
+- The legacy `dra::DraData` / `dra::parse_dra_data` / `dra::apply_dra`
+  chain stays untouched in this round — it does **not** match the
+  §7.3.6 wire format (the round-11 parser made up its own
+  `dra_descriptor_present_flag` / `dra_range_l[]` /
+  `dra_chroma_qp_offset[]` shape). A follow-up round wiring §8.9.3
+  luma inverse mapping (eq. 1374-1376) + §8.9.6 chroma scale (eq.
+  1384-1385) will route through the new spec-faithful pair and
+  retire the legacy types.
+
 ### Round 148 — §8.9.5 range-idx helper + per-sample co-located-luma chroma DRA offset
 
 #### Added

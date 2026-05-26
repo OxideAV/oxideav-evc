@@ -7,6 +7,62 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-151 status
+
+Round 151 lands the **§7.3.6-faithful `dra_data()` parser + §7.4.7
+derivation** — the long-noted followup that the round-11
+[`parse_dra_data`] above does not match the ISO/IEC 23094-1:2020(E)
+wire format (it made up its own `dra_descriptor_present_flag` /
+`dra_range_l[]` / `dra_chroma_qp_offset[]` shape that no real EVC DRA
+APS payload follows). The new spec-faithful pair lives alongside the
+legacy types so the round-148 `apply_dra` chroma-offset compatibility
+is preserved while a follow-up round wires §8.9.3 luma mapping
+(eq. 1374-1376) + §8.9.6 chroma scale (eq. 1384-1385) on top of the
+new state and retires the legacy chain. New surface: `DraSyntax`
+captures every raw bit `dra_data()` writes per §7.3.6 (page 42 — eight
+fields including the two `dra_descriptor*` u(4) widths, the
+ue(v)-coded `dra_number_ranges_minus1` + `dra_table_idx`, the u(10)
+`dra_global_offset` + `dra_delta_range[]`, and the
+`numBitsDraScale`-bit `dra_scale_value[]` + Cb / Cr scale values).
+`DraDerived` holds every §7.4.7 per-APS derived variable from those
+bits: `num_bits_dra_scale` (eq. 111), `joined_scale_flag` (the
+`dra_table_idx == 58` branch), `in_dra_range[0..=num_ranges]`
+(eq. 112-114 with the `BitDepthY − 10` pre-shift), `out_ranges_l`
+(eq. 115-116 then re-shifted per eq. 122), `inv_luma_scales[]`
+(eq. 117-119), and `dra_offsets[]` (eq. 120-121) — sized for up to 32
+ranges, matching the spec ceiling on `dra_number_ranges_minus1`.
+`parse_dra_syntax(payload, bit_depth_y)` performs the bitstream parse
+*and* invokes the §7.4.7 derivation in one call, rejecting every
+§7.4.7 bitstream-conformance violation with `Error::Invalid`
+(`numBitsDraScale == 0`, `dra_number_ranges_minus1 > 31`,
+`dra_global_offset` outside `[1, Min(1023, (1 << BitDepthY) − 1)]`,
+`dra_scale_value` outside `[1, (4 << dra_descriptor2) − 1]`,
+`dra_table_idx > 58`, `InDraRange[j] > (1 << BitDepthY) − 1`).
+`derive_dra_state(syntax, bit_depth_y)` is the standalone §7.4.7 step
+surfaced so a re-encoder can compute derived state from a
+hand-built `DraSyntax`. `EvcDecoder::dra_syntax_aps` is a 32-slot
+parallel cache indexed by `adaptation_parameter_set_id` that the APS
+NAL branch populates when an SPS is in hand (so `BitDepthY` is known).
+356 unit tests pass (was 339) — 17 new cover the minimal single-range
+payload round-trip, the `joined_scale_flag` polarity on
+`dra_table_idx ∈ {0, 58}`, equal-ranges delta distribution across 4
+ranges, unequal-ranges per-range deltas across 3 ranges, the
+`BitDepthY ∈ {8, 10, 12}` shift arithmetic on `InDraRange[]`, the
+six §7.4.7 rejection paths (empty payload, zero/overlarge
+`dra_scale_value`, zero `dra_global_offset`, overlarge
+`dra_table_idx`, overlarge `dra_number_ranges_minus1`, `InDraRange`
+overflow), `OutRangesL[]` post-eq.-122 recursion with identity Q4.9
+scale (verifies the [0, 100, 200, 300] sequence exactly), and
+`InvLumaScales[]` eq.-118 with identity (512 → 512) + halved
+(256 → 1024) input scales, plus a decoder test that the parallel
+`dra_syntax_aps` cache stores `(DraSyntax, DraDerived)` pairs.
+Suggested workspace-README row delta: EVC now parses §7.3.6
+`dra_data()` faithfully and derives every §7.4.7 per-APS variable
+(`InvLumaScales` / `DraOffsets` / `OutRangesL` / `InDraRange` /
+`DraJoinedScaleFlag`) ready for §8.9.3 / §8.9.6 wiring (lacks: §8.9.3
+luma inverse mapping + §8.9.6 chromaScale derivation against the new
+state, Main-profile toolset — BTT/ADMVP/EIPD/ATS/AMVR/affine).
+
 ## Round-148 status
 
 Round 148 lands the **§8.9.5 piecewise-function range-index identification
