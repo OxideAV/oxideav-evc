@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+### Round 174 — §8.9.3 luma inverse mapping helpers + documented §7.4.7 docs gap
+
+#### Added
+- `dra::apply_luma_inverse_mapping(plane, derived, bit_depth_y)`: pure
+  §8.9.3 luma inverse-mapping apply for a `u16` plane, transcribing
+  ISO/IEC 23094-1:2020(E) eq. 1374 (`incrValue = InvLumaScales[apsId][rangeIdx]
+  * lumaSample`), eq. 1375 (`mappedSample = (DraOffsets[apsId][rangeIdx]
+  + incrValue + (1 << 8)) >> 9`), and eq. 1376 (`invLumaSample =
+  Clip1Y(mappedSample)`). The range-index is selected via the round-148
+  §8.9.5 `find_range_idx` helper against `derived.out_ranges_l`
+  re-materialised as the §8.9.5 `rangesArray`. Covers 8 / 10 / 12-bit
+  luma uniformly through the `u16` element type.
+- `dra::apply_luma_inverse_mapping_u8(plane, derived)`: 8-bit shortcut
+  that builds a 256-entry LUT once via the new
+  [`build_inv_luma_lut_8bit`] and applies it to every sample.
+- `dra::build_inv_luma_lut_8bit(derived)`: pre-computed
+  `[u8; 256]` LUT for the 8-bit fast path. Returns an identity LUT
+  when `derived.num_ranges == 0`.
+- `dra::fill_inv_luma_scales_range_zero(derived, syntax)`: opt-in
+  helper that fills `InvLumaScales[0]` and `DraOffsets[0]` by extending
+  eq. 118 / 120 / 121 to `i = 0` — the off-by-one reconciliation of the
+  §7.4.7 docs gap below. Rejects `dra_scale_value[0] == 0` as a
+  defence-in-depth check.
+
+#### Documented docs gap (§7.4.7 InvLumaScales[0] / DraOffsets[0])
+- §7.4.7 (page 86) restricts the `InvLumaScales[apsId][i]` /
+  `DraOffsets[apsId][i]` derivation (eq. 117-121) to
+  `i ∈ [1, dra_number_ranges_minus1]`, leaving index 0 explicitly
+  undefined. But §8.9.3 indexes both arrays with
+  `rangeIdx ∈ [0, numOutRangesL − 1]` — including index 0. Under the
+  literal spec reading, every sample falling in the lowest segment
+  collapses to `(0 + 0*sample + 256) >> 9 = 0` regardless of bit depth
+  — a degenerate behaviour the identity-DRA case rules out.
+- Round 174 implements both interpretations side-by-side:
+  - Default `derive_dra_state` (round 151) leaves index 0 at zero
+    (literal spec).
+  - `fill_inv_luma_scales_range_zero` reconciles the off-by-one
+    (extends eq. 118 / 120 / 121 to `i = 0`).
+- No wiring into the `apply_post_filters` pipeline yet. Both helpers
+  are surfaced for the docs collaborator + a follow-up round to pick
+  the resolution. This makes the gap empirically visible (a new
+  `round174_literal_spec_range0_is_degenerate` test pins the
+  symptom) without taking a stance on which reading is correct.
+
+#### Tests
+- 11 new unit tests (367 total; was 356):
+  - `round174_literal_spec_range0_is_degenerate`: confirms the
+    `InvLumaScales[0] = DraOffsets[0] = 0` literal-spec reading
+    collapses range-0 samples to 0 under eq. 1375.
+  - `round174_fill_inv_luma_range0_restores_non_degenerate`: with the
+    off-by-one fill applied, range-0 samples produce a monotonic,
+    bounded mapping (no flattening).
+  - `round174_fill_range0_rejects_zero_scale`: defensive rejection of
+    `dra_scale_value[0] == 0`.
+  - `round174_fill_range0_noop_when_num_ranges_zero`: empty derived
+    state is a no-op.
+  - `round174_apply_eq1376_clips_to_bit_depth`: Clip1Y caps at
+    `(1 << bit_depth_y) − 1`.
+  - `round174_apply_eq1376_clips_negative_to_zero`: Clip1Y at the
+    lower bound.
+  - `round174_apply_u16_in_place`: end-to-end plane apply for the
+    identity-Q18 case (every sample maps to itself).
+  - `round174_apply_u8_in_place_matches_lut`: the 8-bit shortcut and
+    the LUT path agree bit-for-bit.
+  - `round174_apply_noop_when_num_ranges_zero`: both `u8` / `u16`
+    helpers are no-ops on an empty derived state.
+  - `round174_build_lut_identity_when_num_ranges_zero`: LUT builder
+    returns an identity LUT on an empty derived state.
+  - `round174_apply_multi_range_segment_dispatch`: a 2-range DRA with
+    distinct per-range `InvLumaScales` / `DraOffsets` correctly
+    dispatches each sample through eq. 1374-1376 per §8.9.5's
+    `rangeIdx`, verified with hand-computed mapped values across the
+    split and at the Clip1Y upper bound.
+
 ### Round 151 — §7.3.6-faithful `dra_data()` parser + §7.4.7 derivation
 
 #### Added

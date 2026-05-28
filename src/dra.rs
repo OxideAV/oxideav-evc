@@ -837,6 +837,237 @@ fn derived_ok(d: DraDerived) -> DraDerived {
 }
 
 // =====================================================================
+// Round 174 — §8.9.3 luma inverse mapping (eq. 1374-1376).
+// =====================================================================
+//
+// §8.9.3 takes the §7.4.7-derived state (`InvLumaScales`, `DraOffsets`,
+// `OutRangesL`, `numOutRangesL`) and applies, per luma sample:
+//
+//   rangeIdx     = §8.9.5(lumaSample, OutRangesL, numOutRangesL)
+//   incrValue    = InvLumaScales[apsId][rangeIdx] * lumaSample        (1374)
+//   mappedSample = (DraOffsets[apsId][rangeIdx] + incrValue
+//                   + (1 << 8)) >> 9                                   (1375)
+//   invLumaSample = Clip1Y(mappedSample)                              (1376)
+//
+// where `Clip1Y(v) = Clip3(0, (1 << BitDepthY) − 1, v)`.
+//
+// ## Documented §7.4.7 docs gap on `InvLumaScales[0]` / `DraOffsets[0]`
+//
+// §7.4.7 spec text on page 86 defines `InvLumaScales[apsId][i]` and
+// `DraOffsets[apsId][i]` "for i in the range of 1 to
+// dra_number_ranges_minus1, inclusive". With `numOutRangesL =
+// dra_number_ranges_minus1 + 1` that loop fills indices
+// `[1, numOutRangesL − 1]`, leaving index 0 explicitly undefined.
+//
+// But §8.9.3 indexes `InvLumaScales[apsId][rangeIdx]` and
+// `DraOffsets[apsId][rangeIdx]` with `rangeIdx ∈ [0, numOutRangesL − 1]`
+// — including index 0, the lowest-luma segment. Per the literal spec
+// (i.e. taking `InvLumaScales[0] = DraOffsets[0] = 0` as the default
+// from "unwritten" semantics), eq. 1375 collapses to
+// `(0 + 0 + 256) >> 9 = 0` for every sample whose value falls in the
+// lowest segment, so every dark sample is forced to 0 — clearly
+// degenerate behaviour and inconsistent with the spec's identity-DRA
+// case (`dra_scale_value[i] = 1 << dra_descriptor2` for all i) which
+// must reproduce input verbatim.
+//
+// The most plausible reconciliation is that the §7.4.7 loop bounds are
+// an off-by-one — "for i in the range of 0 to dra_number_ranges_minus1,
+// inclusive" — which matches the per-range one-scale-per-range data
+// flow (the parser reads `dra_scale_value[j]` for
+// `j ∈ [0, dra_number_ranges_minus1]`, and §8.9.5 returns
+// `rangeIdx ∈ [0, numOutRangesL − 1]`). Under that reading
+// `InvLumaScales[0]` and `DraOffsets[0]` are computed identically to
+// every other entry via eq. 118/120/121, just substituting i = 0.
+//
+// **Round 174 takes no stance.** Both interpretations are made
+// available so a future round can wire whichever the docs collaborator
+// resolves to. The default `derive_dra_state` (round 151) leaves index
+// 0 at zero matching the literal spec text; the new
+// [`fill_inv_luma_scales_range_zero`] applies the off-by-one
+// reconciliation in-place on a `DraDerived` for callers that need a
+// non-degenerate §8.9.3.
+
+/// Fill `InvLumaScales[0]` and `DraOffsets[0]` on a `DraDerived` using the
+/// off-by-one reconciliation of §7.4.7 (extending eq. 118/120/121 to
+/// `i = 0`).
+///
+/// **This is an interpretation, not a spec reading.** §7.4.7 page 86
+/// literally restricts the InvLumaScales / DraOffsets derivation to
+/// `i ∈ [1, dra_number_ranges_minus1]`. §8.9.3 needs
+/// `InvLumaScales[0]` / `DraOffsets[0]` to map samples in the lowest
+/// segment. This helper applies the same eq. 118 / 120 / 121 formulas to
+/// `i = 0`, treating `dra_scale_value[0]` as the scale for range 0 — the
+/// natural symmetric extension. See the module-level docs gap above.
+///
+/// * `derived` must already have been derived via [`derive_dra_state`]
+///   from `syntax`.
+/// * Read-only on `syntax`. Mutates `derived.inv_luma_scales[0]` and
+///   `derived.dra_offsets[0]`; leaves every other entry alone.
+/// * Returns an error if the eq. 118 division would divide by zero
+///   (spec already forbids `dra_scale_value[j] == 0`, so this is a
+///   defence-in-depth check).
+pub fn fill_inv_luma_scales_range_zero(derived: &mut DraDerived, syntax: &DraSyntax) -> Result<()> {
+    if derived.num_ranges == 0 {
+        return Ok(());
+    }
+    let dsv0 = syntax.dra_scale_value[0] as i64;
+    if dsv0 == 0 {
+        return Err(Error::invalid(
+            "evc dra: dra_scale_value[0] == 0 (forbidden by §7.4.7); cannot derive InvLumaScales[0]",
+        ));
+    }
+    const INV_SCALE_PREC: u32 = 18;
+    let d2 = syntax.dra_descriptor2 as u32;
+
+    // eq. 118 at i = 0.
+    let inv_scale = ((1i64 << INV_SCALE_PREC) + (dsv0 >> 1)) / dsv0;
+    derived.inv_luma_scales[0] = inv_scale;
+
+    // eq. 120 at i = 0: diffVal = OutRangesL[1] * invScale.
+    // out_ranges_l[1] has already been post-shifted by eq. 122 inside
+    // `derive_dra_state`. The eq. 121 numerator wants the
+    // pre-eq-122 `OutRangesL[1]` to keep the arithmetic dimensionally
+    // consistent with the i ≥ 1 entries (where eq. 120 was evaluated
+    // before eq. 122). We reconstruct the pre-shift value here by left-
+    // shifting by d2 (an exact inverse only when d2 = 0 or eq. 122
+    // didn't round up; this matches what `derive_dra_state` does
+    // implicitly at i ≥ 1 because it evaluates eq. 120 first, then
+    // applies eq. 122 separately).
+    let out1_pre_shift = if d2 == 0 {
+        derived.out_ranges_l[1]
+    } else {
+        derived.out_ranges_l[1] << d2
+    };
+    let diff_val = out1_pre_shift * inv_scale;
+
+    // eq. 121: DraOffsets[0] = ((InDraRange[1] << invScalePrec)
+    //                           − diffVal + (1 << (d2 − 1))) >> d2.
+    let term1 = (derived.in_dra_range[1] as i64) << INV_SCALE_PREC;
+    let dra_off = if d2 == 0 {
+        term1 - diff_val
+    } else {
+        (term1 - diff_val + (1i64 << (d2 - 1))) >> d2
+    };
+    derived.dra_offsets[0] = dra_off;
+
+    Ok(())
+}
+
+/// Apply §8.9.3 (eq. 1374-1376) to a `u16` luma plane in-place.
+///
+/// Each sample is mapped per:
+///
+/// ```text
+///   rangeIdx     = find_range_idx(lumaSample, &out_ranges_l_i32, num_ranges)
+///   incrValue    = InvLumaScales[rangeIdx] * lumaSample              (1374)
+///   mappedSample = (DraOffsets[rangeIdx] + incrValue + 256) >> 9     (1375)
+///   invLumaSample = Clip3(0, (1 << bit_depth_y) − 1, mappedSample)   (1376)
+/// ```
+///
+/// `bit_depth_y` controls the `Clip1Y` upper bound; samples are read and
+/// written as `u16` so this covers 8 / 10 / 12-bit luma uniformly.
+///
+/// ## DOCS-GAP awareness
+///
+/// `derived.inv_luma_scales[0]` and `derived.dra_offsets[0]` are read
+/// for every sample whose value falls into range 0 (the lowest segment
+/// after §8.9.5). The default `derive_dra_state` leaves both at zero
+/// (literal spec); call [`fill_inv_luma_scales_range_zero`] before
+/// invoking this helper if you need non-degenerate output for the
+/// lowest segment. See the module-level docs-gap notes for the full
+/// rationale.
+pub fn apply_luma_inverse_mapping(plane: &mut [u16], derived: &DraDerived, bit_depth_y: u32) {
+    if derived.num_ranges == 0 {
+        return;
+    }
+    let ranges_array = out_ranges_l_as_i32(derived);
+    let clip_max = ((1u32 << bit_depth_y).saturating_sub(1)) as i64;
+    for sample in plane.iter_mut() {
+        *sample = map_one_luma_sample(*sample as i64, &ranges_array, derived, clip_max) as u16;
+    }
+}
+
+/// Apply §8.9.3 to a `u8` luma plane in-place (8-bit shortcut).
+///
+/// Equivalent to [`apply_luma_inverse_mapping`] with `bit_depth_y = 8`
+/// against a `u16`-widened plane, but works directly on `u8` so callers
+/// holding 8-bit pictures don't need to widen-then-narrow. Internally
+/// builds a 256-entry LUT via [`build_inv_luma_lut_8bit`] and applies it
+/// to every sample.
+pub fn apply_luma_inverse_mapping_u8(plane: &mut [u8], derived: &DraDerived) {
+    if derived.num_ranges == 0 {
+        return;
+    }
+    let lut = build_inv_luma_lut_8bit(derived);
+    for sample in plane.iter_mut() {
+        *sample = lut[*sample as usize];
+    }
+}
+
+/// Build a 256-entry LUT applying §8.9.3 to every 8-bit luma sample
+/// value `[0, 255]`.
+///
+/// For 8-bit pictures the §8.9.3 process is a pure function of the
+/// 8-bit sample value, so the per-sample apply degenerates to a LUT
+/// lookup. Each entry is computed by running [`map_one_luma_sample`]
+/// against `derived`'s `out_ranges_l` / `inv_luma_scales` /
+/// `dra_offsets` and clipping to `[0, 255]`.
+///
+/// Returns an identity LUT when `derived.num_ranges == 0`.
+pub fn build_inv_luma_lut_8bit(derived: &DraDerived) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    if derived.num_ranges == 0 {
+        for (i, slot) in lut.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        return lut;
+    }
+    let ranges_array = out_ranges_l_as_i32(derived);
+    let clip_max = 255i64;
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = map_one_luma_sample(i as i64, &ranges_array, derived, clip_max) as u8;
+    }
+    lut
+}
+
+/// Materialise `derived.out_ranges_l[0..=num_ranges]` as an `i32` vector
+/// suitable for [`find_range_idx`]. Saturates at `i32::MAX` if the
+/// post-eq-122 value somehow exceeds (it cannot in spec-valid bit
+/// depths, but the saturation guards against contrived inputs).
+fn out_ranges_l_as_i32(derived: &DraDerived) -> Vec<i32> {
+    let n = derived.num_ranges + 1;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = derived.out_ranges_l[i];
+        let clamped = v.clamp(i32::MIN as i64, i32::MAX as i64);
+        out.push(clamped as i32);
+    }
+    out
+}
+
+/// Apply §8.9.3 eq. 1374-1376 to a single luma sample.
+///
+/// Pure function: `(lumaSample, OutRangesL, DraDerived, clip_max) →
+/// invLumaSample`. Returns an `i64` to avoid lossy narrowing; callers
+/// down-convert to the plane element type.
+#[inline]
+fn map_one_luma_sample(
+    luma_sample: i64,
+    ranges_array: &[i32],
+    derived: &DraDerived,
+    clip_max: i64,
+) -> i64 {
+    let range_idx = find_range_idx(luma_sample as i32, ranges_array, derived.num_ranges);
+    let inv_scale = derived.inv_luma_scales[range_idx];
+    let dra_offset = derived.dra_offsets[range_idx];
+    // eq. 1374-1375.
+    let incr_value = inv_scale * luma_sample;
+    let mapped = (dra_offset + incr_value + (1i64 << 8)) >> 9;
+    // eq. 1376: Clip1Y.
+    mapped.clamp(0, clip_max)
+}
+
+// =====================================================================
 // Tests.
 // =====================================================================
 
@@ -1636,5 +1867,228 @@ mod tests {
         let der = derive_dra_state(&syn, 10).unwrap();
         // (262144 + 128) / 256 = 1024.5 → 1024.
         assert_eq!(der.inv_luma_scales[1], 1024);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 174 — §8.9.3 luma inverse mapping (eq. 1374-1376).
+    // -----------------------------------------------------------------
+
+    /// Helper: build a `DraSyntax` for a 2-range identity DRA at 10-bit
+    /// luma (every `dra_scale_value[j] = 512 = 1 << 9` reproduces the
+    /// Q4.9 representation of scale 1.0).
+    fn identity_two_range_syntax(bit_depth: u32) -> DraSyntax {
+        let _ = bit_depth; // accepted for future extension, currently fixed
+        let mut delta = [0u16; DRA_MAX_RANGES_V2];
+        delta[0] = 64;
+        let mut scales = [0u16; DRA_MAX_RANGES_V2];
+        scales[0] = 512;
+        scales[1] = 512;
+        DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 1,
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 16,
+            dra_delta_range: delta,
+            dra_scale_value: scales,
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            dra_table_idx: 58,
+        }
+    }
+
+    #[test]
+    fn round174_literal_spec_range0_is_degenerate() {
+        // Without the off-by-one fill, every sample whose value falls in
+        // segment 0 (the lowest segment after §8.9.5) reads
+        // InvLumaScales[0] = DraOffsets[0] = 0, so eq. 1375 collapses to
+        // (0 + 0*sample + 256) >> 9 = 0. This is the documented
+        // §7.4.7 docs-gap symptom (see module-level notes).
+        let syn = identity_two_range_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert_eq!(der.inv_luma_scales[0], 0, "literal spec leaves [0] unset");
+        assert_eq!(der.dra_offsets[0], 0, "literal spec leaves [0] unset");
+        // Sample whose value is in segment 0's range maps to 0.
+        let ranges = out_ranges_l_as_i32(&der);
+        // OutRangesL is small in identity case; pick a sample value that
+        // definitely falls in range 0 after §8.9.5. InDraRange[0] = 16,
+        // InDraRange[1] = 80; OutRangesL[1] after eq. 122 ≈ 64. So a
+        // small lumaSample like 10 falls into range 0.
+        let mapped = map_one_luma_sample(10, &ranges, &der, 1023);
+        assert_eq!(mapped, 0, "literal spec produces 0 in segment 0");
+    }
+
+    #[test]
+    fn round174_fill_inv_luma_range0_restores_non_degenerate() {
+        // After the off-by-one reconciliation, range-0 samples no longer
+        // collapse to 0. We don't assert bit-exactness against the §7.4.7
+        // identity (the spec's identity-DRA round-trip is itself
+        // affected by the docs gap); we assert the qualitative
+        // non-degeneracy: a non-zero, non-saturated, monotonic mapping.
+        let syn = identity_two_range_syntax(10);
+        let mut der = derive_dra_state(&syn, 10).unwrap();
+        fill_inv_luma_scales_range_zero(&mut der, &syn).unwrap();
+        assert_eq!(der.inv_luma_scales[0], 512, "eq. 118 at i=0 with scale=512");
+        // Two distinct range-0 samples must map to two distinct outputs
+        // (no degenerate flattening).
+        let ranges = out_ranges_l_as_i32(&der);
+        let m0 = map_one_luma_sample(5, &ranges, &der, 1023);
+        let m1 = map_one_luma_sample(10, &ranges, &der, 1023);
+        assert_ne!(m0, m1, "range-0 mapping must not be flat");
+        assert!(m1 > m0, "range-0 mapping must be monotonic");
+        // Mapping is bounded by Clip1Y.
+        assert!((0..=1023).contains(&m0));
+        assert!((0..=1023).contains(&m1));
+    }
+
+    #[test]
+    fn round174_fill_range0_rejects_zero_scale() {
+        // Defence-in-depth: dra_scale_value[0] = 0 is already forbidden
+        // by the parser; the helper rejects it explicitly so a
+        // hand-constructed DraSyntax doesn't trigger a divide-by-zero.
+        let mut syn = identity_two_range_syntax(10);
+        syn.dra_scale_value[0] = 0;
+        let mut der = DraDerived::empty();
+        der.num_ranges = 2;
+        assert!(fill_inv_luma_scales_range_zero(&mut der, &syn).is_err());
+    }
+
+    #[test]
+    fn round174_fill_range0_noop_when_num_ranges_zero() {
+        // Empty DraDerived → no-op (no division, no error).
+        let syn = identity_two_range_syntax(10);
+        let mut der = DraDerived::empty();
+        // num_ranges intentionally left at 0.
+        assert!(fill_inv_luma_scales_range_zero(&mut der, &syn).is_ok());
+        assert_eq!(der.inv_luma_scales[0], 0);
+        assert_eq!(der.dra_offsets[0], 0);
+    }
+
+    #[test]
+    fn round174_apply_eq1376_clips_to_bit_depth() {
+        // Construct a DraDerived that would, without Clip1Y, produce a
+        // mapped value outside [0, (1 << bit_depth_y) − 1]. The clip
+        // brings it back into range.
+        let mut der = DraDerived::empty();
+        der.num_ranges = 1;
+        // Single range covers [0, 1024) at 10-bit.
+        der.out_ranges_l[0] = 0;
+        der.out_ranges_l[1] = 1024;
+        // Pick an InvLumaScales that, multiplied by a maxed-out sample,
+        // overshoots: invScale * 1023 + (dra_offset + 256) >> 9 ≫ 1023.
+        der.inv_luma_scales[0] = 1024; // 2× nominal
+        der.dra_offsets[0] = 100_000; // bias upward
+                                      // ranges array for find_range_idx.
+        let mapped = map_one_luma_sample(1023, &out_ranges_l_as_i32(&der), &der, 1023);
+        assert_eq!(mapped, 1023, "Clip1Y caps at (1<<10) − 1");
+    }
+
+    #[test]
+    fn round174_apply_eq1376_clips_negative_to_zero() {
+        // Symmetric clip: very negative DraOffsets pushes mappedSample
+        // negative; Clip1Y(_) at lower bound is 0.
+        let mut der = DraDerived::empty();
+        der.num_ranges = 1;
+        der.out_ranges_l[0] = 0;
+        der.out_ranges_l[1] = 1024;
+        der.inv_luma_scales[0] = 1;
+        der.dra_offsets[0] = -1_000_000;
+        let mapped = map_one_luma_sample(512, &out_ranges_l_as_i32(&der), &der, 1023);
+        assert_eq!(mapped, 0);
+    }
+
+    #[test]
+    fn round174_apply_u16_in_place() {
+        // Plane-level apply: every sample is run through eq. 1374-1376.
+        // Use a degenerate-by-design DraDerived where InvLumaScales[0]
+        // is non-zero (skipping the spec-literal range-0 trap) so we can
+        // verify the loop body, not the gap.
+        let mut der = DraDerived::empty();
+        der.num_ranges = 1;
+        der.out_ranges_l[0] = 0;
+        der.out_ranges_l[1] = 1024;
+        der.inv_luma_scales[0] = 512; // Q18 representation of 1.0
+        der.dra_offsets[0] = 0;
+        // Per-sample: mapped = (0 + 512*v + 256) >> 9 = v + (256 >> 9) = v.
+        let mut plane = vec![0u16, 100, 500, 1023];
+        apply_luma_inverse_mapping(&mut plane, &der, 10);
+        assert_eq!(plane, vec![0u16, 100, 500, 1023]);
+    }
+
+    #[test]
+    fn round174_apply_u8_in_place_matches_lut() {
+        // 8-bit shortcut: u8 plane apply equals LUT-of-LUT lookup.
+        let mut der = DraDerived::empty();
+        der.num_ranges = 1;
+        der.out_ranges_l[0] = 0;
+        der.out_ranges_l[1] = 256;
+        der.inv_luma_scales[0] = 512;
+        der.dra_offsets[0] = 0;
+        let lut = build_inv_luma_lut_8bit(&der);
+        let mut plane = vec![0u8, 1, 50, 128, 200, 255];
+        let expected: Vec<u8> = plane.iter().map(|&v| lut[v as usize]).collect();
+        apply_luma_inverse_mapping_u8(&mut plane, &der);
+        assert_eq!(plane, expected);
+        // For this identity-Q18 case the LUT is identity.
+        for (i, &v) in lut.iter().enumerate() {
+            assert_eq!(v, i as u8, "LUT[{i}] should be {i}");
+        }
+    }
+
+    #[test]
+    fn round174_apply_noop_when_num_ranges_zero() {
+        // Empty derived: helper is a no-op, plane is unchanged.
+        let der = DraDerived::empty();
+        let mut plane = vec![10u16, 100, 1000];
+        apply_luma_inverse_mapping(&mut plane, &der, 10);
+        assert_eq!(plane, vec![10u16, 100, 1000]);
+        let mut plane8 = vec![10u8, 100, 250];
+        apply_luma_inverse_mapping_u8(&mut plane8, &der);
+        assert_eq!(plane8, vec![10u8, 100, 250]);
+    }
+
+    #[test]
+    fn round174_build_lut_identity_when_num_ranges_zero() {
+        let der = DraDerived::empty();
+        let lut = build_inv_luma_lut_8bit(&der);
+        for (i, &v) in lut.iter().enumerate() {
+            assert_eq!(v, i as u8);
+        }
+    }
+
+    #[test]
+    fn round174_apply_multi_range_segment_dispatch() {
+        // Two ranges with distinct InvLumaScales/DraOffsets — verify
+        // §8.9.5 picks the right one and eq. 1374-1376 applies
+        // per-range. Construct OutRangesL = [0, 128, 256] (mid-point
+        // split for an 8-bit sample space) and check a value below /
+        // above 128 maps via the correct entry.
+        let mut der = DraDerived::empty();
+        der.num_ranges = 2;
+        der.out_ranges_l[0] = 0;
+        der.out_ranges_l[1] = 128;
+        der.out_ranges_l[2] = 256;
+        // Range 0: scale = 1.0 (Q18 = 512), offset = 0.
+        der.inv_luma_scales[0] = 512;
+        der.dra_offsets[0] = 0;
+        // Range 1: scale = 2.0 (Q18 = 1024), offset = -65_536 to
+        // re-anchor (1024*128 - 65536 = 65536 vs 512*128 = 65536 ≈
+        // continuity at the boundary).
+        der.inv_luma_scales[1] = 1024;
+        der.dra_offsets[1] = -65_536;
+        let ranges = out_ranges_l_as_i32(&der);
+        // Below split: range 0 path → v.
+        let v_lo = map_one_luma_sample(64, &ranges, &der, 255);
+        // (0 + 512*64 + 256) >> 9 = 32768 + 256 >> 9 = 64.
+        assert_eq!(v_lo, 64);
+        // At split: range 1 path → 2*v − 128.
+        let v_hi = map_one_luma_sample(200, &ranges, &der, 255);
+        // (−65536 + 1024*200 + 256) >> 9 = (−65536 + 204800 + 256) >> 9
+        //                                 = 139520 >> 9 = 272 → Clip1Y(255) = 255.
+        assert_eq!(v_hi, 255);
+        // A middle range-1 value just above the split.
+        let v_mid = map_one_luma_sample(150, &ranges, &der, 255);
+        // (−65536 + 153600 + 256) >> 9 = 88320 >> 9 = 172.
+        assert_eq!(v_mid, 172);
     }
 }

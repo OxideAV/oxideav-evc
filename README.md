@@ -7,6 +7,78 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-174 status
+
+Round 174 lands the **§8.9.3 luma inverse mapping helpers** + an
+**empirical pin for the §7.4.7 `InvLumaScales[0]` / `DraOffsets[0]`
+docs gap**. The round-151 `derive_dra_state` populates every
+[`DraDerived`] field except entry 0 of `inv_luma_scales` /
+`dra_offsets` — the spec text on page 86 restricts eq. 117-121 to
+`i ∈ [1, dra_number_ranges_minus1]` but §8.9.3 indexes both arrays
+with `rangeIdx ∈ [0, numOutRangesL − 1]`. Under the literal reading
+every sample falling in the lowest segment collapses to
+`(0 + 0 * sample + 256) >> 9 = 0`, clearly degenerate. New surface:
+`apply_luma_inverse_mapping(plane, derived, bit_depth_y)` is a pure
+§8.9.3 apply over a `u16` plane transcribing eq. 1374
+(`incrValue = InvLumaScales[rangeIdx] * lumaSample`), eq. 1375
+(`mappedSample = (DraOffsets[rangeIdx] + incrValue + 256) >> 9`),
+and eq. 1376 (`invLumaSample = Clip1Y(mappedSample)`) — the
+`rangeIdx` selected via the round-148 `find_range_idx` against the
+derived `out_ranges_l`. `apply_luma_inverse_mapping_u8` is the
+8-bit shortcut that builds a 256-entry LUT once via the new
+`build_inv_luma_lut_8bit` helper. `fill_inv_luma_scales_range_zero`
+applies the most plausible reconciliation of the docs gap — extending
+eq. 118 / 120 / 121 to `i = 0` (treating `dra_scale_value[0]` as the
+range-0 scale by symmetry with `OutRangesL`'s `i=0` `= 0` base case)
+— in-place on a mutable `DraDerived` so callers that need
+non-degenerate §8.9.3 output can opt in. **Round 174 takes no stance**
+on the gap: both interpretations are surfaced so a follow-up round
+can wire whichever the docs collaborator resolves to. No wiring into
+`apply_post_filters` yet — the `dra_syntax_aps` 32-slot cache stays
+populated in parallel with the legacy `dra_aps` cache until §8.9.6
+chromaScale derivation is also ready. 367 unit tests pass (was 356) —
+11 new cover: literal-spec range-0 degeneracy pin (a sample in the
+lowest segment maps to 0), off-by-one fill produces a monotonic
+non-flat range-0 mapping, defensive rejection of
+`dra_scale_value[0] == 0`, num_ranges-zero no-op for the fill helper,
+eq. 1376 `Clip1Y` upper-bound clip, eq. 1376 lower-bound clip to 0,
+end-to-end `u16` plane apply with identity-Q18 round-trip, `u8`
+shortcut bit-for-bit agreement with the LUT path, both `u8`/`u16`
+helpers no-op on empty derived state, LUT-builder identity on empty
+state, and a 2-range dispatch test (`OutRangesL = [0, 128, 256]`,
+distinct per-range `InvLumaScales`/`DraOffsets`) verifying §8.9.5
+picks the right segment and eq. 1374-1376 applies per-range with
+hand-computed mapped values across the split and at the Clip1Y cap.
+Suggested workspace-README row delta: EVC now provides §8.9.3 pure
+luma inverse-mapping helpers (eq. 1374-1376) over `DraDerived`,
+with the §7.4.7 `InvLumaScales[0]` / `DraOffsets[0]` docs gap
+empirically pinned + an off-by-one reconciliation surfaced behind
+explicit opt-in (lacks: docs-collaborator resolution of the §7.4.7
+range-0 ambiguity + `apply_post_filters` wiring once §8.9.6
+chromaScale also lands, Main-profile toolset — BTT/ADMVP/EIPD/ATS/
+AMVR/affine).
+
+### Documented spec gap
+
+ISO/IEC 23094-1:2020(E) §7.4.7 page 86 restricts the
+`InvLumaScales[apsId][i]` / `DraOffsets[apsId][i]` derivation
+(eq. 117-121) to "i in the range of 1 to dra_number_ranges_minus1,
+inclusive", leaving index 0 explicitly undefined. §8.9.3 (page 304)
+indexes both arrays with `rangeIdx ∈ [0, numOutRangesL − 1]`
+— including index 0. Under the literal spec reading, every sample
+whose value falls in the lowest segment collapses to
+`(0 + 0 * sample + 256) >> 9 = 0`, inconsistent with the spec's
+own identity-DRA invariant (a DRA configured with
+`dra_scale_value[j] = 1 << dra_descriptor2` for all `j` must
+reproduce the input). The most plausible reconciliation is that the
+§7.4.7 loop bounds are an off-by-one ("for i in the range of 0 to
+dra_number_ranges_minus1, inclusive"), matching the per-range
+one-scale-per-range data flow on the parser side and the
+`rangeIdx ∈ [0, numOutRangesL − 1]` invocation surface of §8.9.3.
+Recommend a §7.4.7 patch clarifying the loop bound — round 174
+surfaces both readings (literal default + opt-in reconciliation)
+pending the docs collaborator's resolution.
+
 ## Round-151 status
 
 Round 151 lands the **§7.3.6-faithful `dra_data()` parser + §7.4.7
