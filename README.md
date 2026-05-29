@@ -7,6 +7,42 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-181 status
+
+Round 181 wires the round-151 spec-faithful `(DraSyntax, DraDerived)`
+cache populated by `parse_dra_syntax` / `derive_dra_state` into a
+dedicated public §8.9.3 entry point on `EvcDecoder`:
+
+```rust
+pub fn apply_luma_inverse_mapping_spec_faithful(
+    &self,
+    pic: &mut YuvPicture,
+    pps_dra_aps_id: Option<u8>,
+) -> Result<bool>;
+```
+
+The method looks up the cache slot for `pps_dra_aps_id`, runs the
+round-174 §7.4.7 off-by-one reconciliation
+(`fill_inv_luma_scales_range_zero`) on a local clone so the cached
+state stays as the literal spec reading, then applies
+`apply_luma_inverse_mapping_u8` over the picture's `y` plane. Returns
+`Ok(true)` when the apply ran and `Ok(false)` when the slot was empty
+(clean no-op). `dra_scale_value[0] == 0` propagates the
+reconciliation's `Err`; the picture stays untouched on the error path.
+
+**Independent of `apply_post_filters`.** The post-filter pipeline
+stays on the round-148 `dra::apply_dra` path so existing fixtures
+don't shift bit-positions in this round; the new entry point is
+opt-in. A follow-up round can decide whether to retire the legacy
+path or thread §8.9.3 alongside it once a `sps_dra_flag = 1` fixture
+with a populated `dra_syntax_aps` is staged.
+
+6 new unit tests (373 total; was 367) cover empty-slot no-op, strict
+`None` `pps_dra_aps_id` no-op, identity scale (Q9 1.0 ⇒ identity LUT
+on `[0, 255]`), doubled scale (input 240 ⇒ 120 via
+`InvLumaScales[0] = 256`), the `dra_scale_value[0] == 0` error path,
+and orthogonality to the legacy `dra_aps` cache.
+
 ## Round-174 status
 
 Round 174 lands the **§8.9.3 luma inverse mapping helpers** + an

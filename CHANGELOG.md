@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+### Round 181 — wire round-151 spec-faithful DRA state into a §8.9.3 entry point
+
+#### Added
+- `EvcDecoder::apply_luma_inverse_mapping_spec_faithful(pic,
+  pps_dra_aps_id) -> Result<bool>`: public entry point that closes the
+  round-151 → round-174 → r181 chain. Looks up the
+  `(DraSyntax, DraDerived)` pair populated by `parse_dra_syntax` +
+  `derive_dra_state` for `pps_dra_aps_id`, runs the §7.4.7 off-by-one
+  reconciliation (`dra::fill_inv_luma_scales_range_zero`) on a local
+  clone so the cache stays as the literal spec reading, then applies
+  `dra::apply_luma_inverse_mapping_u8` over the picture's luma plane.
+  Returns `Ok(true)` when the cache slot was populated and the apply
+  ran, `Ok(false)` when the slot was empty (clean no-op), and the
+  reconciliation's `Err(Error::invalid)` when
+  `dra_scale_value[0] == 0`.
+- `EvcDecoder::dra_syntax_aps_for_pps(pps_dra_aps_id) -> Option<&
+  (DraSyntax, DraDerived)>`: private accessor for the round-151
+  cache, mirroring `dra_aps_for_pps`'s shape but strict on the
+  `None` `pps_dra_aps_id` path (no `last_dra_aps_id` fallback — §8.9
+  always invokes §8.9.3 with an explicit `pic_dra_aps_id`).
+
+#### Wiring stance
+- The new entry point is independent of the legacy round-148
+  `dra::apply_dra` path used by `apply_post_filters`. Callers opt in
+  explicitly. The post-filter pipeline stays on the round-148 path so
+  existing fixtures don't shift bit-positions in this round; a
+  subsequent round can decide whether to retire the legacy path or
+  thread §8.9.3 alongside it once a fixture with `sps_dra_flag = 1`
+  + populated `dra_syntax_aps` is staged.
+
+#### Tests
+- 6 new unit tests (373 total; was 367):
+  - `round181_apply_luma_inv_map_empty_slot_is_noop` — empty cache
+    slot returns `Ok(false)` and leaves the picture untouched.
+  - `round181_apply_luma_inv_map_none_aps_id_is_noop` — strict
+    `None` `pps_dra_aps_id` is a clean no-op.
+  - `round181_apply_luma_inv_map_identity_scale_is_identity_on_8bit_codespace`
+    — `dra_scale_value[0] = 512` at `dra_descriptor2 = 9` (Q9 1.0)
+    yields the identity LUT on `[0, 255]`.
+  - `round181_apply_luma_inv_map_doubled_scale_halves_midpoint` —
+    `dra_scale_value[0] = 1024` produces a monotone non-decreasing
+    mapping with `InvLumaScales[0] = 256`; input 240 maps to 120.
+  - `round181_apply_luma_inv_map_zero_scale_value_propagates_error`
+    — `dra_scale_value[0] == 0` errors out of the reconciliation;
+    the picture stays untouched on the error path.
+  - `round181_spec_faithful_path_is_orthogonal_to_legacy_apply_dra`
+    — populating both `dra_aps[id]` and `dra_syntax_aps[id]` for
+    the same id; the new entry point reads only the round-151
+    cache.
+
+#### Clean-room
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
+
 ### Round 174 — §8.9.3 luma inverse mapping helpers + documented §7.4.7 docs gap
 
 #### Added
@@ -432,8 +486,7 @@
   set 0 is always applied — and the §8.8.4.3 ALF transpose / filter-index
   classification (the apply uses the fixed diamond tap layout).
 - Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
-  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec evcdec
-  consulted; no web access.
+  `docs/video/evc/`); spec-only sourcing, no web access.
 
 ### Round 107 — `coding_tree_unit()` ALF applicability map (§7.3.8.2)
 
@@ -494,8 +547,7 @@
   per-CTB `AlfCtbFlags` are decoded and counted but not yet consulted by
   the post-filter pass.
 - Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
-  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec evcdec
-  consulted; no web access.
+  `docs/video/evc/`); spec-only sourcing, no web access.
 
 ### Round 103 — IBC-branch `cu_qp_delta` wiring (§7.3.8.5)
 
@@ -557,8 +609,7 @@
   `transform_unit()` entry points (intra single-tree, regular inter,
   IDR IBC, non-IDR IBC) decode per-CU `cu_qp_delta`.
 - Clean-room from ISO/IEC 23094-1:2020 (PDF + extracted text in
-  `docs/video/evc/`). No xeve, xevd, ETM reference, or libavcodec
-  evcdec consulted; no web access.
+  `docs/video/evc/`); spec-only sourcing, no web access.
 
 ### Round 100 — non-IDR (P/B) inter-CU `cu_qp_delta` wiring (§7.3.8.5)
 
@@ -687,8 +738,8 @@
   the negative gates (`sps_ibc_flag = 0` + cu_skip suppression) and
   the bit-exact reconstruction is covered by the pure-compute
   helper tests.
-- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
-  No xeve, xevd, ETM reference, or libavcodec evcdec consulted.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
 
 ### Round 90 — IBC `coding_unit()` wiring
 
@@ -788,8 +839,8 @@
   `isIbcAllowed` probe inside `decode_inter_coding_unit` plus an
   IBC branch invocation when the IBC flag fires; deferred to a
   follow-up round.
-- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
-  No xeve, xevd, ETM reference, libavcodec evcdec consulted.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
 
 ### Round 74 — IBC pipeline composition + MV rounding helper
 
@@ -852,8 +903,8 @@
   `decode_ibc_cu`. The §8.6.1 step-4 residual decode currently lives
   in the inter slice walker; sharing it for IBC needs a small
   refactor.
-- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
-  No xeve, xevd, ETM reference, libavcodec evcdec consulted.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
 
 ### Round 73 — IBC (Intra Block Copy) primitive scaffold
 
@@ -923,8 +974,8 @@
   directly.
 
 #### Notes
-- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`).
-  No xeve, xevd, ETM reference, libavcodec evcdec consulted.
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
 
 ### Round 11 — ALF adaptive loop filter + DRA dynamic range adjustment
 

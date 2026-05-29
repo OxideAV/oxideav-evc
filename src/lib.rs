@@ -71,9 +71,9 @@
 //!   `Error::Unsupported`.
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)** at
-//! `docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf`. No third-party EVC
-//! decoder source (MPEG-5 reference, `xeve`, `xevd`, …) was consulted —
-//! every module is spec-only.
+//! `docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf`. Every module is
+//! spec-only — clauses, equations, and table numbers cite the
+//! Recommendation directly.
 
 pub mod alf;
 pub mod alf_tables;

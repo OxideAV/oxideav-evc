@@ -208,6 +208,63 @@ impl EvcDecoder {
             .and_then(|id| self.dra_aps.get(id as usize).and_then(|s| s.as_ref()))
     }
 
+    /// Resolve the round-151 spec-faithful DRA APS cache slot. Returns the
+    /// `(DraSyntax, DraDerived)` pair populated by `parse_dra_syntax` +
+    /// `derive_dra_state` whenever the §7.3.6 `dra_data()` syntax was
+    /// parsed (i.e. modern path); `None` when the slot is empty or the
+    /// PPS surfaced no `pic_dra_aps_id`.
+    fn dra_syntax_aps_for_pps(
+        &self,
+        pps_dra_aps_id: Option<u8>,
+    ) -> Option<&(DraSyntax, DraDerived)> {
+        let id = pps_dra_aps_id?;
+        self.dra_syntax_aps
+            .get(id as usize)
+            .and_then(|s| s.as_ref())
+    }
+
+    /// Round-181 — apply §8.9.3 (Inverse mapping process for a luma
+    /// sample) to the picture's luma plane using the round-151 spec-faithful
+    /// DRA state, returning `true` if the mapping was applied and `false`
+    /// if the cache slot for `pps_dra_aps_id` was empty (no-op).
+    ///
+    /// The pipeline is:
+    ///
+    /// 1. Look up `(DraSyntax, DraDerived)` for `pps_dra_aps_id` in
+    ///    `dra_syntax_aps`. Skip the apply if absent.
+    /// 2. Clone the derived state and run the §7.4.7 off-by-one
+    ///    reconciliation via [`dra::fill_inv_luma_scales_range_zero`] so
+    ///    range 0 carries a non-degenerate `InvLumaScales[0]` /
+    ///    `DraOffsets[0]`. This is the interpretation flagged in the
+    ///    r174 docs gap; the original cache entry is unchanged.
+    /// 3. Apply [`dra::apply_luma_inverse_mapping_u8`] over the picture's
+    ///    `y` plane in-place, which iterates §8.9.5 → eq. 1374-1376 per
+    ///    sample.
+    ///
+    /// 8-bit only — `YuvPicture` stores samples as `u8`, matching the
+    /// only `bit_depth_luma_minus8 == 0` case we currently materialise.
+    ///
+    /// **This method is independent of the legacy round-148
+    /// [`dra::apply_dra`] path used by [`Self::apply_post_filters`].**
+    /// Callers who want the spec-faithful §8.9.3 must invoke this method
+    /// explicitly; the post-filter wiring stays on the round-148 path so
+    /// existing fixtures don't shift.
+    pub fn apply_luma_inverse_mapping_spec_faithful(
+        &self,
+        pic: &mut YuvPicture,
+        pps_dra_aps_id: Option<u8>,
+    ) -> Result<bool> {
+        let pair = match self.dra_syntax_aps_for_pps(pps_dra_aps_id) {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        let (syntax, derived) = pair;
+        let mut local = derived.clone();
+        dra::fill_inv_luma_scales_range_zero(&mut local, syntax)?;
+        dra::apply_luma_inverse_mapping_u8(&mut pic.y, &local);
+        Ok(true)
+    }
+
     /// Find the DPB entry with the given POC, returning a borrow. None
     /// when no entry matches (caller may signal a malformed bitstream).
     fn dpb_find(&self, poc: i32) -> Option<&DpbEntry> {
@@ -1394,5 +1451,235 @@ mod tests {
         assert!(!got_der.joined_scale_flag);
         // Slot 6 (untouched) must remain unpopulated.
         assert!(dec.dra_syntax_aps[6].is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Round 181 — spec-faithful §8.9.3 luma inverse mapping wiring tests.
+    //
+    // [`EvcDecoder::apply_luma_inverse_mapping_spec_faithful`] is the
+    // public entry point that closes the round-151 → round-174 → r181
+    // chain: parser cache → derived state with eq. 118/120/121 →
+    // off-by-one reconciliation → §8.9.3 per-sample apply.
+    //
+    // Tests below pin the four observable behaviours:
+    //   * empty cache slot ⇒ Ok(false), picture untouched.
+    //   * identity scale (dra_scale_value = 512 at all ranges) +
+    //     `dra_descriptor2 = 9` (Q9) ⇒ §8.9.3 LUT is exactly the
+    //     identity on `[0, 255]`.
+    //   * doubled scale (dra_scale_value = 1024) ⇒ mapped values are
+    //     halved against the pre-scale (single-range case).
+    //   * `dra_scale_value[0] == 0` ⇒ Err propagated from
+    //     `fill_inv_luma_scales_range_zero`.
+    // ------------------------------------------------------------------
+
+    /// Build a `DraSyntax` with a single range covering the whole 8-bit
+    /// luma domain and `dra_scale_value[0] = scale`. The §7.4.7 derivation
+    /// runs in Q9 (`dra_descriptor2 = 9`).
+    #[cfg(test)]
+    fn round181_make_syntax(scale: u16) -> dra::DraSyntax {
+        use crate::dra::DRA_MAX_RANGES_V2;
+        let mut dra_scale_value = [0u16; DRA_MAX_RANGES_V2];
+        dra_scale_value[0] = scale;
+        let mut dra_delta_range = [0u16; DRA_MAX_RANGES_V2];
+        // Single range covering the whole 8-bit luma codespace [0, 256).
+        // §7.4.7 (eq. 117) reads `dra_delta_range[0]` as the range width
+        // in input-space units; 256 places the range edge at the top of
+        // an 8-bit picture so every sample falls into range 0.
+        dra_delta_range[0] = 256;
+        dra::DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 0,
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 0,
+            dra_delta_range,
+            dra_scale_value,
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            // dra_table_idx = 58 ⇒ joined_scale_flag = false (single
+            // scale per range, no joined-scale path).
+            dra_table_idx: 58,
+        }
+    }
+
+    /// Empty cache slot — the public entry point returns `Ok(false)` and
+    /// leaves the picture's luma plane untouched. Exercises the early-out
+    /// in `dra_syntax_aps_for_pps`.
+    #[test]
+    fn round181_apply_luma_inv_map_empty_slot_is_noop() {
+        let dec = EvcDecoder::new();
+        let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        // Seed luma with a known pattern so we can detect any mutation.
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = (i as u8).wrapping_mul(17);
+        }
+        let before = pic.y.clone();
+        let applied = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(3))
+            .expect("empty slot is a clean no-op, not an error");
+        assert!(!applied, "empty cache slot returns Ok(false)");
+        assert_eq!(pic.y, before, "luma plane must be untouched");
+    }
+
+    /// `pps_dra_aps_id = None` ⇒ no fallback to `last_dra_aps_id`; spec-
+    /// faithful mode is strict (the legacy path's last-slot fallback is
+    /// deliberately not mirrored here, because §8.9.3 is invoked with an
+    /// explicit `pic_dra_aps_id` per §8.9 ordering).
+    #[test]
+    fn round181_apply_luma_inv_map_none_aps_id_is_noop() {
+        let dec = EvcDecoder::new();
+        let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        pic.y.fill(123);
+        let applied = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, None)
+            .expect("None aps id is a clean no-op");
+        assert!(!applied);
+        assert!(pic.y.iter().all(|&v| v == 123));
+    }
+
+    /// `dra_scale_value[0] = 512` at `dra_descriptor2 = 9` is the Q9
+    /// representation of 1.0. The eq. 118 inverse `(1 << 18) / 512 = 512`
+    /// yields `InvLumaScales[0] = 512`, which §8.9.3 eq. 1374-1375
+    /// reduces to `(0 + 512 * s + 256) >> 9 = s` for every input sample
+    /// `s ∈ [0, 255]` once `DraOffsets[0]` is the matched zero from the
+    /// off-by-one reconciliation. The §8.9.3 LUT is therefore the
+    /// identity on the 8-bit codespace, modulo clipping at the upper
+    /// edge.
+    #[test]
+    fn round181_apply_luma_inv_map_identity_scale_is_identity_on_8bit_codespace() {
+        use crate::dra::derive_dra_state;
+        let mut dec = EvcDecoder::new();
+        let syn = round181_make_syntax(512);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        dec.dra_syntax_aps[7] = Some((syn, der));
+
+        // Walk every 8-bit sample value and check the post-§8.9.3 LUT
+        // returns the input unchanged. We populate a 256-px linear ramp
+        // so `pic.y[i] = i`.
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        let applied = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(7))
+            .expect("identity scale must not error");
+        assert!(applied, "populated slot ⇒ Ok(true)");
+        for (i, &v) in pic.y.iter().enumerate() {
+            assert_eq!(v, i as u8, "identity LUT failed at i = {i}: got {v}");
+        }
+    }
+
+    /// Doubled scale (`dra_scale_value[0] = 1024`) maps a 0.5× inverse
+    /// onto the luma plane. eq. 118 gives `InvLumaScales[0] = (1 << 18) /
+    /// 1024 = 256`; eq. 1375 then maps sample `s` to `(off + 256 * s +
+    /// 256) >> 9`. With the off-by-one-reconciled `DraOffsets[0]` the
+    /// midpoint sample 128 maps to ~64 (halved), and 0 stays 0.
+    #[test]
+    fn round181_apply_luma_inv_map_doubled_scale_halves_midpoint() {
+        use crate::dra::derive_dra_state;
+        let mut dec = EvcDecoder::new();
+        let syn = round181_make_syntax(1024);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        dec.dra_syntax_aps[2] = Some((syn, der));
+
+        let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        // 16 samples covering the input domain in 16-wide steps.
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = (i as u8).saturating_mul(16);
+        }
+        let applied = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(2))
+            .unwrap();
+        assert!(applied);
+        // 0 ⇒ 0 (incrValue = 0, offset = 0 in the identity-offset
+        // single-range case, mappedSample = (0 + 0 + 256) >> 9 = 0).
+        assert_eq!(pic.y[0], 0);
+        // Strict monotonicity check across the full mapped sequence
+        // (eq. 1374-1375 is linear in `s` with positive slope).
+        for w in pic.y.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "§8.9.3 mapping must be monotone non-decreasing in s; saw {} -> {}",
+                w[0],
+                w[1]
+            );
+        }
+        // Final input s = 240 with InvLumaScales[0] = 256 ⇒
+        // (0 + 256*240 + 256) >> 9 = (61440 + 256) >> 9 = 120 (halved
+        // against the pre-scale, as expected for a 2× scale on the
+        // forward path / 0.5× inverse).
+        assert_eq!(pic.y[15], 120);
+    }
+
+    /// `dra_scale_value[0] == 0` is explicitly forbidden by §7.4.7 (the
+    /// inverse `(1 << 18) / dsv0` would divide by zero).
+    /// `fill_inv_luma_scales_range_zero` returns an `Error::invalid` for
+    /// this case, and the public entry point must propagate it without
+    /// touching the picture.
+    #[test]
+    fn round181_apply_luma_inv_map_zero_scale_value_propagates_error() {
+        use crate::dra::derive_dra_state;
+        let mut dec = EvcDecoder::new();
+        // Build a derived state on a valid scale, then *poison* the
+        // syntax's `dra_scale_value[0]` to zero so the reconciliation
+        // step trips the divide-by-zero guard. `derive_dra_state` skips
+        // index 0 in its loop so we can't trip eq. 118 there directly;
+        // the round-174 reconciliation helper is where the check lives.
+        let valid_syn = round181_make_syntax(512);
+        let der = derive_dra_state(&valid_syn, 10).unwrap();
+        let mut poisoned = valid_syn.clone();
+        poisoned.dra_scale_value[0] = 0;
+        dec.dra_syntax_aps[1] = Some((poisoned, der));
+
+        let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        pic.y.fill(200);
+        let before = pic.y.clone();
+        let err = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(1))
+            .expect_err("dra_scale_value[0] == 0 must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dra_scale_value[0] == 0"),
+            "error message should carry the §7.4.7 violation phrase; got: {msg}"
+        );
+        // Picture state must be untouched on the error path (the apply
+        // happens after the reconciliation, so a clone+fail sequence
+        // means `pic.y` was never written).
+        assert_eq!(pic.y, before, "picture must be untouched on error");
+    }
+
+    /// The new public API must NOT collide with the legacy round-148
+    /// [`dra::apply_dra`] path. We verify by populating BOTH cache slots
+    /// for the same `pps_dra_aps_id` and checking that
+    /// `apply_luma_inverse_mapping_spec_faithful` only consumes
+    /// `dra_syntax_aps`; the legacy `DraData` slot remains a valid input
+    /// for the post-filter pipeline.
+    #[test]
+    fn round181_spec_faithful_path_is_orthogonal_to_legacy_apply_dra() {
+        use crate::dra::derive_dra_state;
+        let mut dec = EvcDecoder::new();
+        let syn = round181_make_syntax(512);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        dec.dra_syntax_aps[4] = Some((syn, der));
+        // Populate the legacy slot with a hand-built `DraData` so we can
+        // confirm the spec-faithful entry point doesn't read it. A
+        // minimum-viable `DraData` with `descriptor_present = false` is
+        // the round-11 no-op case — the legacy slot is "there" but the
+        // legacy `apply_dra` would early-return; the spec-faithful entry
+        // point ignores this slot entirely.
+        let legacy = DraData::default();
+        dec.dra_aps[4] = Some(legacy);
+
+        let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = (i as u8) * 16;
+        }
+        let before = pic.y.clone();
+        let applied = dec
+            .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(4))
+            .unwrap();
+        assert!(applied, "spec-faithful path reads dra_syntax_aps[4]");
+        // Identity scale ⇒ luma plane unchanged.
+        assert_eq!(pic.y, before);
     }
 }
