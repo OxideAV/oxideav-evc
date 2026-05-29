@@ -2,6 +2,95 @@
 
 ## [Unreleased]
 
+### Round 187 — §8.9.7 chroma DRA derived state + §8.9.6 chromaScale entry point (DraJoinedScaleFlag = 0 path)
+
+#### Added
+- `dra::DraChromaDerived` — per-APS chroma DRA derived state for a
+  single chroma component (`ChromaIdx::Cb` / `ChromaIdx::Cr`). Holds
+  `out_ranges_c[]` (§8.9.7 eq. 1387 midpoints + §8.9.5 top sentinel),
+  `chroma_scales[]` (eq. 1394), `inv_chroma_scales[]` (eq. 1386),
+  `out_scales_c[]` (eq. 1391 / 1393), `out_offsets_c[]` (eq. 1389 /
+  1392).
+- `dra::ChromaIdx { Cb, Cr }` — explicit Cb/Cr selector with
+  `.as_u32()` returning the §8.9.8 `cIdx ∈ {0, 1}`.
+- `dra::derive_dra_chroma_state(syntax, derived, cidx, bit_depth_y)`
+  — full §8.9.7 derivation (eq. 1386-1393) for a single chroma
+  component on the `DraJoinedScaleFlag = 0` path (eq. 1394). Returns
+  `Err(Error::Unsupported)` for `DraJoinedScaleFlag = 1` (joined
+  table-driven path, deferred to a follow-up round). Defensive
+  divide-by-zero guard on `dra_cb_scale_value == 0` /
+  `dra_cr_scale_value == 0` (already forbidden by §7.4.7).
+- `dra::chroma_scale_for_luma_sample(luma_sample, chroma_derived) ->
+  i64` — §8.9.6 entry point: runs §8.9.5 against `out_ranges_c[]`
+  with `numRanges = num_ranges_l + 1`, then transcribes eq. 1384
+  (`incValue = lumaSample − OutRangesC[rangeIdx]`) and eq. 1385
+  (`OutOffsetsC[rangeIdx] + ((OutScalesC[rangeIdx] * incValue +
+  (1 << 9)) >> 10)`).
+- `dra::DRA_MAX_RANGES_C = DRA_MAX_RANGES_V2 + 2 = 34` — storage
+  size for `OutRangesC` including the §8.9.5 one-past-end top
+  sentinel placed at `1 << bit_depth_y`.
+
+#### Wiring stance
+- The new entry point is independent of the legacy round-148
+  `dra::apply_dra` chroma path used by `apply_post_filters`. Callers
+  opt in explicitly. The post-filter pipeline stays on the round-148
+  path so existing fixtures don't shift bit-positions in this round;
+  a subsequent round can decide whether to retire the legacy path or
+  thread §8.9.6 alongside it once a fixture with `sps_dra_flag = 1`
+  + populated `dra_syntax_aps` is staged.
+
+#### Tests
+- 16 new unit tests (389 total; was 373):
+  - `round187_chroma_derive_rejects_joined_path` — `dra_table_idx
+    != 58` errors out.
+  - `round187_chroma_derive_rejects_zero_cb_scale` — eq. 1386
+    divide-by-zero defence on Cb path.
+  - `round187_chroma_derive_rejects_zero_cr_scale` — eq. 1386
+    divide-by-zero defence on Cr path.
+  - `round187_chroma_derive_noop_on_empty_state` — `num_ranges == 0`
+    returns empty state + `chroma_scale_for_luma_sample == 0`.
+  - `round187_chroma_derive_eq1386_inv_chroma_scales_identity` —
+    `dra_cb_scale_value = 512` (Q9 1.0) ⇒ `invChromaScales = 512`.
+  - `round187_chroma_derive_eq1386_doubled_chroma_scale` —
+    `dra_cb_scale_value = 1024` (Q9 2.0) ⇒ `invChromaScales = 256`.
+  - `round187_chroma_derive_eq1387_out_ranges_c_midpoints` —
+    eq. 1387 midpoints.
+  - `round187_chroma_derive_eq1389_eq1391_out_scales_offsets_unjoined`
+    — `OutScalesC[i] = 0` (deltaScale collapses to 0 under joined
+    = 0); `OutOffsetsC[i] = invChromaScales[i−1]`.
+  - `round187_chroma_derive_eq1392_eq1393_top_sentinel` —
+    `i = numRangesL` final-pair.
+  - `round187_chroma_derive_index_zero_layout_matches_spec` — the
+    "respectively" line above eq. 1387 (`OutOffsetsC[0] =
+    invChromaScales[0]`).
+  - `round187_chroma_derive_cb_cr_distinct` — Cb scale = 256 / Cr
+    scale = 1024 derive independently; `OutRangesC` is component-
+    agnostic.
+  - `round187_chroma_scale_for_sample_eq1384_eq1385_unjoined` —
+    §8.9.6 on unjoined path collapses to `invChromaScales[0]`.
+  - `round187_chroma_scale_constant_property_unjoined` —
+    exhaustive 10-bit sample-space sweep verifying constancy.
+  - `round187_chroma_scale_for_sample_handles_out_of_range_high` —
+    §8.9.5 top sentinel handles `luma > last_internal_boundary`
+    without panic.
+  - `round187_chroma_derive_single_range_identity` — edge case
+    `num_ranges_minus1 = 0` (empty eq. 1388-1391 loop body).
+  - `round187_chroma_idx_as_u32` — Cb = 0, Cr = 1.
+
+#### Documented followup
+- §8.9.8 `DraJoinedScaleFlag = 1` (joined chroma-scale via
+  `ChromaQpTable`): eq. 1395-1419 + `ScaleQP[54]` / `QpScale[25]`
+  tables (eq. 1420 / 1421) + the SPS `ChromaQpTable` (per §7.4.3
+  page 78). Implementation needs the `ChromaQpTable` threaded
+  through from the SPS into either `DraDerived` or the §8.9.6 entry
+  point's signature. Round 187 surfaces the joined path as
+  `Err(Error::Unsupported)` so the caller can branch; the table
+  transcription + integration is the suggested round-188 EVC slot.
+
+#### Clean-room
+- Clean-room from ISO/IEC 23094-1:2020 (PDF in `docs/video/evc/`);
+  spec-only sourcing.
+
 ### Round 181 — wire round-151 spec-faithful DRA state into a §8.9.3 entry point
 
 #### Added

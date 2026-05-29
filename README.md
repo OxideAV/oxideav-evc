@@ -7,6 +7,118 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-187 status
+
+Round 187 lands the **§8.9.7 chroma DRA derived-state + §8.9.6 chromaScale
+entry point** for the simpler `DraJoinedScaleFlag = 0` branch of §8.9.8
+(eq. 1394 — `dra_table_idx == 58` → use `dra_cb_scale_value` /
+`dra_cr_scale_value` directly). This closes the long-noted round-148
+followup "lacks full §8.9.6 / §8.9.7 / §8.9.8 chromaScale derivation".
+
+New surface:
+
+* `dra::DraChromaDerived` — per-APS chroma DRA derived state for a
+  single `ChromaIdx::Cb` / `ChromaIdx::Cr` component, holding
+  `out_ranges_c[]` (§8.9.7 eq. 1387 midpoints + the §8.9.5 top sentinel
+  at `1 << bit_depth_y`), `chroma_scales[]` (eq. 1394), `inv_chroma_scales[]`
+  (eq. 1386), `out_scales_c[]` (eq. 1391 / 1393), and `out_offsets_c[]`
+  (eq. 1389 / 1392). Indices follow the spec verbatim:
+  `OutScalesC[0] = 0`, `OutOffsetsC[0] = invChromaScales[0]`,
+  `OutRangesC[0] = OutRangesL[0]`; per-i recursion for
+  `i ∈ [1, num_ranges_minus1]`; explicit top-sentinel at
+  `i = num_ranges_l`.
+
+* `dra::derive_dra_chroma_state(syntax, derived, cidx, bit_depth_y)`
+  — runs §8.9.7 eq. 1386-1393 over a `(DraSyntax, DraDerived)` pair
+  produced by the round-151 `parse_dra_syntax` /
+  `derive_dra_state`, for one of the two chroma components.
+  **Returns `Err(Error::Unsupported)` for `DraJoinedScaleFlag = 1`** —
+  the table-driven §8.9.8 chain (eq. 1395-1419, depending on the SPS's
+  `ChromaQpTable` + the §8.9.5 `ScaleQP` / `QpScale` tables) is the
+  documented round-187 followup, blocked on threading the SPS chroma-QP
+  table through to `DraDerived`. Defensive `Err(Error::Invalid)` on
+  zero `dra_cb_scale_value` (Cb path) / `dra_cr_scale_value` (Cr path)
+  even though §7.4.7 forbids them; pre-empts a divide-by-zero in
+  eq. 1386.
+
+* `dra::chroma_scale_for_luma_sample(luma_sample, chroma_derived) -> i64`
+  — §8.9.6 entry point. Given a luma sample, runs §8.9.5 against the
+  derived `out_ranges_c[]` (with `numRanges = num_ranges_l + 1`) to
+  pick `rangeIdx`, then eq. 1384 (`incValue = lumaSample -
+  OutRangesC[rangeIdx]`) and eq. 1385 (`OutOffsetsC[rangeIdx] +
+  ((OutScalesC[rangeIdx] * incValue + (1 << 9)) >> 10)`). Returns 0 on
+  an empty `DraChromaDerived` (num_ranges_l == 0).
+
+* `dra::ChromaIdx { Cb, Cr }` — explicit Cb/Cr selector with `.as_u32()`
+  returning the §8.9.8 `cIdx ∈ {0, 1}`.
+
+* `DRA_MAX_RANGES_C = DRA_MAX_RANGES_V2 + 2 = 34` — storage size for
+  `OutRangesC` + its §8.9.5 top sentinel.
+
+### Wiring stance
+
+Independent of `apply_post_filters`. The post-filter chroma path stays
+on the round-148 `dra::apply_dra` legacy chain so existing fixtures
+don't shift bit-positions in this round; the new entry point is opt-in
+behind `derive_dra_chroma_state` + `chroma_scale_for_luma_sample`,
+matching the round-181 pattern for the §8.9.3 luma side. A follow-up
+round can decide whether to retire the legacy chain or thread §8.9.6
+alongside it once a `sps_dra_flag = 1` fixture with a populated
+`dra_syntax_aps` lands.
+
+### Tests
+
+16 new unit tests (389 total; was 373):
+
+* `round187_chroma_derive_rejects_joined_path` — `dra_table_idx != 58`
+  (joined-flag = 1) errors out; surfaces the §8.9.8 joined-chain gap.
+* `round187_chroma_derive_rejects_zero_cb_scale` /
+  `round187_chroma_derive_rejects_zero_cr_scale` — divide-by-zero
+  defence on eq. 1386.
+* `round187_chroma_derive_noop_on_empty_state` — `num_ranges == 0`
+  returns an empty `DraChromaDerived` + the §8.9.6 helper returns 0.
+* `round187_chroma_derive_eq1386_inv_chroma_scales_identity` /
+  `round187_chroma_derive_eq1386_doubled_chroma_scale` — eq. 1386 on
+  Q9 = 1.0 / 2.0 scale values.
+* `round187_chroma_derive_eq1387_out_ranges_c_midpoints` — eq. 1387
+  midpoints between successive `OutRangesL` entries.
+* `round187_chroma_derive_eq1389_eq1391_out_scales_offsets_unjoined`
+  — under joined = 0, `deltaScale = 0` ⇒ `OutScalesC[i] = 0`;
+  `OutOffsetsC[i] = invChromaScales[i−1]`.
+* `round187_chroma_derive_eq1392_eq1393_top_sentinel` — `i =
+  numRangesL` final-pair derivation.
+* `round187_chroma_derive_index_zero_layout_matches_spec` — the
+  "respectively" line above eq. 1387 (the `OutOffsetsC[0] =
+  invChromaScales[0]` reading).
+* `round187_chroma_derive_cb_cr_distinct` — Cb (scale 256) vs Cr
+  (scale 1024) derive independently; `OutRangesC` is component-
+  agnostic.
+* `round187_chroma_scale_for_sample_eq1384_eq1385_unjoined` — §8.9.6
+  on the unjoined path collapses to `invChromaScales[0]` regardless
+  of luma range (since `OutScalesC = 0` and all `OutOffsetsC =`
+  same constant).
+* `round187_chroma_scale_constant_property_unjoined` — exhaustive
+  10-bit sample-space sweep confirming the constancy property.
+* `round187_chroma_scale_for_sample_handles_out_of_range_high`
+  — §8.9.5 top sentinel handles luma samples beyond the last
+  internal boundary without panic.
+* `round187_chroma_derive_single_range_identity` — `num_ranges_minus1
+  = 0` edge case (the eq. 1388-1391 loop body is empty).
+* `round187_chroma_idx_as_u32` — `ChromaIdx::Cb.as_u32() == 0`,
+  `Cr == 1`.
+
+### Documented followup
+
+§8.9.8 `DraJoinedScaleFlag = 1` (joined chroma-scale path):
+eq. 1395-1419 + `ScaleQP` / `QpScale` lookup tables + the SPS
+`ChromaQpTable` (per §7.4.3). Round 187 surfaces the entry point as
+`Err(Error::Unsupported)` so the caller can branch — but the
+implementation needs `ChromaQpTable` threaded through from the SPS
+into either `DraDerived` or the §8.9.6 entry point's signature, plus
+the `ScaleQP[54]` / `QpScale[25]` tables transcribed verbatim from
+eq. 1420 / 1421. Suggested split: tables + entry point in a
+round 188 EVC slot.
+
 ## Round-181 status
 
 Round 181 wires the round-151 spec-faithful `(DraSyntax, DraDerived)`

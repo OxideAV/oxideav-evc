@@ -1068,6 +1068,327 @@ fn map_one_luma_sample(
 }
 
 // =====================================================================
+// Round 187 — §8.9.7 / §8.9.8 chroma derived state + §8.9.6 chromaScale
+// (DraJoinedScaleFlag = 0 path).
+// =====================================================================
+//
+// Round 174 / 181 landed the §8.9.3 luma inverse mapping helpers; the
+// outstanding "lacks" tail on the workspace README row is the matching
+// chroma derivation (eq. 1384-1385 for the §8.9.6 entry point;
+// eq. 1386-1393 for the §8.9.7 derived state; eq. 1394 for the §8.9.8
+// adjusted chroma DRA scales).
+//
+// §8.9.8 has two branches:
+//
+//   - `DraJoinedScaleFlag == 0` (the simpler path, `dra_table_idx == 58`
+//     per §7.4.7 page 85): `chromaScale = (cIdx == 0) ? dra_cb_scale_value
+//     : dra_cr_scale_value` (eq. 1394). The chroma scale is independent
+//     of the luma scale entry: `chromaScales[cIdx][i]` collapses to the
+//     same value for every `i ∈ [0, numRangesL − 1]`.
+//
+//   - `DraJoinedScaleFlag == 1` (the table-driven path,
+//     `dra_table_idx ∈ [0, 57]`): runs the long eq. 1395-1419 chain
+//     against `ChromaQpTable` (which is itself an SPS-derived table per
+//     §7.4.3 page 78) and the §8.9.5 `ScaleQP` / `QpScale` tables
+//     (eq. 1420-1421). This requires plumbing through the active SPS's
+//     `ChromaQpTable` (an inter-crate surface), so round 187 surfaces
+//     the joined path as a documented `Err(Error::Unsupported)` and
+//     leaves it for a follow-up round once the SPS half is wired in.
+//
+// Round 187 lands the §8.9.7 + §8.9.8-unjoined chain end-to-end so
+// callers can apply §8.9.6 chroma scaling for the `DraJoinedScaleFlag = 0`
+// path; the joined path is signalled at the derive-time entry point so
+// the caller surfaces the gap rather than silently producing the wrong
+// scale.
+//
+// Stays bit-faithful to the spec: every eq. number quoted in a code
+// comment below is a direct transcription of the ISO/IEC 23094-1:2020(E)
+// PDF.
+
+/// Maximum size of the §8.9.7 chroma-range arrays. `numRangesC =
+/// dra_number_ranges_minus1 + 2`, so the array has `DRA_MAX_RANGES_V2 + 1`
+/// in-spec entries (32 + 1 = 33). §8.9.5 indexes one entry past the
+/// `numRanges`-th slot (the top sentinel), so the storage needs
+/// `DRA_MAX_RANGES_V2 + 2 = 34` slots.
+pub const DRA_MAX_RANGES_C: usize = DRA_MAX_RANGES_V2 + 2;
+
+/// §8.9.7-derived per-APS chroma DRA state for a single chroma component
+/// `cIdx` (Cb when `cIdx == 0`, Cr when `cIdx == 1`).
+///
+/// Built by [`derive_dra_chroma_state`] from a [`DraSyntax`] +
+/// [`DraDerived`] pair (the round-151 luma half).
+///
+/// Layout mirrors §8.9.7 (page 306):
+///
+/// * `out_ranges_c[0..=num_ranges_l]` — boundary array indexed
+///   `[0, numRangesC − 1] = [0, numRangesL]`. Index 0 is
+///   `OutRangesL[0] = 0` (the line before eq. 1387). Indices
+///   `[1, numRangesL]` come from eq. 1387 (`(OutRangesL[i] +
+///   OutRangesL[i − 1]) >> 1`). The total of `numRangesL + 1` boundaries
+///   matches the §8.9.5 invocation that takes
+///   `dra_number_ranges_minus1 + 2 = numRangesC` as its `numRanges`.
+/// * `chroma_scales[i]` — eq. 1394 evaluated for `cIdx`; constant
+///   across `i ∈ [0, numRangesL − 1]` under `DraJoinedScaleFlag == 0`.
+/// * `inv_chroma_scales[i]` — eq. 1386 for `i ∈ [0, numRangesL − 1]`.
+/// * `out_scales_c[i]` / `out_offsets_c[i]` for `i ∈
+///   [0, numRangesC − 1] = [0, numRangesL]`:
+///   - `i = 0`: explicit `OutScalesC[0] = OutOffsetsC[0] = 0` +
+///     `OutRangesC[0] = OutRangesL[0]` per the line above eq. 1387.
+///     The fact that `OutOffsetsC[0] = invChromaScales[0]` is also a
+///     valid reading: spec page 306 line above eq. 1387 says
+///     "Variables OutScalesC[cIdx][0], OutOffsetsC[cIdx][0] and
+///     OutRangesC[0] are set equal to 0, invChromaScales[cIdx][0] and
+///     OutRangesL[0], respectively." — i.e. `OutOffsetsC[0] =
+///     invChromaScales[0]`, not 0. The "respectively" pattern makes
+///     the spec text ambiguous at first reading; round 187 follows
+///     the parallel structure of the sentence (three left-hand
+///     variables matched to three right-hand values position-wise),
+///     so `OutOffsetsC[0]` is set equal to `invChromaScales[0]`,
+///     `OutScalesC[0]` to 0, `OutRangesC[0]` to `OutRangesL[0]`.
+///   - `i ∈ [1, numRangesL − 1]`: eq. 1391 + eq. 1389.
+///   - `i = numRangesL`: eq. 1392 + eq. 1393.
+#[derive(Clone, Debug)]
+pub struct DraChromaDerived {
+    /// Which chroma component this state was derived for.
+    pub cidx: ChromaIdx,
+    /// `numRangesL = dra_number_ranges_minus1 + 1`.
+    pub num_ranges_l: usize,
+    /// `OutRangesC[0..=num_ranges_l]` — the §8.9.5 `rangesArray` input
+    /// for §8.9.6, with `numRangesC = num_ranges_l + 1` total entries.
+    pub out_ranges_c: [i64; DRA_MAX_RANGES_C],
+    /// `chromaScales[cIdx][i]` per eq. 1394 (DraJoinedScaleFlag = 0).
+    /// Sized to `num_ranges_l` entries.
+    pub chroma_scales: [i64; DRA_MAX_RANGES_V2],
+    /// `invChromaScales[cIdx][i]` per eq. 1386.
+    pub inv_chroma_scales: [i64; DRA_MAX_RANGES_V2],
+    /// `OutScalesC[cIdx][i]` for `i ∈ [0, numRangesC − 1]` — §8.9.6
+    /// reads `OutScalesC[cIdx][rangeIdx]` in eq. 1385.
+    pub out_scales_c: [i64; DRA_MAX_RANGES_C],
+    /// `OutOffsetsC[cIdx][i]` for `i ∈ [0, numRangesC − 1]` — §8.9.6
+    /// reads `OutOffsetsC[cIdx][rangeIdx]` in eq. 1385.
+    pub out_offsets_c: [i64; DRA_MAX_RANGES_C],
+}
+
+/// Chroma component index used by §8.9.6 / §8.9.7 / §8.9.8. EVC has two
+/// chroma components: `Cb` (`cIdx == 0`) and `Cr` (`cIdx == 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromaIdx {
+    /// Cb — `cIdx == 0`. Eq. 1394 picks `dra_cb_scale_value`.
+    Cb,
+    /// Cr — `cIdx == 1`. Eq. 1394 picks `dra_cr_scale_value`.
+    Cr,
+}
+
+impl ChromaIdx {
+    /// Numeric value of `cIdx` per spec convention.
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ChromaIdx::Cb => 0,
+            ChromaIdx::Cr => 1,
+        }
+    }
+}
+
+impl DraChromaDerived {
+    /// Zero-initialised state for a `cidx` with no ranges populated. The
+    /// §8.9.6 helpers no-op on this (zero `num_ranges_l`).
+    fn empty(cidx: ChromaIdx) -> Self {
+        Self {
+            cidx,
+            num_ranges_l: 0,
+            out_ranges_c: [0i64; DRA_MAX_RANGES_C],
+            chroma_scales: [0i64; DRA_MAX_RANGES_V2],
+            inv_chroma_scales: [0i64; DRA_MAX_RANGES_V2],
+            out_scales_c: [0i64; DRA_MAX_RANGES_C],
+            out_offsets_c: [0i64; DRA_MAX_RANGES_C],
+        }
+    }
+}
+
+/// Derive the §8.9.7 chroma DRA state for chroma component `cidx`, given
+/// the parsed [`DraSyntax`] + the round-151 §7.4.7 [`DraDerived`].
+///
+/// Runs eq. 1386-1393 transcribed verbatim. For the §8.9.8 chromaScales
+/// derivation it follows the `DraJoinedScaleFlag == 0` branch (eq. 1394)
+/// — the simpler "use `dra_cb_scale_value` / `dra_cr_scale_value`
+/// directly" path.
+///
+/// Returns an [`Error::Unsupported`] when `derived.joined_scale_flag` is
+/// `true` (the `dra_table_idx != 58` joined path; eq. 1395-1419 — needs
+/// the SPS's `ChromaQpTable` which round 187 does not thread through).
+///
+/// Returns an [`Error::Invalid`] when:
+///
+/// * `dra_cb_scale_value == 0` (cIdx = Cb path); a zero divides
+///   eq. 1386's `(1 << 18) / chromaScales[0]`.
+/// * `dra_cr_scale_value == 0` (cIdx = Cr path), same reason.
+///
+/// Both cases are forbidden by §7.4.7's scale-value range
+/// `[1, (4 << dra_descriptor2) − 1]`, but we check defensively so a
+/// malformed APS doesn't panic on division.
+pub fn derive_dra_chroma_state(
+    syntax: &DraSyntax,
+    derived: &DraDerived,
+    cidx: ChromaIdx,
+    bit_depth_y: u32,
+) -> Result<DraChromaDerived> {
+    if derived.joined_scale_flag {
+        return Err(Error::unsupported(
+            "evc dra: §8.9.8 DraJoinedScaleFlag = 1 (joined chroma scale via ChromaQpTable) \
+             is not yet wired through round 187; needs SPS ChromaQpTable threading",
+        ));
+    }
+    if !(8..=16).contains(&bit_depth_y) {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_y must be in [8, 16] (per SPS §7.4.3.1)",
+        ));
+    }
+    if derived.num_ranges == 0 {
+        return Ok(DraChromaDerived::empty(cidx));
+    }
+
+    let mut c = DraChromaDerived::empty(cidx);
+    c.num_ranges_l = derived.num_ranges;
+    let num_ranges_l = c.num_ranges_l;
+    // numRangesC = dra_number_ranges_minus1 + 2 = num_ranges_l + 1.
+    let num_ranges_c = num_ranges_l + 1;
+
+    // eq. 1394 (§8.9.8 DraJoinedScaleFlag = 0 path): chromaScale =
+    // (cIdx == 0) ? dra_cb_scale_value : dra_cr_scale_value.
+    // Independent of `i` — so `chromaScales[cIdx][i]` is constant across
+    // the luma range index `i`.
+    let scale_value = match cidx {
+        ChromaIdx::Cb => syntax.dra_cb_scale_value as i64,
+        ChromaIdx::Cr => syntax.dra_cr_scale_value as i64,
+    };
+    if scale_value == 0 {
+        return Err(Error::invalid(
+            "evc dra: chroma scale value == 0 (forbidden by §7.4.7); cannot derive invChromaScales",
+        ));
+    }
+
+    // eq. 1386: invChromaScales[cIdx][i] = ((1 << 18) + (chromaScales[cIdx][i] >> 1))
+    //                                       / chromaScales[cIdx][i].
+    // Since chromaScales is constant across `i` under DraJoinedScaleFlag = 0,
+    // invChromaScales is also constant.
+    let inv_scale = ((1i64 << 18) + (scale_value >> 1)) / scale_value;
+    for i in 0..num_ranges_l {
+        c.chroma_scales[i] = scale_value;
+        c.inv_chroma_scales[i] = inv_scale;
+    }
+
+    // Line above eq. 1387: "Variables OutScalesC[cIdx][0],
+    // OutOffsetsC[cIdx][0] and OutRangesC[0] are set equal to 0,
+    // invChromaScales[cIdx][0] and OutRangesL[0], respectively."
+    c.out_scales_c[0] = 0;
+    c.out_offsets_c[0] = inv_scale;
+    c.out_ranges_c[0] = derived.out_ranges_l[0];
+
+    // eq. 1387: OutRangesC[i] = (OutRangesL[i] + OutRangesL[i − 1]) >> 1
+    // for i in [1, numRangesC − 1] = [1, numRangesL].
+    for i in 1..num_ranges_c {
+        c.out_ranges_c[i] = (derived.out_ranges_l[i] + derived.out_ranges_l[i - 1]) >> 1;
+    }
+
+    // eq. 1388-1391: for i in [1, dra_number_ranges_minus1] =
+    // [1, num_ranges_l − 1].
+    for i in 1..num_ranges_l {
+        // eq. 1388: deltaRange = OutRangesC[i + 1] − OutRangesC[i].
+        let delta_range = c.out_ranges_c[i + 1] - c.out_ranges_c[i];
+        // eq. 1389: OutOffsetsC[cIdx][i] = invChromaScales[cIdx][i − 1].
+        c.out_offsets_c[i] = c.inv_chroma_scales[i - 1];
+        // eq. 1390: deltaScale = invChromaScales[cIdx][i] − invChromaScales[cIdx][i − 1].
+        let delta_scale = c.inv_chroma_scales[i] - c.inv_chroma_scales[i - 1];
+        // eq. 1391: OutScalesC[cIdx][i] = ((deltaScale << 10) + (deltaRange >> 1)) / deltaRange.
+        // delta_range == 0 would divide by zero — that requires
+        // OutRangesC[i + 1] == OutRangesC[i], which only happens with
+        // degenerate DRA syntax (zero-width range). Guard defensively.
+        c.out_scales_c[i] = if delta_range == 0 {
+            0
+        } else {
+            ((delta_scale << 10) + (delta_range >> 1)) / delta_range
+        };
+    }
+
+    // eq. 1392-1393: i = numRangesL.
+    // OutOffsetsC[cIdx][numRangesL] = invChromaScales[cIdx][numRangesL − 1].
+    c.out_offsets_c[num_ranges_l] = c.inv_chroma_scales[num_ranges_l - 1];
+    // OutScalesC[cIdx][numRangesL] = 0.
+    c.out_scales_c[num_ranges_l] = 0;
+
+    // §8.9.5 top-sentinel: §8.9.6 invokes §8.9.5 with `numRanges =
+    // dra_number_ranges_minus1 + 2 = num_ranges_c`, which reads
+    // `rangesArray[rangeIdx + 1]` for `rangeIdx ∈ [0, num_ranges_c − 1]`
+    // — so the final iteration reads `rangesArray[num_ranges_c]`. §8.9.7
+    // only derives OutRangesC up to `[num_ranges_c − 1] = [num_ranges_l]`,
+    // so we synthesise a top sentinel at `1 << bit_depth_y` (the sample-
+    // space upper bound), matching round 148's `build_ranges_array` for
+    // the luma side. Without this, samples larger than every internal
+    // chroma boundary would index past the derived state's end.
+    c.out_ranges_c[num_ranges_c] = 1i64 << bit_depth_y;
+
+    Ok(c)
+}
+
+/// Apply §8.9.6 to a single luma sample: derive the §8.9.6 `chromaScale`
+/// for a given luma sample value, using the round-187 [`DraChromaDerived`]
+/// state.
+///
+/// Spec text:
+///
+/// ```text
+/// rangeIdx = §8.9.5(lumaSample, OutRangesC, dra_number_ranges_minus1 + 2)
+/// incValue = lumaSample − OutRangesC[cIdx][rangeIdx]                  (1384)
+/// chromaScale = OutOffsetsC[apsId][cIdx][rangeIdx] +
+///   (OutScalesC[apsId][cIdx][rangeIdx] * incValue + (1 << 9)) >> 10   (1385)
+/// ```
+///
+/// `chroma_derived` must be the [`DraChromaDerived`] returned by
+/// [`derive_dra_chroma_state`] (it already encodes `cIdx`). The caller
+/// passes `lumaSample` as the **decoded pre-mapping luma sample at the
+/// co-located position** (§8.9.2 input contract; see round 148 for the
+/// matching subsampling logic).
+///
+/// Returns the §8.9.6 `chromaScale` as `i64` so callers can apply
+/// eq. 1378 (signed-magnitude chroma multiply) without losing
+/// precision. Returns 0 when `num_ranges_l == 0` (empty state).
+pub fn chroma_scale_for_luma_sample(luma_sample: i64, chroma_derived: &DraChromaDerived) -> i64 {
+    if chroma_derived.num_ranges_l == 0 {
+        return 0;
+    }
+    // §8.9.5 over OutRangesC with numRanges = numRangesC = num_ranges_l + 1.
+    let ranges_array = out_ranges_c_as_i32(chroma_derived);
+    let num_ranges_c = chroma_derived.num_ranges_l + 1;
+    let range_idx = find_range_idx(luma_sample as i32, &ranges_array, num_ranges_c);
+    // eq. 1384.
+    let inc_value = luma_sample - chroma_derived.out_ranges_c[range_idx];
+    // eq. 1385.
+    chroma_derived.out_offsets_c[range_idx]
+        + ((chroma_derived.out_scales_c[range_idx] * inc_value + (1i64 << 9)) >> 10)
+}
+
+/// Materialise `chroma_derived.out_ranges_c[0..=num_ranges_c]` as an
+/// `i32` vector suitable for [`find_range_idx`]. Includes the top
+/// sentinel `1 << bit_depth_y` placed at index `num_ranges_c` by
+/// [`derive_dra_chroma_state`]. Mirrors [`out_ranges_l_as_i32`] for the
+/// chroma side; the +1 over the chroma-derived count reflects §8.9.5's
+/// one-past-end indexing.
+fn out_ranges_c_as_i32(chroma_derived: &DraChromaDerived) -> Vec<i32> {
+    // numRangesC = num_ranges_l + 1; we need num_ranges_l + 2 boundaries
+    // (one per range + one top sentinel) so §8.9.5 indexes safely up to
+    // rangesArray[numRangesC].
+    let n = chroma_derived.num_ranges_l + 2;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = chroma_derived.out_ranges_c[i];
+        let clamped = v.clamp(i32::MIN as i64, i32::MAX as i64);
+        out.push(clamped as i32);
+    }
+    out
+}
+
+// =====================================================================
 // Tests.
 // =====================================================================
 
@@ -2090,5 +2411,299 @@ mod tests {
         let v_mid = map_one_luma_sample(150, &ranges, &der, 255);
         // (−65536 + 153600 + 256) >> 9 = 88320 >> 9 = 172.
         assert_eq!(v_mid, 172);
+    }
+
+    // ============================================================
+    // Round 187 — §8.9.6 / §8.9.7 / §8.9.8 chroma derivation tests.
+    // ============================================================
+
+    /// Three-range syntax with `dra_table_idx = 58` (DraJoinedScaleFlag = 0
+    /// path). Cb scale = 256 (Q9 ≈ 0.5), Cr scale = 1024 (Q9 ≈ 2.0).
+    fn three_range_unjoined_chroma_syntax(bit_depth: u32) -> DraSyntax {
+        let _ = bit_depth;
+        let mut delta = [0u16; DRA_MAX_RANGES_V2];
+        // Equal-ranges off; per-range distinct deltas.
+        delta[0] = 32;
+        delta[1] = 64;
+        delta[2] = 96;
+        let mut scales = [0u16; DRA_MAX_RANGES_V2];
+        scales[0] = 512; // Q9 = 1.0
+        scales[1] = 512;
+        scales[2] = 512;
+        DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 2, // 3 luma ranges
+            dra_equal_ranges_flag: false,
+            dra_global_offset: 16,
+            dra_delta_range: delta,
+            dra_scale_value: scales,
+            dra_cb_scale_value: 256,
+            dra_cr_scale_value: 1024,
+            dra_table_idx: 58,
+        }
+    }
+
+    #[test]
+    fn round187_chroma_derive_rejects_joined_path() {
+        // dra_table_idx != 58 ⇒ DraJoinedScaleFlag = 1 ⇒ §8.9.8
+        // eq. 1395-1419 chain (needs ChromaQpTable). Round 187 surfaces
+        // this as Err so the caller doesn't silently use a wrong scale.
+        let mut syn = three_range_unjoined_chroma_syntax(10);
+        syn.dra_table_idx = 0; // joined path
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let res = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10);
+        assert!(res.is_err(), "joined path must error out");
+    }
+
+    #[test]
+    fn round187_chroma_derive_rejects_zero_cb_scale() {
+        // dra_cb_scale_value = 0 is forbidden by §7.4.7; helper
+        // defends against the divide-by-zero in eq. 1386.
+        let mut syn = three_range_unjoined_chroma_syntax(10);
+        syn.dra_cb_scale_value = 0;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert!(derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).is_err());
+        // Cr path still derives fine.
+        assert!(derive_dra_chroma_state(&syn, &der, ChromaIdx::Cr, 10).is_ok());
+    }
+
+    #[test]
+    fn round187_chroma_derive_rejects_zero_cr_scale() {
+        let mut syn = three_range_unjoined_chroma_syntax(10);
+        syn.dra_cr_scale_value = 0;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert!(derive_dra_chroma_state(&syn, &der, ChromaIdx::Cr, 10).is_err());
+        assert!(derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).is_ok());
+    }
+
+    #[test]
+    fn round187_chroma_derive_noop_on_empty_state() {
+        // num_ranges = 0 ⇒ chroma derivation is a no-op (empty state).
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let mut der = DraDerived::empty();
+        der.joined_scale_flag = false;
+        // num_ranges intentionally 0.
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        assert_eq!(c.num_ranges_l, 0);
+        assert_eq!(c.cidx, ChromaIdx::Cb);
+        // chroma_scale_for_luma_sample on empty state returns 0.
+        assert_eq!(chroma_scale_for_luma_sample(100, &c), 0);
+    }
+
+    #[test]
+    fn round187_chroma_derive_eq1386_inv_chroma_scales_identity() {
+        // Cb scale = 512 (Q9 1.0) ⇒ invChromaScales = ((1<<18) + 256) / 512 = 512.
+        let mut syn = three_range_unjoined_chroma_syntax(10);
+        syn.dra_cb_scale_value = 512;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        // ((1 << 18) + (512 >> 1)) / 512 = (262144 + 256) / 512 = 262400 / 512 = 512.
+        let expected_inv = ((1i64 << 18) + (512 >> 1)) / 512;
+        assert_eq!(expected_inv, 512);
+        for i in 0..c.num_ranges_l {
+            assert_eq!(c.chroma_scales[i], 512, "chroma_scales[{i}]");
+            assert_eq!(c.inv_chroma_scales[i], 512, "inv_chroma_scales[{i}]");
+        }
+    }
+
+    #[test]
+    fn round187_chroma_derive_eq1386_doubled_chroma_scale() {
+        // Cb scale = 1024 (Q9 = 2.0) ⇒ invChromaScales = ((1<<18) + 512) / 1024 = 256.
+        // The Cb path uses dra_cb_scale_value (256), so override for this test.
+        let mut syn = three_range_unjoined_chroma_syntax(10);
+        syn.dra_cb_scale_value = 1024;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        // ((1<<18) + 512) / 1024 = 262656 / 1024 = 256.
+        for i in 0..c.num_ranges_l {
+            assert_eq!(c.chroma_scales[i], 1024);
+            assert_eq!(c.inv_chroma_scales[i], 256);
+        }
+    }
+
+    #[test]
+    fn round187_chroma_derive_eq1387_out_ranges_c_midpoints() {
+        // OutRangesC[0] = OutRangesL[0] = 0.
+        // OutRangesC[i] = (OutRangesL[i] + OutRangesL[i-1]) >> 1 for i in [1, numRangesL].
+        // With identity-Q9 luma scale and 3 ranges, OutRangesL is monotonic so
+        // OutRangesC[i] sits halfway between OutRangesL[i-1] and OutRangesL[i].
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        // OutRangesC[0] == OutRangesL[0].
+        assert_eq!(c.out_ranges_c[0], der.out_ranges_l[0]);
+        // OutRangesC[i] = midpoint.
+        for i in 1..=der.num_ranges {
+            let mid = (der.out_ranges_l[i] + der.out_ranges_l[i - 1]) >> 1;
+            assert_eq!(c.out_ranges_c[i], mid, "OutRangesC[{i}]");
+        }
+    }
+
+    #[test]
+    fn round187_chroma_derive_eq1389_eq1391_out_scales_offsets_unjoined() {
+        // Under DraJoinedScaleFlag = 0, invChromaScales is constant across i,
+        // so deltaScale = invChromaScales[i] − invChromaScales[i−1] = 0 for
+        // every i ∈ [1, num_ranges_minus1]. Therefore OutScalesC[i] = 0 for
+        // every such i. OutOffsetsC[i] = invChromaScales[i−1] = the constant.
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        // num_ranges_minus1 = 2 ⇒ loop runs i ∈ [1, 2].
+        for i in 1..der.num_ranges {
+            assert_eq!(
+                c.out_scales_c[i], 0,
+                "OutScalesC[{i}] = 0 (deltaScale is 0 under joined=0)"
+            );
+            assert_eq!(
+                c.out_offsets_c[i], c.inv_chroma_scales[0],
+                "OutOffsetsC[{i}] = invChromaScales[i−1]"
+            );
+        }
+    }
+
+    #[test]
+    fn round187_chroma_derive_eq1392_eq1393_top_sentinel() {
+        // i = numRangesL: OutOffsetsC[numRangesL] = invChromaScales[numRangesL − 1]
+        //                 OutScalesC[numRangesL] = 0.
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cr, 10).unwrap();
+        let top = c.num_ranges_l;
+        assert_eq!(c.out_offsets_c[top], c.inv_chroma_scales[top - 1]);
+        assert_eq!(c.out_scales_c[top], 0);
+    }
+
+    #[test]
+    fn round187_chroma_derive_index_zero_layout_matches_spec() {
+        // Line above eq. 1387: "Variables OutScalesC[cIdx][0],
+        // OutOffsetsC[cIdx][0] and OutRangesC[0] are set equal to 0,
+        // invChromaScales[cIdx][0] and OutRangesL[0], respectively."
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        assert_eq!(c.out_scales_c[0], 0);
+        assert_eq!(c.out_offsets_c[0], c.inv_chroma_scales[0]);
+        assert_eq!(c.out_ranges_c[0], der.out_ranges_l[0]);
+    }
+
+    #[test]
+    fn round187_chroma_derive_cb_cr_distinct() {
+        // Cb and Cr paths derive independently from their own scale values.
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let cb = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        let cr = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cr, 10).unwrap();
+        // Cb uses dra_cb_scale_value = 256; Cr uses dra_cr_scale_value = 1024.
+        assert_eq!(cb.chroma_scales[0], 256);
+        assert_eq!(cr.chroma_scales[0], 1024);
+        // Different inverse: ((1<<18) + 128) / 256 = 1024 vs 256.
+        assert_eq!(cb.inv_chroma_scales[0], ((1i64 << 18) + 128) / 256);
+        assert_eq!(cr.inv_chroma_scales[0], ((1i64 << 18) + 512) / 1024);
+        // OutRangesC is component-agnostic — it's a function of OutRangesL.
+        for i in 0..=cb.num_ranges_l {
+            assert_eq!(cb.out_ranges_c[i], cr.out_ranges_c[i]);
+        }
+    }
+
+    #[test]
+    fn round187_chroma_scale_for_sample_eq1384_eq1385_unjoined() {
+        // Under joined = 0, eq. 1385 with constant invChromaScales:
+        //   OutOffsetsC[0] = invChromaScales[0] = const,
+        //   OutScalesC[0] = 0 ⇒ eq. 1385 collapses to chromaScale =
+        //     OutOffsetsC[0] + ((0 * incValue + 512) >> 10) = invChromaScales[0].
+        // i.e. the §8.9.6 chromaScale is constant across luma samples
+        // (matches the §8.9.8 joined-flag-0 reading where the scale is a
+        // single value per chroma component, not per luma range).
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        let expected = c.inv_chroma_scales[0];
+        // Pick a luma sample inside the first range. OutRangesC[0] = 0,
+        // OutRangesC[1] is some positive midpoint, so 10 will hit range 0.
+        let s0 = chroma_scale_for_luma_sample(10, &c);
+        assert_eq!(s0, expected);
+        // And a higher sample value: still picks a range with same constant
+        // OutOffsetsC + zero OutScalesC contribution.
+        // But the higher ranges use OutOffsetsC[i] = invChromaScales[i−1] =
+        // the same constant. So every range yields the same scale.
+        let s_mid = chroma_scale_for_luma_sample(c.out_ranges_c[1] + 1, &c);
+        let s_hi = chroma_scale_for_luma_sample(c.out_ranges_c[c.num_ranges_l], &c);
+        assert_eq!(s_mid, expected);
+        assert_eq!(s_hi, expected);
+    }
+
+    #[test]
+    fn round187_chroma_scale_constant_property_unjoined() {
+        // The whole point of DraJoinedScaleFlag = 0 is that §8.9.6's
+        // chromaScale collapses to a single value per chroma component —
+        // verify across the full 10-bit sample range that
+        // chroma_scale_for_luma_sample is constant.
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cr, 10).unwrap();
+        let baseline = chroma_scale_for_luma_sample(0, &c);
+        for v in (0..1024).step_by(13) {
+            let s = chroma_scale_for_luma_sample(v as i64, &c);
+            assert_eq!(s, baseline, "chromaScale should be constant; v = {v}");
+        }
+    }
+
+    #[test]
+    fn round187_chroma_scale_for_sample_handles_out_of_range_high() {
+        // §8.9.5 ends with Min(rangeIdx, numRanges − 1) — a luma sample
+        // larger than OutRangesC's top boundary still picks the last range
+        // (no panic, no out-of-bounds). With joined = 0 the constant chroma
+        // scale is unchanged.
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        let baseline = chroma_scale_for_luma_sample(0, &c);
+        let s = chroma_scale_for_luma_sample(i32::MAX as i64 / 2, &c);
+        assert_eq!(s, baseline);
+    }
+
+    #[test]
+    fn round187_chroma_derive_single_range_identity() {
+        // num_ranges_minus1 = 0 ⇒ num_ranges_l = 1, num_ranges_c = 2.
+        // Eq. 1388-1391 loop body is empty (i ∈ [1, 0] = ∅).
+        // Only eq. 1392-1393 (top sentinel) and the i = 0 line apply.
+        let mut delta = [0u16; DRA_MAX_RANGES_V2];
+        delta[0] = 64;
+        let mut scales = [0u16; DRA_MAX_RANGES_V2];
+        scales[0] = 512;
+        let syn = DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 0,
+            dra_equal_ranges_flag: true,
+            dra_global_offset: 16,
+            dra_delta_range: delta,
+            dra_scale_value: scales,
+            dra_cb_scale_value: 512,
+            dra_cr_scale_value: 512,
+            dra_table_idx: 58,
+        };
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10).unwrap();
+        assert_eq!(c.num_ranges_l, 1);
+        // OutRangesC has 2 entries: [OutRangesL[0], (OutRangesL[1] + OutRangesL[0]) >> 1].
+        assert_eq!(c.out_ranges_c[0], der.out_ranges_l[0]);
+        assert_eq!(
+            c.out_ranges_c[1],
+            (der.out_ranges_l[1] + der.out_ranges_l[0]) >> 1
+        );
+        // i = 0 layout.
+        assert_eq!(c.out_scales_c[0], 0);
+        assert_eq!(c.out_offsets_c[0], c.inv_chroma_scales[0]);
+        // Top sentinel at i = num_ranges_l = 1.
+        assert_eq!(c.out_offsets_c[1], c.inv_chroma_scales[0]);
+        assert_eq!(c.out_scales_c[1], 0);
+    }
+
+    #[test]
+    fn round187_chroma_idx_as_u32() {
+        assert_eq!(ChromaIdx::Cb.as_u32(), 0);
+        assert_eq!(ChromaIdx::Cr.as_u32(), 1);
     }
 }
