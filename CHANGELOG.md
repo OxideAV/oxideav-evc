@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-evc/compare/v0.0.1...v0.0.2) - 2026-05-29
+
+### Other
+
+- §8.9.7 chroma DRA derived state + §8.9.6 chromaScale entry point (DraJoinedScaleFlag = 0)
+- wire round-151 spec-faithful DRA state into §8.9.3 entry point
+- §8.9.3 luma inverse mapping helpers + §7.4.7 InvLumaScales[0] docs gap
+- §7.3.6-faithful dra_data() parser + §7.4.7 derivation
+- §8.9.5 range-idx helper + per-sample co-located-luma chroma DRA offset
+- §8.8.4.4 per-CTB chroma type filtering + eq. 1321 tap fix
+- multi-APS cache indexed by adaptation_parameter_set_id
+- §7.3.5 alf_data() rewrite + §8.9.4 AlfCoeffL + §8.8.4.2 classified luma apply
+- derive §8.8.4.3 ALF transpose + classification filter index
+- mask §8.9 ALF luma apply per CTB by the decoded §7.3.8.2 map
+- decode §7.3.8.2 coding_tree_unit() ALF applicability map
+- wire §7.3.8.5 cu_qp_delta into both IBC transform_unit() branches
+- wire §7.3.8.5 cu_qp_delta into the non-skip inter coding_unit() path
+- non-IDR (P/B) IBC coding_unit() wiring
+- IBC coding_unit() branch wiring
+- IBC pipeline composition + §8.5.3.10 MV rounding helper
+- IBC primitive scaffold — §8.6 derivation + validation + integer-pel block copy
+- ALF adaptive loop filter + DRA dynamic range adjustment
+- spatial-neighbour MV grid AMVP + LTRP RPL resolution + flush() drain
+
 ### Round 187 — §8.9.7 chroma DRA derived state + §8.9.6 chromaScale entry point (DraJoinedScaleFlag = 0 path)
 
 #### Added
