@@ -7,6 +7,147 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-193 status
+
+Round 193 lands the **§8.9.8 `DraJoinedScaleFlag = 1` (joined chroma
+scale via `ChromaQpTable`) path**, plus the spec-page-67 default
+`ChromaQpTable` builder for the `chroma_qp_table_present_flag == 0`
+case. This closes the round-187 documented followup ("eq. 1395-1419
+chain needs `ChromaQpTable` threading"). Round-187 still owned the
+unjoined `dra_table_idx == 58` shortcut; round 193 picks up the
+table-driven branch.
+
+New surface:
+
+* `dra::SCALE_QP[55]` — eq. 1420 transcribed verbatim. 55 entries (one
+  extra trailing entry so eq. 1399's `ScaleQP[IndexScaleQP + 1]` is
+  in-bounds at the top).
+* `dra::QP_SCALE[25]` — eq. 1421 transcribed verbatim.
+* `dra::ChromaQpTableEntry { qp_bd_offset_c, table }` — flat-packed
+  `ChromaQpTable[qPi]` for `qPi ∈ [−QpBdOffsetC, 57]`, with
+  `QpBdOffsetC = 6 * bit_depth_chroma_minus8`. `lookup(qpi)` applies
+  the spec's `Clip3(−QpBdOffsetC, 57, qPi)` clamping from eq. 1403 /
+  1404.
+* `dra::ChromaQpTable { cb, cr }` — both chroma components' tables in
+  one struct. `lookup(cidx, qpi)` dispatches by `ChromaIdx`.
+* `dra::default_chroma_qp_table(sps_iqt_flag, bit_depth_chroma_minus8)`
+  — Table 5 (`sps_iqt_flag = 0`) / Table 6 (`sps_iqt_flag = 1`)
+  builder for the `chroma_qp_table_present_flag == 0` path on
+  `ChromaArrayType == 1` (4:2:0). Both `cb` and `cr` are identical
+  byte-for-byte (spec page 67: "for m being equal to 0 and 1").
+* `dra::chroma_scale_joined(luma_scale, dra_cb_scale_value,
+  dra_cr_scale_value, cidx, dra_table_idx, chroma_qp_table) -> i64`
+  — eq. 1395 → 1419 verbatim. Pure function: no state besides the
+  caller-supplied `ChromaQpTable` + the `SCALE_QP` / `QP_SCALE`
+  constants. Used per-luma-range to populate `chromaScales[i]` in
+  `derive_dra_chroma_state_joined`.
+* `dra::derive_dra_chroma_state_joined(syntax, derived, cidx,
+  bit_depth_y, chroma_qp_table)` — full §8.9.7 derivation over the
+  joined `DraJoinedScaleFlag = 1` path. `chromaScales[i]` differs
+  per luma range (function of `dra_scale_value[i]` via eq. 1395);
+  eq. 1386 reciprocates into `inv_chroma_scales[i]`; eq. 1387 /
+  1389-1393 / top-sentinel match the round-187 unjoined chain
+  byte-for-byte (same downstream `out_ranges_c` / `out_scales_c` /
+  `out_offsets_c` shape, so `chroma_scale_for_luma_sample` accepts
+  joined state without modification).
+
+The §8.9.8 spec text has one ambiguity at the "If tableNum is equal
+to 0" branch on page 308. The "otherwise" branch derives
+`qpDraIntAdj` from `qpDraFrac` (eq. 1407) and feeds it into
+eq. 1409's `draChromaQpShift`; the `tableNum == 0` branch sets
+`qpDraFrac = 0` + `qpDraInt -= 1` but leaves `draChromaQpShift`
+undefined in the literal text. Round 193 follows the parallel-
+structure reading: `qpDraIntAdj = 0` (since `qpDraFrac == 0` makes
+the eq. 1407 product trivially 0), `qpDraFracAdj = 0`, and
+eq. 1409 still applies (`draChromaQpShift =
+ChromaQpTable[cIdx][dra_table_idx] − qp0 − qp_dra_int`). The
+in-tree comment quotes the spec text verbatim; a docs collaborator
+should verify the reading before any conformance fixture exercises
+the `tableNum == 0` corner.
+
+### Wiring stance
+
+Same as round 187: the new joined entry point is independent of
+`apply_post_filters` / the legacy `dra::apply_dra` chain. The
+post-filter pipeline stays on the round-148 path so existing
+fixtures don't shift bit positions in this round; the joined entry
+is opt-in behind `derive_dra_chroma_state_joined` +
+`chroma_scale_for_luma_sample`. A subsequent round can decide
+whether to retire the legacy chain once a `sps_dra_flag = 1`
+fixture with `chroma_qp_table_present_flag = 1` arrives.
+
+### Tests
+
+18 new unit tests (407 total; was 389):
+
+* `round193_scale_qp_table_eq1420_first_and_last_entries` — eq. 1420
+  spot checks + monotonicity.
+* `round193_qp_scale_table_eq1421_first_and_last_entries` — eq. 1421
+  spot checks + strict monotonicity + length = 25.
+* `round193_default_chroma_qp_table_iqt_off_table5_spot_checks` —
+  Table 5 (`qPi < 30 ⇒ QpC = qPi`, `qPi=43 ⇒ 36`, `qPi=57 ⇒ 41`);
+  Cb and Cr identical.
+* `round193_default_chroma_qp_table_iqt_on_table6_spot_checks` —
+  Table 6 tabulated entries + the `qPi > 43 ⇒ QpC = qPi − 3` tail.
+* `round193_default_chroma_qp_table_bit_depth_10_negative_qpi` —
+  `bit_depth_chroma_minus8 = 2 ⇒ QpBdOffsetC = 12`; negative `qPi`
+  identity (Table 5, `qPi < 30`); out-of-range `Clip3` clamping.
+* `round193_default_chroma_qp_table_rejects_out_of_range_bit_depth`
+  — `bit_depth_chroma_minus8 > 8` errors.
+* `round193_chroma_scale_joined_returns_positive_for_table5` —
+  joined chromaScale > 0 for both Cb and Cr.
+* `round193_chroma_scale_joined_scales_with_luma_scale` —
+  monotonicity in `lumaScale` (doubling input ⇒ output grows).
+* `round193_chroma_scale_joined_pure_function_property` — same
+  inputs ⇒ same output (no hidden state).
+* `round193_derive_dra_chroma_state_joined_basic` — end-to-end
+  three-range joined derivation populates positive per-range
+  `chroma_scales[]` / `inv_chroma_scales[]`.
+* `round193_derive_joined_per_range_chromascales_differ` — the
+  signature property of the joined path: with distinct luma scales
+  per range, `chroma_scales[]` is NOT constant (distinguishes from
+  unjoined collapse).
+* `round193_derive_joined_rejects_unjoined_state` — calling the
+  joined entry on a `joined_scale_flag == 0` state errors.
+* `round193_derive_joined_rejects_zero_cb_scale` — defensive
+  zero-divisor guard (§7.4.7 forbids zero scales).
+* `round193_derive_joined_rejects_zero_luma_scale` — same guard
+  on `dra_scale_value[i] == 0`; verified against a hand-built
+  `DraDerived` (since `derive_dra_state` itself divides by the luma
+  scales and would panic upstream).
+* `round193_derive_joined_noop_on_empty_state` — `num_ranges == 0`
+  returns an empty `DraChromaDerived`.
+* `round193_chroma_scale_for_sample_works_with_joined_state` —
+  `chroma_scale_for_luma_sample` works transparently on joined
+  state; samples at distinct `OutRangesC` boundaries return distinct
+  scales (joined-path signature, unlike unjoined collapse).
+* `round193_chroma_qp_table_lookup_clamps_to_table_range` — direct
+  `Clip3(−QpBdOffsetC, 57, qPi)` clamping property.
+* `round193_unjoined_derive_error_hint_mentions_joined_entry` —
+  round-187 entry's `Err(Unsupported)` now points at
+  `derive_dra_chroma_state_joined` instead of saying "round 187
+  doesn't thread through".
+
+### Documented followups
+
+* **SPS-signalled `ChromaQpTable` (`chroma_qp_table_present_flag = 1`)
+  parsing.** `crates/oxideav-evc/src/sps.rs:340-358` reads
+  `delta_qp_in_val_minus1[i][j]` + `delta_qp_out_val[i][j]` but
+  discards them. The eq. 74 / spec-page-67 derivation (with
+  `qpInVal[]` / `qpOutVal[]` interpolation across pivot points)
+  needs to populate a `ChromaQpTable` on the parsed [`Sps`] so the
+  joined-path consumer can pick the per-SPS table instead of the
+  Table 5/6 default. Pure transcription work; round 194 slot.
+* `ChromaArrayType == 0` (monochrome) path — spec page 67 line "Otherwise"
+  reads `ChromaQpTable[m][qPi] = qPi`; trivial identity, but the
+  `default_chroma_qp_table` helper currently doesn't take a
+  `chroma_format_idc` argument and would degenerate to a Table-5
+  result for a monochrome SPS. Round 194 follow-up alongside the SPS
+  parser change.
+* The `tableNum == 0` `draChromaQpShift` ambiguity flagged above —
+  needs a docs collaborator's confirmation before the joined path
+  ships against a real `chroma_qp_table_present_flag = 1` fixture.
+
 ## Round-187 status
 
 Round 187 lands the **§8.9.7 chroma DRA derived-state + §8.9.6 chromaScale

@@ -1236,7 +1236,10 @@ pub fn derive_dra_chroma_state(
     if derived.joined_scale_flag {
         return Err(Error::unsupported(
             "evc dra: §8.9.8 DraJoinedScaleFlag = 1 (joined chroma scale via ChromaQpTable) \
-             is not yet wired through round 187; needs SPS ChromaQpTable threading",
+             requires the joined entry point — call \
+             `derive_dra_chroma_state_joined(syntax, derived, cidx, bit_depth_y, &chroma_qp_table)` \
+             with a `ChromaQpTable` from `default_chroma_qp_table` (no signalled SPS table) \
+             or from the SPS-signalled chroma QP mapping (round-193 followup)",
         ));
     }
     if !(8..=16).contains(&bit_depth_y) {
@@ -1366,6 +1369,484 @@ pub fn chroma_scale_for_luma_sample(luma_sample: i64, chroma_derived: &DraChroma
     // eq. 1385.
     chroma_derived.out_offsets_c[range_idx]
         + ((chroma_derived.out_scales_c[range_idx] * inc_value + (1i64 << 9)) >> 10)
+}
+
+// =====================================================================
+// Round 193 — §8.9.8 DraJoinedScaleFlag = 1 (joined chroma scale via
+// ChromaQpTable) + default Table 5/6 ChromaQpTable builder.
+// =====================================================================
+//
+// Round 187 surfaced the joined path (`dra_table_idx ∈ [0, 57]`) as a
+// documented `Err(Error::Unsupported)` because the eq. 1395-1419 chain
+// needs `ChromaQpTable[cIdx][qPi]` — itself an SPS-derived table per
+// §7.4.3 page 67-68 — to translate the integer + fractional `qpDra`
+// shifts into a `draChromaScaleShift`. The actual joined chain is
+// otherwise a pure function of `(lumaScale, dra_cb_scale_value /
+// dra_cr_scale_value, dra_table_idx, ChromaQpTable, ScaleQP, QpScale)`.
+//
+// Round 193 lands the joined path against an externally-supplied
+// `ChromaQpTable`, plus a `default_chroma_qp_table()` builder for the
+// `chroma_qp_table_present_flag == 0` case — the simpler and more
+// common path where the SPS does not signal a user-defined chroma QP
+// mapping and the spec falls back to Table 5 (`sps_iqt_flag == 0`) or
+// Table 6 (`sps_iqt_flag == 1`).
+//
+// The SPS-signalled chroma-QP-table path (eq. 74, with `qpInVal[][]`
+// / `qpOutVal[][]` interpolation across user-supplied pivot points)
+// stays a documented gap: round 193 has the consumer side complete
+// — callers can hand-build a `ChromaQpTable` from any source — but
+// the SPS parser still discards `delta_qp_in_val_minus1` and
+// `delta_qp_out_val`. That's the round-194 follow-up.
+//
+// Stays bit-faithful: every eq. number quoted below is a verbatim
+// transcription of ISO/IEC 23094-1:2020(E).
+
+/// §8.9.8 eq. 1420: `ScaleQP[]` — the 55-entry integer-QP scale table
+/// indexed by `IndexScaleQP ∈ [0, 53]` (one extra trailing entry so
+/// eq. 1399's `ScaleQP[IndexScaleQP + 1]` is in-bounds at the top).
+pub const SCALE_QP: [i64; 55] = [
+    0, 1, 1, 1, 1, 1, 2, 2, 3, 4, 4, 6, 7, 9, 11, 14, 18, 23, 29, 36, 45, 57, 72, 91, 114, 144,
+    181, 228, 287, 362, 456, 575, 724, 912, 1149, 1448, 1825, 2299, 2896, 3649, 4598, 5793, 7298,
+    9195, 11585, 14596, 18390, 23170, 29193, 36781, 46341, 58386, 73562, 92682, 116772,
+];
+
+/// §8.9.8 eq. 1421: `QpScale[]` — the 25-entry inverse-scale table
+/// indexed by `idx ∈ [0, 24]`.
+pub const QP_SCALE: [i64; 25] = [
+    128, 144, 161, 181, 203, 228, 256, 287, 322, 362, 406, 456, 512, 574, 645, 724, 812, 912, 1024,
+    1149, 1290, 1448, 1625, 1825, 2048,
+];
+
+/// `ChromaQpTable` for a single chroma component, indexed by
+/// `qPi ∈ [−QpBdOffsetC, 57]`.
+///
+/// `QpBdOffsetC = 6 * bit_depth_chroma_minus8`. With
+/// `bit_depth_chroma_minus8 ∈ [0, 8]`, the maximum `QpBdOffsetC` is 48
+/// and the maximum table length is `48 + 57 + 1 = 106`. The table
+/// stores values flat-packed at offset `qp_bd_offset_c` so that
+/// `table[(qPi + qp_bd_offset_c) as usize] = ChromaQpTable[qPi]`.
+///
+/// Use [`ChromaQpTableEntry::lookup`] to index by `qPi` directly with
+/// spec-faithful `Clip3(−QpBdOffsetC, 57, qPi)` clamping.
+#[derive(Clone, Debug)]
+pub struct ChromaQpTableEntry {
+    /// `QpBdOffsetC = 6 * bit_depth_chroma_minus8`. The table is indexed
+    /// by `qPi ∈ [−qp_bd_offset_c, 57]` with the `−qp_bd_offset_c`
+    /// origin packed at vector index 0.
+    pub qp_bd_offset_c: i32,
+    /// Flat-packed `ChromaQpTable[qPi]` for
+    /// `qPi ∈ [−qp_bd_offset_c, 57]`.
+    /// Length is `qp_bd_offset_c + 57 + 1 = qp_bd_offset_c + 58`.
+    pub table: Vec<i32>,
+}
+
+impl ChromaQpTableEntry {
+    /// `ChromaQpTable[qPi]` with the spec's `Clip3(−QpBdOffsetC, 57, qPi)`
+    /// clamping per eq. 1403 / 1404. Returns the clamped output value
+    /// (`QpC` in Tables 5/6).
+    #[inline]
+    pub fn lookup(&self, qpi: i32) -> i32 {
+        let lo = -self.qp_bd_offset_c;
+        let hi = 57;
+        let clamped = qpi.clamp(lo, hi);
+        let idx = (clamped + self.qp_bd_offset_c) as usize;
+        self.table[idx]
+    }
+}
+
+/// Both `ChromaQpTable[0]` (Cb) and `ChromaQpTable[1]` (Cr).
+///
+/// When the SPS sets `chroma_qp_table_present_flag == 0`, both tables
+/// derive from Table 5 (`sps_iqt_flag == 0`) or Table 6 (`sps_iqt_flag
+/// == 1`) and are identical across components — use
+/// [`default_chroma_qp_table`] to build that case.
+///
+/// When `chroma_qp_table_present_flag == 1` with
+/// `same_qp_table_for_chroma == 1`, both entries hold the same parsed
+/// table; with `same_qp_table_for_chroma == 0`, the two entries differ.
+#[derive(Clone, Debug)]
+pub struct ChromaQpTable {
+    /// `ChromaQpTable[0]` — Cb component.
+    pub cb: ChromaQpTableEntry,
+    /// `ChromaQpTable[1]` — Cr component.
+    pub cr: ChromaQpTableEntry,
+}
+
+impl ChromaQpTable {
+    /// Look up `ChromaQpTable[cIdx][qPi]` with eq. 1403 / 1404 clamping.
+    #[inline]
+    pub fn lookup(&self, cidx: ChromaIdx, qpi: i32) -> i32 {
+        match cidx {
+            ChromaIdx::Cb => self.cb.lookup(qpi),
+            ChromaIdx::Cr => self.cr.lookup(qpi),
+        }
+    }
+}
+
+/// Build the spec-page-67 default `ChromaQpTable` for the
+/// `chroma_qp_table_present_flag == 0`, `ChromaArrayType == 1` (4:2:0)
+/// path.
+///
+/// `sps_iqt_flag == 0` → Table 5; `sps_iqt_flag == 1` → Table 6. Both
+/// tables produce the same value for Cb and Cr (spec page 67: "for m
+/// being equal to 0 and 1"), so the returned [`ChromaQpTable`] has
+/// `cb == cr` byte-for-byte.
+///
+/// `bit_depth_chroma_minus8` must be in `[0, 8]`. The resulting table
+/// is indexed by `qPi ∈ [−QpBdOffsetC, 57]` where
+/// `QpBdOffsetC = 6 * bit_depth_chroma_minus8`.
+pub fn default_chroma_qp_table(
+    sps_iqt_flag: bool,
+    bit_depth_chroma_minus8: u32,
+) -> Result<ChromaQpTable> {
+    if bit_depth_chroma_minus8 > 8 {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_chroma_minus8 must be in [0, 8]",
+        ));
+    }
+    let qp_bd_offset_c = 6 * bit_depth_chroma_minus8 as i32;
+    let len = (qp_bd_offset_c + 58) as usize;
+    let mut tbl = Vec::with_capacity(len);
+    for qpi in -qp_bd_offset_c..=57 {
+        let qp_c = if sps_iqt_flag {
+            // Table 6.
+            table6_qp_c(qpi)
+        } else {
+            // Table 5.
+            table5_qp_c(qpi)
+        };
+        tbl.push(qp_c);
+    }
+    let cb = ChromaQpTableEntry {
+        qp_bd_offset_c,
+        table: tbl.clone(),
+    };
+    let cr = ChromaQpTableEntry {
+        qp_bd_offset_c,
+        table: tbl,
+    };
+    Ok(ChromaQpTable { cb, cr })
+}
+
+/// Table 5 (ISO/IEC 23094-1:2020(E) page 67) — `QpC` as a function of
+/// `qPi` when `sps_iqt_flag == 0`.
+fn table5_qp_c(qpi: i32) -> i32 {
+    // Tabulated entries for qPi ∈ [30, 57]. qPi < 30 ⇒ QpC = qPi.
+    // qPi >= 58 is out-of-range per §8.9.8 (Clip3(−QpBdOffsetC, 57, ...))
+    // but we tolerate it defensively by returning the qPi == 57 value.
+    if qpi < 30 {
+        return qpi;
+    }
+    const TBL: [i32; 28] = [
+        29, 29, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, // 30..=43
+        36, 36, 37, 37, 37, 38, 38, 39, 39, 40, 40, 40, 41, 41, // 44..=57
+    ];
+    let idx = (qpi.min(57) - 30) as usize;
+    TBL[idx]
+}
+
+/// Table 6 (ISO/IEC 23094-1:2020(E) page 67) — `QpC` as a function of
+/// `qPi` when `sps_iqt_flag == 1`.
+fn table6_qp_c(qpi: i32) -> i32 {
+    // qPi < 30 ⇒ QpC = qPi. qPi > 43 ⇒ QpC = qPi − 3. Tabulated for
+    // qPi ∈ [30, 43].
+    if qpi < 30 {
+        return qpi;
+    }
+    if qpi > 43 {
+        return qpi - 3;
+    }
+    const TBL: [i32; 14] = [29, 30, 31, 32, 33, 34, 35, 36, 37, 37, 38, 39, 40, 40];
+    let idx = (qpi - 30) as usize;
+    TBL[idx]
+}
+
+/// §8.9.5 helper specialised for the `ScaleQP` array — find the largest
+/// `IndexScaleQP ∈ [0, len − 1]` such that `ScaleQP[IndexScaleQP] <=
+/// scale_dra_norm < ScaleQP[IndexScaleQP + 1]`.
+///
+/// `ScaleQP` is monotonically non-decreasing (eq. 1420), so the spec's
+/// `inputSample < rangesArray[rangeIdx + 1]` early-out lookup is well
+/// defined. The §8.9.8 invocation passes `size = 54` and the table has
+/// 55 entries (one extra for the upper sentinel) so the +1 is safe.
+fn scale_qp_range_idx(scale_dra_norm: i64) -> usize {
+    // §8.9.5 with numRanges = 54, rangesArray = ScaleQP.
+    let num_ranges: usize = 54;
+    for range_idx in 0..num_ranges {
+        if scale_dra_norm < SCALE_QP[range_idx + 1] {
+            return range_idx;
+        }
+    }
+    num_ranges - 1
+}
+
+/// §8.9.8 (joined path) — derive `chromaScale` for a single `lumaScale`
+/// + `cIdx` input. Pure function: every input is on the call line and
+///   the only state read is the eq. 1420 / 1421 `SCALE_QP` / `QP_SCALE`
+///   constants + the caller-supplied `ChromaQpTable`.
+///
+/// Transcribes eq. 1395 → 1419 verbatim. Used by
+/// [`derive_dra_chroma_state_joined`] to fill `chroma_scales[i]` for
+/// every luma range `i`.
+///
+/// `dra_table_idx` must be in `[0, 57]` (joined path); the unjoined
+/// shortcut at `dra_table_idx == 58` is handled by
+/// [`derive_dra_chroma_state`] (eq. 1394).
+pub fn chroma_scale_joined(
+    luma_scale: i64,
+    dra_cb_scale_value: u16,
+    dra_cr_scale_value: u16,
+    cidx: ChromaIdx,
+    dra_table_idx: u8,
+    chroma_qp_table: &ChromaQpTable,
+) -> i64 {
+    // Eq. 1395: scaleDra = lumaScale * ((cIdx == 0) ? dra_cb_scale_value
+    //                                                : dra_cr_scale_value).
+    let component_scale = match cidx {
+        ChromaIdx::Cb => dra_cb_scale_value as i64,
+        ChromaIdx::Cr => dra_cr_scale_value as i64,
+    };
+    let scale_dra = luma_scale * component_scale;
+    // Eq. 1396: scaleDraNorm = (scaleDra + (1 << 8)) >> 9.
+    let scale_dra_norm = (scale_dra + (1i64 << 8)) >> 9;
+
+    // IndexScaleQP via §8.9.5 over ScaleQP.
+    let index_scale_qp = scale_qp_range_idx(scale_dra_norm);
+
+    // Eq. 1397: qpDraInt = 2 * IndexScaleQP − 60.
+    let mut qp_dra_int: i64 = 2 * (index_scale_qp as i64) - 60;
+
+    // Eq. 1398-1399.
+    let table_num = scale_dra_norm - SCALE_QP[index_scale_qp];
+    let table_delta = SCALE_QP[index_scale_qp + 1] - SCALE_QP[index_scale_qp];
+
+    // Spec page 308: "If tableNum is equal to 0, the variable qpDraFrac
+    // is set equal to 0, and the variable qpDraInt is decreased by 1,
+    // otherwise the variables qpDraInt, qpDraFrac and draChromaQpShift
+    // are derived as follows: …"
+    //
+    // Both branches end up computing draChromaQpShift (eq. 1409 in the
+    // "otherwise" branch). The tableNum == 0 branch leaves
+    // draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 −
+    // qpDraIntAdj − qpDraInt with qpDraIntAdj = 0 and qpDraFracAdj = 0
+    // (since qpDraFrac is set to 0 and qp1 − qp0 multiplied by 0 is 0);
+    // the qpDraInt -= 1 line then matches the qpDraInt += (qpDraFrac
+    // >> 9) of the otherwise branch under qpDraFrac == 0 (which gives
+    // qpDraFrac = 1 << 9 after eq. 1402, then qpDraInt += 1; net zero
+    // — except for the explicit -= 1 in the tableNum == 0 branch).
+    let (qp_dra_frac_adj, dra_chroma_qp_shift) = if table_num == 0 {
+        // qpDraFrac = 0; qpDraInt -= 1.
+        qp_dra_int -= 1;
+        let qp_dra_frac_adj: i64 = 0;
+        let idx0 = (dra_table_idx as i64 - qp_dra_int)
+            .clamp(-chroma_qp_table.cb.qp_bd_offset_c as i64, 57);
+        let qp0 = chroma_qp_table.lookup(cidx, idx0 as i32) as i64;
+        // qpDraIntAdj = 0 (qpDraFrac == 0 ⇒ (qp1 − qp0) * 0 >> 9 = 0).
+        let dra_chroma_qp_shift =
+            chroma_qp_table.lookup(cidx, dra_table_idx as i32) as i64 - qp0 - qp_dra_int;
+        (qp_dra_frac_adj, dra_chroma_qp_shift)
+    } else {
+        // Eq. 1400: qpDraFrac = (tableNum << 10) / tableDelta.
+        let mut qp_dra_frac = (table_num << 10) / table_delta;
+        // Eq. 1401: qpDraInt += (qpDraFrac >> 9).
+        qp_dra_int += qp_dra_frac >> 9;
+        // Eq. 1402: qpDraFrac = (1 << 9) − qpDraFrac % (1 << 9).
+        qp_dra_frac = (1i64 << 9) - qp_dra_frac.rem_euclid(1i64 << 9);
+
+        // Eq. 1403 / 1404: idx0, idx1 with Clip3.
+        let lo = -chroma_qp_table.cb.qp_bd_offset_c as i64;
+        let hi = 57i64;
+        let idx0 = (dra_table_idx as i64 - qp_dra_int).clamp(lo, hi);
+        let idx1 = (dra_table_idx as i64 - qp_dra_int + 1).clamp(lo, hi);
+
+        // Eq. 1405 / 1406: qp0, qp1.
+        let qp0 = chroma_qp_table.lookup(cidx, idx0 as i32) as i64;
+        let qp1 = chroma_qp_table.lookup(cidx, idx1 as i32) as i64;
+
+        // Eq. 1407: qpDraIntAdj = ((qp1 − qp0) * qpDraFrac) >> 9.
+        let qp_dra_int_adj = ((qp1 - qp0) * qp_dra_frac) >> 9;
+
+        // Eq. 1408: qpDraFracAdj = qpDraFrac − (((qp1 − qp0) * qpDraFrac) % (1 << 9)).
+        let mut qp_dra_frac_adj = qp_dra_frac - (((qp1 - qp0) * qp_dra_frac).rem_euclid(1i64 << 9));
+
+        // Eq. 1409: draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx]
+        //                              − qp0 − qpDraIntAdj − qpDraInt.
+        let mut dra_chroma_qp_shift = chroma_qp_table.lookup(cidx, dra_table_idx as i32) as i64
+            - qp0
+            - qp_dra_int_adj
+            - qp_dra_int;
+
+        // Eq. 1410-1411: qpDraFracAdj < 0 fix-up.
+        if qp_dra_frac_adj < 0 {
+            dra_chroma_qp_shift -= 1;
+            qp_dra_frac_adj += 1i64 << 9;
+        }
+        (qp_dra_frac_adj, dra_chroma_qp_shift)
+    };
+
+    // Eq. 1412-1414: idx0, idx1, idx2 with Clip3(0, 24, ·).
+    let idx0 = (dra_chroma_qp_shift + 12).clamp(0, 24) as usize;
+    let idx1 = (dra_chroma_qp_shift + 12 - 1).clamp(0, 24) as usize;
+    let idx2 = (dra_chroma_qp_shift + 12 + 1).clamp(0, 24) as usize;
+
+    // Eq. 1415: draChromaScaleShift = QpScale[idx0].
+    let mut dra_chroma_scale_shift = QP_SCALE[idx0];
+    // Eq. 1416 / 1417.
+    let dra_chroma_scale_shift_frac = if dra_chroma_qp_shift < 0 {
+        QP_SCALE[idx0] - QP_SCALE[idx1]
+    } else {
+        QP_SCALE[idx2] - QP_SCALE[idx0]
+    };
+    // Eq. 1418: draChromaScaleShift = draChromaScaleShift +
+    //   (draChromaScaleShiftFrac * qpDraFracAdj + (1 << 8)) >> 9.
+    // Spec text uses a single >> 9 of the whole sum-with-add — the
+    // outer addition rebases the shift on draChromaScaleShift. Reading
+    // the formula as written places the >> 9 outside the parenthesised
+    // sum, so we shift only the (frac * adj + 256) term.
+    dra_chroma_scale_shift += (dra_chroma_scale_shift_frac * qp_dra_frac_adj + (1i64 << 8)) >> 9;
+
+    // Eq. 1419: chromaScale = ((scaleDra * draChromaScaleShift) + (1 << 17)) >> 18.
+    ((scale_dra * dra_chroma_scale_shift) + (1i64 << 17)) >> 18
+}
+
+/// Derive the §8.9.7 chroma DRA state for chroma component `cidx` under
+/// the **joined-scale path** (`DraJoinedScaleFlag == 1`,
+/// `dra_table_idx ∈ [0, 57]`).
+///
+/// The structural difference from [`derive_dra_chroma_state`] (which
+/// handles the simpler `DraJoinedScaleFlag == 0` / `dra_table_idx ==
+/// 58` path) is in eq. 1394: under the joined path,
+/// `chromaScales[cIdx][i]` is derived **per luma range** by invoking
+/// §8.9.8 with `lumaScale = lumaScales[i] = dra_scale_value[i]` (the
+/// per-range luma scale parsed in §7.3.6). Eq. 1386-1393 are
+/// identical to the unjoined path, just with the per-`i`
+/// `chromaScales[i]` instead of the constant.
+///
+/// `chroma_qp_table` is the `ChromaQpTable` for the active SPS — built
+/// from [`default_chroma_qp_table`] when `chroma_qp_table_present_flag
+/// == 0`, or from the SPS-signalled chroma QP mapping (eq. 74) when
+/// the flag is set. (Round 193 ships the consumer side; the SPS-side
+/// parser still discards the signalled deltas — that's the round-194
+/// follow-up.)
+///
+/// Returns [`Error::Unsupported`] when `derived.joined_scale_flag` is
+/// `false` (the caller should use [`derive_dra_chroma_state`] instead).
+/// Returns [`Error::Invalid`] when `dra_cb_scale_value == 0` (Cb path)
+/// or `dra_cr_scale_value == 0` (Cr path) or any luma
+/// `dra_scale_value[i] == 0` — all forbidden by §7.4.7.
+pub fn derive_dra_chroma_state_joined(
+    syntax: &DraSyntax,
+    derived: &DraDerived,
+    cidx: ChromaIdx,
+    bit_depth_y: u32,
+    chroma_qp_table: &ChromaQpTable,
+) -> Result<DraChromaDerived> {
+    if !derived.joined_scale_flag {
+        return Err(Error::unsupported(
+            "evc dra: derive_dra_chroma_state_joined invoked with \
+             DraJoinedScaleFlag = 0 — call `derive_dra_chroma_state` for \
+             the unjoined `dra_table_idx == 58` path",
+        ));
+    }
+    if !(8..=16).contains(&bit_depth_y) {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_y must be in [8, 16] (per SPS §7.4.3.1)",
+        ));
+    }
+    if derived.num_ranges == 0 {
+        return Ok(DraChromaDerived::empty(cidx));
+    }
+    // Spec §7.4.7 forbids zero scales; defend against the divide-by-zero
+    // in eq. 1386 (and the trivial multiply-by-zero in eq. 1395 that
+    // would collapse the entire joined chain).
+    let component_scale = match cidx {
+        ChromaIdx::Cb => syntax.dra_cb_scale_value,
+        ChromaIdx::Cr => syntax.dra_cr_scale_value,
+    };
+    if component_scale == 0 {
+        return Err(Error::invalid(
+            "evc dra: chroma scale value == 0 (forbidden by §7.4.7); \
+             cannot derive joined chromaScales",
+        ));
+    }
+    // dra_table_idx must be in the joined range [0, 57]; the unjoined
+    // shortcut at 58 is rejected at the top of the function via the
+    // joined_scale_flag check.
+    if syntax.dra_table_idx > 57 {
+        return Err(Error::invalid(
+            "evc dra: dra_table_idx must be in [0, 57] on the joined path",
+        ));
+    }
+    for i in 0..derived.num_ranges {
+        if syntax.dra_scale_value[i] == 0 {
+            return Err(Error::invalid(
+                "evc dra: dra_scale_value[i] == 0 (forbidden by §7.4.7); \
+                 joined chromaScale[i] would collapse",
+            ));
+        }
+    }
+
+    let mut c = DraChromaDerived::empty(cidx);
+    c.num_ranges_l = derived.num_ranges;
+    let num_ranges_l = c.num_ranges_l;
+    let num_ranges_c = num_ranges_l + 1;
+
+    // Eq. 1394 (joined path): chromaScales[cIdx][i] = §8.9.8(lumaScales[i],
+    //                                                         cIdx).
+    // `lumaScales[i]` is the per-range luma scale, i.e. dra_scale_value[i]
+    // (§7.4.7 line below eq. 117: "lumaScales[apsId][i] = dra_scale_value[i]").
+    for i in 0..num_ranges_l {
+        let luma_scale_i = syntax.dra_scale_value[i] as i64;
+        let chroma_scale_i = chroma_scale_joined(
+            luma_scale_i,
+            syntax.dra_cb_scale_value,
+            syntax.dra_cr_scale_value,
+            cidx,
+            syntax.dra_table_idx,
+            chroma_qp_table,
+        );
+        if chroma_scale_i <= 0 {
+            return Err(Error::invalid(
+                "evc dra: joined chromaScale[i] <= 0 — divide-by-zero in \
+                 eq. 1386 would follow",
+            ));
+        }
+        c.chroma_scales[i] = chroma_scale_i;
+        // Eq. 1386 reuses chromaScales[i] for invChromaScales[i].
+        c.inv_chroma_scales[i] = ((1i64 << 18) + (chroma_scale_i >> 1)) / chroma_scale_i;
+    }
+
+    // Line above eq. 1387: i = 0 layout.
+    c.out_scales_c[0] = 0;
+    c.out_offsets_c[0] = c.inv_chroma_scales[0];
+    c.out_ranges_c[0] = derived.out_ranges_l[0];
+
+    // Eq. 1387: OutRangesC[i] = (OutRangesL[i] + OutRangesL[i − 1]) >> 1
+    // for i in [1, num_ranges_c − 1] = [1, num_ranges_l].
+    for i in 1..num_ranges_c {
+        c.out_ranges_c[i] = (derived.out_ranges_l[i] + derived.out_ranges_l[i - 1]) >> 1;
+    }
+
+    // Eq. 1388-1391: i in [1, num_ranges_l − 1].
+    for i in 1..num_ranges_l {
+        let delta_range = c.out_ranges_c[i + 1] - c.out_ranges_c[i];
+        c.out_offsets_c[i] = c.inv_chroma_scales[i - 1];
+        let delta_scale = c.inv_chroma_scales[i] - c.inv_chroma_scales[i - 1];
+        c.out_scales_c[i] = if delta_range == 0 {
+            0
+        } else {
+            ((delta_scale << 10) + (delta_range >> 1)) / delta_range
+        };
+    }
+
+    // Eq. 1392-1393: i = num_ranges_l.
+    c.out_offsets_c[num_ranges_l] = c.inv_chroma_scales[num_ranges_l - 1];
+    c.out_scales_c[num_ranges_l] = 0;
+
+    // §8.9.5 top sentinel.
+    c.out_ranges_c[num_ranges_c] = 1i64 << bit_depth_y;
+
+    Ok(c)
 }
 
 /// Materialise `chroma_derived.out_ranges_c[0..=num_ranges_c]` as an
@@ -2705,5 +3186,345 @@ mod tests {
     fn round187_chroma_idx_as_u32() {
         assert_eq!(ChromaIdx::Cb.as_u32(), 0);
         assert_eq!(ChromaIdx::Cr.as_u32(), 1);
+    }
+
+    // ============================================================
+    // Round 193 — §8.9.8 joined chroma scale (DraJoinedScaleFlag = 1)
+    //              + default Table 5 / Table 6 ChromaQpTable.
+    // ============================================================
+
+    #[test]
+    fn round193_scale_qp_table_eq1420_first_and_last_entries() {
+        // Spot-check the spec literal (page 308 eq. 1420). The table is
+        // monotonically non-decreasing — required for the §8.9.5 lookup.
+        assert_eq!(SCALE_QP[0], 0);
+        assert_eq!(SCALE_QP[1], 1);
+        assert_eq!(SCALE_QP[6], 2);
+        assert_eq!(SCALE_QP[7], 2);
+        assert_eq!(SCALE_QP[10], 4);
+        assert_eq!(SCALE_QP[21], 57);
+        assert_eq!(SCALE_QP[54], 116772);
+        // Monotonicity (strict above the leading zero).
+        for i in 1..SCALE_QP.len() {
+            assert!(
+                SCALE_QP[i] >= SCALE_QP[i - 1],
+                "SCALE_QP non-monotonic at i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn round193_qp_scale_table_eq1421_first_and_last_entries() {
+        // Spec literal page 308 eq. 1421.
+        assert_eq!(QP_SCALE[0], 128);
+        assert_eq!(QP_SCALE[6], 256);
+        assert_eq!(QP_SCALE[12], 512);
+        assert_eq!(QP_SCALE[18], 1024);
+        assert_eq!(QP_SCALE[24], 2048);
+        // Monotonically increasing.
+        for i in 1..QP_SCALE.len() {
+            assert!(
+                QP_SCALE[i] > QP_SCALE[i - 1],
+                "QP_SCALE non-monotonic at i={i}"
+            );
+        }
+        assert_eq!(QP_SCALE.len(), 25);
+    }
+
+    #[test]
+    fn round193_default_chroma_qp_table_iqt_off_table5_spot_checks() {
+        // sps_iqt_flag == 0 ⇒ Table 5.
+        // qPi < 30 ⇒ QpC = qPi.
+        // qPi 30 → 29, qPi 33 → 30, qPi 35 → 32, qPi 43 → 36, qPi 50 → 38,
+        // qPi 57 → 41.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        assert_eq!(t.cb.qp_bd_offset_c, 0);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 0), 0);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 10), 10);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 29), 29);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 30), 29);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 33), 30);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 35), 32);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 43), 36);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 50), 38);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 57), 41);
+        // Cb and Cr identical under chroma_qp_table_present_flag == 0.
+        for qpi in 0..=57 {
+            assert_eq!(t.lookup(ChromaIdx::Cb, qpi), t.lookup(ChromaIdx::Cr, qpi));
+        }
+    }
+
+    #[test]
+    fn round193_default_chroma_qp_table_iqt_on_table6_spot_checks() {
+        // sps_iqt_flag == 1 ⇒ Table 6.
+        // qPi < 30 ⇒ QpC = qPi. qPi > 43 ⇒ QpC = qPi − 3.
+        // qPi 30 → 29, qPi 31 → 30, qPi 40 → 37, qPi 43 → 40.
+        // qPi 44 → 41, qPi 57 → 54.
+        let t = default_chroma_qp_table(true, 0).unwrap();
+        assert_eq!(t.lookup(ChromaIdx::Cb, 29), 29);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 30), 29);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 31), 30);
+        // Tabulated for qPi 30..=43; qPi=40 → tbl[10] = 38.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 40), 38);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 43), 40);
+        // qPi > 43: QpC = qPi − 3.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 44), 41);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 50), 47);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 57), 54);
+    }
+
+    #[test]
+    fn round193_default_chroma_qp_table_bit_depth_10_negative_qpi() {
+        // bit_depth_chroma_minus8 == 2 ⇒ QpBdOffsetC = 12.
+        // qPi ∈ [−12, 57]. Negative qPi ⇒ Table 5 path qPi < 30 ⇒ QpC = qPi.
+        let t = default_chroma_qp_table(false, 2).unwrap();
+        assert_eq!(t.cb.qp_bd_offset_c, 12);
+        assert_eq!(t.cb.table.len(), 12 + 58);
+        for qpi in -12..30 {
+            assert_eq!(t.lookup(ChromaIdx::Cb, qpi), qpi);
+        }
+        // Out-of-range clamps to qPi == −12 on the low side.
+        assert_eq!(t.lookup(ChromaIdx::Cb, -100), -12);
+        // …and to qPi == 57 on the high side.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 100), 41);
+    }
+
+    #[test]
+    fn round193_default_chroma_qp_table_rejects_out_of_range_bit_depth() {
+        assert!(default_chroma_qp_table(false, 9).is_err());
+        assert!(default_chroma_qp_table(true, 100).is_err());
+    }
+
+    /// Three-range joined-path syntax: dra_table_idx = 30 (mid Table 5
+    /// range), Cb = 256, Cr = 1024, per-range luma scales 256/512/1024.
+    fn three_range_joined_chroma_syntax() -> DraSyntax {
+        let mut delta = [0u16; DRA_MAX_RANGES_V2];
+        delta[0] = 32;
+        delta[1] = 64;
+        delta[2] = 96;
+        let mut scales = [0u16; DRA_MAX_RANGES_V2];
+        scales[0] = 256;
+        scales[1] = 512;
+        scales[2] = 1024;
+        DraSyntax {
+            dra_descriptor1: 4,
+            dra_descriptor2: 9,
+            dra_number_ranges_minus1: 2,
+            dra_equal_ranges_flag: false,
+            dra_global_offset: 16,
+            dra_delta_range: delta,
+            dra_scale_value: scales,
+            dra_cb_scale_value: 256,
+            dra_cr_scale_value: 1024,
+            dra_table_idx: 30,
+        }
+    }
+
+    #[test]
+    fn round193_chroma_scale_joined_returns_positive_for_table5() {
+        // Reasonable joined inputs: luma scale 512 (Q9 = 1.0), Cb scale
+        // 256 (Q9 ≈ 0.5), dra_table_idx 30. Output must be > 0 (the
+        // §8.9.6 eq. 1386 invChromaScale divides by chromaScale, so a
+        // zero return would blow up).
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let s = chroma_scale_joined(512, 256, 1024, ChromaIdx::Cb, 30, &t);
+        assert!(s > 0, "joined chromaScale should be positive, got {s}");
+        let s_cr = chroma_scale_joined(512, 256, 1024, ChromaIdx::Cr, 30, &t);
+        assert!(
+            s_cr > 0,
+            "joined chromaScale (Cr) should be positive, got {s_cr}"
+        );
+    }
+
+    #[test]
+    fn round193_chroma_scale_joined_scales_with_luma_scale() {
+        // §8.9.8 eq. 1395 multiplies lumaScale * component_scale: doubling
+        // lumaScale roughly doubles scaleDra (and the eventual chromaScale,
+        // since draChromaScaleShift varies smoothly with the QP-domain
+        // shift). Verify the joined chromaScale grows monotonically.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let s1 = chroma_scale_joined(256, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let s2 = chroma_scale_joined(512, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let s4 = chroma_scale_joined(1024, 256, 1024, ChromaIdx::Cb, 30, &t);
+        assert!(
+            s2 > s1,
+            "doubling lumaScale should grow chromaScale (got {s1} → {s2})"
+        );
+        assert!(
+            s4 > s2,
+            "doubling lumaScale should grow chromaScale (got {s2} → {s4})"
+        );
+    }
+
+    #[test]
+    fn round193_derive_dra_chroma_state_joined_basic() {
+        // End-to-end joined-path derivation: three-range syntax →
+        // DraChromaDerived with per-range chroma_scales[i] populated.
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert!(der.joined_scale_flag, "table_idx 30 ⇒ joined = 1");
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let c = derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).unwrap();
+        assert_eq!(c.num_ranges_l, der.num_ranges);
+        // Each chroma_scales[i] must be positive (eq. 1386 reciprocates).
+        for i in 0..c.num_ranges_l {
+            assert!(
+                c.chroma_scales[i] > 0,
+                "chroma_scales[{i}] = {} should be positive",
+                c.chroma_scales[i]
+            );
+            assert!(
+                c.inv_chroma_scales[i] > 0,
+                "inv_chroma_scales[{i}] = {} should be positive",
+                c.inv_chroma_scales[i]
+            );
+        }
+    }
+
+    #[test]
+    fn round193_derive_joined_per_range_chromascales_differ() {
+        // The whole point of the joined path is that chromaScales[i]
+        // depend on lumaScales[i] (eq. 1395), so with distinct
+        // dra_scale_value[i] entries (256/512/1024) the per-range
+        // chroma_scales[] should NOT be constant — distinguishing from
+        // the unjoined path where they collapse to a single value.
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let c = derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).unwrap();
+        let all_same = c.chroma_scales[0..c.num_ranges_l]
+            .iter()
+            .all(|&v| v == c.chroma_scales[0]);
+        assert!(
+            !all_same,
+            "joined chroma_scales should vary across ranges; got {:?}",
+            &c.chroma_scales[0..c.num_ranges_l]
+        );
+    }
+
+    #[test]
+    fn round193_derive_joined_rejects_unjoined_state() {
+        // Unjoined state (dra_table_idx == 58 ⇒ joined_scale_flag == 0)
+        // should be rejected — caller should go through
+        // `derive_dra_chroma_state` instead.
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_table_idx = 58;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert!(!der.joined_scale_flag);
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        assert!(derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).is_err());
+    }
+
+    #[test]
+    fn round193_derive_joined_rejects_zero_cb_scale() {
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_cb_scale_value = 0;
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        assert!(derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).is_err());
+        // Cr still derives (its own scale is non-zero).
+        assert!(derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cr, 10, &t).is_ok());
+    }
+
+    #[test]
+    fn round193_derive_joined_rejects_zero_luma_scale() {
+        // Setting dra_scale_value[1] = 0 violates §7.4.7's scale range
+        // [1, (4 << descriptor2) − 1] — but defensively, the joined helper
+        // must reject before it would feed a zero into eq. 1395.
+        //
+        // We can't go through `derive_dra_state` to produce the
+        // `DraDerived` companion here because that helper itself divides
+        // by `dra_scale_value[i]` (eq. 118 InvLumaScales) and would panic
+        // on a zero. Hand-build the derived state to isolate the joined
+        // helper's own defensive check.
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_scale_value[1] = 0;
+        let mut der = DraDerived::empty();
+        der.joined_scale_flag = true;
+        der.num_ranges = 3; // matches syn.dra_number_ranges_minus1 + 1
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        assert!(derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).is_err());
+    }
+
+    #[test]
+    fn round193_derive_joined_noop_on_empty_state() {
+        let syn = three_range_joined_chroma_syntax();
+        let mut der = DraDerived::empty();
+        der.joined_scale_flag = true;
+        // num_ranges intentionally 0.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let c = derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).unwrap();
+        assert_eq!(c.num_ranges_l, 0);
+        assert_eq!(chroma_scale_for_luma_sample(100, &c), 0);
+    }
+
+    #[test]
+    fn round193_chroma_scale_joined_pure_function_property() {
+        // chroma_scale_joined is a pure function: same inputs ⇒ same output.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let a = chroma_scale_joined(512, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let b = chroma_scale_joined(512, 256, 1024, ChromaIdx::Cb, 30, &t);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn round193_chroma_scale_for_sample_works_with_joined_state() {
+        // The §8.9.6 entry point (chroma_scale_for_luma_sample) should
+        // work transparently on a DraChromaDerived produced by either the
+        // joined or unjoined builder — eq. 1384 / 1385 only consume
+        // out_offsets_c / out_scales_c / out_ranges_c, which are filled
+        // identically (modulo the per-i chroma_scales).
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, 10).unwrap();
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let c = derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, 10, &t).unwrap();
+        // Sample at OutRangesC[0] (= OutRangesL[0]) lands in range 0 with
+        // incValue = 0; eq. 1385 collapses to OutOffsetsC[0] +
+        // ((OutScalesC[0] * 0 + 512) >> 10) = OutOffsetsC[0]
+        // (= inv_chroma_scales[0]). Use the actual OutRangesC[0] to avoid
+        // depending on the §7.4.7 luma-derivation arithmetic.
+        let s0 = chroma_scale_for_luma_sample(c.out_ranges_c[0], &c);
+        assert_eq!(s0, c.out_offsets_c[0]);
+        // Cross-check: a sample beyond every OutRangesC boundary lands in
+        // the last range (§8.9.5 Min(rangeIdx, numRanges − 1)) and returns
+        // OutOffsetsC[num_ranges_l] (= inv_chroma_scales[num_ranges_l-1],
+        // with OutScalesC[num_ranges_l] = 0 per eq. 1393).
+        let s_top = chroma_scale_for_luma_sample(i32::MAX as i64, &c);
+        assert_eq!(s_top, c.out_offsets_c[c.num_ranges_l]);
+        // Joined-path chromaScales[] differ across ranges, so the §8.9.6
+        // outputs at distinct ranges must differ too.
+        assert_ne!(
+            s0, s_top,
+            "joined chroma_scale_for_sample should vary across ranges"
+        );
+    }
+
+    #[test]
+    fn round193_chroma_qp_table_lookup_clamps_to_table_range() {
+        // Direct clamping property of ChromaQpTable::lookup.
+        let t = default_chroma_qp_table(false, 1).unwrap();
+        // QpBdOffsetC = 6. Lookup at qPi = -1000 clamps to -6.
+        assert_eq!(t.lookup(ChromaIdx::Cb, -1000), t.lookup(ChromaIdx::Cb, -6));
+        // Lookup at qPi = 1000 clamps to 57.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 1000), t.lookup(ChromaIdx::Cb, 57));
+    }
+
+    #[test]
+    fn round193_unjoined_derive_error_hint_mentions_joined_entry() {
+        // The unjoined derive_dra_chroma_state still returns
+        // Err(Unsupported) on a joined-flag state — round 193 updates its
+        // error message to point the caller at the joined entry instead
+        // of saying "round 187 doesn't thread through".
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_table_idx = 30; // joined
+        let der = derive_dra_state(&syn, 10).unwrap();
+        assert!(der.joined_scale_flag);
+        let res = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 10);
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("derive_dra_chroma_state_joined"),
+            "error message should point at the joined entry; got: {msg}"
+        );
     }
 }
