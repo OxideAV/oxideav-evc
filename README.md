@@ -7,6 +7,103 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-195 status
+
+Round 195 lands the **§7.4.3.1 SPS-signalled `ChromaQpTable` parse
+(eq. 74 + the surrounding pivot-fill loops)** flagged by the round 193
+documented followup. With `chroma_qp_table_present_flag = 1`, the SPS
+parser now derives a per-stream `ChromaQpTable` from the signalled
+`(delta_qp_in_val_minus1[i][j], delta_qp_out_val[i][j])` pivot points
+and stores it on `Sps::chroma_qp_table`. Round 193 fell back to
+`default_chroma_qp_table` (Tables 5 / 6) because the parser discarded
+those values.
+
+New surface:
+
+* `dra::SignalledChromaQpTableParams { same_qp_table_for_chroma,
+  global_offset_flag, tables }` — the SPS chroma-QP-table body, with
+  one or two `SignalledChromaQpTablePivots` rows depending on
+  `same_qp_table_for_chroma`.
+* `dra::SignalledChromaQpTablePivots { delta_qp_in_val_minus1[],
+  delta_qp_out_val[] }` — one chroma component's pivot points,
+  carried verbatim from the SPS body.
+* `dra::build_signalled_chroma_qp_table(params, bit_depth_chroma_minus8)`
+  — eq. 74 + the down-fill / per-segment linear interpolation /
+  up-fill loops (spec page 67–68, lines 4003-4026) transcribed
+  verbatim. `same_qp_table_for_chroma == 1` aliases Cr := Cb
+  byte-for-byte. Rejects empty / mismatched / out-of-range pivot
+  inputs.
+* `Sps::chroma_qp_table: Option<ChromaQpTable>` — `Some` when
+  `chroma_qp_table_present_flag = 1` and `chroma_format_idc != 0`,
+  `None` otherwise. Downstream consumers (the round-193 joined entry,
+  the §8.8.4 deblocker) can now pick the per-SPS table instead of the
+  Table 5 / 6 default.
+
+The SPS parser also tightens the `num_points_in_qp_table_minus1[i]`
+bound from a round-1 placeholder (`> 64`) to the spec's page-67 bound
+`57 + QpBdOffsetC − (global_offset_flag == 1 ? 16 : 0)`.
+
+### Spec-text note (eq. 74)
+
+The literal eq. 74 line in the 2020-published PDF lacks the trailing
+`)` after `delta_qp_out_val[i][j]`. The bracketing we follow closes
+the `(` opened just before `delta_qp_in_val_minus1[i][j] + 1`, so the
+recurrence is
+`qpOutVal[i][j] = qpOutVal[i][j-1] + (delta_qp_in_val_minus1[i][j] + 1 - delta_qp_out_val[i][j])`.
+`qpOutVal[]` is **not** used to fill `ChromaQpTable[]` past the first
+anchor (line 4011); the per-segment loop (lines 4015-4019) reads
+`delta_qp_out_val[]` directly. So the only observable consequence is
+the value of `ChromaQpTable[qpInVal[0]] = qpOutVal[0]` (which is
+bracketed unambiguously, line 4005). A docs collaborator should
+confirm eq. 74's bracketing before any conformance fixture exercises a
+stream whose validity check hinges on `qpOutVal[]`.
+
+### Tests
+
+10 new unit tests (417 total; was 407):
+
+* `round195_signalled_chroma_qp_table_same_qp_table_for_chroma_one_pivot`
+  — minimal one-pivot identity table, both Cb and Cr aliased.
+* `round195_signalled_chroma_qp_table_two_pivots_interpolates_linearly`
+  — two pivots; per-segment linear interpolation; distinct Cr proves
+  `same_qp_table_for_chroma == 0` honoured.
+* `round195_signalled_chroma_qp_table_down_fill_below_first_pivot_clamps`
+  — `bit_depth_chroma_minus8 = 1` ⇒ `QpBdOffsetC = 6`; down-fill from
+  the first pivot clamps at the negative lower bound.
+* `round195_signalled_chroma_qp_table_global_offset_flag_uses_startqp_16`
+  — `global_offset_flag == 1` ⇒ `startQP = 16`.
+* `round195_signalled_chroma_qp_table_rejects_mismatched_table_count` —
+  `same_qp_table_for_chroma == true` with 2 pivot sets errors.
+* `round195_signalled_chroma_qp_table_rejects_qpinval_out_of_range` —
+  `qpInVal[0] > 57` errors.
+* `round195_signalled_chroma_qp_table_rejects_empty_pivots` — empty
+  pivot vector errors.
+* `round195_signalled_chroma_qp_table_rejects_mismatched_pivot_lengths`
+  — `delta_qp_in_val_minus1.len() != delta_qp_out_val.len()` errors.
+* `round195_parses_signalled_chroma_qp_table_two_pivots` — full SPS
+  round-trip: build an SPS RBSP with `chroma_qp_table_present_flag = 1`
+  + two pivots, parse, verify `Sps::chroma_qp_table` matches the
+  expected entries.
+* `round195_chroma_qp_table_none_when_not_present` — default minimal
+  SPS leaves `chroma_qp_table = None`.
+
+### Documented followups
+
+* `ChromaArrayType == 0` (monochrome) — spec page 67 "Otherwise" says
+  `ChromaQpTable[m][qPi] = qPi`. The §7.4.3.1 parser does not enter
+  the `chroma_qp_table_present_flag` body when `chroma_format_idc = 0`,
+  so the field stays `None`; consumers must synthesise the identity
+  table on demand. A `default_chroma_qp_table_monochrome()` helper +
+  consumer rewiring is the round 196 slot.
+* The joined chroma-scale derivation (`derive_dra_chroma_state_joined`)
+  still consumes a caller-built `ChromaQpTable`; it does not yet read
+  `Sps::chroma_qp_table` automatically. A thin adapter that picks
+  `sps.chroma_qp_table.as_ref().cloned().or_else(|| default_…)` and
+  feeds the joined entry would close the SPS → joined path
+  end-to-end; round 196 slot.
+* The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
 ## Round-193 status
 
 Round 193 lands the **§8.9.8 `DraJoinedScaleFlag = 1` (joined chroma

@@ -1528,6 +1528,254 @@ pub fn default_chroma_qp_table(
     Ok(ChromaQpTable { cb, cr })
 }
 
+/// SPS-signalled chroma QP mapping table parameters — what the §7.3.2.1
+/// `chroma_qp_table_present_flag == 1` body carries through to the eq. 74
+/// derivation.
+///
+/// Layout matches the spec: a one- or two-entry table set, each row a
+/// vector of `num_points_in_qp_table_minus1 + 1` pivot points. When
+/// `same_qp_table_for_chroma == 1` only `tables[0]` is signalled and Cr
+/// is set equal to Cb by [`build_signalled_chroma_qp_table`].
+#[derive(Clone, Debug, Default)]
+pub struct SignalledChromaQpTableParams {
+    /// `same_qp_table_for_chroma` from the SPS body. When `true`, only
+    /// `tables[0]` is parsed and Cr aliases Cb.
+    pub same_qp_table_for_chroma: bool,
+    /// `global_offset_flag` from the SPS body. Selects `startQP = 16`
+    /// when `true`, `startQP = -QpBdOffsetC` when `false`.
+    pub global_offset_flag: bool,
+    /// One or two pivot-point sets, `tables[i]` carrying the i-th
+    /// chroma-QP mapping table's pivot points. Length is 1 when
+    /// `same_qp_table_for_chroma == true`, 2 otherwise.
+    pub tables: Vec<SignalledChromaQpTablePivots>,
+}
+
+/// One chroma component's pivot-point set, parsed verbatim from the SPS.
+///
+/// `delta_qp_in_val_minus1[j]` corresponds to the spec syntax element of
+/// the same name; `delta_qp_out_val[j]` is signed (`se(v)`).
+#[derive(Clone, Debug, Default)]
+pub struct SignalledChromaQpTablePivots {
+    /// `delta_qp_in_val_minus1[j]` for `j ∈ [0, num_points_in_qp_table_minus1]`.
+    pub delta_qp_in_val_minus1: Vec<u32>,
+    /// `delta_qp_out_val[j]` for `j ∈ [0, num_points_in_qp_table_minus1]`.
+    pub delta_qp_out_val: Vec<i32>,
+}
+
+/// Build a [`ChromaQpTable`] from SPS-signalled pivot points per
+/// ISO/IEC 23094-1:2020(E) §7.4.3.1 page 67–68 (eq. 74 + the surrounding
+/// fill loops).
+///
+/// `bit_depth_chroma_minus8` selects `QpBdOffsetC = 6 *
+/// bit_depth_chroma_minus8` (eq. 39 + the chroma table layout).
+///
+/// Algorithm transcribed verbatim from the spec text:
+///
+/// ```text
+/// startQp = ( global_offset_flag == 1 ) ? 16 : −QpBdOffsetC
+/// qpInVal[i][0]  = startQP + delta_qp_in_val_minus1[i][0]
+/// qpOutVal[i][0] = startQP + delta_qp_in_val_minus1[i][0]
+///                          + delta_qp_out_val[i][0]
+/// for j = 1..=num_points_in_qp_table_minus1[i]:
+///     qpInVal[i][j]  = qpInVal[i][j−1]  + delta_qp_in_val_minus1[i][j] + 1
+///     qpOutVal[i][j] = qpOutVal[i][j−1] + ( delta_qp_in_val_minus1[i][j] + 1
+///                                          − delta_qp_out_val[i][j] )      (74)
+/// ChromaQpTable[i][qpInVal[i][0]] = qpOutVal[i][0]
+/// for k = qpInVal[i][0] − 1 down to −QpBdOffsetC:
+///     ChromaQpTable[i][k] = Clip3(−QpBdOffsetC, 57,
+///                                  ChromaQpTable[i][k+1] − 1)
+/// for j = 0..num_points_in_qp_table_minus1[i] − 1:
+///     sh = ( delta_qp_in_val_minus1[i][j+1] + 1 ) >> 1
+///     for k = qpInVal[i][j] + 1, m = 1; k <= qpInVal[i][j+1]; k+=1, m+=1:
+///         ChromaQpTable[i][k] = ChromaQpTable[i][qpInVal[i][j]]
+///             + ( delta_qp_out_val[i][j+1] * m + sh )
+///             / ( delta_qp_in_val_minus1[i][j+1] + 1 )
+/// for k = qpInVal[i][last] + 1..=57:
+///     ChromaQpTable[i][k] = Clip3(−QpBdOffsetC, 57,
+///                                  ChromaQpTable[i][k−1] + 1)
+/// ```
+///
+/// When `same_qp_table_for_chroma == 1`, `ChromaQpTable[1][k]` is set
+/// equal to `ChromaQpTable[0][k]` for `k ∈ [−QpBdOffsetC, 57]`.
+///
+/// # Spec-text note (eq. 74)
+///
+/// The literal eq. 74 line in the 2020-published PDF lacks the trailing
+/// `)` after `delta_qp_out_val[i][j]`. The bracketing we follow here
+/// closes the `(` opened just before `delta_qp_in_val_minus1[i][j] + 1`,
+/// so the recurrence is
+/// `qpOutVal[i][j] = qpOutVal[i][j−1] + (delta_qp_in_val_minus1[i][j] + 1 − delta_qp_out_val[i][j])`.
+///
+/// `qpOutVal[]` is **not** used to fill `ChromaQpTable[]` except at
+/// `qpInVal[0]` (line 4011 of the spec text); the per-segment loop
+/// (lines 4015–4019) uses `delta_qp_out_val[]` directly. So the only
+/// observable consequence of this bracketing choice is the value of
+/// `ChromaQpTable[qpInVal[0]] = qpOutVal[0]` (which is bracketed
+/// unambiguously, line 4005). A docs collaborator should confirm
+/// eq. 74's bracketing before any conformance fixture exercises a
+/// `chroma_qp_table_present_flag == 1` stream whose validity check
+/// hinges on `qpOutVal[]`.
+pub fn build_signalled_chroma_qp_table(
+    params: &SignalledChromaQpTableParams,
+    bit_depth_chroma_minus8: u32,
+) -> Result<ChromaQpTable> {
+    if bit_depth_chroma_minus8 > 8 {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_chroma_minus8 must be in [0, 8]",
+        ));
+    }
+    let n_tables_expected = if params.same_qp_table_for_chroma {
+        1
+    } else {
+        2
+    };
+    if params.tables.len() != n_tables_expected {
+        return Err(Error::invalid(format!(
+            "evc dra: SignalledChromaQpTableParams expected {} pivot \
+             set(s) (same_qp_table_for_chroma = {}), got {}",
+            n_tables_expected,
+            params.same_qp_table_for_chroma,
+            params.tables.len()
+        )));
+    }
+
+    let qp_bd_offset_c = 6 * bit_depth_chroma_minus8 as i32;
+    let start_qp = if params.global_offset_flag {
+        16i32
+    } else {
+        -qp_bd_offset_c
+    };
+
+    let mut built: [Option<ChromaQpTableEntry>; 2] = [None, None];
+    for (i, pivots) in params.tables.iter().enumerate() {
+        let table_i = build_one_signalled_table(pivots, start_qp, qp_bd_offset_c)?;
+        built[i] = Some(table_i);
+    }
+
+    let cb = built[0]
+        .take()
+        .ok_or_else(|| Error::invalid("evc dra: missing Cb pivot set"))?;
+    let cr = if params.same_qp_table_for_chroma {
+        // Spec page 68: "When same_qp_table_for_chroma is equal to 1,
+        // ChromaQpTable[1][k] is set equal to ChromaQpTable[0][k] for
+        // k = −QpBdOffsetC..57."
+        cb.clone()
+    } else {
+        built[1]
+            .take()
+            .ok_or_else(|| Error::invalid("evc dra: missing Cr pivot set"))?
+    };
+
+    Ok(ChromaQpTable { cb, cr })
+}
+
+/// Build one chroma component's `ChromaQpTable[i][k]` for
+/// `k ∈ [−QpBdOffsetC, 57]` from the spec's pivot-point construction.
+fn build_one_signalled_table(
+    pivots: &SignalledChromaQpTablePivots,
+    start_qp: i32,
+    qp_bd_offset_c: i32,
+) -> Result<ChromaQpTableEntry> {
+    let n_points = pivots.delta_qp_in_val_minus1.len();
+    if n_points == 0 {
+        return Err(Error::invalid(
+            "evc dra: signalled chroma QP table needs at least one pivot point",
+        ));
+    }
+    if pivots.delta_qp_out_val.len() != n_points {
+        return Err(Error::invalid(format!(
+            "evc dra: delta_qp_in_val_minus1 / delta_qp_out_val length \
+             mismatch ({} vs {})",
+            n_points,
+            pivots.delta_qp_out_val.len()
+        )));
+    }
+    let num_points_minus1 = (n_points - 1) as i32;
+
+    // qpInVal[] / qpOutVal[] derivation (eq. 74 + line 4004 / 4005).
+    let mut qp_in_val = Vec::with_capacity(n_points);
+    let mut qp_out_val = Vec::with_capacity(n_points);
+    // j == 0
+    let delta_in_0 = pivots.delta_qp_in_val_minus1[0] as i32;
+    let delta_out_0 = pivots.delta_qp_out_val[0];
+    qp_in_val.push(start_qp + delta_in_0);
+    qp_out_val.push(start_qp + delta_in_0 + delta_out_0);
+    for j in 1..n_points {
+        let delta_in_j = pivots.delta_qp_in_val_minus1[j] as i32;
+        let delta_out_j = pivots.delta_qp_out_val[j];
+        let qp_in_j = qp_in_val[j - 1] + delta_in_j + 1;
+        // eq. 74 — see module note above re: bracketing.
+        let qp_out_j = qp_out_val[j - 1] + (delta_in_j + 1 - delta_out_j);
+        qp_in_val.push(qp_in_j);
+        qp_out_val.push(qp_out_j);
+    }
+
+    // Spec page 68: "The values of qpInVal[i][j] and qpOutval[i][j] shall
+    // be in the range of −QpBdOffsetC to 57, inclusive." Catch the
+    // qpInVal[] over-run (qpOutVal[] is informational with the eq. 74
+    // bracketing — see fn doc) so we surface bad streams instead of
+    // panicking on the indexing below.
+    for (j, &in_v) in qp_in_val.iter().enumerate() {
+        if !(-qp_bd_offset_c..=57).contains(&in_v) {
+            return Err(Error::invalid(format!(
+                "evc dra: qpInVal[{j}] = {in_v} out of range [{}, 57]",
+                -qp_bd_offset_c
+            )));
+        }
+    }
+
+    let len = (qp_bd_offset_c + 58) as usize;
+    let mut table = vec![0i32; len];
+
+    let pack = |k: i32| -> usize { (k + qp_bd_offset_c) as usize };
+    let clip = |v: i32| -> i32 { v.clamp(-qp_bd_offset_c, 57) };
+
+    // Anchor: ChromaQpTable[qpInVal[0]] = qpOutVal[0] (line 4011).
+    let qp_in_0 = qp_in_val[0];
+    table[pack(qp_in_0)] = clip(qp_out_val[0]);
+
+    // Down-fill below the first pivot (line 4012 / 4013).
+    let mut k = qp_in_0 - 1;
+    while k >= -qp_bd_offset_c {
+        table[pack(k)] = clip(table[pack(k + 1)] - 1);
+        k -= 1;
+    }
+
+    // Per-segment linear interpolation between consecutive pivots
+    // (lines 4015–4019).
+    for j in 0..(num_points_minus1 as usize) {
+        let d_next = pivots.delta_qp_in_val_minus1[j + 1] as i32 + 1;
+        let sh = d_next >> 1;
+        let out_next = pivots.delta_qp_out_val[j + 1];
+        let anchor = table[pack(qp_in_val[j])];
+        let mut m = 1;
+        let mut k = qp_in_val[j] + 1;
+        while k <= qp_in_val[j + 1] {
+            // Spec uses integer division on a numerator that can be
+            // negative when delta_qp_out_val[] is negative; preserve
+            // that semantics by using i32 truncated division (Rust's
+            // `/` matches the spec's truncate-toward-zero behaviour).
+            let v = anchor + (out_next * m + sh) / d_next;
+            table[pack(k)] = clip(v);
+            k += 1;
+            m += 1;
+        }
+    }
+
+    // Up-fill above the last pivot (line 4022 / 4023).
+    let qp_in_last = qp_in_val[n_points - 1];
+    let mut k = qp_in_last + 1;
+    while k <= 57 {
+        table[pack(k)] = clip(table[pack(k - 1)] + 1);
+        k += 1;
+    }
+
+    Ok(ChromaQpTableEntry {
+        qp_bd_offset_c,
+        table,
+    })
+}
+
 /// Table 5 (ISO/IEC 23094-1:2020(E) page 67) — `QpC` as a function of
 /// `qPi` when `sps_iqt_flag == 0`.
 fn table5_qp_c(qpi: i32) -> i32 {
@@ -3526,5 +3774,200 @@ mod tests {
             msg.contains("derive_dra_chroma_state_joined"),
             "error message should point at the joined entry; got: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Round 195 — SPS eq. 74 `ChromaQpTable` build from signalled pivots.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_same_qp_table_for_chroma_one_pivot() {
+        // Minimal valid input: one chroma component, one pivot. With
+        // bit_depth_chroma_minus8 = 0, global_offset_flag = false ⇒
+        // startQP = 0, QpBdOffsetC = 0. delta_qp_in_val_minus1[0] = 0 +
+        // delta_qp_out_val[0] = 0 ⇒ qpInVal[0] = qpOutVal[0] = 0.
+        //
+        // ChromaQpTable[k] for k ∈ [0, 57]:
+        //  * k == 0 ⇒ qpOutVal[0] = 0 (line 4011)
+        //  * k > 0 ⇒ up-fill +1 each step (line 4022 / 4023)
+        // So table[k] = k (clamped to [0, 57]).
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![0],
+                delta_qp_out_val: vec![0],
+            }],
+        };
+        let t = build_signalled_chroma_qp_table(&params, 0).unwrap();
+        // Cb and Cr aliased.
+        for qpi in 0..=57 {
+            assert_eq!(t.lookup(ChromaIdx::Cb, qpi), qpi);
+            assert_eq!(t.lookup(ChromaIdx::Cr, qpi), qpi);
+        }
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_two_pivots_interpolates_linearly() {
+        // Two pivots at qPi = 10 and qPi = 20, with
+        // delta_qp_out_val[1] = 10 ⇒ ChromaQpTable[20] − ChromaQpTable[10]
+        // = 10 (slope 1 across a 10-unit input span).
+        //
+        // QpBdOffsetC = 0, startQP = 0:
+        //  * delta_qp_in_val_minus1[0] = 10 ⇒ qpInVal[0] = 10
+        //  * delta_qp_out_val[0] = 5 ⇒ qpOutVal[0] = 15 ⇒ table[10] = 15
+        //  * delta_qp_in_val_minus1[1] = 9 ⇒ qpInVal[1] = 10 + 9 + 1 = 20
+        //  * delta_qp_out_val[1] = 10
+        //  * sh = (9 + 1) >> 1 = 5
+        //  * for k = 11..=20, m = 1..=10:
+        //      table[k] = 15 + (10*m + 5) / 10
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: false,
+            global_offset_flag: false,
+            tables: vec![
+                SignalledChromaQpTablePivots {
+                    delta_qp_in_val_minus1: vec![10, 9],
+                    delta_qp_out_val: vec![5, 10],
+                },
+                // Cr distinct: just verify it's parsed independently.
+                SignalledChromaQpTablePivots {
+                    delta_qp_in_val_minus1: vec![10, 9],
+                    delta_qp_out_val: vec![5, 6],
+                },
+            ],
+        };
+        let t = build_signalled_chroma_qp_table(&params, 0).unwrap();
+        // Cb pivot anchor at qpInVal[0] = 10:
+        assert_eq!(t.lookup(ChromaIdx::Cb, 10), 15);
+        // Linear interp from pivot 10 to pivot 20:
+        for m in 1i32..=10 {
+            let k = 10 + m;
+            let expected = 15 + (10 * m + 5) / 10;
+            assert_eq!(
+                t.lookup(ChromaIdx::Cb, k),
+                expected,
+                "Cb interp at qPi = {k} (m = {m})"
+            );
+        }
+        // ChromaQpTable[20] = 25 (slope 1 across 10 input units).
+        assert_eq!(t.lookup(ChromaIdx::Cb, 20), 25);
+        // Cr signalled distinctly with a different delta_qp_out_val[1]:
+        // slope is 6/10, so table[20] = 15 + (6*10 + 5)/10 = 15 + 6 = 21.
+        assert_eq!(t.lookup(ChromaIdx::Cr, 20), 21);
+        // Cb and Cr differ — same_qp_table_for_chroma == false honoured.
+        assert_ne!(
+            t.lookup(ChromaIdx::Cb, 20),
+            t.lookup(ChromaIdx::Cr, 20),
+            "Cb and Cr must differ when same_qp_table_for_chroma == 0"
+        );
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_down_fill_below_first_pivot_clamps() {
+        // bit_depth_chroma_minus8 = 1 ⇒ QpBdOffsetC = 6.
+        // Pivot at qPi = 4 with output 4. Down-fill from qPi = 3 down to
+        // qPi = -6 (every step = -1, then clamped to [-6, 57]).
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![10],
+                delta_qp_out_val: vec![0], // qpOutVal[0] = -6 + 10 + 0 = 4
+            }],
+        };
+        let t = build_signalled_chroma_qp_table(&params, 1).unwrap();
+        // qpInVal[0] = -6 + 10 = 4, qpOutVal[0] = 4.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 4), 4);
+        // Down-fill: table[3] = clip(4 - 1) = 3, etc., until clamped at -6.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 3), 3);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 0), 0);
+        assert_eq!(t.lookup(ChromaIdx::Cb, -3), -3);
+        assert_eq!(t.lookup(ChromaIdx::Cb, -6), -6);
+        // Up-fill from 4 ⇒ table[5] = 5, ..., table[57] = 57.
+        for qpi in 4..=57 {
+            assert_eq!(t.lookup(ChromaIdx::Cb, qpi), qpi);
+        }
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_global_offset_flag_uses_startqp_16() {
+        // global_offset_flag = true ⇒ startQP = 16. One pivot:
+        //  qpInVal[0] = 16 + 4 = 20, qpOutVal[0] = 16 + 4 + 3 = 23
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: true,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![4],
+                delta_qp_out_val: vec![3],
+            }],
+        };
+        let t = build_signalled_chroma_qp_table(&params, 0).unwrap();
+        assert_eq!(t.lookup(ChromaIdx::Cb, 20), 23);
+        // Down-fill: table[19] = 22, table[18] = 21, ... table[0] = 3.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 0), 3);
+        // Up-fill: table[21] = 24, ..., table[57] = 60 ⇒ clamped to 57.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 21), 24);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 57), 57);
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_rejects_mismatched_table_count() {
+        // same_qp_table_for_chroma == true requires exactly 1 pivot set;
+        // passing 2 should error.
+        let bad = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![
+                SignalledChromaQpTablePivots {
+                    delta_qp_in_val_minus1: vec![0],
+                    delta_qp_out_val: vec![0],
+                },
+                SignalledChromaQpTablePivots {
+                    delta_qp_in_val_minus1: vec![0],
+                    delta_qp_out_val: vec![0],
+                },
+            ],
+        };
+        assert!(build_signalled_chroma_qp_table(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_rejects_qpinval_out_of_range() {
+        // qpInVal[0] = 0 + 100 = 100 > 57 ⇒ rejected.
+        let bad = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![100],
+                delta_qp_out_val: vec![0],
+            }],
+        };
+        assert!(build_signalled_chroma_qp_table(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_rejects_empty_pivots() {
+        let bad = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![],
+                delta_qp_out_val: vec![],
+            }],
+        };
+        assert!(build_signalled_chroma_qp_table(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn round195_signalled_chroma_qp_table_rejects_mismatched_pivot_lengths() {
+        let bad = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![0, 1],
+                delta_qp_out_val: vec![0], // length mismatch
+            }],
+        };
+        assert!(build_signalled_chroma_qp_table(&bad, 0).is_err());
     }
 }

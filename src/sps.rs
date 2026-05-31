@@ -17,6 +17,10 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::dra::{
+    build_signalled_chroma_qp_table, ChromaQpTable, SignalledChromaQpTableParams,
+    SignalledChromaQpTablePivots,
+};
 use crate::rpl::{parse_ref_pic_list_struct, RefPicListStruct};
 
 /// Hard sanity bound on the SPS-declared picture dimensions. Larger values
@@ -100,6 +104,14 @@ pub struct Sps {
     pub picture_crop_right_offset: u32,
     pub picture_crop_top_offset: u32,
     pub picture_crop_bottom_offset: u32,
+
+    /// `ChromaQpTable[]` derived per §7.4.3.1 (eq. 74 and surrounding
+    /// fill loops) when `chroma_qp_table_present_flag == 1` and
+    /// `ChromaArrayType != 0`. `None` when the flag is `0` or when
+    /// `chroma_format_idc == 0` (monochrome — spec page 67 "Otherwise"
+    /// branch makes the table the identity, which the §8.9.8 consumer
+    /// can synthesise on demand).
+    pub chroma_qp_table: Option<ChromaQpTable>,
 
     pub vui_parameters_present_flag: bool,
 }
@@ -337,24 +349,52 @@ pub fn parse(rbsp: &[u8]) -> Result<Sps> {
         picture_crop_bottom_offset = br.ue()?;
     }
 
+    let mut chroma_qp_table: Option<ChromaQpTable> = None;
     if chroma_format_idc != 0 {
         let chroma_qp_table_present_flag = br.u1()? != 0;
         if chroma_qp_table_present_flag {
             let same_qp_table_for_chroma = br.u1()? != 0;
-            let _global_offset_flag = br.u1()? != 0;
+            let global_offset_flag = br.u1()? != 0;
             let n_tables = if same_qp_table_for_chroma { 1 } else { 2 };
-            for _ in 0..n_tables {
+            // Spec page 67: num_points_in_qp_table_minus1[i] is bounded
+            // by `57 + QpBdOffsetC − (global_offset_flag == 1 ? 16 : 0)`.
+            // We surface the spec-faithful bound (worst case
+            // bit_depth_chroma_minus8 == 8 ⇒ QpBdOffsetC == 48 ⇒ 105),
+            // not the round-1 placeholder 64.
+            let qp_bd_offset_c = 6 * bit_depth_chroma_minus8 as i32;
+            let bound = 57 + qp_bd_offset_c - if global_offset_flag { 16 } else { 0 };
+            let mut tables: Vec<SignalledChromaQpTablePivots> = Vec::with_capacity(n_tables);
+            for i in 0..n_tables {
                 let num_points_minus1 = br.ue()?;
-                if num_points_minus1 > 64 {
+                if num_points_minus1 as i32 > bound {
                     return Err(Error::invalid(format!(
-                        "evc sps: num_points_in_qp_table_minus1 {num_points_minus1} > 64"
+                        "evc sps: num_points_in_qp_table_minus1[{i}] = \
+                         {num_points_minus1} > {bound} (page-67 bound for \
+                         QpBdOffsetC = {qp_bd_offset_c}, global_offset_flag \
+                         = {global_offset_flag})"
                     )));
                 }
-                for _ in 0..=num_points_minus1 {
-                    let _delta_qp_in = br.u(6)?;
-                    let _delta_qp_out = br.se()?;
+                let n_pivots = (num_points_minus1 + 1) as usize;
+                let mut delta_in: Vec<u32> = Vec::with_capacity(n_pivots);
+                let mut delta_out: Vec<i32> = Vec::with_capacity(n_pivots);
+                for _ in 0..n_pivots {
+                    delta_in.push(br.u(6)?);
+                    delta_out.push(br.se()?);
                 }
+                tables.push(SignalledChromaQpTablePivots {
+                    delta_qp_in_val_minus1: delta_in,
+                    delta_qp_out_val: delta_out,
+                });
             }
+            let params = SignalledChromaQpTableParams {
+                same_qp_table_for_chroma,
+                global_offset_flag,
+                tables,
+            };
+            chroma_qp_table = Some(build_signalled_chroma_qp_table(
+                &params,
+                bit_depth_chroma_minus8,
+            )?);
         }
     }
 
@@ -419,6 +459,7 @@ pub fn parse(rbsp: &[u8]) -> Result<Sps> {
         picture_crop_right_offset,
         picture_crop_top_offset,
         picture_crop_bottom_offset,
+        chroma_qp_table,
         vui_parameters_present_flag,
     })
 }
@@ -552,6 +593,19 @@ pub(crate) mod tests {
                     panic!("uek encode overflow: value={value} k={k}");
                 }
             }
+        }
+
+        /// Encode a signed 0-th order Exp-Golomb value (§9.2.2). Inverse
+        /// of `BitReader::se`: maps `0 → 0, 1 → 1, −1 → 2, 2 → 3, −2 → 4,
+        /// …` then encodes the codeNum with `ue`.
+        pub fn se(&mut self, value: i32) {
+            let code_num: u32 = if value > 0 {
+                (2 * value - 1) as u32
+            } else {
+                // value <= 0 ⇒ -2 * value is non-negative.
+                (-2 * value) as u32
+            };
+            self.ue(code_num);
         }
 
         pub fn bit_position(&self) -> u32 {
@@ -788,7 +842,83 @@ pub(crate) mod tests {
             picture_crop_right_offset: 0,
             picture_crop_top_offset: 0,
             picture_crop_bottom_offset: 0,
+            chroma_qp_table: None,
             vui_parameters_present_flag: false,
         }
+    }
+
+    /// Round 195 — SPS body with `chroma_qp_table_present_flag = 1`,
+    /// `same_qp_table_for_chroma = 1`, two pivot points. Verifies the
+    /// parser threads the eq. 74 derivation into `sps.chroma_qp_table`.
+    #[test]
+    fn round195_parses_signalled_chroma_qp_table_two_pivots() {
+        let mut emitter = BitEmitter::new();
+        emitter.ue(0); // sps_seq_parameter_set_id
+        emitter.u(8, 0x01); // profile_idc
+        emitter.u(8, 30); // level_idc
+        emitter.u(32, 0); // toolset_idc_h
+        emitter.u(32, 0); // toolset_idc_l
+        emitter.ue(1); // chroma_format_idc = 1 (4:2:0)
+        emitter.ue(320); // pic_width
+        emitter.ue(240); // pic_height
+        emitter.ue(0); // bit_depth_luma_minus8
+        emitter.ue(0); // bit_depth_chroma_minus8
+        emitter.u(1, 0); // sps_btt_flag
+        emitter.u(1, 0); // sps_suco_flag
+        emitter.u(1, 0); // sps_admvp_flag
+        emitter.u(1, 0); // sps_eipd_flag
+        emitter.u(1, 0); // sps_cm_init_flag
+        emitter.u(1, 0); // sps_iqt_flag
+        emitter.u(1, 0); // sps_addb_flag
+        emitter.u(1, 0); // sps_alf_flag
+        emitter.u(1, 0); // sps_htdf_flag
+        emitter.u(1, 0); // sps_rpl_flag
+        emitter.u(1, 0); // sps_pocs_flag
+        emitter.u(1, 0); // sps_dquant_flag
+        emitter.u(1, 0); // sps_dra_flag
+        emitter.ue(1); // log2_sub_gop_length
+        emitter.ue(1); // max_num_tid0_ref_pics
+        emitter.u(1, 0); // picture_cropping_flag
+                         // chroma_qp_table_present_flag = 1
+        emitter.u(1, 1);
+        emitter.u(1, 1); // same_qp_table_for_chroma = 1
+        emitter.u(1, 0); // global_offset_flag = 0
+                         // num_points_in_qp_table_minus1[0] = 1 (two pivots)
+        emitter.ue(1);
+        // Pivot 0: delta_qp_in_val_minus1 = 10, delta_qp_out_val = 5
+        emitter.u(6, 10);
+        emitter.se(5);
+        // Pivot 1: delta_qp_in_val_minus1 = 9, delta_qp_out_val = 10
+        emitter.u(6, 9);
+        emitter.se(10);
+        emitter.u(1, 0); // vui_parameters_present_flag
+        emitter.finish_with_trailing_bits();
+        let rbsp = emitter.into_bytes();
+        let sps = parse(&rbsp).expect("SPS with signalled chroma QP table must parse");
+        let t = sps
+            .chroma_qp_table
+            .as_ref()
+            .expect("chroma_qp_table must be Some when chroma_qp_table_present_flag = 1");
+        // Same as round195_signalled_chroma_qp_table_two_pivots_interpolates_linearly:
+        // pivot anchor at qPi = 10 ⇒ 15, slope 1 across [10, 20].
+        assert_eq!(t.lookup(crate::dra::ChromaIdx::Cb, 10), 15);
+        assert_eq!(t.lookup(crate::dra::ChromaIdx::Cb, 20), 25);
+        // same_qp_table_for_chroma = 1 ⇒ Cb == Cr byte-for-byte.
+        for qpi in 0..=57 {
+            assert_eq!(
+                t.lookup(crate::dra::ChromaIdx::Cb, qpi),
+                t.lookup(crate::dra::ChromaIdx::Cr, qpi),
+                "Cb / Cr must be identical under same_qp_table_for_chroma = 1 (qPi = {qpi})"
+            );
+        }
+    }
+
+    /// Round 195 — sanity check that `chroma_qp_table` is `None` when
+    /// `chroma_qp_table_present_flag = 0` (the default minimal SPS).
+    #[test]
+    fn round195_chroma_qp_table_none_when_not_present() {
+        let rbsp = build_minimal_sps_rbsp();
+        let sps = parse(&rbsp).expect("minimal SPS must parse");
+        assert!(sps.chroma_qp_table.is_none());
     }
 }

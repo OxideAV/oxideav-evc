@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### Round 195 — §7.4.3.1 SPS-signalled `ChromaQpTable` (eq. 74) parse + populate
+
+#### Added
+- `dra::SignalledChromaQpTableParams { same_qp_table_for_chroma,
+  global_offset_flag, tables }` — SPS chroma-QP-table body, one or
+  two pivot-set rows depending on `same_qp_table_for_chroma`.
+- `dra::SignalledChromaQpTablePivots { delta_qp_in_val_minus1[],
+  delta_qp_out_val[] }` — one chroma component's pivot points.
+- `dra::build_signalled_chroma_qp_table(params, bit_depth_chroma_minus8)`
+  — eq. 74 + spec page 67–68 fill loops transcribed verbatim. Anchor
+  at `qpInVal[0]`, down-fill below, per-segment linear interpolation,
+  up-fill above. `same_qp_table_for_chroma == 1` aliases Cr := Cb.
+  Rejects empty / mismatched-length / out-of-range pivots.
+- `Sps::chroma_qp_table: Option<ChromaQpTable>` — populated when
+  `chroma_qp_table_present_flag == 1` and `chroma_format_idc != 0`,
+  `None` otherwise.
+
+#### Changed
+- `sps::parse` no longer discards `delta_qp_in_val_minus1[]` /
+  `delta_qp_out_val[]`; threads them through the eq. 74 derivation.
+- `num_points_in_qp_table_minus1[i]` bound tightened from a round-1
+  placeholder (`> 64`) to the spec's page-67 bound
+  `57 + QpBdOffsetC − (global_offset_flag == 1 ? 16 : 0)`.
+- SPS test-helper `BitEmitter` gained a `se(i32)` method (signed 0-th
+  order Exp-Golomb encoder, inverse of `BitReader::se`).
+
+#### Documented followups
+- `ChromaArrayType == 0` (monochrome) still leaves
+  `Sps::chroma_qp_table = None`; spec page 67 "Otherwise" branch
+  (`ChromaQpTable[m][qPi] = qPi`) needs a helper + consumer rewiring.
+  Round 196 slot.
+- `derive_dra_chroma_state_joined` still takes an externally-built
+  `ChromaQpTable`; a small adapter that reads `Sps::chroma_qp_table`
+  (else falls back to `default_chroma_qp_table`) would close the
+  SPS → joined chroma-scale path end-to-end. Round 196 slot.
+- Eq. 74 bracketing ambiguity (missing trailing `)`) noted on
+  `build_signalled_chroma_qp_table`'s rustdoc; observable only in
+  `qpOutVal[]` (informational), not in `ChromaQpTable[]` past the
+  first pivot. Docs collaborator confirmation outstanding.
+
 ### Round 193 — §8.9.8 joined chroma-scale path (`DraJoinedScaleFlag = 1`) + default `ChromaQpTable` builder
 
 #### Added
