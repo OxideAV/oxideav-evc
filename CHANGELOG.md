@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Round 201 — §7.4.3.1 page-67 "Otherwise" identity `ChromaQpTable` + SPS → table adapter
+
+#### Added
+- `dra::default_chroma_qp_table_identity(bit_depth_chroma_minus8)` —
+  builds the spec-page-67 "Otherwise" branch (`ChromaArrayType != 1`,
+  `chroma_qp_table_present_flag == 0`) identity `ChromaQpTable` with
+  `ChromaQpTable[m][qPi] = qPi`. Cb and Cr byte-for-byte equal.
+  Indexed by `qPi ∈ [−QpBdOffsetC, 57]` with
+  `QpBdOffsetC = 6 * bit_depth_chroma_minus8`; eq. 1403 / 1404
+  clamping still applies on out-of-range lookups.
+- `dra::chroma_qp_table_for_sps(sps) -> Result<ChromaQpTable>` —
+  three-way dispatch that picks `sps.chroma_qp_table.clone()` when
+  `Some`, else [`default_chroma_qp_table`] for `chroma_format_idc == 1`,
+  else [`default_chroma_qp_table_identity`] for non-4:2:0. Lets
+  §8.9.8 callers (including `derive_dra_chroma_state_joined`) consume
+  a parsed `Sps` directly without re-implementing the dispatch.
+
+#### Tests
+- 12 new unit tests (429 total; was 417): identity-table values + Cb
+  ≡ Cr property + 10-bit negative-`qPi` range + out-of-range clamping
+  + bit-depth rejection + identity-vs-Table-5 differentiation, plus 6
+  adapter tests (`Some` passthrough, 4:2:0 / Table 5, 4:2:0 / Table 6,
+  monochrome / identity, 4:2:2 / identity, 4:4:4 / identity), plus an
+  end-to-end test that chains the adapter into round-193's
+  `derive_dra_chroma_state_joined` on a 10-bit monochrome SPS.
+
 ### Round 195 — §7.4.3.1 SPS-signalled `ChromaQpTable` (eq. 74) parse + populate
 
 #### Added

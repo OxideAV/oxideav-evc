@@ -1528,6 +1528,104 @@ pub fn default_chroma_qp_table(
     Ok(ChromaQpTable { cb, cr })
 }
 
+/// Build the spec-page-67 identity `ChromaQpTable` for the
+/// `chroma_qp_table_present_flag == 0` "Otherwise" branch — every
+/// `ChromaArrayType` value other than 1 (i.e. 0 = monochrome,
+/// 2 = 4:2:2, 3 = 4:4:4).
+///
+/// Per spec page 67 (lines 3960-3961): "Otherwise, `ChromaQpTable[m][qPi]`
+/// with `m` being equal to 0 and 1, and `qPi` being in the range of
+/// `−QpBdOffsetC` to 57 are set equal to the value of `qPi`." Both Cb and
+/// Cr are byte-for-byte identical.
+///
+/// `bit_depth_chroma_minus8` must be in `[0, 8]`. The resulting table is
+/// indexed by `qPi ∈ [−QpBdOffsetC, 57]` where `QpBdOffsetC = 6 *
+/// bit_depth_chroma_minus8`. The stored value at each `qPi` equals
+/// `qPi` itself, so `ChromaQpTable.lookup(cidx, qPi) == qPi` for every
+/// in-range `qPi`. Out-of-range lookups still receive the spec's
+/// `Clip3(−QpBdOffsetC, 57, qPi)` clamping from
+/// [`ChromaQpTableEntry::lookup`].
+///
+/// # Use
+///
+/// On a monochrome (`ChromaArrayType == 0`) stream, the §7.4.3.1 parser
+/// never enters the `chroma_qp_table_present_flag` body, so
+/// [`crate::sps::Sps::chroma_qp_table`] stays `None`. A consumer that
+/// nonetheless needs the table — e.g. an exploratory §8.9.8 joined-path
+/// invocation that doesn't short-circuit on monochrome — should call
+/// this helper. On 4:2:2 / 4:4:4 streams with
+/// `chroma_qp_table_present_flag == 0`, the same identity rule applies.
+///
+/// Prefer [`chroma_qp_table_for_sps`] when the SPS is available; it
+/// dispatches between [`default_chroma_qp_table`] (4:2:0),
+/// this helper (non-4:2:0 with `chroma_qp_table_present_flag == 0`),
+/// and the parsed `sps.chroma_qp_table` (any `ChromaArrayType != 0` with
+/// `chroma_qp_table_present_flag == 1`).
+pub fn default_chroma_qp_table_identity(bit_depth_chroma_minus8: u32) -> Result<ChromaQpTable> {
+    if bit_depth_chroma_minus8 > 8 {
+        return Err(Error::invalid(
+            "evc dra: bit_depth_chroma_minus8 must be in [0, 8]",
+        ));
+    }
+    let qp_bd_offset_c = 6 * bit_depth_chroma_minus8 as i32;
+    let len = (qp_bd_offset_c + 58) as usize;
+    let mut tbl = Vec::with_capacity(len);
+    for qpi in -qp_bd_offset_c..=57 {
+        tbl.push(qpi);
+    }
+    let cb = ChromaQpTableEntry {
+        qp_bd_offset_c,
+        table: tbl.clone(),
+    };
+    let cr = ChromaQpTableEntry {
+        qp_bd_offset_c,
+        table: tbl,
+    };
+    Ok(ChromaQpTable { cb, cr })
+}
+
+/// Resolve the active `ChromaQpTable` for an SPS — the SPS → table
+/// adapter that closes the round-195 "joined entry doesn't yet read
+/// `Sps::chroma_qp_table` automatically" follow-up.
+///
+/// Dispatch (per ISO/IEC 23094-1:2020(E) §7.4.3.1 page 67):
+///
+/// * `chroma_qp_table_present_flag == 1` (i.e. `sps.chroma_qp_table` is
+///   `Some`) → returns that parsed table verbatim. The §7.4.3.1 parser
+///   only populates this on `ChromaArrayType != 0` (the spec's syntax
+///   gate at line 2177), so a `Some` here implies a non-monochrome
+///   stream.
+/// * `chroma_qp_table_present_flag == 0` AND `chroma_format_idc == 1`
+///   (4:2:0) → returns [`default_chroma_qp_table`] for the SPS's
+///   `sps_iqt_flag` and `bit_depth_chroma_minus8`. Table 5
+///   (`sps_iqt_flag == 0`) / Table 6 (`sps_iqt_flag == 1`).
+/// * `chroma_qp_table_present_flag == 0` AND `chroma_format_idc != 1`
+///   (monochrome, 4:2:2, 4:4:4) → returns
+///   [`default_chroma_qp_table_identity`] per the spec page-67
+///   "Otherwise" branch.
+///
+/// This lets §8.9.8 callers — including
+/// [`derive_dra_chroma_state_joined`] — pull the right table from a
+/// parsed [`crate::sps::Sps`] without re-implementing the three-way
+/// dispatch at every call site.
+///
+/// Note: on a strictly monochrome stream there is no chroma plane to
+/// run DRA on, so the returned identity table is provided as a safe
+/// fallback for tooling that wants to invoke §8.9.8 introspectively
+/// (e.g. unit tests on the joined chain). Production paths should
+/// short-circuit chroma processing entirely when
+/// `chroma_format_idc == 0`.
+pub fn chroma_qp_table_for_sps(sps: &crate::sps::Sps) -> Result<ChromaQpTable> {
+    if let Some(tbl) = sps.chroma_qp_table.as_ref() {
+        return Ok(tbl.clone());
+    }
+    if sps.chroma_format_idc == 1 {
+        default_chroma_qp_table(sps.sps_iqt_flag, sps.bit_depth_chroma_minus8)
+    } else {
+        default_chroma_qp_table_identity(sps.bit_depth_chroma_minus8)
+    }
+}
+
 /// SPS-signalled chroma QP mapping table parameters — what the §7.3.2.1
 /// `chroma_qp_table_present_flag == 1` body carries through to the eq. 74
 /// derivation.
@@ -3969,5 +4067,281 @@ mod tests {
             }],
         };
         assert!(build_signalled_chroma_qp_table(&bad, 0).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Round 201 — default_chroma_qp_table_identity + chroma_qp_table_for_sps
+    // adapter (closes round 195 followups for monochrome / non-4:2:0).
+    // -------------------------------------------------------------------
+
+    /// Helper: a minimal `Sps` for the round-201 adapter tests. Only the
+    /// fields the adapter inspects (`chroma_format_idc`, `sps_iqt_flag`,
+    /// `bit_depth_chroma_minus8`, `chroma_qp_table`) need to vary across
+    /// the test cases; everything else is set to a benign default.
+    fn round201_sps_for_adapter(
+        chroma_format_idc: u32,
+        sps_iqt_flag: bool,
+        bit_depth_chroma_minus8: u32,
+        chroma_qp_table: Option<ChromaQpTable>,
+    ) -> crate::sps::Sps {
+        crate::sps::Sps {
+            sps_seq_parameter_set_id: 0,
+            profile_idc: 0,
+            level_idc: 30,
+            toolset_idc_h: 0,
+            toolset_idc_l: 0,
+            chroma_format_idc,
+            pic_width_in_luma_samples: 64,
+            pic_height_in_luma_samples: 64,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8,
+            sps_btt_flag: false,
+            log2_ctu_size_minus5: 0,
+            log2_min_cb_size_minus2: 0,
+            log2_diff_ctu_max_14_cb_size: 0,
+            log2_diff_ctu_max_tt_cb_size: 0,
+            log2_diff_min_cb_min_tt_cb_size_minus2: 0,
+            sps_suco_flag: false,
+            log2_diff_ctu_size_max_suco_cb_size: 0,
+            log2_diff_max_suco_min_suco_cb_size: 0,
+            sps_admvp_flag: false,
+            sps_affine_flag: false,
+            sps_amvr_flag: false,
+            sps_dmvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_hmvp_flag: false,
+            sps_eipd_flag: false,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size_minus2: 0,
+            sps_cm_init_flag: false,
+            sps_adcc_flag: false,
+            sps_iqt_flag,
+            sps_ats_flag: false,
+            sps_addb_flag: false,
+            sps_alf_flag: false,
+            sps_htdf_flag: false,
+            sps_rpl_flag: false,
+            sps_pocs_flag: false,
+            sps_dquant_flag: false,
+            sps_dra_flag: false,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            log2_sub_gop_length: 0,
+            log2_ref_pic_gap_length: 0,
+            max_num_tid0_ref_pics: 0,
+            sps_max_dec_pic_buffering_minus1: 0,
+            long_term_ref_pics_flag: false,
+            rpl1_same_as_rpl0_flag: false,
+            num_ref_pic_lists_in_sps_l0: 0,
+            num_ref_pic_lists_in_sps_l1: 0,
+            ref_pic_list_structs_l0: Vec::new(),
+            ref_pic_list_structs_l1: Vec::new(),
+            picture_cropping_flag: false,
+            picture_crop_left_offset: 0,
+            picture_crop_right_offset: 0,
+            picture_crop_top_offset: 0,
+            picture_crop_bottom_offset: 0,
+            chroma_qp_table,
+            vui_parameters_present_flag: false,
+        }
+    }
+
+    #[test]
+    fn round201_identity_chroma_qp_table_8bit_returns_qpi() {
+        // bit_depth_chroma_minus8 = 0 ⇒ QpBdOffsetC = 0, qPi ∈ [0, 57].
+        let t = default_chroma_qp_table_identity(0).unwrap();
+        for qpi in 0..=57 {
+            assert_eq!(
+                t.lookup(ChromaIdx::Cb, qpi),
+                qpi,
+                "Cb identity must return qPi at {qpi}"
+            );
+            assert_eq!(
+                t.lookup(ChromaIdx::Cr, qpi),
+                qpi,
+                "Cr identity must return qPi at {qpi}"
+            );
+        }
+        // Cb and Cr are byte-for-byte equal per spec page-67 "Otherwise"
+        // ("m being equal to 0 and 1").
+        assert_eq!(t.cb.table, t.cr.table);
+        assert_eq!(t.cb.qp_bd_offset_c, 0);
+        assert_eq!(t.cr.qp_bd_offset_c, 0);
+    }
+
+    #[test]
+    fn round201_identity_chroma_qp_table_10bit_negative_qpi_in_range() {
+        // bit_depth_chroma_minus8 = 2 ⇒ QpBdOffsetC = 12, qPi ∈ [-12, 57].
+        let t = default_chroma_qp_table_identity(2).unwrap();
+        assert_eq!(t.cb.qp_bd_offset_c, 12);
+        assert_eq!(t.cb.table.len(), 12 + 58);
+        for qpi in -12..=57 {
+            assert_eq!(t.lookup(ChromaIdx::Cb, qpi), qpi);
+            assert_eq!(t.lookup(ChromaIdx::Cr, qpi), qpi);
+        }
+    }
+
+    #[test]
+    fn round201_identity_chroma_qp_table_lookup_clamps_out_of_range() {
+        // Spec eq. 1403 / 1404 clamping still applies on the identity
+        // table — values outside [-QpBdOffsetC, 57] clamp into range,
+        // so the returned QpC is the clamped boundary (NOT the original
+        // qPi).
+        let t = default_chroma_qp_table_identity(1).unwrap();
+        // QpBdOffsetC = 6. -1000 clamps to -6; +1000 clamps to 57.
+        assert_eq!(t.lookup(ChromaIdx::Cb, -1000), -6);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 1000), 57);
+        assert_eq!(t.lookup(ChromaIdx::Cr, -1000), -6);
+        assert_eq!(t.lookup(ChromaIdx::Cr, 1000), 57);
+    }
+
+    #[test]
+    fn round201_identity_chroma_qp_table_rejects_out_of_range_bit_depth() {
+        assert!(default_chroma_qp_table_identity(9).is_err());
+        assert!(default_chroma_qp_table_identity(100).is_err());
+    }
+
+    #[test]
+    fn round201_identity_differs_from_table5_default() {
+        // The spec-page-67 "Otherwise" identity table is materially
+        // different from the Table-5 default (which folds the [29, 41]
+        // range of qPi ∈ [30, 57] to a non-trivial QpC). This test
+        // documents that distinction so a future refactor doesn't
+        // collapse the two helpers.
+        let id = default_chroma_qp_table_identity(0).unwrap();
+        let t5 = default_chroma_qp_table(false, 0).unwrap();
+        // qPi = 30 ⇒ identity says 30, Table 5 says 29.
+        assert_eq!(id.lookup(ChromaIdx::Cb, 30), 30);
+        assert_eq!(t5.lookup(ChromaIdx::Cb, 30), 29);
+        // qPi = 57 ⇒ identity says 57, Table 5 says 41.
+        assert_eq!(id.lookup(ChromaIdx::Cb, 57), 57);
+        assert_eq!(t5.lookup(ChromaIdx::Cb, 57), 41);
+    }
+
+    #[test]
+    fn round201_adapter_some_chroma_qp_table_returns_it_verbatim() {
+        // Build a recognisable signalled table and stash it on the SPS;
+        // the adapter must surface it without re-deriving.
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![0],
+                delta_qp_out_val: vec![0],
+            }],
+        };
+        let parsed = build_signalled_chroma_qp_table(&params, 0).unwrap();
+        let sps = round201_sps_for_adapter(1, false, 0, Some(parsed.clone()));
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        assert_eq!(out.cb.qp_bd_offset_c, parsed.cb.qp_bd_offset_c);
+        assert_eq!(out.cb.table, parsed.cb.table);
+        assert_eq!(out.cr.qp_bd_offset_c, parsed.cr.qp_bd_offset_c);
+        assert_eq!(out.cr.table, parsed.cr.table);
+    }
+
+    #[test]
+    fn round201_adapter_420_no_signalled_falls_to_table5() {
+        // chroma_format_idc == 1, sps_iqt_flag == 0, no signalled table
+        // ⇒ default_chroma_qp_table(false, bit_depth_chroma_minus8).
+        let sps = round201_sps_for_adapter(1, false, 0, None);
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        let expected = default_chroma_qp_table(false, 0).unwrap();
+        assert_eq!(out.cb.table, expected.cb.table);
+        // Spot check: qPi = 30 ⇒ 29 (Table 5).
+        assert_eq!(out.lookup(ChromaIdx::Cb, 30), 29);
+    }
+
+    #[test]
+    fn round201_adapter_420_no_signalled_iqt_falls_to_table6() {
+        // chroma_format_idc == 1, sps_iqt_flag == 1, no signalled table
+        // ⇒ default_chroma_qp_table(true, bit_depth_chroma_minus8).
+        let sps = round201_sps_for_adapter(1, true, 0, None);
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        let expected = default_chroma_qp_table(true, 0).unwrap();
+        assert_eq!(out.cb.table, expected.cb.table);
+        // Spot check: qPi = 30 ⇒ 29 (Table 6), qPi = 31 ⇒ 30.
+        assert_eq!(out.lookup(ChromaIdx::Cb, 30), 29);
+        assert_eq!(out.lookup(ChromaIdx::Cb, 31), 30);
+    }
+
+    #[test]
+    fn round201_adapter_monochrome_no_signalled_falls_to_identity() {
+        // chroma_format_idc == 0 ⇒ spec page-67 "Otherwise" identity
+        // table. The §7.4.3.1 parser never even enters the
+        // chroma_qp_table_present_flag body for monochrome, so the
+        // adapter MUST synthesise the identity on demand.
+        let sps = round201_sps_for_adapter(0, false, 0, None);
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        for qpi in 0..=57 {
+            assert_eq!(out.lookup(ChromaIdx::Cb, qpi), qpi);
+            assert_eq!(out.lookup(ChromaIdx::Cr, qpi), qpi);
+        }
+    }
+
+    #[test]
+    fn round201_adapter_422_no_signalled_falls_to_identity() {
+        // chroma_format_idc == 2 (4:2:2) ⇒ "Otherwise" branch identity.
+        // Differs from the 4:2:0 case: Table 5/6 are gated on
+        // ChromaArrayType == 1.
+        let sps = round201_sps_for_adapter(2, false, 0, None);
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        let id = default_chroma_qp_table_identity(0).unwrap();
+        assert_eq!(out.cb.table, id.cb.table);
+        // Specifically NOT Table 5 — the 4:2:2 fallback is identity,
+        // not Table 5/6.
+        let t5 = default_chroma_qp_table(false, 0).unwrap();
+        assert_ne!(out.cb.table, t5.cb.table);
+    }
+
+    #[test]
+    fn round201_adapter_444_no_signalled_falls_to_identity() {
+        // chroma_format_idc == 3 (4:4:4) ⇒ same "Otherwise" branch as
+        // 4:2:2 / monochrome.
+        let sps = round201_sps_for_adapter(3, true, 0, None);
+        let out = chroma_qp_table_for_sps(&sps).unwrap();
+        let id = default_chroma_qp_table_identity(0).unwrap();
+        assert_eq!(out.cb.table, id.cb.table);
+        assert_eq!(out.cr.table, id.cr.table);
+        // sps_iqt_flag is irrelevant in the "Otherwise" branch (Tables
+        // 5/6 don't apply): the identity table is the same whether
+        // sps_iqt_flag is 0 or 1.
+        let mut sps_iqt_off = sps.clone();
+        sps_iqt_off.sps_iqt_flag = false;
+        let out_iqt_off = chroma_qp_table_for_sps(&sps_iqt_off).unwrap();
+        assert_eq!(out.cb.table, out_iqt_off.cb.table);
+    }
+
+    #[test]
+    fn round201_adapter_chains_into_derive_dra_chroma_state_joined() {
+        // End-to-end check: the adapter's output is directly consumable
+        // by the round-193 joined §8.9.7 derivation. On a monochrome
+        // SPS, the adapter synthesises the identity table; the joined
+        // derive accepts it and returns positive per-range chromaScales.
+        let sps = round201_sps_for_adapter(0, false, 2, None); // 10-bit mono
+        let table = chroma_qp_table_for_sps(&sps).unwrap();
+        // bit_depth_chroma_minus8 = 2 ⇒ QpBdOffsetC = 12.
+        assert_eq!(table.cb.qp_bd_offset_c, 12);
+        // Borrow the round-193 three-range joined syntax helper for a
+        // realistic invocation. bit_depth_y must match Sps.
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_table_idx = 30; // joined branch
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(der.joined_scale_flag);
+        let chroma =
+            derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, sps.bit_depth_y(), &table)
+                .unwrap();
+        // All per-range chromaScales must be strictly positive (eq.
+        // 1386 reciprocates these; zero would be rejected upstream).
+        for i in 0..chroma.num_ranges_l {
+            assert!(
+                chroma.chroma_scales[i] > 0,
+                "chromaScales[{i}] = {} must be > 0",
+                chroma.chroma_scales[i]
+            );
+            assert!(
+                chroma.inv_chroma_scales[i] > 0,
+                "invChromaScales[{i}] = {} must be > 0",
+                chroma.inv_chroma_scales[i]
+            );
+        }
     }
 }

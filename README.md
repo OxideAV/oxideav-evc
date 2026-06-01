@@ -7,6 +7,105 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-201 status
+
+Round 201 closes both round-195 documented follow-ups in one slot: the
+**spec-page-67 "Otherwise" identity `ChromaQpTable`** for non-4:2:0
+`ChromaArrayType` values (monochrome, 4:2:2, 4:4:4), plus a thin
+**SPS → `ChromaQpTable` adapter** that picks the right table out of an
+[`Sps`] without re-implementing the three-way dispatch at every call
+site.
+
+The spec wording (page 67, lines 3960-3961) for the
+`chroma_qp_table_present_flag == 0`, `ChromaArrayType != 1` branch is:
+
+> Otherwise, `ChromaQpTable[m][qPi]` with `m` being equal to 0 and 1,
+> and `qPi` being in the range of `−QpBdOffsetC` to 57 are set equal to
+> the value of `qPi`.
+
+Round 195 noted this branch but left consumers to synthesise it on
+demand because the §7.4.3.1 parser never enters the
+`chroma_qp_table_present_flag` body for `chroma_format_idc == 0` —
+`Sps::chroma_qp_table` stays `None`. Round 201 materialises the rule
+as a first-class helper and wires the SPS-aware adapter that the
+round-193 joined chain (`derive_dra_chroma_state_joined`) needs in
+order to consume a parsed SPS directly.
+
+New surface:
+
+* `dra::default_chroma_qp_table_identity(bit_depth_chroma_minus8)` —
+  identity `ChromaQpTable` per the "Otherwise" branch. Cb and Cr are
+  byte-for-byte identical (the spec's "for `m` being equal to 0 and 1"
+  language). Indexed by `qPi ∈ [−QpBdOffsetC, 57]` with
+  `QpBdOffsetC = 6 * bit_depth_chroma_minus8`; stored value at each
+  `qPi` is `qPi` itself. Out-of-range lookups still receive the
+  eq. 1403 / 1404 `Clip3(−QpBdOffsetC, 57, qPi)` clamping.
+* `dra::chroma_qp_table_for_sps(sps) -> Result<ChromaQpTable>` — the
+  three-way dispatch:
+  - `Sps::chroma_qp_table = Some(t)` → returns `t.clone()` verbatim
+    (the §7.3.2.1 / §7.4.3.1 signalled body).
+  - `None` AND `chroma_format_idc == 1` →
+    [`default_chroma_qp_table`] for the SPS's `sps_iqt_flag` /
+    `bit_depth_chroma_minus8` (Table 5 / Table 6).
+  - `None` AND `chroma_format_idc != 1` →
+    [`default_chroma_qp_table_identity`] for the SPS's
+    `bit_depth_chroma_minus8`.
+
+### Wiring stance
+
+Same posture as round 193 / 195: the adapter is an opt-in helper, not
+a behaviour change to existing decoder paths. Consumers that want the
+SPS → table threading call `chroma_qp_table_for_sps(&sps)` and pass
+the result into `derive_dra_chroma_state_joined`. The legacy paths
+that hand-build a table (or call `default_chroma_qp_table` directly)
+keep working unchanged.
+
+### Tests
+
+12 new unit tests (429 total; was 417):
+
+* `round201_identity_chroma_qp_table_8bit_returns_qpi` —
+  `bit_depth_chroma_minus8 = 0`; `lookup(qpi) == qpi` for every
+  `qpi ∈ [0, 57]`, both Cb and Cr; Cb and Cr byte-for-byte equal.
+* `round201_identity_chroma_qp_table_10bit_negative_qpi_in_range` —
+  `bit_depth_chroma_minus8 = 2 ⇒ QpBdOffsetC = 12`; identity holds
+  across the negative `qPi` range.
+* `round201_identity_chroma_qp_table_lookup_clamps_out_of_range` —
+  eq. 1403 / 1404 clamping: `qPi = ±1000` clamp to the table bounds.
+* `round201_identity_chroma_qp_table_rejects_out_of_range_bit_depth`
+  — `bit_depth_chroma_minus8 > 8` errors.
+* `round201_identity_differs_from_table5_default` — pins the
+  observable difference between the identity helper and the Table 5
+  default (`qPi = 30 ⇒` 30 vs 29; `qPi = 57 ⇒` 57 vs 41). Prevents a
+  refactor from collapsing the two helpers.
+* `round201_adapter_some_chroma_qp_table_returns_it_verbatim` — when
+  `Sps::chroma_qp_table = Some(t)`, the adapter returns `t.clone()`
+  with every field (Cb table, Cr table, `qp_bd_offset_c`) preserved.
+* `round201_adapter_420_no_signalled_falls_to_table5` —
+  `chroma_format_idc = 1`, `sps_iqt_flag = false`, no signalled table
+  ⇒ Table 5 (`qPi = 30 ⇒ 29`).
+* `round201_adapter_420_no_signalled_iqt_falls_to_table6` —
+  `chroma_format_idc = 1`, `sps_iqt_flag = true` ⇒ Table 6
+  (`qPi = 30 ⇒ 29`, `qPi = 31 ⇒ 30`).
+* `round201_adapter_monochrome_no_signalled_falls_to_identity` —
+  `chroma_format_idc = 0` ⇒ identity (`lookup(qpi) == qpi`).
+* `round201_adapter_422_no_signalled_falls_to_identity` —
+  `chroma_format_idc = 2` ⇒ identity, materially different from
+  Table 5.
+* `round201_adapter_444_no_signalled_falls_to_identity` —
+  `chroma_format_idc = 3` ⇒ identity; `sps_iqt_flag` is irrelevant in
+  the "Otherwise" branch.
+* `round201_adapter_chains_into_derive_dra_chroma_state_joined` —
+  end-to-end: the adapter's output on a 10-bit monochrome SPS feeds
+  the round-193 joined §8.9.7 derivation; every per-range
+  `chromaScales[i]` is strictly positive (eq. 1386 reciprocates these
+  — zero would collapse the chain).
+
+### Documented followup
+
+* The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
 ## Round-195 status
 
 Round 195 lands the **§7.4.3.1 SPS-signalled `ChromaQpTable` parse
