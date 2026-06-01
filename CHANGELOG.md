@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### Round 207 — `derive_dra_chroma_state_for_sps` SPS adapter (joined + unjoined dispatch)
+
+#### Added
+- `dra::derive_dra_chroma_state_for_sps(syntax, derived, cidx, sps)` —
+  SPS-aware adapter that dispatches between the §8.9.7 unjoined path
+  (`derived.joined_scale_flag == false` ⇒ `derive_dra_chroma_state`)
+  and the §8.9.8 joined path (`derived.joined_scale_flag == true` ⇒
+  `derive_dra_chroma_state_joined` with the SPS-active `ChromaQpTable`
+  from round-201's `chroma_qp_table_for_sps`). `bit_depth_y` is pulled
+  from `sps.bit_depth_y()`. Closes the SPS → §8.9.6 chroma chain at
+  one call site, parallelling round-201's `chroma_qp_table_for_sps`
+  for the table half. Opt-in helper; direct-invocation callers
+  unchanged.
+
+#### Tests
+- 8 new unit tests (437 total; was 429):
+  - `round207_for_sps_unjoined_matches_direct_unjoined` — unjoined
+    path produces byte-identical `DraChromaDerived` to a direct
+    `derive_dra_chroma_state` call (10-bit, 4:2:0).
+  - `round207_for_sps_joined_matches_direct_joined` — joined path
+    matches a direct `derive_dra_chroma_state_joined` invoked with
+    the SPS-active `ChromaQpTable`.
+  - `round207_for_sps_dispatches_on_joined_scale_flag` — same SPS,
+    differing only in `syntax.dra_table_idx`, exercises both
+    dispatch branches. Joined chromaScales[i] varies across i (per-
+    range luma scales 256/512/1024); unjoined chromaScales[i]
+    is constant `= dra_cb_scale_value`.
+  - `round207_for_sps_uses_signalled_chroma_qp_table_on_joined_path`
+    — when `sps.chroma_qp_table = Some(signalled_identity)`, the
+    adapter feeds that table to the joined derive (NOT Table 5).
+    Distinguishing assertion: identity ChromaQpTable produces
+    materially different `chroma_scales` from the Table-5 default.
+  - `round207_for_sps_propagates_zero_cb_scale_error_unjoined` —
+    `dra_cb_scale_value = 0` surfaces verbatim from
+    `derive_dra_chroma_state` (eq. 1386 guard).
+  - `round207_for_sps_propagates_zero_cb_scale_error_joined` —
+    same on the joined path (zero scale rejected by
+    `derive_dra_chroma_state_joined` before eq. 1386 reciprocation).
+  - `round207_for_sps_monochrome_synthesises_identity_on_joined_path`
+    — monochrome SPS (`chroma_format_idc == 0`,
+    `chroma_qp_table = None`): adapter synthesises the spec-page-67
+    "Otherwise" identity table via `chroma_qp_table_for_sps` and the
+    joined chain stays positive-definite.
+  - `round207_for_sps_threads_bit_depth_y_from_sps` — same syntax /
+    derived under 8-bit and 10-bit SPSes produces different §8.9.5
+    top sentinels (`1 << 8` vs `1 << 10`).
+
+#### Documented followups
+- The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
+#### Source
+- ISO/IEC 23094-1:2020(E) §8.9.7 + §8.9.8, plus §7.4.3.1 page 67 for
+  the round-201 `ChromaQpTable` dispatch this round consumes.
+
 ### Round 201 — §7.4.3.1 page-67 "Otherwise" identity `ChromaQpTable` + SPS → table adapter
 
 #### Added

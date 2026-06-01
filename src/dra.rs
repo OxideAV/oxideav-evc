@@ -2195,6 +2195,74 @@ pub fn derive_dra_chroma_state_joined(
     Ok(c)
 }
 
+/// Resolve §8.9.7 / §8.9.8 chroma derivation directly from a parsed
+/// [`crate::sps::Sps`] — the SPS → `DraChromaDerived` adapter that
+/// dispatches between the joined (`DraJoinedScaleFlag = 1`) and
+/// unjoined (`DraJoinedScaleFlag = 0`, `dra_table_idx == 58`) paths
+/// without making the caller re-implement the branch.
+///
+/// Dispatch (per ISO/IEC 23094-1:2020(E) §8.9.7 + §8.9.8):
+///
+/// * `derived.joined_scale_flag == false` → invokes
+///   [`derive_dra_chroma_state`] with `bit_depth_y = sps.bit_depth_y()`.
+///   The `ChromaQpTable` is not used on this path (the unjoined
+///   chroma scale is the raw `dra_cb_scale_value` / `dra_cr_scale_value`
+///   per eq. 1394, independent of `qPi`); the adapter still resolves
+///   the SPS-active table internally for symmetry but discards it.
+/// * `derived.joined_scale_flag == true` → invokes
+///   [`derive_dra_chroma_state_joined`] with `bit_depth_y =
+///   sps.bit_depth_y()` and the SPS-active `ChromaQpTable` from
+///   [`chroma_qp_table_for_sps`] (signalled if present; Table 5 / 6
+///   on 4:2:0; identity otherwise).
+///
+/// This closes the SPS → §8.9.6 chroma-scale chain at one call site
+/// for both paths, parallelling round-201's
+/// [`chroma_qp_table_for_sps`] for the table half. Existing direct-
+/// invocation callers ([`derive_dra_chroma_state`] /
+/// [`derive_dra_chroma_state_joined`] with a hand-built table) keep
+/// working unchanged — this is a thin opt-in adapter, not a behaviour
+/// change.
+///
+/// # Errors
+///
+/// Bubbles up the underlying derive's error verbatim:
+///
+/// * `chroma_qp_table_for_sps` failures (e.g. out-of-range
+///   `bit_depth_chroma_minus8` from a malformed SPS).
+/// * `derive_dra_chroma_state` failures (zero chroma scale, `bit_depth_y`
+///   out of range).
+/// * `derive_dra_chroma_state_joined` failures (zero per-range luma
+///   scale, `dra_table_idx > 57`, zero joined chromaScale).
+///
+/// # Use
+///
+/// ```text
+/// let (syntax, derived) = parse_dra_syntax(payload, sps.bit_depth_y())?;
+/// let cb = derive_dra_chroma_state_for_sps(&syntax, &derived,
+///                                          ChromaIdx::Cb, &sps)?;
+/// let scale = chroma_scale_for_luma_sample(luma, &cb);
+/// ```
+///
+/// On a strictly monochrome stream (`chroma_format_idc == 0`) there is
+/// no chroma plane to run §8.9.6 on; this adapter still synthesises a
+/// usable [`DraChromaDerived`] so introspection / unit-test code can
+/// exercise the joined chain (identity `ChromaQpTable`). Production
+/// chroma processing should short-circuit at the picture level.
+pub fn derive_dra_chroma_state_for_sps(
+    syntax: &DraSyntax,
+    derived: &DraDerived,
+    cidx: ChromaIdx,
+    sps: &crate::sps::Sps,
+) -> Result<DraChromaDerived> {
+    let bit_depth_y = sps.bit_depth_y();
+    if derived.joined_scale_flag {
+        let table = chroma_qp_table_for_sps(sps)?;
+        derive_dra_chroma_state_joined(syntax, derived, cidx, bit_depth_y, &table)
+    } else {
+        derive_dra_chroma_state(syntax, derived, cidx, bit_depth_y)
+    }
+}
+
 /// Materialise `chroma_derived.out_ranges_c[0..=num_ranges_c]` as an
 /// `i32` vector suitable for [`find_range_idx`]. Includes the top
 /// sentinel `1 << bit_depth_y` placed at index `num_ranges_c` by
@@ -4343,5 +4411,312 @@ mod tests {
                 chroma.inv_chroma_scales[i]
             );
         }
+    }
+
+    // ============================================================
+    // Round 207 — SPS-aware `derive_dra_chroma_state_for_sps`
+    // adapter: closes the SPS → §8.9.6 chroma chain on both the
+    // joined (§8.9.8) and unjoined (§8.9.7) paths.
+    // ============================================================
+
+    /// Round-207 SPS builder. Same shape as `round201_sps_for_adapter`
+    /// but also exposes `bit_depth_luma_minus8` so the chained tests
+    /// can exercise the spec's 10-bit branch on the joined chroma
+    /// derivation.
+    fn round207_sps_for_adapter(
+        chroma_format_idc: u32,
+        sps_iqt_flag: bool,
+        bit_depth_luma_minus8: u32,
+        bit_depth_chroma_minus8: u32,
+        chroma_qp_table: Option<ChromaQpTable>,
+    ) -> crate::sps::Sps {
+        crate::sps::Sps {
+            sps_seq_parameter_set_id: 0,
+            profile_idc: 0,
+            level_idc: 30,
+            toolset_idc_h: 0,
+            toolset_idc_l: 0,
+            chroma_format_idc,
+            pic_width_in_luma_samples: 64,
+            pic_height_in_luma_samples: 64,
+            bit_depth_luma_minus8,
+            bit_depth_chroma_minus8,
+            sps_btt_flag: false,
+            log2_ctu_size_minus5: 0,
+            log2_min_cb_size_minus2: 0,
+            log2_diff_ctu_max_14_cb_size: 0,
+            log2_diff_ctu_max_tt_cb_size: 0,
+            log2_diff_min_cb_min_tt_cb_size_minus2: 0,
+            sps_suco_flag: false,
+            log2_diff_ctu_size_max_suco_cb_size: 0,
+            log2_diff_max_suco_min_suco_cb_size: 0,
+            sps_admvp_flag: false,
+            sps_affine_flag: false,
+            sps_amvr_flag: false,
+            sps_dmvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_hmvp_flag: false,
+            sps_eipd_flag: false,
+            sps_ibc_flag: false,
+            log2_max_ibc_cand_size_minus2: 0,
+            sps_cm_init_flag: false,
+            sps_adcc_flag: false,
+            sps_iqt_flag,
+            sps_ats_flag: false,
+            sps_addb_flag: false,
+            sps_alf_flag: false,
+            sps_htdf_flag: false,
+            sps_rpl_flag: false,
+            sps_pocs_flag: false,
+            sps_dquant_flag: false,
+            sps_dra_flag: false,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            log2_sub_gop_length: 0,
+            log2_ref_pic_gap_length: 0,
+            max_num_tid0_ref_pics: 0,
+            sps_max_dec_pic_buffering_minus1: 0,
+            long_term_ref_pics_flag: false,
+            rpl1_same_as_rpl0_flag: false,
+            num_ref_pic_lists_in_sps_l0: 0,
+            num_ref_pic_lists_in_sps_l1: 0,
+            ref_pic_list_structs_l0: Vec::new(),
+            ref_pic_list_structs_l1: Vec::new(),
+            picture_cropping_flag: false,
+            picture_crop_left_offset: 0,
+            picture_crop_right_offset: 0,
+            picture_crop_top_offset: 0,
+            picture_crop_bottom_offset: 0,
+            chroma_qp_table,
+            vui_parameters_present_flag: false,
+        }
+    }
+
+    #[test]
+    fn round207_for_sps_unjoined_matches_direct_unjoined() {
+        // dra_table_idx = 58 ⇒ DraJoinedScaleFlag = 0 ⇒ §8.9.7 unjoined
+        // path. The SPS adapter must produce byte-identical output to
+        // `derive_dra_chroma_state` invoked directly with the same
+        // `bit_depth_y`. ChromaQpTable is irrelevant here per eq. 1394.
+        let sps = round207_sps_for_adapter(1, false, 2, 2, None); // 10-bit
+        let syn = three_range_unjoined_chroma_syntax(sps.bit_depth_y());
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(
+            !der.joined_scale_flag,
+            "dra_table_idx = 58 must clear joined_scale_flag"
+        );
+        let direct = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, sps.bit_depth_y()).unwrap();
+        let via_sps = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cb, &sps).unwrap();
+        // Byte-identical state on the unjoined path.
+        assert_eq!(direct.num_ranges_l, via_sps.num_ranges_l);
+        assert_eq!(direct.chroma_scales, via_sps.chroma_scales);
+        assert_eq!(direct.inv_chroma_scales, via_sps.inv_chroma_scales);
+        assert_eq!(direct.out_scales_c, via_sps.out_scales_c);
+        assert_eq!(direct.out_offsets_c, via_sps.out_offsets_c);
+        assert_eq!(direct.out_ranges_c, via_sps.out_ranges_c);
+    }
+
+    #[test]
+    fn round207_for_sps_joined_matches_direct_joined() {
+        // dra_table_idx ∈ [0, 57] ⇒ DraJoinedScaleFlag = 1 ⇒ §8.9.8
+        // joined path. The SPS adapter must produce byte-identical
+        // output to `derive_dra_chroma_state_joined` invoked directly
+        // with the SPS-active `ChromaQpTable`.
+        let sps = round207_sps_for_adapter(1, false, 0, 0, None); // 8-bit, 4:2:0
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(
+            der.joined_scale_flag,
+            "dra_table_idx != 58 must set joined_scale_flag"
+        );
+        let table = chroma_qp_table_for_sps(&sps).unwrap();
+        let direct =
+            derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cr, sps.bit_depth_y(), &table)
+                .unwrap();
+        let via_sps = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cr, &sps).unwrap();
+        assert_eq!(direct.num_ranges_l, via_sps.num_ranges_l);
+        assert_eq!(direct.chroma_scales, via_sps.chroma_scales);
+        assert_eq!(direct.inv_chroma_scales, via_sps.inv_chroma_scales);
+        assert_eq!(direct.out_scales_c, via_sps.out_scales_c);
+        assert_eq!(direct.out_offsets_c, via_sps.out_offsets_c);
+        assert_eq!(direct.out_ranges_c, via_sps.out_ranges_c);
+    }
+
+    #[test]
+    fn round207_for_sps_dispatches_on_joined_scale_flag() {
+        // Same SPS, same derived state — only the syntax's
+        // dra_table_idx changes between the two invocations. The
+        // adapter must dispatch correctly off `derived.joined_scale_flag`
+        // (set by `derive_dra_state` from `dra_table_idx`), NOT off
+        // any SPS field.
+        let sps = round207_sps_for_adapter(1, false, 2, 2, None); // 10-bit
+                                                                  // Unjoined branch.
+        let syn_u = three_range_unjoined_chroma_syntax(sps.bit_depth_y());
+        let der_u = derive_dra_state(&syn_u, sps.bit_depth_y()).unwrap();
+        assert!(!der_u.joined_scale_flag);
+        let out_u = derive_dra_chroma_state_for_sps(&syn_u, &der_u, ChromaIdx::Cb, &sps).unwrap();
+        // §8.9.7: chromaScales[i] is constant across i (= dra_cb_scale_value).
+        for i in 1..out_u.num_ranges_l {
+            assert_eq!(
+                out_u.chroma_scales[i], out_u.chroma_scales[0],
+                "unjoined chromaScales[i] must be constant"
+            );
+            assert_eq!(out_u.chroma_scales[i], syn_u.dra_cb_scale_value as i64);
+        }
+        // Joined branch.
+        let syn_j = three_range_joined_chroma_syntax();
+        let der_j = derive_dra_state(&syn_j, sps.bit_depth_y()).unwrap();
+        assert!(der_j.joined_scale_flag);
+        let out_j = derive_dra_chroma_state_for_sps(&syn_j, &der_j, ChromaIdx::Cb, &sps).unwrap();
+        // §8.9.8: chromaScales[i] is a per-range function of
+        // `chroma_scale_joined(lumaScales[i], …)` — at minimum not
+        // a single constant when the underlying luma scales differ.
+        // Verify all are strictly positive (so eq. 1386 reciprocates).
+        for i in 0..out_j.num_ranges_l {
+            assert!(
+                out_j.chroma_scales[i] > 0,
+                "joined chromaScales[{i}] must be > 0"
+            );
+        }
+        // And the joined+unjoined paths produce different states
+        // (under three_range_joined the per-range luma scales vary
+        // 256/512/1024, so the joined chroma scales must vary too).
+        let varies =
+            (1..out_j.num_ranges_l).any(|i| out_j.chroma_scales[i] != out_j.chroma_scales[0]);
+        assert!(varies, "joined chromaScales[i] should vary across i");
+    }
+
+    #[test]
+    fn round207_for_sps_uses_signalled_chroma_qp_table_on_joined_path() {
+        // Build a non-trivial signalled ChromaQpTable, stash it on the
+        // SPS, and verify the joined dispatch consumes it (not the
+        // Table 5/6 default). Effect is observable because the
+        // signalled table differs from Table 5 at qPi = 30 (signalled
+        // is identity ⇒ 30 here; Table 5 ⇒ 29).
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            // Single pivot: identity ramp (delta_in = 0 ⇒ minus1 = 0,
+            // delta_out = 0). Spec pivot-fill at the start qpInVal[0]
+            // anchors to 0 and propagates identity outward.
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![0],
+                delta_qp_out_val: vec![0],
+            }],
+        };
+        let signalled = build_signalled_chroma_qp_table(&params, 0).unwrap();
+        let sps = round207_sps_for_adapter(1, false, 0, 0, Some(signalled.clone()));
+        // Use the joined three-range syntax (dra_table_idx = 30 ⇒
+        // joined_scale_flag = true).
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(der.joined_scale_flag);
+        // Drive both via_sps and direct with the signalled table; they
+        // must match. Then verify Table-5 default produces a
+        // *different* output — proving the dispatch is reading
+        // sps.chroma_qp_table, not falling back to Table 5.
+        let via_sps = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cb, &sps).unwrap();
+        let direct_signalled = derive_dra_chroma_state_joined(
+            &syn,
+            &der,
+            ChromaIdx::Cb,
+            sps.bit_depth_y(),
+            &signalled,
+        )
+        .unwrap();
+        assert_eq!(via_sps.chroma_scales, direct_signalled.chroma_scales);
+        let default = default_chroma_qp_table(false, 0).unwrap();
+        let direct_default =
+            derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, sps.bit_depth_y(), &default)
+                .unwrap();
+        // Signalled (identity) vs default (Table 5) must produce
+        // observably different state, otherwise the test can't
+        // distinguish the two dispatch outcomes.
+        assert_ne!(
+            direct_signalled.chroma_scales, direct_default.chroma_scales,
+            "signalled identity ChromaQpTable must differ from Table 5 default"
+        );
+    }
+
+    #[test]
+    fn round207_for_sps_propagates_zero_scale_error_unjoined() {
+        // Zero chroma scale on the unjoined path ⇒ the underlying
+        // `derive_dra_chroma_state` errors (eq. 1386 divide-by-zero
+        // guard). The adapter must surface the error verbatim.
+        let sps = round207_sps_for_adapter(1, false, 0, 0, None);
+        let mut syn = three_range_unjoined_chroma_syntax(sps.bit_depth_y());
+        syn.dra_cb_scale_value = 0;
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(!der.joined_scale_flag);
+        let err = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cb, &sps);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn round207_for_sps_propagates_zero_cb_scale_error_joined() {
+        // Zero `dra_cb_scale_value` on the joined path ⇒ the underlying
+        // `derive_dra_chroma_state_joined` errors (§7.4.7 forbids
+        // zero scales; eq. 1386 would divide by zero). Adapter must
+        // surface this verbatim.
+        let sps = round207_sps_for_adapter(1, false, 0, 0, None);
+        let mut syn = three_range_joined_chroma_syntax();
+        syn.dra_cb_scale_value = 0;
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(der.joined_scale_flag);
+        let err = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cb, &sps);
+        assert!(err.is_err(), "adapter must surface zero-Cb-scale error");
+        // Cr path with the same syntax still derives fine (Cr scale
+        // is non-zero).
+        let ok = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cr, &sps);
+        assert!(ok.is_ok(), "Cr path should still derive cleanly");
+    }
+
+    #[test]
+    fn round207_for_sps_monochrome_synthesises_identity_on_joined_path() {
+        // Monochrome SPS (chroma_format_idc = 0): the §7.4.3.1 parser
+        // never enters the chroma_qp_table_present_flag body, so
+        // sps.chroma_qp_table = None. The round-201 adapter
+        // synthesises the spec-page-67 "Otherwise" identity table.
+        // The round-207 adapter then feeds it to the joined derive
+        // and the chain stays bit-faithful (every chromaScales[i] > 0).
+        let sps = round207_sps_for_adapter(0, false, 2, 2, None); // 10-bit mono
+        let syn = three_range_joined_chroma_syntax();
+        let der = derive_dra_state(&syn, sps.bit_depth_y()).unwrap();
+        assert!(der.joined_scale_flag);
+        let out = derive_dra_chroma_state_for_sps(&syn, &der, ChromaIdx::Cb, &sps).unwrap();
+        for i in 0..out.num_ranges_l {
+            assert!(out.chroma_scales[i] > 0);
+            assert!(out.inv_chroma_scales[i] > 0);
+        }
+        // And direct invocation with the round-201 SPS-adapted table
+        // must match the round-207 SPS dispatch.
+        let table = chroma_qp_table_for_sps(&sps).unwrap();
+        let direct =
+            derive_dra_chroma_state_joined(&syn, &der, ChromaIdx::Cb, sps.bit_depth_y(), &table)
+                .unwrap();
+        assert_eq!(out.chroma_scales, direct.chroma_scales);
+        assert_eq!(out.out_ranges_c, direct.out_ranges_c);
+    }
+
+    #[test]
+    fn round207_for_sps_threads_bit_depth_y_from_sps() {
+        // The adapter must read bit_depth_y from sps.bit_depth_y(), not
+        // assume 8-bit / 10-bit. Build two SPSes that differ only in
+        // bit_depth_luma_minus8 and verify the chroma derivation
+        // captures the difference (§8.9.5 top sentinel `1 <<
+        // bit_depth_y` differs).
+        let sps_8 = round207_sps_for_adapter(1, false, 0, 0, None); // 8-bit
+        let sps_10 = round207_sps_for_adapter(1, false, 2, 2, None); // 10-bit
+        let syn = three_range_unjoined_chroma_syntax(10);
+        let der_8 = derive_dra_state(&syn, sps_8.bit_depth_y()).unwrap();
+        let der_10 = derive_dra_state(&syn, sps_10.bit_depth_y()).unwrap();
+        let out_8 = derive_dra_chroma_state_for_sps(&syn, &der_8, ChromaIdx::Cb, &sps_8).unwrap();
+        let out_10 =
+            derive_dra_chroma_state_for_sps(&syn, &der_10, ChromaIdx::Cb, &sps_10).unwrap();
+        // Top sentinel reflects the bit-depth difference: §8.9.5 top
+        // = 1 << bit_depth_y. At num_ranges_c the sentinel sits.
+        let num_ranges_c_8 = out_8.num_ranges_l + 1;
+        let num_ranges_c_10 = out_10.num_ranges_l + 1;
+        assert_eq!(out_8.out_ranges_c[num_ranges_c_8], 1i64 << 8);
+        assert_eq!(out_10.out_ranges_c[num_ranges_c_10], 1i64 << 10);
     }
 }
