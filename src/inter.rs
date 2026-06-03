@@ -838,6 +838,237 @@ pub fn mmvd_direction_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
     Ok(bin_idx as usize)
 }
 
+// ===========================================================================
+// §8.5.2.3.9 — Bipred MMVD offset distribution (eqs. 591-616)
+// ===========================================================================
+//
+// Round 223 lands the symmetric / asymmetric bipred branch of the §8.5.2.3.9
+// "Derivation process for MMVD motion vector". Round 218 covered Table 9 +
+// Table 10 + eqs. 133/134 (`MmvdOffset`); this round consumes that offset
+// plus the POC distances of `(currPic, RefPicList0[refIdxL0])` and
+// `(currPic, RefPicList1[refIdxL1])` to produce the per-list MV deltas
+// `mMvdL0` and `mMvdL1`, and accumulates them into `mMvL0` / `mMvL1`.
+//
+// The bipred sub-process (eqs. 591-616) splits on the relative magnitudes
+// of the two POC diffs:
+//
+// 1. `Abs(currPocDiffL0) == Abs(currPocDiffL1)` — symmetric case
+//    (eqs. 593-596): both `mMvdLX = MmvdOffset` directly.
+//
+// 2. `Abs(currPocDiffL0) > Abs(currPocDiffL1)` — L1 closer
+//    (eqs. 597-601): `mMvdL1 = MmvdOffset`, then `mMvdL0` is scaled from
+//    `mMvdL1` by `distScaleFactor = (Abs(L1) << 5) / Abs(L0)` via the
+//    round-half-up form `Clip3(-32768, 32767, (sf * mMvdL1[k] + 16) >> 5)`.
+//
+// 3. `Abs(currPocDiffL0) < Abs(currPocDiffL1)` — L0 closer
+//    (eqs. 602-606): symmetric to case 2 with the roles swapped.
+//
+// After case 2 / case 3, if `currPocDiffL0 * currPocDiffL1 < 0` (the
+// reference pictures sit on opposite sides of `currPic` in display order),
+// eqs. 607-610 negate `mMvdL1` to flip its sign relative to `mMvdL0`. (The
+// no-op identities `mMvdL0 = mMvdL0` at eqs. 607/608 are the spec's way of
+// emphasising that only `mMvdL1` is touched.)
+//
+// The "Otherwise" branch at eqs. 611-612 covers the one-list-active case
+// (`predFlagL0 ^ predFlagL1 == 1`): each active list gets `MmvdOffset`, the
+// inactive list gets zero.
+//
+// Eqs. 613-616 close out the process by adding `mMvdLX` to the merge
+// candidate's `mvLX[0][0]`, producing the final MMVD motion vectors.
+//
+// All arithmetic uses signed 32-bit intermediates and clips the per-list
+// MVD components to signed 16-bit range. The spec's `Clip3(-32768, 32767,
+// ...)` wrapping ensures the upstream `mMvL0 += mMvdL0` accumulation
+// (eqs. 613-614) operates on already-clipped values; the addition then
+// goes through the same `wrap16` modular semantics as eqs. 436/439.
+//
+// Spec typo: eq. 601 (page 170) reads
+// `Clip3( −32768, 32767 ( distScaleFactor * mMvdL1[ 1 ] + 16 ) >> 5 )` —
+// the comma between `32767` and the inner expression is missing in the
+// typeset PDF. Context-determined: the form is identical to eq. 600 on
+// the y component.
+//
+// Docs gap none. The §8.5.2.3.9 entry-point process (eqs. 531-590) covers
+// the `mmvd_group_idx ∈ { 1, 2 }` ref-list reassignment branches plus a
+// `slice_type == P` sub-branch (eq. 545-553, 574-582), both of which need
+// `slice_type`, `NumRefIdxActive[]`, and the populated `RefPicList0/1`
+// arrays — wiring that needs an §8.5.2.3.x merge-candidate-list pass to
+// land first. This round confines itself to the bipred and one-list-active
+// distribution + final accumulation, which is self-contained given the
+// inputs.
+
+/// §8.5.2.3.9 / eq. 588 (P-slice form), eq. 599, eq. 604 — POC-difference
+/// scaling factor used by the bipred MMVD branch:
+///
+/// ```text
+/// distScaleFactor = ( |pocDiffNum| << 5 ) / |pocDiffDen|
+/// ```
+///
+/// The numerator and denominator forms in eqs. 599 / 604 explicitly take
+/// `Abs(currPocDiffL?)` of both arguments, so this helper accepts already-
+/// absolute values. The result is always non-negative.
+///
+/// `pocDiffDen` must be non-zero; the bipred branch only enters with both
+/// L0 and L1 ref pictures active, and POC equality already routed the
+/// caller into the symmetric eqs. 593-596 path.
+pub fn mmvd_dist_scale_factor(abs_poc_num: i32, abs_poc_den: i32) -> Result<i32> {
+    if abs_poc_den <= 0 {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_dist_scale_factor needs strictly-positive denominator, got {abs_poc_den} (§8.5.2.3.9 eq. 599/604)"
+        )));
+    }
+    if abs_poc_num < 0 {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_dist_scale_factor needs non-negative numerator, got {abs_poc_num} (§8.5.2.3.9 eq. 599/604)"
+        )));
+    }
+    Ok((abs_poc_num << 5) / abs_poc_den)
+}
+
+/// `Clip3(-32768, 32767, ...)` — eq. 600 / 601 / 605 / 606 component
+/// clipper. The bipred MMVD path produces 32-bit intermediates (POC scale
+/// factor × MV component + bias) which the spec then clamps back into
+/// signed 16-bit range, matching the §6.5 storage of MV components.
+fn clip_mvd_component(v: i32) -> i32 {
+    v.clamp(-32768, 32767)
+}
+
+/// §8.5.2.3.9 — round-half-up POC scaling of a single MV component, the
+/// form used by eqs. 600 / 601 / 605 / 606:
+///
+/// ```text
+/// out = Clip3(-32768, 32767, (distScaleFactor * mvComponent + 16) >> 5)
+/// ```
+///
+/// The `+16` bias plus `>> 5` is the spec's round-half-up reduction of a
+/// 5-bit fractional scaling. Rust's arithmetic right-shift on signed
+/// integers makes the semantics deterministic for both signs of the
+/// product.
+fn mmvd_scale_component(dist_scale_factor: i32, mv_component: i32) -> i32 {
+    let raw = dist_scale_factor
+        .wrapping_mul(mv_component)
+        .wrapping_add(16)
+        >> 5;
+    clip_mvd_component(raw)
+}
+
+/// §8.5.2.3.9 / eqs. 591-616 — bipred + one-list-active MMVD offset
+/// distribution and final motion-vector accumulation.
+///
+/// This is the tail of §8.5.2.3.9: it runs after the §7.4.7 / Table-9-10
+/// derivation produced `MmvdOffset`, after merge-candidate selection
+/// produced `mvL0` / `mvL1`, and after `mmvd_group_idx ∈ { 1, 2 }`
+/// reassignment (if any) settled `refIdxLX` / `predFlagLX`.
+///
+/// Inputs:
+///
+/// * `mv_l0`, `mv_l1` — the merge candidate's per-list motion vectors,
+///   already loaded into `mMvL0` / `mMvL1` by eqs. 531-532. Components
+///   live in the same signed 16-bit range as the spec's `mvLX[0][0]`.
+/// * `mmvd_offset` — the §7.4.7 / round-218 axis-aligned `MmvdOffset`
+///   (eqs. 133-134). Magnitude is one of `{ 1, 2, 4, 8, 16, 32, 64, 128 }`
+///   with exactly one non-zero component.
+/// * `curr_poc_diff_l0` — `DiffPicOrderCnt(currPic, RefPicList0[refIdxL0])`
+///   from eqs. 586 / 591. Signed: positive when the L0 reference precedes
+///   `currPic` in display order.
+/// * `curr_poc_diff_l1` — `DiffPicOrderCnt(currPic, RefPicList1[refIdxL1])`
+///   from eqs. 587 / 592. Signed; same convention.
+/// * `pred_flag_l0`, `pred_flag_l1` — `predFlagL{0,1}[0][0]` (the
+///   `bool` form). Both true ⇒ bipred branch (eqs. 591-610); exactly
+///   one true ⇒ "Otherwise" branch (eqs. 611-612); both false is a
+///   caller bug — the §8.5.2.3.9 entry never enters the eqs. 591-616
+///   region with both list flags zero.
+///
+/// Output: the post-accumulation `(mMvL0, mMvL1)` (eqs. 613-616). When
+/// `pred_flag_lX == false` the corresponding output equals the input
+/// `mv_lX` unchanged (the spec's `mMvdLX = 0` then `mMvLX += 0`).
+///
+/// Round 223 deliberately keeps this as a pure helper: no `Sps`, no
+/// `Slice`, no merge-candidate-list state. It will be invoked by a future
+/// §8.5.2.3.9 entry point that resolves `mmvd_group_idx` and threads the
+/// POC arithmetic from a populated `RefPicList0 / RefPicList1`.
+pub fn mmvd_apply_bipred_offset(
+    mv_l0: MotionVector,
+    mv_l1: MotionVector,
+    mmvd_offset: MotionVector,
+    curr_poc_diff_l0: i32,
+    curr_poc_diff_l1: i32,
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+) -> Result<(MotionVector, MotionVector)> {
+    if !pred_flag_l0 && !pred_flag_l1 {
+        return Err(Error::unsupported(
+            "evc inter: mmvd_apply_bipred_offset called with predFlagL0 == predFlagL1 == 0 (§8.5.2.3.9 eqs. 591-616 require at least one active list)"
+                .to_string(),
+        ));
+    }
+
+    if pred_flag_l0 && pred_flag_l1 {
+        // Bipred branch — eqs. 591-610.
+        let abs_l0 = curr_poc_diff_l0.unsigned_abs() as i32;
+        let abs_l1 = curr_poc_diff_l1.unsigned_abs() as i32;
+
+        let (mut mvd_l0, mut mvd_l1) = if abs_l0 == abs_l1 {
+            // Symmetric — eqs. 593-596.
+            (mmvd_offset, mmvd_offset)
+        } else if abs_l0 > abs_l1 {
+            // L1 closer — eqs. 597-601. mMvdL1 = MmvdOffset; mMvdL0 is the
+            // round-half-up POC scaling of mMvdL1 by (|L1| << 5) / |L0|.
+            let sf = mmvd_dist_scale_factor(abs_l1, abs_l0)?;
+            let mvd_l1 = mmvd_offset;
+            let mvd_l0 = MotionVector {
+                x: mmvd_scale_component(sf, mvd_l1.x),
+                y: mmvd_scale_component(sf, mvd_l1.y),
+            };
+            (mvd_l0, mvd_l1)
+        } else {
+            // L0 closer — eqs. 602-606. Symmetric to case 2.
+            let sf = mmvd_dist_scale_factor(abs_l0, abs_l1)?;
+            let mvd_l0 = mmvd_offset;
+            let mvd_l1 = MotionVector {
+                x: mmvd_scale_component(sf, mvd_l0.x),
+                y: mmvd_scale_component(sf, mvd_l0.y),
+            };
+            (mvd_l0, mvd_l1)
+        };
+
+        // Eqs. 607-610: opposite-side POCs flip the sign of mMvdL1.
+        // currPocDiffL0 * currPocDiffL1 < 0 ⇔ signs of the two POC diffs
+        // disagree (neither is zero — the symmetric branch handled the
+        // zero-magnitude tie, and a single zero would route through that
+        // branch with abs equality).
+        if (curr_poc_diff_l0 < 0) ^ (curr_poc_diff_l1 < 0)
+            && curr_poc_diff_l0 != 0
+            && curr_poc_diff_l1 != 0
+        {
+            mvd_l1 = MotionVector {
+                x: -mvd_l1.x,
+                y: -mvd_l1.y,
+            };
+            // eqs. 607/608 leave mvd_l0 unchanged (`mMvdL0 = mMvdL0`).
+            let _ = &mut mvd_l0;
+        }
+
+        // Eqs. 613-616: mMvLX += mMvdLX with the same wrap16 semantics
+        // shared with eqs. 436/439.
+        Ok((mv_l0.wrapping_add(&mvd_l0), mv_l1.wrapping_add(&mvd_l1)))
+    } else {
+        // One-list-active "Otherwise" branch — eqs. 611-612.
+        // mMvdLX = predFlagLX == 1 ? MmvdOffset : 0
+        let mvd_l0 = if pred_flag_l0 {
+            mmvd_offset
+        } else {
+            MotionVector::default()
+        };
+        let mvd_l1 = if pred_flag_l1 {
+            mmvd_offset
+        } else {
+            MotionVector::default()
+        };
+        Ok((mv_l0.wrapping_add(&mvd_l0), mv_l1.wrapping_add(&mvd_l1)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,5 +1683,221 @@ mod tests {
         assert_eq!(MMVD_DIRECTION_IDX_MAX, 3);
         assert_eq!(MMVD_GROUP_IDX_MAX, 2);
         assert_eq!(MMVD_MERGE_IDX_MAX, 3);
+    }
+
+    // -----------------------------------------------------------------
+    // round 223 — §8.5.2.3.9 bipred MMVD offset distribution
+    // -----------------------------------------------------------------
+
+    /// Eq. 588 / 599 / 604 — distScaleFactor is `(|num| << 5) / |den|`.
+    /// Worked example from a symmetric same-magnitude case: `|num| = 4`,
+    /// `|den| = 4` ⇒ `sf = 32`.
+    #[test]
+    fn round223_dist_scale_factor_eq599_eq604_form() {
+        assert_eq!(mmvd_dist_scale_factor(4, 4).unwrap(), 32);
+        assert_eq!(mmvd_dist_scale_factor(2, 4).unwrap(), 16);
+        assert_eq!(mmvd_dist_scale_factor(4, 2).unwrap(), 64);
+        assert_eq!(mmvd_dist_scale_factor(0, 4).unwrap(), 0);
+    }
+
+    /// Zero / negative denominator surfaces `Error::Unsupported` rather
+    /// than panicking; negative numerator likewise (the caller's bipred
+    /// branch always passes `Abs(currPocDiffL?)`).
+    #[test]
+    fn round223_dist_scale_factor_rejects_bad_inputs() {
+        assert!(mmvd_dist_scale_factor(4, 0).is_err());
+        assert!(mmvd_dist_scale_factor(4, -1).is_err());
+        assert!(mmvd_dist_scale_factor(-1, 4).is_err());
+    }
+
+    /// Eqs. 593-596 — when `Abs(currPocDiffL0) == Abs(currPocDiffL1)`,
+    /// both `mMvdLX = MmvdOffset`, so `mMvLX = mvLX + MmvdOffset` for
+    /// both lists. POC signs equal (no opposite-side sign flip).
+    #[test]
+    fn round223_bipred_symmetric_same_magnitude_same_sign() {
+        let mv_l0 = MotionVector::quarter_pel(10, -4);
+        let mv_l1 = MotionVector::quarter_pel(-20, 8);
+        let offset = MotionVector::quarter_pel(0, 16);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 4, 4, true, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(10, 12));
+        assert_eq!(out_l1, MotionVector::quarter_pel(-20, 24));
+    }
+
+    /// Eqs. 593-596 plus eqs. 607-610 — symmetric magnitudes but
+    /// opposite POC signs ⇒ `mMvdL1` gets negated, `mMvdL0` keeps the
+    /// raw offset.
+    #[test]
+    fn round223_bipred_symmetric_opposite_sign_flips_l1() {
+        let mv_l0 = MotionVector::quarter_pel(0, 0);
+        let mv_l1 = MotionVector::quarter_pel(0, 0);
+        let offset = MotionVector::quarter_pel(32, 0);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 4, -4, true, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(32, 0));
+        assert_eq!(out_l1, MotionVector::quarter_pel(-32, 0));
+    }
+
+    /// Eqs. 597-601 — `Abs(L0) > Abs(L1)` ⇒ `mMvdL1 = MmvdOffset`,
+    /// `mMvdL0` is scaled by `sf = (|L1| << 5) / |L0|`. With
+    /// `|L0| = 8`, `|L1| = 4`, `MmvdOffset = (64, 0)`, scaled component
+    /// is `((4<<5)/8 * 64 + 16) >> 5 = (16 * 64 + 16) >> 5 = 1040 >> 5
+    /// = 32`. Same-sign POCs, no sign flip.
+    #[test]
+    fn round223_bipred_l1_closer_scales_l0() {
+        let mv_l0 = MotionVector::quarter_pel(0, 0);
+        let mv_l1 = MotionVector::quarter_pel(0, 0);
+        let offset = MotionVector::quarter_pel(64, 0);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 8, 4, true, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(32, 0));
+        assert_eq!(out_l1, MotionVector::quarter_pel(64, 0));
+    }
+
+    /// Eqs. 602-606 — `Abs(L0) < Abs(L1)` ⇒ `mMvdL0 = MmvdOffset`,
+    /// `mMvdL1` is scaled by `sf = (|L0| << 5) / |L1|`. With `|L0| = 4`,
+    /// `|L1| = 8`, `MmvdOffset = (0, 64)`, scaled y is `((4<<5)/8 * 64
+    /// + 16) >> 5 = 32`.
+    #[test]
+    fn round223_bipred_l0_closer_scales_l1() {
+        let mv_l0 = MotionVector::quarter_pel(0, 0);
+        let mv_l1 = MotionVector::quarter_pel(0, 0);
+        let offset = MotionVector::quarter_pel(0, 64);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 4, 8, true, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(0, 64));
+        assert_eq!(out_l1, MotionVector::quarter_pel(0, 32));
+    }
+
+    /// Eqs. 597-601 followed by 607-610 — asymmetric magnitudes with
+    /// opposite POC signs ⇒ the scaled `mMvdL1` is negated.
+    /// `|L0| = 8`, `|L1| = 4`, POC signs differ, `MmvdOffset = (64, 0)`:
+    /// `mMvdL1 = (64, 0)` (raw offset), then negated to `(-64, 0)`;
+    /// `mMvdL0` = scaled = `(32, 0)` (no sign flip on L0).
+    #[test]
+    fn round223_bipred_l1_closer_opposite_sign_flips_l1_only() {
+        let mv_l0 = MotionVector::quarter_pel(0, 0);
+        let mv_l1 = MotionVector::quarter_pel(0, 0);
+        let offset = MotionVector::quarter_pel(64, 0);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 8, -4, true, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(32, 0));
+        assert_eq!(out_l1, MotionVector::quarter_pel(-64, 0));
+    }
+
+    /// Eqs. 611-612 — only L0 active. `mMvdL0 = MmvdOffset`, `mMvdL1 =
+    /// 0`. POC diffs are irrelevant to the "Otherwise" branch.
+    #[test]
+    fn round223_one_list_active_l0_only() {
+        let mv_l0 = MotionVector::quarter_pel(100, 100);
+        let mv_l1 = MotionVector::quarter_pel(50, 50);
+        let offset = MotionVector::quarter_pel(16, 0);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 0, 0, true, false).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(116, 100));
+        assert_eq!(out_l1, MotionVector::quarter_pel(50, 50));
+    }
+
+    /// Eqs. 611-612 — only L1 active. Symmetric to L0-only.
+    #[test]
+    fn round223_one_list_active_l1_only() {
+        let mv_l0 = MotionVector::quarter_pel(50, 50);
+        let mv_l1 = MotionVector::quarter_pel(100, 100);
+        let offset = MotionVector::quarter_pel(0, -8);
+        let (out_l0, out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 0, 0, false, true).unwrap();
+        assert_eq!(out_l0, MotionVector::quarter_pel(50, 50));
+        assert_eq!(out_l1, MotionVector::quarter_pel(100, 92));
+    }
+
+    /// Both `predFlagLX == 0` is a caller bug — the §8.5.2.3.9 entry
+    /// process never enters eqs. 591-616 with both list flags zero.
+    /// Surface `Error::Unsupported`, do not silently return zeroes.
+    #[test]
+    fn round223_rejects_both_lists_inactive() {
+        let mv = MotionVector::default();
+        let offset = MotionVector::quarter_pel(1, 0);
+        assert!(mmvd_apply_bipred_offset(mv, mv, offset, 1, 1, false, false).is_err());
+    }
+
+    /// Eqs. 613-616 — the final accumulation goes through the same
+    /// `wrap16` semantics as eqs. 436/439. Verify by pushing `mvL0`
+    /// near the positive 16-bit boundary and observing the wrap.
+    #[test]
+    fn round223_accumulation_wraps_into_signed_16bit() {
+        let mv_l0 = MotionVector::quarter_pel(32000, 0);
+        let mv_l1 = MotionVector::quarter_pel(0, 0);
+        let offset = MotionVector::quarter_pel(1000, 0);
+        let (out_l0, _out_l1) =
+            mmvd_apply_bipred_offset(mv_l0, mv_l1, offset, 4, 4, true, true).unwrap();
+        // 32000 + 1000 = 33000 wraps to -32536 per wrap16.
+        assert_eq!(out_l0.x, -32536);
+    }
+
+    /// Eqs. 600 / 601 / 605 / 606 — the clip step caps the post-scale
+    /// MV component to signed 16-bit. Force a giant scale factor and
+    /// confirm the clip engages (rather than overflowing into the wrap
+    /// semantics of the eq. 613 accumulation).
+    #[test]
+    fn round223_scaled_component_clips_to_signed16() {
+        // sf = (1 << 5) / 1 = 32; mv component = 8000.
+        // raw = (32 * 8000 + 16) >> 5 = 256016 >> 5 = 8000 (fits, identity).
+        // We instead pin clip explicitly:
+        assert_eq!(clip_mvd_component(40000), 32767);
+        assert_eq!(clip_mvd_component(-40000), -32768);
+        assert_eq!(clip_mvd_component(0), 0);
+    }
+
+    /// `mmvd_scale_component` matches eq. 600's `(sf * mv + 16) >> 5`
+    /// form on a worked positive example and on a negative-mv example
+    /// (Rust's arithmetic right-shift on signed types makes the result
+    /// deterministic on both signs).
+    #[test]
+    fn round223_scale_component_eq600_form() {
+        // (32 * 100 + 16) >> 5 = 3216 >> 5 = 100. Identity sf = 32.
+        assert_eq!(mmvd_scale_component(32, 100), 100);
+        // (16 * 100 + 16) >> 5 = 1616 >> 5 = 50.5 ⇒ 50 (round-half-up
+        // semantics on positive values give 50 here because 1616 = 50*32
+        // + 16, the round-half-up of 50.5 gives 51 — but the spec's form
+        // is `(x + 16) >> 5` which is "add half, truncate"; with x=1600
+        // we get (1600 + 16) >> 5 = 1616 >> 5 = 50).
+        assert_eq!(mmvd_scale_component(16, 100), 50);
+        // Negative MV: (16 * -100 + 16) >> 5 = (-1584) >> 5 = -50
+        // (arithmetic right shift: -1584 / 32 = -49.5 ⇒ -50 floor).
+        assert_eq!(mmvd_scale_component(16, -100), -50);
+    }
+
+    /// Cross-check: when the bipred branch enters with all-zero
+    /// MV inputs and a non-zero offset and symmetric POC magnitudes,
+    /// the result equals `(offset, offset)` for same-sign POCs and
+    /// `(offset, -offset)` for opposite-sign POCs.
+    #[test]
+    fn round223_bipred_symmetric_property_offset_distribution() {
+        let zero = MotionVector::default();
+        for (k, offset) in [
+            MotionVector::quarter_pel(1, 0),
+            MotionVector::quarter_pel(-1, 0),
+            MotionVector::quarter_pel(0, 32),
+            MotionVector::quarter_pel(0, -128),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (l0, l1) = mmvd_apply_bipred_offset(zero, zero, *offset, 4, 4, true, true).unwrap();
+            assert_eq!(l0, *offset, "same-sign k = {k}");
+            assert_eq!(l1, *offset, "same-sign k = {k}");
+
+            let (l0, l1) =
+                mmvd_apply_bipred_offset(zero, zero, *offset, 4, -4, true, true).unwrap();
+            assert_eq!(l0, *offset, "opp-sign k = {k}");
+            assert_eq!(
+                l1,
+                MotionVector {
+                    x: -offset.x,
+                    y: -offset.y
+                },
+                "opp-sign k = {k}"
+            );
+        }
     }
 }

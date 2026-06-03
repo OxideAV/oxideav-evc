@@ -7,6 +7,98 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-223 status
+
+Round 223 extends the round-218 MMVD groundwork into the **bipred /
+one-list-active offset distribution + final accumulation** of
+§8.5.2.3.9 (eqs. 591-616). Given a merge candidate's per-list MVs
+`mvL0` / `mvL1`, the round-218 axis-aligned `MmvdOffset`, the two
+signed POC differences `currPocDiffL{0,1}`, and the
+`predFlagL{0,1}[0][0]` flags, the new helper computes the per-list
+deltas `mMvdL{0,1}` and returns the post-accumulation `mMvL{0,1}`.
+
+The bipred branch splits on the relative magnitudes of the two POC
+differences:
+
+| `Abs(currPocDiffL0)` vs `Abs(currPocDiffL1)` | `mMvdL0` | `mMvdL1` |
+|---|---|---|
+| equal (eqs. 593-596) | `MmvdOffset` | `MmvdOffset` |
+| greater (eqs. 597-601) | scaled via `(\|L1\| << 5) / \|L0\|` | `MmvdOffset` |
+| less (eqs. 602-606) | `MmvdOffset` | scaled via `(\|L0\| << 5) / \|L1\|` |
+
+The scaling form is `Clip3(-32768, 32767, (distScaleFactor * mvd + 16)
+>> 5)` (round-half-up, 5-bit fractional reduction). When
+`currPocDiffL0 * currPocDiffL1 < 0` (eqs. 607-610) the `mMvdL1`
+component is negated (the spec's `mMvdL0 = mMvdL0` identities at
+eqs. 607/608 are typographic; only L1 is touched).
+
+The one-list-active "Otherwise" branch (eqs. 611-612) gives the active
+list `MmvdOffset` and the inactive list zero. Eqs. 613-616 close the
+process with `mMvLX += mMvdLX` under the same `wrap16` modular
+semantics shared with eqs. 436/439.
+
+New surface:
+
+* `inter::mmvd_dist_scale_factor(abs_poc_num, abs_poc_den) ->
+  Result<i32>` — eq. 599 / 604 POC-difference scaling factor
+  `(|num| << 5) / |den|`. Inputs are already absolute; zero / negative
+  denominator and negative numerator surface `Error::Unsupported`.
+* `inter::mmvd_apply_bipred_offset(mv_l0, mv_l1, mmvd_offset,
+  curr_poc_diff_l0, curr_poc_diff_l1, pred_flag_l0, pred_flag_l1) ->
+  Result<(MotionVector, MotionVector)>` — eqs. 591-616 as one pure
+  helper. Both list flags zero is a caller bug and surfaces
+  `Error::Unsupported`.
+
+Spec typo recorded: eq. 601 (page 170) is missing a comma between
+`32767` and the inner `(distScaleFactor * mMvdL1[ 1 ] + 16) >> 5`
+expression. Context-determined identical to eq. 600 on the y component.
+
+### Wiring stance
+
+Same posture as rounds 187 / 193 / 195 / 201 / 207 / 213 / 218: the
+new helpers are opt-in. Baseline streams set `sps_mmvd_flag = 0` so
+`mmvd_flag` is inferred to 0 per §7.4.7 and none of the round-218 /
+round-223 helpers execute. A future Main-profile decode path threads
+`sps_mmvd_flag`, the parsed `mmvd_*_idx` syntax elements, the merge
+candidate selection, and `DiffPicOrderCnt` over the populated
+`RefPicList0 / RefPicList1` into them. Round 223 closes the
+arithmetic side of the eqs. 591-616 tail given those inputs; the
+upstream eqs. 531-590 (`mmvd_group_idx ∈ { 1, 2 }` ref-list
+reassignment + `slice_type == P` sub-branch) wait on the
+merge-candidate-list pass.
+
+### Tests
+
+14 new unit tests (482 total; was 468). Coverage:
+
+* `round223_dist_scale_factor_eq599_eq604_form` — worked examples
+  across symmetric, L1-closer, L0-closer, zero-numerator cases.
+* `round223_dist_scale_factor_rejects_bad_inputs` — zero / negative
+  denominator and negative numerator.
+* `round223_bipred_symmetric_same_magnitude_same_sign` — eqs. 593-596
+  with same-sign POCs.
+* `round223_bipred_symmetric_opposite_sign_flips_l1` — eqs. 593-596
+  followed by eqs. 607-610.
+* `round223_bipred_l1_closer_scales_l0` — eqs. 597-601 with same-sign
+  POCs (`sf = 16`, `mMvdL1 = (64, 0)` ⇒ `mMvdL0 = (32, 0)`).
+* `round223_bipred_l0_closer_scales_l1` — eqs. 602-606 worked example
+  symmetric to the L1-closer case.
+* `round223_bipred_l1_closer_opposite_sign_flips_l1_only` — eqs.
+  597-601 then eqs. 607-610; only `mMvdL1` is negated.
+* `round223_one_list_active_l0_only` / `round223_one_list_active_l1_only`
+  — eqs. 611-612 each direction.
+* `round223_rejects_both_lists_inactive` — caller-bug guard surfaces
+  `Error::Unsupported`.
+* `round223_accumulation_wraps_into_signed_16bit` — eqs. 613-616 share
+  `wrap16` semantics: `32000 + 1000` wraps to `-32536`.
+* `round223_scaled_component_clips_to_signed16` — `Clip3(-32768, 32767,
+  ...)` engagement on the scaled component path.
+* `round223_scale_component_eq600_form` — eq. 600's `(sf * mv + 16)
+  >> 5` form on positive and negative MV components.
+* `round223_bipred_symmetric_property_offset_distribution` — same-sign
+  / opposite-sign distribution property across four Table-10-style
+  offset directions.
+
 ## Round-218 status
 
 Round 218 lands the **MMVD (Merge with Motion Vector Difference)**

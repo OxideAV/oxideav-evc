@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+### Round 223 — §8.5.2.3.9 bipred MMVD offset distribution (eqs. 591-616)
+
+#### Added
+- `inter::mmvd_dist_scale_factor(abs_poc_num, abs_poc_den) -> Result<i32>`
+  — §8.5.2.3.9 eq. 599 / 604 POC-difference scaling factor
+  `(|num| << 5) / |den|`. Zero / negative denominator and negative
+  numerator surface `Error::Unsupported` (the bipred caller always
+  passes `Abs(currPocDiffL?)`).
+- `inter::mmvd_apply_bipred_offset(mv_l0, mv_l1, mmvd_offset,
+  curr_poc_diff_l0, curr_poc_diff_l1, pred_flag_l0, pred_flag_l1) ->
+  Result<(MotionVector, MotionVector)>` — the tail of §8.5.2.3.9
+  (eqs. 591-616). Resolves the bipred branch's three magnitude cases
+  (`Abs(L0) ==/>/< Abs(L1)`), applies the opposite-POC-sign flip
+  (eqs. 607-610) to `mMvdL1` only, handles the one-list-active
+  "Otherwise" branch (eqs. 611-612), and accumulates `mMvLX += mMvdLX`
+  with the shared `wrap16` semantics (eqs. 613-616). Pure helper:
+  inputs are already-resolved POC diffs + offset + per-list flags;
+  no `Sps` / `Slice` / merge-candidate-list state.
+
+#### Internal
+- `inter::clip_mvd_component(v)` — `Clip3(-32768, 32767, v)` for the
+  scaled-MV components per eqs. 600 / 601 / 605 / 606.
+- `inter::mmvd_scale_component(sf, mv)` — round-half-up POC scaling
+  `Clip3(-32768, 32767, (sf * mv + 16) >> 5)` shared by eqs. 600 /
+  601 / 605 / 606.
+
+#### Tests
+- 14 new unit tests (482 total; was 468):
+  - `round223_dist_scale_factor_eq599_eq604_form`
+  - `round223_dist_scale_factor_rejects_bad_inputs`
+  - `round223_bipred_symmetric_same_magnitude_same_sign`
+  - `round223_bipred_symmetric_opposite_sign_flips_l1`
+  - `round223_bipred_l1_closer_scales_l0`
+  - `round223_bipred_l0_closer_scales_l1`
+  - `round223_bipred_l1_closer_opposite_sign_flips_l1_only`
+  - `round223_one_list_active_l0_only`
+  - `round223_one_list_active_l1_only`
+  - `round223_rejects_both_lists_inactive`
+  - `round223_accumulation_wraps_into_signed_16bit`
+  - `round223_scaled_component_clips_to_signed16`
+  - `round223_scale_component_eq600_form`
+  - `round223_bipred_symmetric_property_offset_distribution`
+
+#### Notes
+- Spec typo recorded: eq. 601 (page 170) reads
+  `Clip3( −32768, 32767 ( distScaleFactor * mMvdL1[ 1 ] + 16 ) >> 5 )`
+  — the comma between `32767` and the inner expression is missing in
+  the typeset PDF. Context-determined: the form is identical to
+  eq. 600 on the y component.
+- Wiring stance unchanged from rounds 218 / 213: the bipred-MMVD
+  distribution helper is opt-in. The §8.5.2.3.9 entry process
+  (eqs. 531-590) covers the `mmvd_group_idx ∈ { 1, 2 }` ref-list
+  reassignment and a `slice_type == P` sub-branch, both of which need
+  the merge-candidate list + populated `RefPicList0 / RefPicList1`
+  arrays; threading that is the documented follow-up.
+
 ### Round 218 — §7.4.7 MMVD distance / sign / offset derivation + §9.3.4 ctxInc
 
 #### Added
