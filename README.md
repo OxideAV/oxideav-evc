@@ -7,6 +7,119 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-213 status
+
+Round 213 lands the **AMVR (Adaptive Motion Vector Resolution)** §8.5
+helper trio in `inter.rs`. AMVR is gated by `sps_amvr_flag = 1` and
+controls the per-CU resolution of both the AMVP predictor and the
+motion-vector difference via the `amvr_idx[ x0 ][ y0 ]` TR-binarised
+syntax element (cMax = 4 ⇒ valid range `0..=4`):
+
+| `amvr_idx` | Resolution |
+|---|---|
+| 0 | 1/4-pel (Baseline; no shift) |
+| 1 | 1/2-pel |
+| 2 | integer-pel |
+| 3 | 2-pel |
+| 4 | 4-pel |
+
+New surface:
+
+* `inter::AMVR_IDX_MAX = 4` — TR cMax constant.
+* `inter::amvr_apply_to_mvd(mvd_component, amvr_idx) -> Result<i32>` —
+  eq. 145: `MvdLX[…] = MvdLX[…] << amvr_idx`. `amvr_idx > 4`
+  surfaces `Error::Unsupported`.
+* `inter::amvr_apply_to_mvd_vector(mvd, amvr_idx)` — vector form
+  (both components).
+* `inter::amvr_round_mvp(mvp_component, amvr_idx) -> Result<i32>` —
+  eq. 645/646: sign-symmetric magnitude round of the AMVP predictor.
+  The spec's branchless ternary:
+
+  ```text
+  mvpLX[k] = mvpLX[k] >= 0
+    ? (( mvpLX[k] + (1 << (amvr_idx − 1))) >> amvr_idx) << amvr_idx
+    : −((((−mvpLX[k]) + (1 << (amvr_idx − 1))) >> amvr_idx) << amvr_idx)
+  ```
+
+  i.e. round-half-away-from-zero, sign-symmetric. **Materially
+  different** from `round_motion_vector` (§8.5.3.10 eq. 907-909, used
+  for affine MV derivation), which is round-toward-negative-infinity:
+
+  | input | `amvr_round_mvp(_, 2)` | `round_motion_vector(_, 2, 2)` |
+  |---|---|---|
+  |  +2 | +4 | +4 |
+  |  −2 | **−4** | **0** |
+
+  The `mv = −2` case is the smoking-gun distinction; round-213 tests
+  pin it so a future swap surfaces immediately.
+* `inter::amvr_round_mvp_vector(mvp, amvr_idx)` — vector form.
+* `inter::amvr_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `amvr_idx` TR bins. `amvr_idx` is
+  **not** in Table 96 (which only lists `affine_flag`,
+  `cu_skip_flag`, `pred_mode_flag`, `ibc_flag`), so the ctxInc is
+  purely positional: bin `k` → ctx `k`, both `initType` halves of
+  Table 67 cover the same `0..3` ladder.
+
+### Wiring stance
+
+Same posture as rounds 187 / 193 / 195 / 201 / 207: these are opt-in
+helpers, not behaviour changes to existing decoder paths. Baseline
+streams set `sps_amvr_flag = 0`, in which case `amvr_idx` is inferred
+to 0 and every helper is a no-op (`amvr_apply_to_mvd` shifts by 0,
+`amvr_round_mvp` returns its input unchanged). A future Main-profile
+decode path threads `sps_amvr_flag` from `Sps` and the parsed
+`amvr_idx` from the CABAC bitstream into the helpers; round 213 is
+the math/algebra side of that chain.
+
+### Tests
+
+15 new unit tests (452 total; was 437):
+
+* `round213_amvr_apply_to_mvd_zero_idx_identity` — eq. 145 with
+  `amvr_idx = 0` is the identity on every component.
+* `round213_amvr_apply_to_mvd_shift_examples` — eq. 145 worked at
+  `amvr_idx ∈ {1, 2, 4}` for positive and negative components.
+* `round213_amvr_apply_to_mvd_vector_both_axes` — vector form mirrors
+  component form on both axes.
+* `round213_amvr_apply_to_mvd_rejects_oob_idx` — `amvr_idx = 5`
+  surfaces `Error::Unsupported`.
+* `round213_amvr_round_mvp_zero_idx_identity` — eq. 645/646 with
+  `amvr_idx = 0` returns input unchanged (helper is defined for the
+  full `0..=4` range so callers can lift the gate without a
+  special case).
+* `round213_amvr_round_mvp_sign_symmetric_at_idx2` — worked
+  ±{1, 2, 3} ↦ {0, ±4, ±4} at `amvr_idx = 2`.
+* `round213_amvr_round_mvp_differs_from_affine_round_for_negatives` —
+  pin the `mv = −2, amvr_idx = 2` distinguishing case (AMVR ↦ −4,
+  affine ↦ 0). Asserts `assert_ne!` between the two.
+* `round213_amvr_round_mvp_half_pel` — eq. 645/646 at `amvr_idx = 1`
+  for ±{1, 3, 4}.
+* `round213_amvr_round_mvp_four_pel` — eq. 645/646 at `amvr_idx = 4`
+  for ±{7, 8}.
+* `round213_amvr_round_mvp_vector_both_axes` — vector form at
+  `amvr_idx = 3` (multiples of 8).
+* `round213_amvr_round_mvp_rejects_oob_idx` — `amvr_idx = 5`
+  surfaces `Error::Unsupported`.
+* `round213_amvr_idx_ctx_inc_is_positional` — bins 0..=3 map 1-to-1.
+* `round213_amvr_idx_ctx_inc_rejects_oob_bin` — bin 4+ surfaces
+  `Error::Unsupported` (TR with cMax = 4 means at most 4 prefix bins,
+  no terminator bin for the all-ones codeword "1111").
+* `round213_amvr_baseline_pipeline_identity_at_idx0` — round-trip:
+  Baseline pipeline (`amvr_idx = 0`) reconstructs `mv = mvp + mvd`
+  unchanged.
+* `round213_amvr_worked_chain_at_idx2` — Main-profile reconstruction
+  at integer-pel: `mvp = (13, −10) ↦ (12, −12)`, `mvd = (2, −3) ↦
+  (8, −12)`, sum `= (20, −24)`.
+
+### Documented followup
+
+* Main-profile decode path needs to thread `sps_amvr_flag` from
+  `Sps` into the CABAC `amvr_idx` parse + the helpers above. Round 213
+  ships the arithmetic; the wiring lands when the BTT/CU-partition
+  path is in place to host it.
+* The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
 ## Round-207 status
 
 Round 207 closes the SPS → §8.9.6 chroma-scale chain at one call site

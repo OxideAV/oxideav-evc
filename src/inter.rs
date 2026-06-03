@@ -533,6 +533,131 @@ where
     ]
 }
 
+// ===========================================================================
+// §8.5 AMVR — Adaptive Motion Vector Resolution helpers
+// ===========================================================================
+//
+// AMVR is a Main-profile tool (gated by `sps_amvr_flag = 1`) which lets the
+// encoder signal a coarser resolution for both the per-CU motion-vector
+// difference (`MvdLX`, eq. 145) and the AMVP predictor (`mvpLX`,
+// eq. 645/646). The signal is `amvr_idx[ x0 ][ y0 ]`, a TR-binarised
+// syntax element with `cMax = 4` (§9.3.3 binarization table), so the
+// valid range is `0..=4`:
+//
+// * `amvr_idx == 0` — 1/4-pel resolution (Baseline, no shifting).
+// * `amvr_idx == 1` — 1/2-pel.
+// * `amvr_idx == 2` — integer-pel.
+// * `amvr_idx == 3` — 2-pel.
+// * `amvr_idx == 4` — 4-pel.
+//
+// The Main-profile decode path slots these helpers in after the standard
+// AMVP MVD reconstruction (eq. 144) and the MVP candidate derivation
+// (eq. 619-644). Baseline streams set `sps_amvr_flag = 0` and skip both —
+// the helpers below remain dead code on that path, so adding them does
+// not perturb the existing Baseline pixel pipeline.
+//
+// The §9.3.4 ctxIdxInc for `amvr_idx`'s TR-binarised bins is just the
+// bin position (Table 67 carries 4 trained states per `initType`, both
+// initTypes spanning ctxIdx ranges `0..3` and `4..7` — there is no
+// neighbour-derived `ctxInc` term, so bin `k` simply maps to ctx `k`).
+
+/// Maximum legal value of `amvr_idx` (TR cMax). See §9.3.3 binarization
+/// table.
+pub const AMVR_IDX_MAX: u32 = 4;
+
+/// Eq. 145 — `MvdLX[ x0 ][ y0 ][ compIdx ] = MvdLX[ x0 ][ y0 ][ compIdx ]
+/// << amvr_idx[ x0 ][ y0 ]`. Applies the AMVR resolution shift to one
+/// component of the motion-vector difference. The caller is responsible
+/// for gating on `sps_amvr_flag == 1`; with `sps_amvr_flag == 0` the
+/// shift would never be invoked (Baseline forces `amvr_idx == 0` anyway,
+/// so this is a left-shift by 0 ≡ identity).
+///
+/// `amvr_idx` is rejected with [`Error::Unsupported`] outside `0..=4`
+/// (the TR cMax range).
+pub fn amvr_apply_to_mvd(mvd_component: i32, amvr_idx: u32) -> Result<i32> {
+    if amvr_idx > AMVR_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: amvr_idx = {amvr_idx} exceeds TR cMax = {AMVR_IDX_MAX} (§8.5 eq. 145)"
+        )));
+    }
+    Ok(mvd_component << amvr_idx)
+}
+
+/// Vector form of [`amvr_apply_to_mvd`] — applies eq. 145 to both
+/// components of an MVD.
+pub fn amvr_apply_to_mvd_vector(mvd: MotionVector, amvr_idx: u32) -> Result<MotionVector> {
+    Ok(MotionVector {
+        x: amvr_apply_to_mvd(mvd.x, amvr_idx)?,
+        y: amvr_apply_to_mvd(mvd.y, amvr_idx)?,
+    })
+}
+
+/// Eq. 645/646 — magnitude-preserving AMVR round of one component of the
+/// motion-vector predictor `mvpLX[ k ]`. The spec writes the operation
+/// branchless on the sign of the predictor:
+///
+/// ```text
+/// mvpLX[ k ] = mvpLX[ k ] >= 0 ?
+///   ( ( mvpLX[ k ] + ( 1 << ( amvr_idx - 1 ) ) ) >> amvr_idx ) << amvr_idx :
+///   −( ( ( −mvpLX[ k ] + ( 1 << ( amvr_idx - 1 ) ) ) >> amvr_idx ) << amvr_idx )
+/// ```
+///
+/// This rounds magnitude-towards-zero with a "round-half-away-from-zero"
+/// tie break — i.e. `+2` at `amvr_idx == 2` rounds to `+4`, `−2` rounds
+/// to `−4`. The sign-symmetric branching distinguishes it from
+/// [`round_motion_vector`] (§8.5.3.10 eq. 907-909), which is a
+/// round-toward-negative-infinity flavour for affine MV derivation.
+///
+/// The caller is responsible for gating on `sps_amvr_flag == 1 &&
+/// amvr_idx != 0`; with `amvr_idx == 0` this returns the input
+/// unchanged. `amvr_idx` outside `0..=4` is rejected.
+pub fn amvr_round_mvp(mvp_component: i32, amvr_idx: u32) -> Result<i32> {
+    if amvr_idx > AMVR_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: amvr_idx = {amvr_idx} exceeds TR cMax = {AMVR_IDX_MAX} (§8.5 eq. 645/646)"
+        )));
+    }
+    if amvr_idx == 0 {
+        return Ok(mvp_component);
+    }
+    let shift = amvr_idx;
+    let half: i32 = 1i32 << (shift - 1);
+    Ok(if mvp_component >= 0 {
+        ((mvp_component + half) >> shift) << shift
+    } else {
+        // Spec: −((((−mvp) + half) >> shift) << shift)
+        let m = -mvp_component;
+        -(((m + half) >> shift) << shift)
+    })
+}
+
+/// Vector form of [`amvr_round_mvp`].
+pub fn amvr_round_mvp_vector(mvp: MotionVector, amvr_idx: u32) -> Result<MotionVector> {
+    Ok(MotionVector {
+        x: amvr_round_mvp(mvp.x, amvr_idx)?,
+        y: amvr_round_mvp(mvp.y, amvr_idx)?,
+    })
+}
+
+/// §9.3.4 ctxIdxInc for the `amvr_idx` TR-binarised bins. Table 67's
+/// 4-per-initType layout (positions `0..3` / `4..7`) means each bin maps
+/// 1-to-1 to a ctxIdx within the initType range; the assignment is
+/// purely positional (no neighbour-derived `ctxInc` term — `amvr_idx` is
+/// **not** one of the four entries of Table 96).
+///
+/// * `bin_idx` — 0-based bin position within the TR string (0..=3, since
+///   `cMax = 4` means at most 4 prefix bins).
+///
+/// Returns [`Error::Unsupported`] for `bin_idx >= 4`.
+pub fn amvr_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= AMVR_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: amvr_idx bin_idx = {bin_idx} exceeds TR cMax = {AMVR_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,5 +912,189 @@ mod tests {
     fn round_mv_zero_round_trip_at_right_shift_one() {
         let r = round_motion_vector(MotionVector::default(), 1, 0);
         assert_eq!(r, MotionVector::default());
+    }
+
+    // ====================================================================
+    // §8.5 AMVR — round-213 (eq. 145, eq. 645/646, §9.3.4 ctx layout).
+    // ====================================================================
+
+    /// Eq. 145 is a plain left-shift; `amvr_idx == 0` is identity.
+    #[test]
+    fn round213_amvr_apply_to_mvd_zero_idx_identity() {
+        assert_eq!(amvr_apply_to_mvd(5, 0).unwrap(), 5);
+        assert_eq!(amvr_apply_to_mvd(-7, 0).unwrap(), -7);
+        assert_eq!(amvr_apply_to_mvd(0, 0).unwrap(), 0);
+    }
+
+    /// Eq. 145 shifts MVD components left by amvr_idx (signed).
+    #[test]
+    fn round213_amvr_apply_to_mvd_shift_examples() {
+        // amvr_idx = 1 (1/2-pel): MVD scales by 2.
+        assert_eq!(amvr_apply_to_mvd(3, 1).unwrap(), 6);
+        assert_eq!(amvr_apply_to_mvd(-3, 1).unwrap(), -6);
+        // amvr_idx = 2 (integer-pel): MVD scales by 4.
+        assert_eq!(amvr_apply_to_mvd(3, 2).unwrap(), 12);
+        assert_eq!(amvr_apply_to_mvd(-3, 2).unwrap(), -12);
+        // amvr_idx = 4 (4-pel): MVD scales by 16.
+        assert_eq!(amvr_apply_to_mvd(1, 4).unwrap(), 16);
+        assert_eq!(amvr_apply_to_mvd(-1, 4).unwrap(), -16);
+    }
+
+    /// Vector form mirrors the component form on both axes.
+    #[test]
+    fn round213_amvr_apply_to_mvd_vector_both_axes() {
+        let mvd = MotionVector::quarter_pel(3, -5);
+        let scaled = amvr_apply_to_mvd_vector(mvd, 2).unwrap();
+        assert_eq!(scaled, MotionVector::quarter_pel(12, -20));
+    }
+
+    /// `amvr_idx > 4` is outside the TR cMax range.
+    #[test]
+    fn round213_amvr_apply_to_mvd_rejects_oob_idx() {
+        assert!(amvr_apply_to_mvd(0, 5).is_err());
+        assert!(amvr_apply_to_mvd_vector(MotionVector::default(), 5).is_err());
+    }
+
+    /// Eq. 645/646 with `amvr_idx == 0` returns the predictor unchanged.
+    /// (The spec gates the entire eq. 645/646 block on `amvr_idx != 0`,
+    /// but the helper is defined for the full `0..=4` range so callers
+    /// can lift the gate without a special case.)
+    #[test]
+    fn round213_amvr_round_mvp_zero_idx_identity() {
+        assert_eq!(amvr_round_mvp(13, 0).unwrap(), 13);
+        assert_eq!(amvr_round_mvp(-13, 0).unwrap(), -13);
+    }
+
+    /// Eq. 645/646 — sign-symmetric round-half-up worked examples at
+    /// `amvr_idx == 2` (mask = 0b11, half = 2, shift = 2):
+    ///   +1 → ((+1+2)>>2)<<2 = 0
+    ///   +2 → ((+2+2)>>2)<<2 = 4
+    ///   +3 → ((+3+2)>>2)<<2 = 4
+    ///   −1 → −(((+1+2)>>2)<<2) = 0
+    ///   −2 → −(((+2+2)>>2)<<2) = −4
+    ///   −3 → −(((+3+2)>>2)<<2) = −4
+    #[test]
+    fn round213_amvr_round_mvp_sign_symmetric_at_idx2() {
+        assert_eq!(amvr_round_mvp(1, 2).unwrap(), 0);
+        assert_eq!(amvr_round_mvp(2, 2).unwrap(), 4);
+        assert_eq!(amvr_round_mvp(3, 2).unwrap(), 4);
+        assert_eq!(amvr_round_mvp(-1, 2).unwrap(), 0);
+        assert_eq!(amvr_round_mvp(-2, 2).unwrap(), -4);
+        assert_eq!(amvr_round_mvp(-3, 2).unwrap(), -4);
+    }
+
+    /// The sign-symmetric AMVR round distinguishes itself from the
+    /// §8.5.3.10 round_motion_vector at `mv = -2, amvr_idx = 2`:
+    /// AMVR returns −4 (rounds toward larger magnitude), affine round
+    /// returns 0 (rounds toward zero). This is the load-bearing
+    /// distinction between the two rounding modes — using one in place
+    /// of the other yields non-conforming MV reconstruction.
+    #[test]
+    fn round213_amvr_round_mvp_differs_from_affine_round_for_negatives() {
+        let mv = MotionVector::quarter_pel(-2, -2);
+        let amvr = amvr_round_mvp_vector(mv, 2).unwrap();
+        let affine = round_motion_vector(mv, 2, 2);
+        assert_eq!(amvr, MotionVector::quarter_pel(-4, -4));
+        assert_eq!(affine, MotionVector::quarter_pel(0, 0));
+        assert_ne!(amvr, affine);
+    }
+
+    /// Eq. 645/646 at `amvr_idx == 1` rounds 1/4-pel toward 1/2-pel.
+    #[test]
+    fn round213_amvr_round_mvp_half_pel() {
+        // +1 → ((1+1)>>1)<<1 = 2; -1 → -2.
+        assert_eq!(amvr_round_mvp(1, 1).unwrap(), 2);
+        assert_eq!(amvr_round_mvp(-1, 1).unwrap(), -2);
+        // +3 → 4; -3 → -4. Even values unchanged.
+        assert_eq!(amvr_round_mvp(3, 1).unwrap(), 4);
+        assert_eq!(amvr_round_mvp(-3, 1).unwrap(), -4);
+        assert_eq!(amvr_round_mvp(4, 1).unwrap(), 4);
+        assert_eq!(amvr_round_mvp(-4, 1).unwrap(), -4);
+    }
+
+    /// Eq. 645/646 at `amvr_idx == 4` rounds to multiples of 16.
+    #[test]
+    fn round213_amvr_round_mvp_four_pel() {
+        // +7 → ((7+8)>>4)<<4 = 0; +8 → ((8+8)>>4)<<4 = 16.
+        assert_eq!(amvr_round_mvp(7, 4).unwrap(), 0);
+        assert_eq!(amvr_round_mvp(8, 4).unwrap(), 16);
+        // -7 → 0; -8 → -16.
+        assert_eq!(amvr_round_mvp(-7, 4).unwrap(), 0);
+        assert_eq!(amvr_round_mvp(-8, 4).unwrap(), -16);
+    }
+
+    /// Vector form mirrors the component form on both axes.
+    #[test]
+    fn round213_amvr_round_mvp_vector_both_axes() {
+        let mv = MotionVector::quarter_pel(7, -8);
+        // amvr_idx = 3 → multiples of 8, half = 4.
+        // +7 → ((7+4)>>3)<<3 = (11>>3)<<3 = 8.
+        // -8 → -(((8+4)>>3)<<3) = -((12>>3)<<3) = -8.
+        let r = amvr_round_mvp_vector(mv, 3).unwrap();
+        assert_eq!(r, MotionVector::quarter_pel(8, -8));
+    }
+
+    /// `amvr_idx > 4` outside TR cMax range.
+    #[test]
+    fn round213_amvr_round_mvp_rejects_oob_idx() {
+        assert!(amvr_round_mvp(0, 5).is_err());
+        assert!(amvr_round_mvp_vector(MotionVector::default(), 5).is_err());
+    }
+
+    /// §9.3.4 ctxInc for `amvr_idx` is positional (Table 67 ranges
+    /// `0..3` / `4..7`; `amvr_idx` is **not** in Table 96, so there is
+    /// no neighbour-derived term).
+    #[test]
+    fn round213_amvr_idx_ctx_inc_is_positional() {
+        assert_eq!(amvr_idx_ctx_inc(0).unwrap(), 0);
+        assert_eq!(amvr_idx_ctx_inc(1).unwrap(), 1);
+        assert_eq!(amvr_idx_ctx_inc(2).unwrap(), 2);
+        assert_eq!(amvr_idx_ctx_inc(3).unwrap(), 3);
+    }
+
+    /// `bin_idx >= 4` is outside the TR prefix range (cMax = 4 means at
+    /// most 4 prefix bins — the 4-bit TR codeword "1111" has bin 3 as
+    /// its last bin and no terminator).
+    #[test]
+    fn round213_amvr_idx_ctx_inc_rejects_oob_bin() {
+        assert!(amvr_idx_ctx_inc(4).is_err());
+        assert!(amvr_idx_ctx_inc(99).is_err());
+    }
+
+    /// The AMVR-MVD shift (eq. 145) and the AMVR-MVP round (eq. 645/646)
+    /// commute with the "fully encoded → fully reconstructed" pipeline
+    /// at `amvr_idx == 0` — i.e. a Baseline-style stream sees `mv_recon
+    /// = mvp + mvd` unchanged. This is the round-trip property the
+    /// Baseline pipeline relies on (`sps_amvr_flag = 0` ⇒ all AMVR
+    /// helpers are no-ops).
+    #[test]
+    fn round213_amvr_baseline_pipeline_identity_at_idx0() {
+        let mvp = MotionVector::quarter_pel(12, -8);
+        let mvd = MotionVector::quarter_pel(3, 5);
+        let mvp_rounded = amvr_round_mvp_vector(mvp, 0).unwrap();
+        let mvd_shifted = amvr_apply_to_mvd_vector(mvd, 0).unwrap();
+        let mv_recon = mvp_rounded.wrapping_add(&mvd_shifted);
+        assert_eq!(mvp_rounded, mvp);
+        assert_eq!(mvd_shifted, mvd);
+        assert_eq!(mv_recon, MotionVector::quarter_pel(15, -3));
+    }
+
+    /// Worked Main-profile reconstruction example at `amvr_idx == 2`
+    /// (integer-pel resolution): mvp at 1/4-pel `(13, -10)` rounds to
+    /// `(12, -12)` (sign-symmetric round-half-up), mvd at 1/4-pel
+    /// `(2, -3)` shifts to `(8, -12)`, sum is `(20, -24)`. Demonstrates
+    /// the chain pulls cleanly out of the spec, no off-by-one anywhere.
+    #[test]
+    fn round213_amvr_worked_chain_at_idx2() {
+        let mvp = MotionVector::quarter_pel(13, -10);
+        let mvd = MotionVector::quarter_pel(2, -3);
+        let mvp_rounded = amvr_round_mvp_vector(mvp, 2).unwrap();
+        let mvd_shifted = amvr_apply_to_mvd_vector(mvd, 2).unwrap();
+        // mvp: +13 → ((13+2)>>2)<<2 = 12; -10 → -(((10+2)>>2)<<2) = -12.
+        assert_eq!(mvp_rounded, MotionVector::quarter_pel(12, -12));
+        // mvd: 2<<2 = 8; -3<<2 = -12.
+        assert_eq!(mvd_shifted, MotionVector::quarter_pel(8, -12));
+        let mv_recon = mvp_rounded.wrapping_add(&mvd_shifted);
+        assert_eq!(mv_recon, MotionVector::quarter_pel(20, -24));
     }
 }

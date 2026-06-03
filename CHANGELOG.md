@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Round 213 — §8.5 AMVR (Adaptive Motion Vector Resolution) helper trio
+
+#### Added
+- `inter::AMVR_IDX_MAX = 4` — TR cMax constant (§9.3.3 binarization
+  table) for the `amvr_idx[ x0 ][ y0 ]` syntax element.
+- `inter::amvr_apply_to_mvd(mvd_component, amvr_idx) -> Result<i32>` —
+  eq. 145: `MvdLX[…] = MvdLX[…] << amvr_idx`. `amvr_idx > 4` surfaces
+  `Error::Unsupported` with a §-cited message.
+- `inter::amvr_apply_to_mvd_vector(mvd, amvr_idx)` — vector form.
+- `inter::amvr_round_mvp(mvp_component, amvr_idx) -> Result<i32>` —
+  eq. 645/646: sign-symmetric magnitude round of the AMVP predictor
+  (round-half-away-from-zero, symmetric on sign). Distinguishes
+  itself from `round_motion_vector` (§8.5.3.10) at `mv = −2,
+  amvr_idx = 2` (AMVR ↦ −4 ; affine ↦ 0).
+- `inter::amvr_round_mvp_vector(mvp, amvr_idx)` — vector form.
+- `inter::amvr_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `amvr_idx` TR bins. `amvr_idx` is
+  **not** in Table 96; the ctxInc is purely positional (bin `k` →
+  ctx `k`, both `initType` halves of Table 67 cover `0..3`).
+
+#### Tests
+- 15 new unit tests (452 total; was 437):
+  - `round213_amvr_apply_to_mvd_zero_idx_identity`
+  - `round213_amvr_apply_to_mvd_shift_examples`
+  - `round213_amvr_apply_to_mvd_vector_both_axes`
+  - `round213_amvr_apply_to_mvd_rejects_oob_idx`
+  - `round213_amvr_round_mvp_zero_idx_identity`
+  - `round213_amvr_round_mvp_sign_symmetric_at_idx2`
+  - `round213_amvr_round_mvp_differs_from_affine_round_for_negatives`
+    — pins the smoking-gun distinction vs `round_motion_vector` at
+    `mv = −2, amvr_idx = 2`.
+  - `round213_amvr_round_mvp_half_pel`
+  - `round213_amvr_round_mvp_four_pel`
+  - `round213_amvr_round_mvp_vector_both_axes`
+  - `round213_amvr_round_mvp_rejects_oob_idx`
+  - `round213_amvr_idx_ctx_inc_is_positional`
+  - `round213_amvr_idx_ctx_inc_rejects_oob_bin`
+  - `round213_amvr_baseline_pipeline_identity_at_idx0` — round-trip
+    on Baseline pipeline (sps_amvr_flag = 0 ⇒ amvr_idx = 0 ⇒ all
+    helpers no-op, `mv = mvp + mvd` unchanged).
+  - `round213_amvr_worked_chain_at_idx2` — full Main-profile MV
+    reconstruction at integer-pel resolution.
+
+#### Notes
+- Helpers are opt-in: the Baseline pipeline (sps_amvr_flag = 0)
+  treats them as no-ops (`amvr_idx = 0` is identity for both shift
+  and round). A future Main-profile decode path threads
+  `sps_amvr_flag` from `Sps` + the parsed `amvr_idx` into them.
+
 ### Round 207 — `derive_dra_chroma_state_for_sps` SPS adapter (joined + unjoined dispatch)
 
 #### Added
