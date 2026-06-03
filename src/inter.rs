@@ -658,6 +658,186 @@ pub fn amvr_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
     Ok(bin_idx as usize)
 }
 
+// ===========================================================================
+// §7.4.7 / §9.3.3 / §9.3.4 — MMVD (Merge with Motion Vector Difference)
+// distance / sign / offset derivation
+// ===========================================================================
+//
+// MMVD is a Main-profile tool (gated by `sps_mmvd_flag = 1`) which lets the
+// encoder modify a regular merge candidate by a small extra MV offset
+// `MmvdOffset[ x0 ][ y0 ][ k ]` (k ∈ {0, 1}). The offset is derived from
+// two enumerative syntax elements `mmvd_distance_idx[ x0 ][ y0 ]` and
+// `mmvd_direction_idx[ x0 ][ y0 ]` via spec Tables 9 and 10:
+//
+//   * `mmvd_distance_idx` ∈ 0..=7 → `MmvdDistance ∈ { 1, 2, 4, 8, 16, 32,
+//     64, 128 }` (i.e. `MmvdDistance = 1 << mmvd_distance_idx`). The
+//     §9.3.3 binarization is TR with `cMax = 7, cRiceParam = 0`.
+//   * `mmvd_direction_idx` ∈ 0..=3 → `(MmvdSign[0], MmvdSign[1])` ∈
+//     `{ (+1, 0), (−1, 0), (0, +1), (0, −1) }` (Table 10). The §9.3.3
+//     binarization is FL with `cMax = 3` (two bits).
+//
+// Eqs. 133 / 134 then combine the two:
+//
+//   `MmvdOffset[ x0 ][ y0 ][ k ] = MmvdDistance * MmvdSign[ k ]`
+//
+// for k ∈ { 0, 1 }. Note `MmvdOffset` is always axis-aligned (one of the
+// two components is zero), since each of the four `mmvd_direction_idx`
+// rows of Table 10 has at most one non-zero `MmvdSign` component.
+//
+// Round 218 ships the table + offset derivation as opt-in helpers, plus
+// the §9.3.4 ctxIdxInc for the five MMVD syntax elements (`mmvd_flag`,
+// `mmvd_group_idx`, `mmvd_merge_idx`, `mmvd_distance_idx`,
+// `mmvd_direction_idx`). The Main-profile decode path threads
+// `sps_mmvd_flag` + the parsed `mmvd_*_idx` values into them; Baseline
+// streams (`sps_mmvd_flag = 0`) infer `mmvd_flag = 0` per §7.4.7 and the
+// helpers stay dead code on that path.
+//
+// The downstream §8.5.2.3.9 derivation (eqs. 531-616, "Derivation process
+// for MMVD motion vector") which adds the offset to a merge candidate
+// while POC-scaling between L0 and L1 still needs the merge-candidate
+// list + DiffPicOrderCnt + reference-list infrastructure that has not
+// landed yet; it is the documented follow-up after round 218.
+
+/// Maximum legal value of `mmvd_distance_idx` (TR cMax). §9.3.3
+/// binarization table.
+pub const MMVD_DISTANCE_IDX_MAX: u32 = 7;
+
+/// Maximum legal value of `mmvd_direction_idx` (FL cMax). §9.3.3
+/// binarization table.
+pub const MMVD_DIRECTION_IDX_MAX: u32 = 3;
+
+/// Maximum legal value of `mmvd_group_idx` (TR cMax). §9.3.3 binarization
+/// table.
+pub const MMVD_GROUP_IDX_MAX: u32 = 2;
+
+/// Maximum legal value of `mmvd_merge_idx` (TR cMax). §9.3.3 binarization
+/// table.
+pub const MMVD_MERGE_IDX_MAX: u32 = 3;
+
+/// Table 9 — derivation of `MmvdDistance[ x0 ][ y0 ]` from
+/// `mmvd_distance_idx[ x0 ][ y0 ]`. The table is `1 << mmvd_distance_idx`
+/// (i.e. `{ 1, 2, 4, 8, 16, 32, 64, 128 }` for indices 0..7), kept as
+/// a transcribed lookup so a future spec amendment that breaks the
+/// power-of-two pattern is a single edit.
+const TABLE_9_MMVD_DISTANCE: [i32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Table 9 — return `MmvdDistance` for a parsed `mmvd_distance_idx`.
+/// Out-of-range indices surface `Error::Unsupported`.
+pub fn mmvd_distance(mmvd_distance_idx: u32) -> Result<i32> {
+    if mmvd_distance_idx > MMVD_DISTANCE_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_distance_idx = {mmvd_distance_idx} exceeds TR cMax = {MMVD_DISTANCE_IDX_MAX} (Table 9 / §9.3.3)"
+        )));
+    }
+    Ok(TABLE_9_MMVD_DISTANCE[mmvd_distance_idx as usize])
+}
+
+/// Table 10 — derivation of `(MmvdSign[ 0 ], MmvdSign[ 1 ])` from
+/// `mmvd_direction_idx[ x0 ][ y0 ]`. Each row of Table 10 has exactly
+/// one non-zero component (axis-aligned), and that component is ±1.
+const TABLE_10_MMVD_SIGN: [(i32, i32); 4] = [
+    (1, 0),  // mmvd_direction_idx = 0 → (+1,  0)
+    (-1, 0), // mmvd_direction_idx = 1 → (−1,  0)
+    (0, 1),  // mmvd_direction_idx = 2 → ( 0, +1)
+    (0, -1), // mmvd_direction_idx = 3 → ( 0, −1)
+];
+
+/// Table 10 — return `(MmvdSign[ 0 ], MmvdSign[ 1 ])` for a parsed
+/// `mmvd_direction_idx`. Out-of-range indices surface
+/// `Error::Unsupported`.
+pub fn mmvd_sign(mmvd_direction_idx: u32) -> Result<(i32, i32)> {
+    if mmvd_direction_idx > MMVD_DIRECTION_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_direction_idx = {mmvd_direction_idx} exceeds FL cMax = {MMVD_DIRECTION_IDX_MAX} (Table 10 / §9.3.3)"
+        )));
+    }
+    Ok(TABLE_10_MMVD_SIGN[mmvd_direction_idx as usize])
+}
+
+/// Eq. 133 + 134 — derive `MmvdOffset[ x0 ][ y0 ]` from the parsed
+/// `mmvd_distance_idx[ x0 ][ y0 ]` and `mmvd_direction_idx[ x0 ][ y0 ]`.
+/// Returns a [`MotionVector`] in the spec's raw integer-pel units; the
+/// downstream §8.5.2.3.9 derivation consumes the same units when adding
+/// the offset to the merge candidate's `mvL0` / `mvL1`.
+///
+/// Because Table 10's sign vector is axis-aligned at each row, the
+/// returned offset always has exactly one non-zero component (or both
+/// zero — but Table 10 has no all-zero row, so in practice always one
+/// non-zero component, ranging in magnitude over `{ 1, 2, 4, 8, 16, 32,
+/// 64, 128 }`).
+pub fn mmvd_offset(mmvd_distance_idx: u32, mmvd_direction_idx: u32) -> Result<MotionVector> {
+    let dist = mmvd_distance(mmvd_distance_idx)?;
+    let (sx, sy) = mmvd_sign(mmvd_direction_idx)?;
+    Ok(MotionVector {
+        x: dist * sx, // eq. 133
+        y: dist * sy, // eq. 134
+    })
+}
+
+/// §9.3.4 ctxIdxInc for the `mmvd_flag` FL bin. `mmvd_flag` is **not**
+/// in Table 96, so the assignment is purely positional. Table 50 carries
+/// a single trained state per `initType` (initType-0 at ctxIdx 0,
+/// initType-1 at ctxIdx 1; cMax = 1 ⇒ exactly one bin); the only valid
+/// `bin_idx` is 0.
+pub fn mmvd_flag_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx != 0 {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_flag bin_idx = {bin_idx} exceeds FL cMax = 1 single bin (§9.3.4)"
+        )));
+    }
+    Ok(0)
+}
+
+/// §9.3.4 ctxIdxInc for the `mmvd_group_idx` TR bins (cMax = 2 ⇒ up to
+/// two prefix bins). Not in Table 96 ⇒ purely positional. Table 51
+/// carries 2 trained states per `initType` (ctxIdx 0..1 and 2..3).
+pub fn mmvd_group_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= MMVD_GROUP_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_group_idx bin_idx = {bin_idx} exceeds TR cMax = {MMVD_GROUP_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+/// §9.3.4 ctxIdxInc for the `mmvd_merge_idx` TR bins (cMax = 3 ⇒ up to
+/// three prefix bins). Not in Table 96 ⇒ purely positional. Table 52
+/// carries 3 trained states per `initType` (ctxIdx 0..2 and 3..5).
+pub fn mmvd_merge_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= MMVD_MERGE_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_merge_idx bin_idx = {bin_idx} exceeds TR cMax = {MMVD_MERGE_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+/// §9.3.4 ctxIdxInc for the `mmvd_distance_idx` TR bins (cMax = 7 ⇒ up
+/// to seven prefix bins). Not in Table 96 ⇒ purely positional. Table 53
+/// carries 7 trained states per `initType` (ctxIdx 0..6 and 7..13).
+pub fn mmvd_distance_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= MMVD_DISTANCE_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_distance_idx bin_idx = {bin_idx} exceeds TR cMax = {MMVD_DISTANCE_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+/// §9.3.4 ctxIdxInc for the `mmvd_direction_idx` FL bins (cMax = 3 ⇒
+/// exactly two bits). Not in Table 96 ⇒ purely positional. Table 54
+/// carries 2 trained states per `initType` (ctxIdx 0..1 and 2..3).
+pub fn mmvd_direction_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    // FL with cMax = 3 means a 2-bit code (`Ceil(Log2(cMax + 1)) = 2`),
+    // so bins 0 and 1 are the only valid positions.
+    if bin_idx >= 2 {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_direction_idx bin_idx = {bin_idx} exceeds FL cMax = {MMVD_DIRECTION_IDX_MAX} 2-bit code (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,5 +1276,181 @@ mod tests {
         assert_eq!(mvd_shifted, MotionVector::quarter_pel(8, -12));
         let mv_recon = mvp_rounded.wrapping_add(&mvd_shifted);
         assert_eq!(mv_recon, MotionVector::quarter_pel(20, -24));
+    }
+
+    // ---- Round 218 — MMVD distance / sign / offset / ctxInc -------------
+
+    /// Table 9 — `MmvdDistance ∈ { 1, 2, 4, 8, 16, 32, 64, 128 }` across
+    /// the full `mmvd_distance_idx ∈ 0..=7` range.
+    #[test]
+    fn round218_mmvd_distance_table9_full_range() {
+        let expected: [i32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                mmvd_distance(idx as u32).unwrap(),
+                want,
+                "mmvd_distance_idx = {idx}"
+            );
+        }
+    }
+
+    /// Table 9 — `mmvd_distance_idx = 8` is past TR cMax = 7.
+    #[test]
+    fn round218_mmvd_distance_rejects_oob_idx() {
+        assert!(mmvd_distance(8).is_err());
+        assert!(mmvd_distance(255).is_err());
+    }
+
+    /// Table 10 — all four `mmvd_direction_idx` rows are axis-aligned and
+    /// of unit magnitude.
+    #[test]
+    fn round218_mmvd_sign_table10_full_range() {
+        let expected: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(mmvd_sign(idx as u32).unwrap(), want, "row {idx}");
+        }
+    }
+
+    /// Table 10 — `mmvd_direction_idx = 4` is past FL cMax = 3.
+    #[test]
+    fn round218_mmvd_sign_rejects_oob_idx() {
+        assert!(mmvd_sign(4).is_err());
+        assert!(mmvd_sign(7).is_err());
+    }
+
+    /// Eq. 133 / 134 — `MmvdOffset = MmvdDistance * MmvdSign` for every
+    /// `(mmvd_distance_idx, mmvd_direction_idx)` pair. Spot-check
+    /// `(idx_d = 5, idx_dir = 1) ⇒ (−32, 0)` and
+    /// `(idx_d = 7, idx_dir = 2) ⇒ (0, 128)`.
+    #[test]
+    fn round218_mmvd_offset_eq133_eq134_spot_checks() {
+        assert_eq!(mmvd_offset(5, 1).unwrap(), MotionVector { x: -32, y: 0 });
+        assert_eq!(mmvd_offset(7, 2).unwrap(), MotionVector { x: 0, y: 128 });
+        // Smallest non-trivial: idx_d = 0 (distance 1), idx_dir = 0
+        // (+x axis) ⇒ (1, 0).
+        assert_eq!(mmvd_offset(0, 0).unwrap(), MotionVector { x: 1, y: 0 });
+        // Largest negative-y: idx_d = 7, idx_dir = 3 ⇒ (0, −128).
+        assert_eq!(mmvd_offset(7, 3).unwrap(), MotionVector { x: 0, y: -128 });
+    }
+
+    /// Eq. 133 / 134 — the offset is always axis-aligned. Iterates the
+    /// full 8 × 4 = 32-entry Cartesian product and asserts at least one
+    /// component is zero. Pins the Table-10 "single non-zero axis"
+    /// property so a future column swap surfaces.
+    #[test]
+    fn round218_mmvd_offset_always_axis_aligned() {
+        for d in 0..=MMVD_DISTANCE_IDX_MAX {
+            for dir in 0..=MMVD_DIRECTION_IDX_MAX {
+                let off = mmvd_offset(d, dir).unwrap();
+                assert!(
+                    off.x == 0 || off.y == 0,
+                    "axis-aligned violated at (d = {d}, dir = {dir}): {off:?}"
+                );
+            }
+        }
+    }
+
+    /// Eq. 133 / 134 — offset magnitude equals `MmvdDistance` on the
+    /// non-zero axis for every direction. Confirms the Table-10 sign
+    /// component is unit magnitude (±1) at every row.
+    #[test]
+    fn round218_mmvd_offset_magnitude_equals_distance() {
+        for d in 0..=MMVD_DISTANCE_IDX_MAX {
+            let want_mag = mmvd_distance(d).unwrap();
+            for dir in 0..=MMVD_DIRECTION_IDX_MAX {
+                let off = mmvd_offset(d, dir).unwrap();
+                let mag = off.x.abs().max(off.y.abs());
+                assert_eq!(mag, want_mag, "(d = {d}, dir = {dir})");
+            }
+        }
+    }
+
+    /// Eq. 133 / 134 — out-of-range `mmvd_distance_idx` propagates as
+    /// `Error::Unsupported` from the offset entry too (defence in depth
+    /// at the boundary).
+    #[test]
+    fn round218_mmvd_offset_propagates_oob_distance_idx() {
+        assert!(mmvd_offset(8, 0).is_err());
+    }
+
+    /// Eq. 133 / 134 — out-of-range `mmvd_direction_idx` propagates from
+    /// the offset entry.
+    #[test]
+    fn round218_mmvd_offset_propagates_oob_direction_idx() {
+        assert!(mmvd_offset(0, 4).is_err());
+    }
+
+    /// §9.3.4 — `mmvd_flag` is a single FL bit; bin 0 → ctx 0, bin 1+
+    /// rejects.
+    #[test]
+    fn round218_mmvd_flag_ctx_inc_positional() {
+        assert_eq!(mmvd_flag_ctx_inc(0).unwrap(), 0);
+        assert!(mmvd_flag_ctx_inc(1).is_err());
+    }
+
+    /// §9.3.4 — `mmvd_group_idx` TR bins map 1-to-1 to ctx slots
+    /// 0..MMVD_GROUP_IDX_MAX.
+    #[test]
+    fn round218_mmvd_group_idx_ctx_inc_positional() {
+        assert_eq!(mmvd_group_idx_ctx_inc(0).unwrap(), 0);
+        assert_eq!(mmvd_group_idx_ctx_inc(1).unwrap(), 1);
+        assert!(mmvd_group_idx_ctx_inc(MMVD_GROUP_IDX_MAX).is_err());
+    }
+
+    /// §9.3.4 — `mmvd_merge_idx` TR bins map 1-to-1 to ctx slots
+    /// 0..MMVD_MERGE_IDX_MAX.
+    #[test]
+    fn round218_mmvd_merge_idx_ctx_inc_positional() {
+        for bin in 0..MMVD_MERGE_IDX_MAX {
+            assert_eq!(mmvd_merge_idx_ctx_inc(bin).unwrap(), bin as usize);
+        }
+        assert!(mmvd_merge_idx_ctx_inc(MMVD_MERGE_IDX_MAX).is_err());
+    }
+
+    /// §9.3.4 — `mmvd_distance_idx` TR bins map 1-to-1 to ctx slots
+    /// 0..MMVD_DISTANCE_IDX_MAX (the seven trained states of
+    /// Table 53 per `initType`).
+    #[test]
+    fn round218_mmvd_distance_idx_ctx_inc_positional() {
+        for bin in 0..MMVD_DISTANCE_IDX_MAX {
+            assert_eq!(mmvd_distance_idx_ctx_inc(bin).unwrap(), bin as usize);
+        }
+        assert!(mmvd_distance_idx_ctx_inc(MMVD_DISTANCE_IDX_MAX).is_err());
+    }
+
+    /// §9.3.4 — `mmvd_direction_idx` is FL with cMax = 3, encoded as a
+    /// 2-bit FL code (`Ceil(Log2(cMax + 1)) = 2`). The two bins map to
+    /// ctx 0 and ctx 1 (Table 54 carries two trained states per
+    /// `initType`). bin 2+ rejects.
+    #[test]
+    fn round218_mmvd_direction_idx_ctx_inc_positional() {
+        assert_eq!(mmvd_direction_idx_ctx_inc(0).unwrap(), 0);
+        assert_eq!(mmvd_direction_idx_ctx_inc(1).unwrap(), 1);
+        assert!(mmvd_direction_idx_ctx_inc(2).is_err());
+    }
+
+    /// End-to-end: a parsed `(mmvd_distance_idx, mmvd_direction_idx) =
+    /// (3, 2)` ⇒ `MmvdDistance = 8`, `MmvdSign = (0, +1)`, ⇒ `MmvdOffset
+    /// = (0, 8)`. This is the offset that the §8.5.2.3.9 derivation
+    /// adds to the selected merge candidate's `mvL0` / `mvL1`. Round
+    /// 218 ships the (idx → offset) chain; the merge-candidate add /
+    /// POC-scaling part is the follow-up.
+    #[test]
+    fn round218_mmvd_worked_chain_dist3_dir2() {
+        let off = mmvd_offset(3, 2).unwrap();
+        assert_eq!(off, MotionVector { x: 0, y: 8 });
+    }
+
+    /// Baseline pipeline (`sps_mmvd_flag = 0` ⇒ `mmvd_flag = 0`) skips
+    /// the MMVD path entirely. No call into any of the round-218
+    /// helpers happens — assertion: the helpers' constants are
+    /// consistent with the §9.3.3 binarization table (no integer
+    /// arithmetic surprise from a refactor changing cMax values).
+    #[test]
+    fn round218_mmvd_binarization_cmax_constants_match_spec() {
+        assert_eq!(MMVD_DISTANCE_IDX_MAX, 7);
+        assert_eq!(MMVD_DIRECTION_IDX_MAX, 3);
+        assert_eq!(MMVD_GROUP_IDX_MAX, 2);
+        assert_eq!(MMVD_MERGE_IDX_MAX, 3);
     }
 }

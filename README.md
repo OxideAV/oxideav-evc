@@ -7,6 +7,136 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-218 status
+
+Round 218 lands the **MMVD (Merge with Motion Vector Difference)**
+distance / sign / offset derivation in `inter.rs`. MMVD is gated by
+`sps_mmvd_flag = 1` and lets the encoder modify a regular merge
+candidate by a small extra MV offset `MmvdOffset[ x0 ][ y0 ][ k ]`
+(k ∈ {0, 1}), derived from two enumerative syntax elements via Tables 9
+and 10:
+
+| `mmvd_distance_idx` | `MmvdDistance` |
+|---|---|
+| 0 | 1 |
+| 1 | 2 |
+| 2 | 4 |
+| 3 | 8 |
+| 4 | 16 |
+| 5 | 32 |
+| 6 | 64 |
+| 7 | 128 |
+
+| `mmvd_direction_idx` | `MmvdSign[ 0 ]` | `MmvdSign[ 1 ]` |
+|---|---|---|
+| 0 | +1 |  0 |
+| 1 | −1 |  0 |
+| 2 |  0 | +1 |
+| 3 |  0 | −1 |
+
+Eqs. 133 / 134 combine the two: `MmvdOffset[ k ] = MmvdDistance *
+MmvdSign[ k ]`. Note `MmvdOffset` is always axis-aligned (Table 10 has
+no row with two non-zero sign components).
+
+New surface:
+
+* `inter::MMVD_DISTANCE_IDX_MAX = 7` — §9.3.3 TR cMax for
+  `mmvd_distance_idx`.
+* `inter::MMVD_DIRECTION_IDX_MAX = 3` — §9.3.3 FL cMax for
+  `mmvd_direction_idx`.
+* `inter::MMVD_GROUP_IDX_MAX = 2` — §9.3.3 TR cMax for
+  `mmvd_group_idx`.
+* `inter::MMVD_MERGE_IDX_MAX = 3` — §9.3.3 TR cMax for
+  `mmvd_merge_idx`.
+* `inter::mmvd_distance(mmvd_distance_idx) -> Result<i32>` — Table 9
+  lookup; out-of-range surfaces `Error::Unsupported`.
+* `inter::mmvd_sign(mmvd_direction_idx) -> Result<(i32, i32)>` — Table 10
+  lookup; out-of-range surfaces `Error::Unsupported`.
+* `inter::mmvd_offset(mmvd_distance_idx, mmvd_direction_idx) ->
+  Result<MotionVector>` — eqs. 133 + 134 combined; axis-aligned by
+  construction.
+* `inter::mmvd_flag_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the single `mmvd_flag` FL bit (Table 50
+  carries one trained state per `initType`). `mmvd_flag` is **not** in
+  Table 96.
+* `inter::mmvd_group_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_group_idx` TR bins (Table 51,
+  cMax = 2 ⇒ at most 2 prefix bins). Not in Table 96.
+* `inter::mmvd_merge_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_merge_idx` TR bins (Table 52,
+  cMax = 3 ⇒ at most 3 prefix bins). Not in Table 96.
+* `inter::mmvd_distance_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_distance_idx` TR bins (Table 53,
+  cMax = 7 ⇒ at most 7 prefix bins). Not in Table 96.
+* `inter::mmvd_direction_idx_ctx_inc(bin_idx) -> Result<usize>` —
+  §9.3.4 positional ctxIdxInc for the `mmvd_direction_idx` FL bins
+  (Table 54 carries two trained states per `initType`; FL with
+  cMax = 3 ⇒ a 2-bit code). Not in Table 96.
+
+### Wiring stance
+
+Same posture as rounds 187 / 193 / 195 / 201 / 207 / 213: these are
+opt-in helpers, not behaviour changes to existing decoder paths.
+Baseline streams set `sps_mmvd_flag = 0` so `mmvd_flag` is inferred
+to 0 per §7.4.7 and the helpers stay dead code. A future Main-profile
+decode path threads `sps_mmvd_flag` from `Sps` and the parsed
+`mmvd_*_idx` syntax elements from the CABAC bitstream into the helpers;
+round 218 is the table / arithmetic side of that chain.
+
+### Tests
+
+16 new unit tests (468 total; was 452):
+
+* `round218_mmvd_distance_table9_full_range` — Table 9 across the full
+  `mmvd_distance_idx ∈ 0..=7`.
+* `round218_mmvd_distance_rejects_oob_idx` — `mmvd_distance_idx > 7`
+  surfaces `Error::Unsupported`.
+* `round218_mmvd_sign_table10_full_range` — Table 10 across the full
+  `mmvd_direction_idx ∈ 0..=3`.
+* `round218_mmvd_sign_rejects_oob_idx` — `mmvd_direction_idx > 3`
+  surfaces `Error::Unsupported`.
+* `round218_mmvd_offset_eq133_eq134_spot_checks` — `(5, 1) ⇒ (−32, 0)`,
+  `(7, 2) ⇒ (0, 128)`, `(0, 0) ⇒ (1, 0)`, `(7, 3) ⇒ (0, −128)`.
+* `round218_mmvd_offset_always_axis_aligned` — Cartesian-product 8 × 4
+  property: at least one component is 0 for every legal input.
+* `round218_mmvd_offset_magnitude_equals_distance` — Cartesian-product
+  property: the non-zero axis's magnitude equals `MmvdDistance` at every
+  `(d, dir)`.
+* `round218_mmvd_offset_propagates_oob_distance_idx` — defence in depth:
+  `mmvd_offset` propagates an out-of-range `mmvd_distance_idx`.
+* `round218_mmvd_offset_propagates_oob_direction_idx` — same on the
+  direction axis.
+* `round218_mmvd_flag_ctx_inc_positional` — bin 0 → ctx 0, bin 1+
+  rejects.
+* `round218_mmvd_group_idx_ctx_inc_positional` — TR bins 0..1 map 1-to-1,
+  bin 2+ rejects.
+* `round218_mmvd_merge_idx_ctx_inc_positional` — TR bins 0..2 map
+  1-to-1, bin 3+ rejects.
+* `round218_mmvd_distance_idx_ctx_inc_positional` — TR bins 0..6 map
+  1-to-1, bin 7+ rejects.
+* `round218_mmvd_direction_idx_ctx_inc_positional` — FL bins 0, 1 → ctx
+  0, 1; bin 2+ rejects (the FL code is 2-bit since
+  `Ceil(Log2(cMax + 1)) = 2`).
+* `round218_mmvd_worked_chain_dist3_dir2` — `(mmvd_distance_idx,
+  mmvd_direction_idx) = (3, 2)` ⇒ `MmvdOffset = (0, 8)`.
+* `round218_mmvd_binarization_cmax_constants_match_spec` — pins the
+  four cMax constants so a future refactor that drifts them surfaces.
+
+### Documented followups
+
+* The §8.5.2.3.9 "Derivation process for MMVD motion vector" (eqs.
+  531–616) — the consumer that adds `MmvdOffset` to a selected merge
+  candidate's `mvL0` / `mvL1` while POC-scaling across L0 / L1 (via
+  `DiffPicOrderCnt`) — needs the merge-candidate list builder + ref-list
+  threading that has not landed yet. Round 218 ships the
+  syntax-element → offset half of the chain.
+* Main-profile decode path needs to thread `sps_mmvd_flag` from `Sps`
+  into the CABAC `mmvd_*_idx` parse + the helpers above. Round 218
+  ships the arithmetic / binarization side; the wiring lands when the
+  BTT/CU-partition path is in place to host it.
+* The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
 ## Round-213 status
 
 Round 213 lands the **AMVR (Adaptive Motion Vector Resolution)** §8.5

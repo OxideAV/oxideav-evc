@@ -2,6 +2,73 @@
 
 ## [Unreleased]
 
+### Round 218 — §7.4.7 MMVD distance / sign / offset derivation + §9.3.4 ctxInc
+
+#### Added
+- `inter::MMVD_DISTANCE_IDX_MAX = 7` — §9.3.3 TR cMax for
+  `mmvd_distance_idx`.
+- `inter::MMVD_DIRECTION_IDX_MAX = 3` — §9.3.3 FL cMax for
+  `mmvd_direction_idx`.
+- `inter::MMVD_GROUP_IDX_MAX = 2` — §9.3.3 TR cMax for
+  `mmvd_group_idx`.
+- `inter::MMVD_MERGE_IDX_MAX = 3` — §9.3.3 TR cMax for
+  `mmvd_merge_idx`.
+- `inter::mmvd_distance(mmvd_distance_idx) -> Result<i32>` — Table 9
+  lookup mapping `mmvd_distance_idx ∈ 0..=7` to
+  `MmvdDistance ∈ { 1, 2, 4, 8, 16, 32, 64, 128 }`.
+- `inter::mmvd_sign(mmvd_direction_idx) -> Result<(i32, i32)>` —
+  Table 10 lookup mapping `mmvd_direction_idx ∈ 0..=3` to the
+  axis-aligned `(MmvdSign[0], MmvdSign[1])`.
+- `inter::mmvd_offset(mmvd_distance_idx, mmvd_direction_idx) ->
+  Result<MotionVector>` — eqs. 133 + 134 combined; axis-aligned by
+  construction.
+- `inter::mmvd_flag_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the single `mmvd_flag` FL bit. Not in
+  Table 96.
+- `inter::mmvd_group_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_group_idx` TR bins (cMax = 2).
+- `inter::mmvd_merge_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_merge_idx` TR bins (cMax = 3).
+- `inter::mmvd_distance_idx_ctx_inc(bin_idx) -> Result<usize>` — §9.3.4
+  positional ctxIdxInc for the `mmvd_distance_idx` TR bins (cMax = 7).
+- `inter::mmvd_direction_idx_ctx_inc(bin_idx) -> Result<usize>` —
+  §9.3.4 positional ctxIdxInc for the `mmvd_direction_idx` FL bins
+  (cMax = 3 ⇒ 2-bit FL code, two bin positions).
+
+#### Tests
+- 16 new unit tests (468 total; was 452):
+  - `round218_mmvd_distance_table9_full_range`
+  - `round218_mmvd_distance_rejects_oob_idx`
+  - `round218_mmvd_sign_table10_full_range`
+  - `round218_mmvd_sign_rejects_oob_idx`
+  - `round218_mmvd_offset_eq133_eq134_spot_checks`
+  - `round218_mmvd_offset_always_axis_aligned` — Cartesian-product
+    8 × 4 axis-alignment property.
+  - `round218_mmvd_offset_magnitude_equals_distance` — Cartesian-
+    product magnitude property pins Table-10 unit-magnitude rows.
+  - `round218_mmvd_offset_propagates_oob_distance_idx`
+  - `round218_mmvd_offset_propagates_oob_direction_idx`
+  - `round218_mmvd_flag_ctx_inc_positional`
+  - `round218_mmvd_group_idx_ctx_inc_positional`
+  - `round218_mmvd_merge_idx_ctx_inc_positional`
+  - `round218_mmvd_distance_idx_ctx_inc_positional`
+  - `round218_mmvd_direction_idx_ctx_inc_positional`
+  - `round218_mmvd_worked_chain_dist3_dir2` — `(3, 2) ⇒ (0, 8)`.
+  - `round218_mmvd_binarization_cmax_constants_match_spec` — pins
+    the four cMax constants.
+
+#### Notes
+- Helpers are opt-in: the Baseline pipeline (`sps_mmvd_flag = 0`)
+  treats `mmvd_flag` as inferred-0 per §7.4.7 and never reaches these
+  helpers. A future Main-profile decode path threads `sps_mmvd_flag`
+  from `Sps` + the parsed `mmvd_*_idx` values from the CABAC bitstream
+  into them.
+- The §8.5.2.3.9 "Derivation process for MMVD motion vector" (eqs.
+  531–616) — the consumer that adds `MmvdOffset` to a selected merge
+  candidate's `mvL0` / `mvL1` while POC-scaling across L0 / L1 — is
+  the documented follow-up: it requires the merge-candidate list
+  builder + ref-list threading.
+
 ### Round 213 — §8.5 AMVR (Adaptive Motion Vector Resolution) helper trio
 
 #### Added
