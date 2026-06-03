@@ -2,6 +2,67 @@
 
 ## [Unreleased]
 
+### Round 229 — §8.5.2.3.9 entry-process signed POC scaling primitives
+
+#### Added
+- `inter::MMVD_P_SAME_TARGET_SHIFT: i32 = 3` — §8.5.2.3.9 eqs. 547 /
+  576 P-slice "same target ref" magnitude. Group 1 adds the constant
+  to `mMvL0[0]`; group 2 subtracts it.
+- `inter::mmvd_signed_dist_scale_factor(poc_diff_num, poc_diff_den)
+  -> Result<i32>` — §8.5.2.3.9 eqs. 542 / 551 / 559 / 571 / 580 /
+  588 signed POC-diff scaling factor `(num << 5) / den`. Operates on
+  the **signed** POC differences directly (unlike round-223's
+  `mmvd_dist_scale_factor` which pre-absolutes). Zero denominator
+  surfaces `Error::Unsupported`. Widens to `i64` internally to keep
+  the left-shift safe at the i32 boundary; the spec's domain is
+  small POC differences so the cast back to i32 is lossless in
+  practice.
+- `inter::mmvd_signed_scale_component(dist_scale_factor, v) -> i32` —
+  §8.5.2.3.9 eqs. 543 / 544 / 552 / 553 / 560 / 561 / 572 / 573 /
+  581 / 582 / 589 / 590 round-toward-zero scaling of one MV
+  component: `Clip3(-32768, 32767, Sign(s*v) * ((Abs(s*v) + 16) >>
+  5))`. This is the **symmetric** half-up rounding form the entry
+  process uses, distinct from the round-223 bipred-tail form
+  `(s*v + 16) >> 5` that rides arithmetic right shift. Both forms
+  agree at most operand pairs; we keep both literal to mirror the
+  spec arithmetic.
+- `inter::mmvd_signed_scale_mv(dist_scale_factor, mv) ->
+  MotionVector` — both axes of `mmvd_signed_scale_component` with
+  the same `distScaleFactor`, matching the eqs. (543, 544), (552,
+  553), … pair structure.
+
+#### Tests
+- 11 new unit tests (493 total; was 482):
+  - `round229_signed_dist_scale_factor_worked_examples`
+  - `round229_signed_dist_scale_factor_rejects_zero_denominator`
+  - `round229_signed_dist_scale_factor_zero_numerator`
+  - `round229_signed_scale_component_symmetric_in_sign`
+  - `round229_signed_scale_component_half_up_threshold`
+  - `round229_signed_scale_component_clamps_to_signed16`
+  - `round229_signed_scale_mv_applies_to_both_axes`
+  - `round229_signed_scale_component_unit_factor_identity`
+  - `round229_signed_scale_component_zero_inputs`
+  - `round229_p_same_target_shift_constant_pinned`
+  - `round229_signed_scale_agreement_at_zero_threshold` —
+    documents that the entry-process and bipred-tail forms agree at
+    the `|product| < 16` zero-threshold, where both reduce to 0.
+
+#### Notes
+- Wiring stance unchanged from rounds 187 / 193 / 195 / 201 / 207 /
+  213 / 218 / 223: these helpers are opt-in. Baseline streams set
+  `sps_mmvd_flag = 0` so `mmvd_flag` is inferred 0 per §7.4.7 and
+  nothing in §8.5.2.3.9 executes. The full §8.5.2.3.9 entry process
+  (`mmvd_group_idx ∈ { 1, 2 }` dispatch + `slice_type == B` / P
+  sub-branches + `refIdxLX` / `predFlagLX` updates) still depends
+  on the merge-candidate-list builder, `NumRefIdxActive[]`, and the
+  populated `RefPicListX` arrays. Round 229 closes the arithmetic
+  side: the signed POC-scale form is now a tested pure helper ready
+  to drop into the eventual entry-process dispatcher.
+- No docs gap. Eqs. 542 / 551 / 559 / 571 / 580 / 588 are the
+  signed denominator form (zero is reached only by callers that
+  already routed through a same-POC-distance fallback). Eqs. 543-
+  590 spell the round-toward-zero scaling literally; we mirror it.
+
 ### Round 223 — §8.5.2.3.9 bipred MMVD offset distribution (eqs. 591-616)
 
 #### Added

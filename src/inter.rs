@@ -1069,6 +1069,120 @@ pub fn mmvd_apply_bipred_offset(
     }
 }
 
+// =====================================================================
+// §8.5.2.3.9 — Round 229: entry-process signed POC scaling primitives
+//
+// The §8.5.2.3.9 entry process (eqs. 531-590) reassigns the merge
+// candidate's `(refIdxL0, refIdxL1, predFlagL0[0][0], predFlagL1[0][0])`
+// and pre-scales one list's MV against the other when
+// `mmvd_group_idx ∈ { 1, 2 }`. The scaling form that repeats across
+// eqs. 543/544, 552/553, 560/561, 572/573, 581/582, 589/590 is
+//
+//   distScaleFactor = ( currPocDiffNum << 5 ) / currPocDiffDen      [signed]
+//   mMv[k] = Clip3(-32768, 32767,
+//               Sign(distScaleFactor * mMv[k])
+//             * ( ( Abs(distScaleFactor * mMv[k]) + 16 ) >> 5 ))
+//
+// This is arithmetically distinct from the bipred-tail eqs. 600/601/
+// 605/606 form (which uses absolute POC diffs into
+// `mmvd_dist_scale_factor` and plain `(s*v + 16) >> 5`): here the
+// POC diffs flow in **signed**, and the magnitude is scaled with
+// **round-toward-zero** semantics via `Sign(x) * ((Abs(x) + 16) >> 5)`.
+// Negative products therefore round differently from r223's arithmetic
+// right-shift form.
+//
+// Round 229 lands the two shared helpers + the `targetRefIdxL0 ==
+// refIdxL0` magic offset constant (eqs. 547 / 576). The full §8.5.2.3.9
+// entry process (mmvd_group_idx + slice_type dispatch, refIdx /
+// predFlag updates) still waits on the merge-candidate-list builder +
+// `NumRefIdxActive[]` / `RefPicListX` threading that the round-218 /
+// round-223 followups documented.
+// =====================================================================
+
+/// §8.5.2.3.9 eqs. 547 / 576 — "same target ref" P-slice offset.
+///
+/// In the `mmvd_group_idx == 1` / `slice_type == P` branch (eqs. 545-548)
+/// the entry process adds 3 to `mMvL0[0]` when the selected
+/// `targetRefIdxL0 == refIdxL0`. The `mmvd_group_idx == 2` mirror branch
+/// (eqs. 574-577) subtracts 3 instead. The y component is untouched in
+/// both cases.
+///
+/// The constant is exposed so the future §8.5.2.3.9 entry-point can use
+/// the same symbol on both sign sides.
+pub const MMVD_P_SAME_TARGET_SHIFT: i32 = 3;
+
+/// §8.5.2.3.9 eqs. 542 / 551 / 559 / 571 / 580 / 588 — signed POC-diff
+/// scaling factor used by the entry-process branches:
+///
+/// ```text
+/// distScaleFactor = ( pocDiffNum << 5 ) / pocDiffDen
+/// ```
+///
+/// Both operands flow in **signed** here (unlike `mmvd_dist_scale_factor`
+/// which takes pre-absoluted operands). A zero denominator surfaces
+/// `Error::Unsupported`; the §8.5.2.3.9 sub-branches all guard against
+/// the zero-POC-diff case upstream (the spec enters the scaled form only
+/// after picking a `currPocDiffL0` from a distinct reference picture).
+pub fn mmvd_signed_dist_scale_factor(poc_diff_num: i32, poc_diff_den: i32) -> Result<i32> {
+    if poc_diff_den == 0 {
+        return Err(Error::unsupported(format!(
+            "evc inter: mmvd_signed_dist_scale_factor needs non-zero denominator, got {poc_diff_den} (§8.5.2.3.9 eqs. 542/551/559/571/580/588)"
+        )));
+    }
+    // Signed left-shift then signed integer division. `i64` widening
+    // avoids overflow when `poc_diff_num` lives near i32 bounds; in
+    // practice POC diffs are tiny but the spec's arithmetic domain is
+    // the same i32 the surrounding equations use.
+    let num = (poc_diff_num as i64) << 5;
+    let den = poc_diff_den as i64;
+    Ok((num / den) as i32)
+}
+
+/// §8.5.2.3.9 eqs. 543 / 544 / 552 / 553 / 560 / 561 / 572 / 573 / 581 /
+/// 582 / 589 / 590 — round-toward-zero scaling of one MV component:
+///
+/// ```text
+/// out = Clip3(-32768, 32767,
+///             Sign(distScaleFactor * v)
+///           * ( ( Abs(distScaleFactor * v) + 16 ) >> 5 ))
+/// ```
+///
+/// The `Sign(x) * ((Abs(x) + 16) >> 5)` form is **round-toward-zero**
+/// (symmetric in `±x`) with a half-up bias on the magnitude. The bipred
+/// tail (eqs. 600 / 601 / 605 / 606, round-223 `mmvd_scale_component`)
+/// uses the simpler `Clip3(-32768, 32767, (s * v + 16) >> 5)` arithmetic
+/// right-shift form, which rounds toward `-infinity` for negative
+/// products. For most operand pairs both forms agree, but the symmetric
+/// form is what §8.5.2.3.9 spells out for every entry-process scaling
+/// equation (eqs. 543-590), so we keep it as the literal arithmetic.
+///
+/// Worked example: `s = 32`, `v = -1` ⇒ product `-32`,
+/// `(|−32| + 16) >> 5 = 48 >> 5 = 1`, `Sign(−32) = −1`, result `−1`.
+/// At `s = 32`, `v = 1` the same calculation flips sign back to `+1`.
+pub fn mmvd_signed_scale_component(dist_scale_factor: i32, mv_component: i32) -> i32 {
+    let product = (dist_scale_factor as i64).wrapping_mul(mv_component as i64);
+    let sign: i64 = match product.cmp(&0) {
+        std::cmp::Ordering::Greater => 1,
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+    };
+    let abs = product.unsigned_abs() as i64;
+    let mag = (abs + 16) >> 5;
+    let scaled = sign * mag;
+    scaled.clamp(-32768, 32767) as i32
+}
+
+/// §8.5.2.3.9 — scale both axes of an MV with the round-toward-zero
+/// signed form. Convenience wrapper around `mmvd_signed_scale_component`
+/// matching the shape the entry-process sub-branches use (each emits
+/// two eqs., one per axis, with the same `distScaleFactor`).
+pub fn mmvd_signed_scale_mv(dist_scale_factor: i32, mv: MotionVector) -> MotionVector {
+    MotionVector {
+        x: mmvd_signed_scale_component(dist_scale_factor, mv.x),
+        y: mmvd_signed_scale_component(dist_scale_factor, mv.y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1899,5 +2013,162 @@ mod tests {
                 "opp-sign k = {k}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 229 — §8.5.2.3.9 entry-process signed POC scaling primitives
+    // -----------------------------------------------------------------
+
+    /// Eq. 542 / 551 / 559 / 571 / 580 / 588 worked examples. Equal POCs
+    /// land at `sf = 32` (`+1` after the `>> 5`). Opposite-sign inputs
+    /// yield negative `sf`. Mixed magnitudes match `(num << 5) / den`
+    /// with truncation toward zero.
+    #[test]
+    fn round229_signed_dist_scale_factor_worked_examples() {
+        // Symmetric: same POC distance → 32 (which downstream rounds
+        // back to ±1 after >>5).
+        assert_eq!(mmvd_signed_dist_scale_factor(4, 4).unwrap(), 32);
+        // num = 4, den = 8 → ( 4 << 5 ) / 8 = 128 / 8 = 16
+        assert_eq!(mmvd_signed_dist_scale_factor(4, 8).unwrap(), 16);
+        // num = -4, den = 8 → ( -4 << 5 ) / 8 = -128 / 8 = -16
+        assert_eq!(mmvd_signed_dist_scale_factor(-4, 8).unwrap(), -16);
+        // num = 4, den = -8 → ( 4 << 5 ) / -8 = 128 / -8 = -16
+        assert_eq!(mmvd_signed_dist_scale_factor(4, -8).unwrap(), -16);
+        // num = -4, den = -8 → ( -4 << 5 ) / -8 = -128 / -8 = 16
+        assert_eq!(mmvd_signed_dist_scale_factor(-4, -8).unwrap(), 16);
+        // L0-closer worked example (eq. 559 form): num = 8, den = 4
+        // → ( 8 << 5 ) / 4 = 256 / 4 = 64.
+        assert_eq!(mmvd_signed_dist_scale_factor(8, 4).unwrap(), 64);
+    }
+
+    /// Eq. 542 / 551 / 559 / 571 / 580 / 588 — zero denominator surfaces
+    /// `Error::Unsupported`. The entry-process callers guard the zero-
+    /// POC case upstream, but a self-protective check is cheap and
+    /// makes the helper safe to call directly.
+    #[test]
+    fn round229_signed_dist_scale_factor_rejects_zero_denominator() {
+        assert!(mmvd_signed_dist_scale_factor(4, 0).is_err());
+        assert!(mmvd_signed_dist_scale_factor(0, 0).is_err());
+        assert!(mmvd_signed_dist_scale_factor(-4, 0).is_err());
+    }
+
+    /// Zero numerator with non-zero denominator is well-defined: 0
+    /// regardless of `pocDiffDen`. Used by §8.5.2.3.9 sub-branches
+    /// where the merge candidate's reference picture is currPic.
+    #[test]
+    fn round229_signed_dist_scale_factor_zero_numerator() {
+        assert_eq!(mmvd_signed_dist_scale_factor(0, 4).unwrap(), 0);
+        assert_eq!(mmvd_signed_dist_scale_factor(0, -4).unwrap(), 0);
+    }
+
+    /// Eq. 543 / 544 / 552 / 553 / … symmetric round-toward-zero
+    /// scaling. `sf = 32`, `v = ±1` ⇒ ±1 (magnitude (1+16)>>5 ... no,
+    /// 32*1 = 32, |32|+16 = 48, 48>>5 = 1). `sf = 16`, `v = 2` ⇒
+    /// 32 → (|32|+16)>>5 = 1, sign +1 → +1.
+    #[test]
+    fn round229_signed_scale_component_symmetric_in_sign() {
+        assert_eq!(mmvd_signed_scale_component(32, 1), 1);
+        assert_eq!(mmvd_signed_scale_component(32, -1), -1);
+        assert_eq!(mmvd_signed_scale_component(-32, 1), -1);
+        assert_eq!(mmvd_signed_scale_component(-32, -1), 1);
+
+        // sf = 16, v = 2 → product 32, (32+16)>>5 = 1
+        assert_eq!(mmvd_signed_scale_component(16, 2), 1);
+        assert_eq!(mmvd_signed_scale_component(16, -2), -1);
+    }
+
+    /// The form rounds **toward zero** with a half-up bias. `sf=1`,
+    /// `v=15` ⇒ product 15, (15+16)>>5 = 31>>5 = 0. `sf=1`, `v=16`
+    /// ⇒ product 16, (16+16)>>5 = 32>>5 = 1. The threshold is at
+    /// `|product| = 16`.
+    #[test]
+    fn round229_signed_scale_component_half_up_threshold() {
+        assert_eq!(mmvd_signed_scale_component(1, 15), 0);
+        assert_eq!(mmvd_signed_scale_component(1, -15), 0);
+        // Same threshold on the other axis of the `Sign(x) *` form.
+        assert_eq!(mmvd_signed_scale_component(1, 16), 1);
+        assert_eq!(mmvd_signed_scale_component(1, -16), -1);
+    }
+
+    /// Result is clipped to signed-16-bit. Pick a giant product to
+    /// exercise both clamps. `sf = 32767`, `v = 32767` produces a
+    /// magnitude well above `i16::MAX`; after the `>>5` reduction it
+    /// still exceeds 32767, so the clip engages.
+    #[test]
+    fn round229_signed_scale_component_clamps_to_signed16() {
+        let out = mmvd_signed_scale_component(32767, 32767);
+        assert_eq!(out, 32767);
+        let out = mmvd_signed_scale_component(32767, -32767);
+        assert_eq!(out, -32768);
+        let out = mmvd_signed_scale_component(-32767, 32767);
+        assert_eq!(out, -32768);
+    }
+
+    /// `mmvd_signed_scale_mv` applies the same `distScaleFactor` to
+    /// both axes (eqs. 543 + 544 pair, 552 + 553 pair, etc.).
+    #[test]
+    fn round229_signed_scale_mv_applies_to_both_axes() {
+        let mv = MotionVector { x: 16, y: -16 };
+        let scaled = mmvd_signed_scale_mv(32, mv);
+        // sf=32, v=16 → product 512, (512+16)>>5 = 528>>5 = 16
+        // sf=32, v=-16 → product -512, (|−512|+16)>>5 = 16, sign -1 → -16
+        assert_eq!(scaled, MotionVector { x: 16, y: -16 });
+
+        // Opposite-sign sf flips both axes (the entry-process branches
+        // that ride on a sign-flipped POC distance).
+        let scaled = mmvd_signed_scale_mv(-32, mv);
+        assert_eq!(scaled, MotionVector { x: -16, y: 16 });
+    }
+
+    /// Round-trip property: scaling by `sf = 32` (i.e. `pocDiffNum ==
+    /// pocDiffDen`) is `+v` on both axes for non-saturating inputs.
+    /// This is the symmetric / "same POC distance" identity the
+    /// §8.5.2.3.9 sub-branches reduce to when the L0 / L1 distances
+    /// match.
+    #[test]
+    fn round229_signed_scale_component_unit_factor_identity() {
+        for v in [-100, -32, -1, 0, 1, 32, 100, 500] {
+            let s = mmvd_signed_scale_component(32, v);
+            // sf * v + 16 = 32 * v + 16. For |v| < 1024 the (Abs+16) >>
+            // 5 path reduces to |v| exactly when v.abs() % 1 == 0
+            // (always); verify it.
+            assert_eq!(s, v, "sf=32, v={v}");
+        }
+    }
+
+    /// Zero-product short-circuit: `sf == 0` or `v == 0` ⇒ 0.
+    #[test]
+    fn round229_signed_scale_component_zero_inputs() {
+        assert_eq!(mmvd_signed_scale_component(0, 32767), 0);
+        assert_eq!(mmvd_signed_scale_component(32767, 0), 0);
+        assert_eq!(mmvd_signed_scale_component(0, 0), 0);
+    }
+
+    /// Eqs. 547 / 576 constant: the §8.5.2.3.9 P-slice / same-target
+    /// branch adds (group 1) or subtracts (group 2) 3 from `mMvL0[0]`.
+    /// The y component is untouched. The pinned constant catches
+    /// future refactors that drift the magnitude.
+    #[test]
+    fn round229_p_same_target_shift_constant_pinned() {
+        assert_eq!(MMVD_P_SAME_TARGET_SHIFT, 3);
+    }
+
+    /// Differential property: at the half-up rounding boundary the
+    /// symmetric and arithmetic-shift forms can diverge for negative
+    /// products. Eq. 600 (round-223 `mmvd_scale_component`) uses
+    /// `(s*v + 16) >> 5` (arithmetic right shift). Eq. 543 (round-229
+    /// `mmvd_signed_scale_component`) uses `Sign(s*v) * ((|s*v| + 16)
+    /// >> 5)`. For `s = 1`, `v = -1` both forms produce 0:
+    /// arithmetic-shift form `(-1 + 16) >> 5 = 15 >> 5 = 0`; symmetric
+    /// form `Sign(-1) * ((1 + 16) >> 5) = -1 * 0 = 0`. Establish the
+    /// agreement-at-zero baseline; the negative-rounding bias only
+    /// matters for products where `((|p| - 16) / 32)` and
+    /// `((p + 16) / 32)` disagree in sign.
+    #[test]
+    fn round229_signed_scale_agreement_at_zero_threshold() {
+        // Both eq. 600 form (mmvd_scale_component) and eq. 543 form
+        // (mmvd_signed_scale_component) agree at the zero crossing.
+        assert_eq!(mmvd_signed_scale_component(1, -1), 0);
+        assert_eq!(mmvd_scale_component(1, -1), 0);
     }
 }

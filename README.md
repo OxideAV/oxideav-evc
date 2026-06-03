@@ -7,6 +7,110 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-229 status
+
+Round 229 lands the **§8.5.2.3.9 entry-process** signed POC scaling
+primitives in `inter.rs`. The §8.5.2.3.9 entry process (eqs. 531-590)
+reassigns the selected merge candidate's `(refIdxLX, predFlagLX[0][0])`
+and pre-scales one list's motion vector against the other when
+`mmvd_group_idx ∈ { 1, 2 }`. Across its many sub-branches it leans on
+two arithmetic shapes that round 229 captures as pure helpers:
+
+* `distScaleFactor = ( currPocDiffNum << 5 ) / currPocDiffDen` — eqs.
+  542 / 551 / 559 / 571 / 580 / 588. **Signed** in both operands
+  (unlike round-223's `mmvd_dist_scale_factor`, which pre-absolutes
+  the POC differences before the bipred-tail division).
+* `mMv[k] = Clip3(-32768, 32767, Sign(s*v) * ((Abs(s*v) + 16) >> 5))`
+  — eqs. 543 / 544 / 552 / 553 / 560 / 561 / 572 / 573 / 581 / 582 /
+  589 / 590. **Round-toward-zero** with a half-up magnitude bias.
+  Distinct from the round-223 bipred-tail form
+  `Clip3(-32768, 32767, (s*v + 16) >> 5)`, which rides arithmetic
+  right shift and rounds negatives toward `-infinity`. For most
+  operand pairs both forms agree at the i32 boundary, but we mirror
+  the spec literally on both sides.
+
+Plus the small `MMVD_P_SAME_TARGET_SHIFT = 3` constant for the P-slice
+`targetRefIdxL0 == refIdxL0` branch (eqs. 547 / 576 add or subtract 3
+from `mMvL0[0]` depending on `mmvd_group_idx`).
+
+New surface:
+
+* `inter::mmvd_signed_dist_scale_factor(poc_diff_num, poc_diff_den)
+  -> Result<i32>` — eq. 542 / 551 / 559 / 571 / 580 / 588 signed
+  POC-diff scaling factor `(num << 5) / den`. Zero denominator
+  surfaces `Error::Unsupported`.
+* `inter::mmvd_signed_scale_component(dist_scale_factor, mv_component)
+  -> i32` — eqs. 543-590 round-toward-zero per-component scaler with
+  the signed-16-bit clip.
+* `inter::mmvd_signed_scale_mv(dist_scale_factor, mv) -> MotionVector`
+  — pair-axis wrapper.
+* `inter::MMVD_P_SAME_TARGET_SHIFT: i32 = 3` — eqs. 547 / 576 magic
+  offset.
+
+### Wiring stance
+
+Same posture as rounds 187 / 193 / 195 / 201 / 207 / 213 / 218 / 223:
+opt-in helpers, no behaviour change to existing decoder paths.
+Baseline streams set `sps_mmvd_flag = 0` so `mmvd_flag` is inferred 0
+per §7.4.7 and §8.5.2.3.9 stays unreached. The full §8.5.2.3.9 entry
+dispatcher (`mmvd_group_idx` branches, `slice_type` sub-branches,
+`refIdxLX` / `predFlagLX` updates) still depends on the
+merge-candidate-list builder + `NumRefIdxActive[]` / `RefPicListX`
+threading that the round-218 / round-223 followups documented.
+Round 229 closes the arithmetic side: the entry-process signed scaling
+is now a tested pure helper ready to drop into the eventual dispatcher.
+
+### Tests
+
+11 new unit tests (493 total; was 482):
+
+* `round229_signed_dist_scale_factor_worked_examples` — eqs. 542 /
+  551 / 559 / 571 / 580 / 588 against symmetric, L1-closer, L0-closer,
+  sign-flipped, and zero-numerator inputs.
+* `round229_signed_dist_scale_factor_rejects_zero_denominator` — self-
+  protective check at the helper boundary.
+* `round229_signed_dist_scale_factor_zero_numerator` — `0 / den == 0`
+  for both signs of `den`.
+* `round229_signed_scale_component_symmetric_in_sign` — eqs. 543-590
+  round-toward-zero form: `f(s, v) = -f(s, -v)` and `f(-s, v) = -f(s,
+  v)`, with worked spot checks at `(sf, v) ∈ { (32, 1), (32, -1),
+  (-32, 1), (16, 2), (16, -2) }`.
+* `round229_signed_scale_component_half_up_threshold` — `(s, v) = (1,
+  15)` ⇒ 0, `(1, 16)` ⇒ 1; the boundary at `|product| == 16`.
+* `round229_signed_scale_component_clamps_to_signed16` — both clamp
+  rails engage on near-i16 products.
+* `round229_signed_scale_mv_applies_to_both_axes` — eq. (543, 544)
+  pair structure: same `distScaleFactor` on `x` and `y`.
+* `round229_signed_scale_component_unit_factor_identity` — `sf = 32`
+  is the identity on non-saturating inputs (the "POC distances match"
+  case the spec uses to short-circuit several branches).
+* `round229_signed_scale_component_zero_inputs` — `sf == 0` or `v ==
+  0` short-circuits to 0.
+* `round229_p_same_target_shift_constant_pinned` — pins eqs. 547 /
+  576 magnitude at 3.
+* `round229_signed_scale_agreement_at_zero_threshold` — establishes
+  the agreement of round-229 (`mmvd_signed_scale_component`) and
+  round-223 (`mmvd_scale_component`) forms at the `|product| < 16`
+  zero-rounding regime.
+
+### Documented followups
+
+* The §8.5.2.3.9 entry-process dispatcher (`mmvd_group_idx == 1` and
+  `mmvd_group_idx == 2` branches, `slice_type == B` / P sub-branches,
+  eqs. 531-590) — the consumer that picks `targetRefIdxL0`, applies
+  the `MMVD_P_SAME_TARGET_SHIFT` offset for the same-target case, and
+  threads `mmvd_signed_dist_scale_factor` + `mmvd_signed_scale_mv`
+  for the differing-target case — still depends on the merge-
+  candidate-list builder + `NumRefIdxActive[]` / `RefPicListX`
+  threading. Round 229 ships the arithmetic primitives that the
+  dispatcher will reuse across eqs. 531-590.
+* The bipred-tail eqs. 591-616 (round 223) and entry-process eqs.
+  531-590 (round 229) both feed the same final accumulation `mMvLX
+  += mMvdLX` with `wrap16` semantics. Once the dispatcher lands, the
+  two halves chain.
+* The §8.9.8 `tableNum == 0` `draChromaQpShift` ambiguity from round
+  193 (docs collaborator task #1278) is still outstanding.
+
 ## Round-223 status
 
 Round 223 extends the round-218 MMVD groundwork into the **bipred /
