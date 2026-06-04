@@ -1183,6 +1183,164 @@ pub fn mmvd_signed_scale_mv(dist_scale_factor: i32, mv: MotionVector) -> MotionV
     }
 }
 
+// ----------------------------------------------------------------
+// §8.5.2.3.10 — Derivation process for motion vector prediction
+// redundancy check
+// ----------------------------------------------------------------
+//
+// Round-232 lands the de-duplication step that closes every §8.5.2.3.x
+// merge-candidate-list append in the spec text. The §8.5.2.3.1 –
+// §8.5.2.3.8 append paths each finish by invoking
+// `merge_cand_redundancy_check` with the (potentially-grown) list and
+// the current `numCurrMergeCand`. The check compares the just-appended
+// tail entry (`mergeCandList[numCurrMergeCand - 1]`) against every
+// entry already in the list, in ascending index order, until either
+// (a) it finds a duplicate (in which case the tail is "absorbed" — the
+// count is decremented by 1 to reclaim the slot), or (b) it has
+// compared against every prior entry (then the tail is genuinely new
+// and the count stays put).
+//
+// The matching predicate per the §8.5.2.3.10 ordered steps:
+//
+//   1) Number of available reference lists agrees (per-LX `predFlag`s
+//      together encode availability — 0/1/2 lists active).
+//   2) Same available reference list indices (i.e. the L0/L1
+//      activation bitmask agrees, not just the count).
+//   3) Same `refIdxLX` in each active list.
+//   4) Same `mvLX` in each active list.
+//
+// Inactive lists are skipped for the (3) / (4) compares: the spec's
+// "corresponding to available reference lists" qualifier means a
+// dormant `predFlagLX = 0` slot's refIdx / MV values are not part of
+// the predicate.
+
+/// §8.5.2.3.x merge-candidate entry — the per-CU motion descriptor
+/// produced by the spatial / temporal / HMVP / MMVD append paths and
+/// consumed by §8.5.2.3.10. Compact value type so the redundancy-check
+/// loop can iterate without bounds checks fighting the borrow checker.
+///
+/// `pred_flag_lX` agrees with `PredFlagLX[ xCb ][ yCb ]` at the
+/// candidate's representative sample (§8.5.2.3 inputs). `ref_idx_lX`
+/// and `mv_lX` only carry meaning when the corresponding flag is set;
+/// the redundancy check explicitly ignores them when the flag is 0
+/// (per the §8.5.2.3.10 "corresponding to available reference lists"
+/// scoping).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeCand {
+    /// `predFlagL0[ 0 ][ 0 ]` for the candidate.
+    pub pred_flag_l0: bool,
+    /// `predFlagL1[ 0 ][ 0 ]` for the candidate.
+    pub pred_flag_l1: bool,
+    /// `refIdxL0` — meaningful only when `pred_flag_l0` is set.
+    pub ref_idx_l0: i32,
+    /// `refIdxL1` — meaningful only when `pred_flag_l1` is set.
+    pub ref_idx_l1: i32,
+    /// `mvL0` — meaningful only when `pred_flag_l0` is set.
+    pub mv_l0: MotionVector,
+    /// `mvL1` — meaningful only when `pred_flag_l1` is set.
+    pub mv_l1: MotionVector,
+}
+
+/// §8.5.2.3.10 matching predicate — `mergeCandList[ a ]` and
+/// `mergeCandList[ b ]` satisfy every condition in the four ordered
+/// steps.
+///
+/// Equivalent to a structural equality on the active-list-restricted
+/// projection: inactive lists never participate in the compare, so two
+/// candidates with the same `predFlag` bitmask but a stale residual
+/// `refIdxL1` from a previous L0-only append are still considered
+/// equal under this predicate.
+///
+/// Used internally by `merge_cand_redundancy_check`; exposed because
+/// the §8.5.2.3.x append paths in future rounds will call it directly
+/// when they need a single-pair compare without the trim loop.
+pub fn merge_cand_matches(a: &MergeCand, b: &MergeCand) -> bool {
+    // Step 1+2: number of available reference lists + which lists are
+    // available collapse to "same `predFlag` bitmask".
+    if a.pred_flag_l0 != b.pred_flag_l0 || a.pred_flag_l1 != b.pred_flag_l1 {
+        return false;
+    }
+    // Step 3: same `refIdxLX` in each active list.
+    if a.pred_flag_l0 && a.ref_idx_l0 != b.ref_idx_l0 {
+        return false;
+    }
+    if a.pred_flag_l1 && a.ref_idx_l1 != b.ref_idx_l1 {
+        return false;
+    }
+    // Step 4: same `mvLX` in each active list.
+    if a.pred_flag_l0 && a.mv_l0 != b.mv_l0 {
+        return false;
+    }
+    if a.pred_flag_l1 && a.mv_l1 != b.mv_l1 {
+        return false;
+    }
+    true
+}
+
+/// §8.5.2.3.10 — trim a freshly-appended merge candidate from the tail
+/// of `merge_cand_list` if it duplicates any earlier entry.
+///
+/// `num_curr_merge_cand` is the count after the §8.5.2.3.x append that
+/// just placed a candidate at index `num_curr_merge_cand - 1`. The
+/// scan walks `cand_indx` from 0 up to (but not equal to)
+/// `num_curr_merge_cand - 1`, terminating at the first duplicate it
+/// finds. When a duplicate is found, the returned count is
+/// `num_curr_merge_cand - 1` (the spec's "decremented by 1"); the
+/// caller treats indices ≥ the returned count as logically removed —
+/// the list buffer itself is unchanged (the spec doesn't mandate
+/// zeroing).
+///
+/// When `num_curr_merge_cand ≤ 1` the routine is a no-op (the spec's
+/// pre-test "When numCurrMergeCand is greater than 1"); the input
+/// count is returned untouched.
+///
+/// Returns the updated `numCurrMergeCand`. Errors:
+///
+/// * `Error::Unsupported` if `num_curr_merge_cand` exceeds the slice's
+///   capacity — that mismatch implies an upstream §8.5.2.3.x append
+///   wrote past the array bound and is a bookkeeping bug, not a
+///   stream-recoverable condition.
+pub fn merge_cand_redundancy_check(
+    merge_cand_list: &[MergeCand],
+    num_curr_merge_cand: usize,
+) -> Result<usize> {
+    if num_curr_merge_cand > merge_cand_list.len() {
+        return Err(Error::Unsupported(format!(
+            "evc inter: merge_cand_redundancy_check num_curr_merge_cand={num_curr_merge_cand} exceeds buffer len={} (§8.5.2.3.10 caller bug)",
+            merge_cand_list.len()
+        )));
+    }
+    // Spec pre-condition: "When numCurrMergeCand is greater than 1".
+    if num_curr_merge_cand <= 1 {
+        return Ok(num_curr_merge_cand);
+    }
+    let tail_indx = num_curr_merge_cand - 1;
+    let tail = &merge_cand_list[tail_indx];
+    let mut cand_indx = 0usize;
+    // "repeated until candIsNew is equal to FALSE or candIndx is equal
+    // to numCurrMergeCand − 2": after the loop body increments
+    // `candIndx`, the spec re-checks both exit predicates. At
+    // `cand_indx == num_curr_merge_cand - 2` (i.e. `cand_indx ==
+    // tail_indx - 1`) the next compare is against the entry directly
+    // before the tail; if that fails, the loop body increments
+    // `cand_indx` to `tail_indx - 1 + 1 = tail_indx` which would
+    // compare the tail against itself — exactly the case the spec's
+    // exit predicate forbids. So the active scan range is `0 ..
+    // tail_indx` (i.e. `0 ..= tail_indx - 1`).
+    while cand_indx < tail_indx {
+        let cand_is_new = !merge_cand_matches(&merge_cand_list[cand_indx], tail);
+        if !cand_is_new {
+            // Spec: "When candIsNew is equal to FALSE, the variable
+            // numCurrMergeCand is decremented by 1." The exit clause
+            // fires immediately.
+            return Ok(num_curr_merge_cand - 1);
+        }
+        cand_indx += 1;
+    }
+    // Walked every prior entry without a match: tail is genuinely new.
+    Ok(num_curr_merge_cand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2170,5 +2328,253 @@ mod tests {
         // (mmvd_signed_scale_component) agree at the zero crossing.
         assert_eq!(mmvd_signed_scale_component(1, -1), 0);
         assert_eq!(mmvd_scale_component(1, -1), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Round 232 — §8.5.2.3.10 motion vector prediction redundancy
+    // check
+    // ----------------------------------------------------------------
+
+    /// Helper for the §8.5.2.3.10 fixtures: build a candidate with both
+    /// lists active and explicit refIdx / MV per list.
+    fn mc_bipred(rl0: i32, mvl0: (i32, i32), rl1: i32, mvl1: (i32, i32)) -> MergeCand {
+        MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            ref_idx_l0: rl0,
+            ref_idx_l1: rl1,
+            mv_l0: MotionVector::quarter_pel(mvl0.0, mvl0.1),
+            mv_l1: MotionVector::quarter_pel(mvl1.0, mvl1.1),
+        }
+    }
+
+    /// Helper for the §8.5.2.3.10 fixtures: build a candidate with only
+    /// L0 active. Residual L1 fields are explicitly set to "junk" so
+    /// the predicate's L1-skip behaviour is observable.
+    fn mc_l0(rl0: i32, mvl0: (i32, i32)) -> MergeCand {
+        MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: rl0,
+            ref_idx_l1: 999,
+            mv_l0: MotionVector::quarter_pel(mvl0.0, mvl0.1),
+            mv_l1: MotionVector::quarter_pel(9999, 9999),
+        }
+    }
+
+    /// §8.5.2.3.10 step (1) — when the two candidates use a different
+    /// `predFlag` bitmask, the predicate fails on the first ordered
+    /// step. A bipred candidate cannot match an L0-only candidate even
+    /// when L0's MV / refIdx coincide.
+    #[test]
+    fn round232_pred_flag_bitmask_mismatch_blocks_match() {
+        let a = mc_bipred(0, (1, 2), 0, (3, 4));
+        let b = mc_l0(0, (1, 2));
+        assert!(!merge_cand_matches(&a, &b));
+        assert!(!merge_cand_matches(&b, &a));
+    }
+
+    /// §8.5.2.3.10 step (3) — when both candidates carry the same
+    /// `predFlag` bitmask and same MVs, a single-list refIdx
+    /// disagreement is enough to make the predicate fail.
+    #[test]
+    fn round232_ref_idx_mismatch_blocks_match() {
+        let a = mc_bipred(0, (1, 2), 0, (3, 4));
+        let b = mc_bipred(1, (1, 2), 0, (3, 4));
+        assert!(!merge_cand_matches(&a, &b));
+    }
+
+    /// §8.5.2.3.10 step (4) — same `predFlag` bitmask and same
+    /// refIdxs, but a single MV component differs.
+    #[test]
+    fn round232_mv_component_mismatch_blocks_match() {
+        let a = mc_bipred(0, (1, 2), 0, (3, 4));
+        let b = mc_bipred(0, (1, 2), 0, (3, 5));
+        assert!(!merge_cand_matches(&a, &b));
+    }
+
+    /// §8.5.2.3.10 "corresponding to available reference lists" — when
+    /// `predFlagL1 = 0` for both candidates, the spec masks out L1's
+    /// refIdx / MV from the compare. Residual stale L1 values do NOT
+    /// disturb the match.
+    #[test]
+    fn round232_inactive_list_fields_are_ignored() {
+        let a = MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: 5, // junk
+            mv_l0: MotionVector::quarter_pel(1, 2),
+            mv_l1: MotionVector::quarter_pel(100, 200), // junk
+        };
+        let b = MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: -3, // different junk
+            mv_l0: MotionVector::quarter_pel(1, 2),
+            mv_l1: MotionVector::quarter_pel(-50, 50), // different junk
+        };
+        assert!(merge_cand_matches(&a, &b));
+    }
+
+    /// §8.5.2.3.10 pre-test — when `numCurrMergeCand ≤ 1` the routine
+    /// returns the count untouched (the spec's outer "When
+    /// numCurrMergeCand is greater than 1" guard).
+    #[test]
+    fn round232_pre_test_no_op_when_count_le_1() {
+        let list = vec![mc_l0(0, (1, 2)); 4];
+        assert_eq!(merge_cand_redundancy_check(&list, 0).unwrap(), 0);
+        assert_eq!(merge_cand_redundancy_check(&list, 1).unwrap(), 1);
+    }
+
+    /// §8.5.2.3.10 happy path — tail entry duplicates an earlier
+    /// entry, count is decremented by 1.
+    #[test]
+    fn round232_duplicate_tail_drops_count() {
+        let mut list = vec![MergeCand::default(); 6];
+        list[0] = mc_l0(0, (1, 2));
+        list[1] = mc_l0(1, (3, 4));
+        list[2] = mc_l0(2, (5, 6));
+        list[3] = mc_l0(1, (3, 4)); // duplicates index 1
+        let out = merge_cand_redundancy_check(&list, 4).unwrap();
+        assert_eq!(out, 3);
+    }
+
+    /// §8.5.2.3.10 happy path — tail entry is genuinely new, count is
+    /// preserved.
+    #[test]
+    fn round232_new_tail_preserves_count() {
+        let mut list = vec![MergeCand::default(); 6];
+        list[0] = mc_l0(0, (1, 2));
+        list[1] = mc_l0(1, (3, 4));
+        list[2] = mc_l0(2, (5, 6));
+        list[3] = mc_l0(3, (7, 8));
+        let out = merge_cand_redundancy_check(&list, 4).unwrap();
+        assert_eq!(out, 4);
+    }
+
+    /// §8.5.2.3.10 scan ordering — when both index 0 AND index 1
+    /// would match the tail, the spec stops at the FIRST duplicate
+    /// (candIndx == 0 path). Verify the loop exits before reaching
+    /// index 1 by mutating index 1 to a different value: the count
+    /// is still decremented exactly once (count - 1).
+    #[test]
+    fn round232_first_duplicate_short_circuits_scan() {
+        let mut list = vec![MergeCand::default(); 6];
+        list[0] = mc_l0(0, (1, 2));
+        list[1] = mc_l0(1, (3, 4));
+        list[2] = mc_l0(2, (5, 6));
+        list[3] = mc_l0(0, (1, 2)); // matches list[0]
+        let out = merge_cand_redundancy_check(&list, 4).unwrap();
+        // Decrement by 1 (single-pass behaviour), not 2.
+        assert_eq!(out, 3);
+    }
+
+    /// §8.5.2.3.10 boundary — when only the entry directly before the
+    /// tail matches, the spec's exit predicate (`candIndx ==
+    /// numCurrMergeCand - 2`) still admits the compare; the routine
+    /// correctly decrements.
+    #[test]
+    fn round232_penultimate_duplicate_decrements() {
+        let mut list = vec![MergeCand::default(); 6];
+        list[0] = mc_l0(0, (1, 2));
+        list[1] = mc_l0(1, (3, 4));
+        list[2] = mc_l0(2, (5, 6));
+        list[3] = mc_l0(2, (5, 6)); // matches index 2 only
+        let out = merge_cand_redundancy_check(&list, 4).unwrap();
+        assert_eq!(out, 3);
+    }
+
+    /// §8.5.2.3.10 `numCurrMergeCand == 2` smallest non-trivial case
+    /// — duplicate.
+    #[test]
+    fn round232_two_element_duplicate() {
+        let list = vec![mc_l0(0, (1, 2)), mc_l0(0, (1, 2))];
+        let out = merge_cand_redundancy_check(&list, 2).unwrap();
+        assert_eq!(out, 1);
+    }
+
+    /// §8.5.2.3.10 `numCurrMergeCand == 2` distinct case.
+    #[test]
+    fn round232_two_element_distinct() {
+        let list = vec![mc_l0(0, (1, 2)), mc_l0(0, (1, 3))];
+        let out = merge_cand_redundancy_check(&list, 2).unwrap();
+        assert_eq!(out, 2);
+    }
+
+    /// §8.5.2.3.10 — bipred duplicate where both L0 and L1 must agree
+    /// for the predicate to fire.
+    #[test]
+    fn round232_bipred_full_match_drops_count() {
+        let mut list = vec![MergeCand::default(); 4];
+        list[0] = mc_bipred(0, (1, 2), 1, (3, 4));
+        list[1] = mc_bipred(2, (5, 6), 3, (7, 8));
+        list[2] = mc_bipred(0, (1, 2), 1, (3, 4)); // matches index 0
+        let out = merge_cand_redundancy_check(&list, 3).unwrap();
+        assert_eq!(out, 2);
+    }
+
+    /// §8.5.2.3.10 — bipred near-match where ONLY L1 differs. The
+    /// predicate must reject the partial match.
+    #[test]
+    fn round232_bipred_l1_only_difference_preserves_count() {
+        let mut list = vec![MergeCand::default(); 4];
+        list[0] = mc_bipred(0, (1, 2), 1, (3, 4));
+        list[1] = mc_bipred(2, (5, 6), 3, (7, 8));
+        list[2] = mc_bipred(0, (1, 2), 1, (3, 5)); // L1 mvy differs
+        let out = merge_cand_redundancy_check(&list, 3).unwrap();
+        assert_eq!(out, 3);
+    }
+
+    /// §8.5.2.3.10 — caller bug: `num_curr_merge_cand` exceeds buffer.
+    #[test]
+    fn round232_oversize_count_errors() {
+        let list = vec![mc_l0(0, (1, 2)); 2];
+        let err = merge_cand_redundancy_check(&list, 3).unwrap_err();
+        match err {
+            Error::Unsupported(msg) => {
+                assert!(msg.contains("§8.5.2.3.10"));
+            }
+            _ => panic!("expected Error::Unsupported"),
+        }
+    }
+
+    /// §8.5.2.3.10 — reflexive identity: the matching predicate is
+    /// reflexive (a candidate always matches itself), as it must be
+    /// for the trim loop to ever fire.
+    #[test]
+    fn round232_predicate_reflexive() {
+        let cand = mc_bipred(2, (-10, 7), -1, (300, -300));
+        assert!(merge_cand_matches(&cand, &cand));
+        let cand_l0 = mc_l0(5, (1, 2));
+        assert!(merge_cand_matches(&cand_l0, &cand_l0));
+    }
+
+    /// §8.5.2.3.10 — symmetric: `matches(a, b) == matches(b, a)`. The
+    /// spec's "have all the following conditions met" wording defines
+    /// an equivalence relation on the active-list-restricted
+    /// projection, so the predicate must be symmetric even in the
+    /// inactive-list-ignored case.
+    #[test]
+    fn round232_predicate_symmetric() {
+        let a = MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: 5,
+            mv_l0: MotionVector::quarter_pel(1, 2),
+            mv_l1: MotionVector::quarter_pel(99, 99),
+        };
+        let b = MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: -3,
+            mv_l0: MotionVector::quarter_pel(1, 2),
+            mv_l1: MotionVector::quarter_pel(-1, -1),
+        };
+        assert_eq!(merge_cand_matches(&a, &b), merge_cand_matches(&b, &a));
+        assert!(merge_cand_matches(&a, &b));
     }
 }

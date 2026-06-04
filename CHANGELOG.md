@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### Round 232 — §8.5.2.3.10 motion vector prediction redundancy check
+
+#### Added
+- `inter::MergeCand` — compact §8.5.2.3.x merge-candidate descriptor
+  carrying `pred_flag_lX`, `ref_idx_lX`, `mv_lX` for X = 0, 1. The
+  per-list refIdx / MV slots only carry meaning when the corresponding
+  `pred_flag_lX` is set; the §8.5.2.3.10 predicate explicitly masks
+  out inactive-list slots ("corresponding to available reference
+  lists" qualifier).
+- `inter::merge_cand_matches(a, b) -> bool` — §8.5.2.3.10 matching
+  predicate. Compresses the spec's four ordered conditions ("number of
+  available reference lists", "same available reference list
+  indices", "same valid reference indices", "same motion vectors") to
+  a single structural compare on the active-list-restricted
+  projection. Reflexive + symmetric on its own; the inactive-list
+  fields participate in neither equality test.
+- `inter::merge_cand_redundancy_check(merge_cand_list,
+  num_curr_merge_cand) -> Result<usize>` — §8.5.2.3.10 trim loop. When
+  `numCurrMergeCand > 1`, scans `candIndx` from 0 against the tail
+  entry at `numCurrMergeCand - 1`. Stops on first match (decrementing
+  the count by 1, per the spec's exit clause), or walks every prior
+  entry and returns the input count untouched. Pre-test no-op when
+  `numCurrMergeCand ≤ 1` per the spec's outer "When numCurrMergeCand
+  is greater than 1" guard. Caller-bug oversized counts surface
+  `Error::Unsupported`.
+
+#### Tests
+- 16 new unit tests (509 total; was 493):
+  - `round232_pred_flag_bitmask_mismatch_blocks_match`
+  - `round232_ref_idx_mismatch_blocks_match`
+  - `round232_mv_component_mismatch_blocks_match`
+  - `round232_inactive_list_fields_are_ignored`
+  - `round232_pre_test_no_op_when_count_le_1`
+  - `round232_duplicate_tail_drops_count`
+  - `round232_new_tail_preserves_count`
+  - `round232_first_duplicate_short_circuits_scan`
+  - `round232_penultimate_duplicate_decrements`
+  - `round232_two_element_duplicate`
+  - `round232_two_element_distinct`
+  - `round232_bipred_full_match_drops_count`
+  - `round232_bipred_l1_only_difference_preserves_count`
+  - `round232_oversize_count_errors`
+  - `round232_predicate_reflexive`
+  - `round232_predicate_symmetric`
+
 ### Round 229 — §8.5.2.3.9 entry-process signed POC scaling primitives
 
 #### Added

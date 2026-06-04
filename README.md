@@ -7,6 +7,89 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-232 status
+
+Round 232 lands the **§8.5.2.3.10 motion vector prediction redundancy
+check** in `inter.rs`. Every §8.5.2.3.x merge-candidate append path
+(§8.5.2.3.1 – §8.5.2.3.8) finishes by invoking the §8.5.2.3.10 trim
+loop with the just-grown list and the current `numCurrMergeCand`. The
+trim compares the tail entry (`mergeCandList[numCurrMergeCand − 1]`)
+against every prior entry; on the first match the tail's slot is
+reclaimed by decrementing the count, otherwise the count stays put.
+
+The matching predicate composes the four ordered conditions the spec
+spells out:
+
+1. Same number of available reference lists.
+2. Same available reference list indices (which of L0 / L1 is used).
+3. Same `refIdxLX` in each available list.
+4. Same `mvLX` in each available list.
+
+The "corresponding to available reference lists" qualifier means
+inactive-list slots are dropped from the compare: two candidates with
+`predFlagL1 = 0` match even when their residual `refIdxL1` / `mvL1`
+values disagree.
+
+New surface:
+
+* `inter::MergeCand` — compact value type for §8.5.2.3.x merge
+  entries (`pred_flag_lX`, `ref_idx_lX`, `mv_lX` per list).
+* `inter::merge_cand_matches(a, b) -> bool` — §8.5.2.3.10 four-step
+  predicate as a pure function. Reflexive + symmetric on the
+  active-list projection.
+* `inter::merge_cand_redundancy_check(merge_cand_list,
+  num_curr_merge_cand) -> Result<usize>` — the trim loop. Returns the
+  updated `numCurrMergeCand`. No-op when `num_curr_merge_cand ≤ 1`
+  (per the spec's outer guard); first-match short-circuits with
+  `count − 1`; oversized counts surface `Error::Unsupported`.
+
+### Wiring stance
+
+Same posture as the rest of the §8.5.2.3 helper rollout (rounds 187 /
+193 / 195 / 201 / 207 / 213 / 218 / 223 / 229): opt-in helper, no
+behaviour change to existing decoder paths. The §8.5.2.3.x
+merge-candidate-list builder remains the open dispatcher pending the
+surrounding §8.5.2.3.1 – §8.5.2.3.8 spatial / temporal / HMVP /
+zero-MV append paths; this round closes the dedup primitive each of
+those append paths needs at their tail.
+
+### Tests
+
+16 new unit tests (509 total; was 493):
+
+* `round232_pred_flag_bitmask_mismatch_blocks_match` — step (1) /
+  (2): a bipred candidate cannot match an L0-only candidate.
+* `round232_ref_idx_mismatch_blocks_match` — step (3): single-list
+  refIdx disagreement defeats the match.
+* `round232_mv_component_mismatch_blocks_match` — step (4): a single
+  MV component disagreement defeats the match.
+* `round232_inactive_list_fields_are_ignored` — the spec's
+  "corresponding to available reference lists" qualifier: residual
+  junk in inactive-list slots is masked out.
+* `round232_pre_test_no_op_when_count_le_1` — outer guard.
+* `round232_duplicate_tail_drops_count` — happy path: count − 1.
+* `round232_new_tail_preserves_count` — happy path: count unchanged.
+* `round232_first_duplicate_short_circuits_scan` — the spec's exit
+  predicate fires at the first match, not at every match.
+* `round232_penultimate_duplicate_decrements` — boundary at
+  `candIndx == numCurrMergeCand − 2`.
+* `round232_two_element_duplicate` /
+  `round232_two_element_distinct` — smallest non-trivial cases.
+* `round232_bipred_full_match_drops_count` /
+  `round232_bipred_l1_only_difference_preserves_count` — bipred
+  candidates require BOTH lists to agree.
+* `round232_oversize_count_errors` — caller-bug surface.
+* `round232_predicate_reflexive` / `round232_predicate_symmetric` —
+  algebraic identities the spec's "have all the following conditions
+  met" wording implies.
+
+### Disclaimer
+
+`merge_cand_redundancy_check` is derived from the §8.5.2.3.10 ordered
+steps in ISO/IEC 23094-1:2020. No external implementation was
+consulted; the algorithm is straight-line transcription of the four
+matching conditions plus the spec's bounded-step exit clause.
+
 ## Round-229 status
 
 Round 229 lands the **§8.5.2.3.9 entry-process** signed POC scaling
