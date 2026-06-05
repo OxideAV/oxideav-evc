@@ -7,6 +7,100 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-237 status
+
+Round 237 lands a **typed tile-grid iterator** on `Pps` plus three
+typed picture-tile counters, grounded in ISO/IEC 23094-1:2020 §6.5.1
+eq. (30) and §7.4.3.2.
+
+The §6.5.1 derivation processes that build `TileId[ ]`, `ColWidth[ ]`
+/ `RowHeight[ ]` and `NumCtusInTile[ ]` all share the same outer
+loop:
+
+```
+for( j = 0, tileIdx = 0; j <= num_tile_rows_minus1; j++ )
+   for( i = 0; i <= num_tile_columns_minus1; i++, tileIdx++ )
+      ...
+```
+
+Round 237 captures that outer loop as a reusable iterator yielding
+one `TileGridCoord { tile_idx, tile_row_j, tile_col_i }` per tile,
+in eq. (30) raster-tile order. The inner two loops that populate
+`TileId[ CtbAddrRsToTs[ … ] ]` per CTB stay caller-controlled — they
+need `ColBd[ ]` / `RowBd[ ]` / `CtbAddrRsToTs[ ]` which are derived
+once the rest of §6.5.1 lands.
+
+New surface:
+
+* `pps::TileGridCoord` — `(tile_idx, tile_row_j, tile_col_i)` triple
+  matching the §6.5.1 eq. (30) local variable names. `Copy + Clone +
+  Debug + PartialEq + Eq`.
+* `pps::TileGridCoordIter` — `ExactSizeIterator` returned by
+  `Pps::tile_grid_coords`. `size_hint` and `len` stay tight against
+  the remaining-tile count.
+* `Pps::num_tile_columns(&self) -> u32` / `num_tile_rows(&self) -> u32`
+  — the `num_tile_*_minus1 + 1` adapter pair. Always at least 1, even
+  for the single-tile-in-pic case.
+* `Pps::num_tiles_in_pic(&self) -> u32` — `NumTilesInPic` from §6.5.1.
+  Product of the two axis counts; the parser's `MAX_TILES_PER_DIM`
+  bound (256 per axis) keeps the product inside `u32`.
+* `Pps::tile_grid_coords(&self) -> TileGridCoordIter` — the eq. (30)
+  outer-loop iterator. Yields `tile_idx` linearly from `0` to
+  `NumTilesInPic - 1`, with `tile_row_j * num_tile_columns +
+  tile_col_i == tile_idx` as the row-major packing identity.
+
+### Spec gap (deferred)
+
+The explicit-id branch of eq. (30) accesses `tile_id_val[ i ][ j ]`
+where the eq's local `i` binds to the column index and `j` to the
+row. The §7.4.3.2 prose for `tile_id_val[ i ][ j ]` defines the
+first dimension as the **row** and the second as the **column**.
+These two binding orders contradict each other.
+
+`Pps::tile_grid_coords` deliberately stops short of resolving
+`tile_id` for that reason; it surfaces only the unambiguous
+`(tile_idx, tile_row_j, tile_col_i)` triple. The round's followups
+note flags this for the docs collaborator.
+
+### Wiring stance
+
+Same posture as the round-187 / 193 / 195 / 201 / 207 / 213 / 218 /
+223 / 229 / 232 helper rollout: opt-in helper, no behaviour change
+to existing decoder paths. The §6.5.1 derivation continues to live
+in the decoder's slice-walker; `tile_grid_coords` exists for it (and
+future per-tile iteration callers) to consume once that path is
+wired through.
+
+### Tests
+
+10 new unit tests (519 total; was 509):
+
+* `round237_num_tiles_single_tile_picture` — the
+  `single_tile_in_pic_flag == 1` shape yields exactly 1.
+* `round237_num_tiles_two_by_one_grid` — 2 columns × 1 row.
+* `round237_num_tiles_three_by_two_grid` — 3 columns × 2 rows.
+* `round237_tile_grid_coords_single_tile` — degenerate iterator
+  yields exactly one coord at the origin.
+* `round237_tile_grid_coords_two_by_one_order` — confirms `i`
+  (columns) is the inner loop and `tile_idx` advances 0, 1.
+* `round237_tile_grid_coords_two_by_two_raster_order` — the
+  eq. (30) outer-loop order (0,0), (0,1), (1,0), (1,1).
+* `round237_tile_grid_coords_three_by_two_full_walk` — exhaustive
+  row-major walk of a 3×2 grid.
+* `round237_tile_grid_iterator_exhausts_to_none` — fused-style
+  `None` after exhaustion.
+* `round237_tile_grid_iterator_size_hint` — `size_hint` + `len`
+  stay tight as the iterator consumes.
+* `round237_tile_idx_matches_row_col_packing` — the row-major
+  packing identity `tile_idx == row * num_cols + col`.
+
+### Disclaimer
+
+`TileGridCoord` / `tile_grid_coords` are derived from ISO/IEC
+23094-1:2020 §6.5.1 eq. (30) and §7.4.3.2's `num_tile_*_minus1`
+semantics. No external implementation was consulted; the iterator
+is a direct transcription of the spec's outer two loop levels.
+
 ## Round-232 status
 
 Round 232 lands the **§8.5.2.3.10 motion vector prediction redundancy

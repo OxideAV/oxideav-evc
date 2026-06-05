@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### Round 237 — §6.5.1 tile-grid iterator + §7.4.3.2 picture-tile counters
+
+#### Added
+- `pps::TileGridCoord` — typed value carrying the
+  `(tile_idx, tile_row_j, tile_col_i)` triple from the §6.5.1 eq. (30)
+  outer tile-enumeration loop. `Copy + Clone + Debug + PartialEq + Eq`.
+- `pps::TileGridCoordIter` — `ExactSizeIterator` returned by
+  `Pps::tile_grid_coords`; `size_hint` and `len` stay tight against
+  the remaining-tile count.
+- `Pps::num_tile_columns(&self) -> u32` /
+  `Pps::num_tile_rows(&self) -> u32` — the
+  `num_tile_*_minus1 + 1` adapter pair from §7.4.3.2. Always at
+  least `1`, including the inferred `single_tile_in_pic_flag == 1`
+  shape.
+- `Pps::num_tiles_in_pic(&self) -> u32` — `NumTilesInPic` from §6.5.1.
+  Product of the two axis counts; the parser's `MAX_TILES_PER_DIM`
+  bound (256 per axis) keeps the product inside `u32`.
+- `Pps::tile_grid_coords(&self) -> TileGridCoordIter` — the §6.5.1
+  eq. (30) outer-loop iterator. Yields `tile_idx` linearly from
+  `0` to `NumTilesInPic - 1`, advancing `i` (columns) within each
+  `j` (row), with `tile_row_j * num_tile_columns + tile_col_i ==
+  tile_idx` as the row-major packing identity.
+
+#### Notes
+- The explicit-id branch of eq. (30) reads `tile_id_val[ i ][ j ]`,
+  but the §7.4.3.2 prose for `tile_id_val[ i ][ j ]` binds the first
+  dimension to the row and the second to the column. These
+  orderings contradict; `Pps::tile_grid_coords` therefore stops at
+  the unambiguous `(tile_idx, tile_row_j, tile_col_i)` triple and
+  does **not** surface `tile_id`. A docs-collaborator clarification
+  will unblock the explicit-id resolution helper.
+
+#### Tests
+- 10 new unit tests (519 total; was 509):
+  - `round237_num_tiles_single_tile_picture`
+  - `round237_num_tiles_two_by_one_grid`
+  - `round237_num_tiles_three_by_two_grid`
+  - `round237_tile_grid_coords_single_tile`
+  - `round237_tile_grid_coords_two_by_one_order`
+  - `round237_tile_grid_coords_two_by_two_raster_order`
+  - `round237_tile_grid_coords_three_by_two_full_walk`
+  - `round237_tile_grid_iterator_exhausts_to_none`
+  - `round237_tile_grid_iterator_size_hint`
+  - `round237_tile_idx_matches_row_col_packing`
+
 ### Round 232 — §8.5.2.3.10 motion vector prediction redundancy check
 
 #### Added
