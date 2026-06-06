@@ -90,6 +90,7 @@ pub mod ibc;
 pub mod inter;
 pub mod intra;
 pub mod nal;
+pub mod neighbour;
 pub mod picture;
 pub mod pps;
 pub mod rpl;

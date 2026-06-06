@@ -7,6 +7,102 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-242 status
+
+Round 242 lands the **§6.4.2 `availLR` derivation** (eq. 23) plus
+the four named tokens `LR_00` / `LR_10` / `LR_01` / `LR_11` from the
+section's closing paragraph, as a new `neighbour` module.
+
+§6.4.2 turns two per-neighbour availability booleans into a packed
+`availLR` value used by every `sps_suco_flag = 1`-aware merge /
+AMVP / partitioning derivation (§8.5.2.4.5.2 `DefaultRefIdxLX`,
+§8.5.2.3.2 spatial merging, §8.5.3.5 affine CP MVP, etc.). The
+formula is the closed-form
+
+```text
+availLR = availableL + availableR * 2                            (23)
+```
+
+with the four output tokens `LR_LR` named so that the first digit
+is the left-neighbour availability and the second the right.
+
+New surface:
+
+* `neighbour::AvailLr` — `repr(u8)` enum carrying the eq. (23)
+  integer in its discriminant (`Lr00 = 0`, `Lr10 = 1`, `Lr01 = 2`,
+  `Lr11 = 3`). `Copy + Clone + Debug + PartialEq + Eq + Hash`.
+* `neighbour::AvailLr::available_l(self) -> bool` /
+  `available_r(self) -> bool` — projections back to the eq. (23)
+  input booleans.
+* `neighbour::AvailLr::as_u8(self) -> u8` /
+  `from_u8(u8) -> Option<Self>` — the eq. (23) integer view.
+  `from_u8` rejects every `value > 3`; the spec never produces
+  such a token.
+* `neighbour::AvailLr::is_suco_consistent(self, sps_suco_flag: u8) -> bool`
+  — the closing-paragraph invariant. With `sps_suco_flag == 0`,
+  `availLR ∈ { LR_00, LR_10 }`; with `sps_suco_flag != 0`, every
+  token is reachable.
+* `neighbour::derive_avail_lr(available_l: bool, available_r: bool) -> AvailLr`
+  — eq. (23). Caller invokes §6.4.1 at the spec-mandated left
+  (`xCurr − 1, yCurr`) and right (`xCurr + nCbW, yCurr`) luma
+  locations and feeds the two booleans in.
+
+### §6.4.1 deliberately out of scope
+
+§6.4.1 (neighbouring-block availability) is **not** wrapped this
+round. Its rule set mixes tile-boundary lookup, the `IsCoded[][]`
+raster, and the "intra / IBC mode" predicate — three pieces of
+state that already live on the slice walker. The §6.4.2 entry
+point mirrors the spec's invocation pattern: callers compute
+`availableL` / `availableR` via §6.4.1 themselves, then call
+`derive_avail_lr`.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237
+helper rollout: pure functions + a typed token, no behaviour
+change to existing decoder paths. The AMVP builder in `inter.rs`
+already derives its own left/right availability via `Option<MotionVector>`
+returns; §8.5.2.4.5.2 / §8.5.3.5 will consume `AvailLr` once they
+land.
+
+### Tests
+
+11 new unit tests (530 total; was 519):
+
+* `round242_eq23_both_unavailable_is_lr00` — eq. (23)
+  `0 + 0 * 2 == 0`.
+* `round242_eq23_left_only_is_lr10` — eq. (23) `1 + 0 * 2 == 1`,
+  confirms the `LR_LR` label convention.
+* `round242_eq23_right_only_is_lr01` — eq. (23) `0 + 1 * 2 == 2`,
+  confirms `availableR` is weighted by `* 2`.
+* `round242_eq23_both_available_is_lr11` — eq. (23)
+  `1 + 1 * 2 == 3`.
+* `round242_projections_invert_derivation` — `available_l` /
+  `available_r` reproduce the eq. (23) input booleans for every
+  truth-table row.
+* `round242_as_u8_matches_eq23_formula` — the packed integer
+  matches the eq. (23) formula at every row.
+* `round242_from_u8_round_trip` — `from_u8(variant.as_u8()) ==
+  Some(variant)` for every legal value.
+* `round242_from_u8_rejects_out_of_range` — values 4..=255 surface
+  `None`.
+* `round242_suco_off_admits_only_lr00_and_lr10` — closing-paragraph
+  invariant for `sps_suco_flag == 0`.
+* `round242_suco_on_admits_every_token` — closing-paragraph
+  invariant for `sps_suco_flag == 1`.
+* `round242_discriminants_match_spec_table` — regression pinning
+  the `repr(u8)` discriminants to eq. (23).
+
+### Disclaimer
+
+`AvailLr` / `derive_avail_lr` are derived from ISO/IEC
+23094-1:2020 §6.4.2 eq. (23) and the four `LR_xx` tokens spelled
+out in that section's closing paragraph. No external
+implementation was consulted; the formula is a direct
+transcription of the spec's two text bullets and the closing
+table.
+
 ## Round-237 status
 
 Round 237 lands a **typed tile-grid iterator** on `Pps` plus three

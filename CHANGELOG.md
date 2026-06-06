@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+### Round 242 — §6.4.2 `availLR` derivation (eq. 23) + `LR_xx` tokens
+
+#### Added
+- `neighbour` module — new module hosting §6.4 neighbouring-block
+  availability derivations.
+- `neighbour::AvailLr` — `repr(u8)` enum carrying the §6.4.2
+  eq. (23) integer in its discriminant. Four variants `Lr00 = 0`,
+  `Lr10 = 1`, `Lr01 = 2`, `Lr11 = 3` matching the section's
+  closing-paragraph token table. `Copy + Clone + Debug +
+  PartialEq + Eq + Hash`.
+- `neighbour::AvailLr::available_l(self) -> bool` /
+  `neighbour::AvailLr::available_r(self) -> bool` — projections
+  back to the eq. (23) input booleans (low bit and high bit
+  respectively).
+- `neighbour::AvailLr::as_u8(self) -> u8` /
+  `neighbour::AvailLr::from_u8(u8) -> Option<Self>` — the eq. (23)
+  integer view. `from_u8` rejects every value greater than 3; the
+  spec never produces such a token.
+- `neighbour::AvailLr::is_suco_consistent(self, sps_suco_flag: u8) -> bool`
+  — the §6.4.2 closing-paragraph invariant: with `sps_suco_flag
+  == 0`, `availLR ∈ { LR_00, LR_10 }`; otherwise every token is
+  reachable.
+- `neighbour::derive_avail_lr(available_l: bool, available_r: bool) -> AvailLr`
+  — eq. (23) `availLR = availableL + availableR * 2`. Caller
+  invokes §6.4.1 at the spec-mandated left
+  (`xCurr − 1, yCurr`) and right (`xCurr + nCbW, yCurr`) luma
+  locations and feeds the booleans in.
+
+#### Notes
+- §6.4.1 (neighbouring-block availability) is deliberately not
+  wrapped this round. Its bullet list mixes tile-boundary lookup,
+  the `IsCoded[][]` raster and the "intra / IBC mode" predicate —
+  all of which already live on the slice walker. The §6.4.2
+  entry point mirrors the spec's invocation pattern: callers
+  compute `availableL` / `availableR` via §6.4.1 themselves.
+
+#### Tests
+- 11 new unit tests (530 total; was 519):
+  - `round242_eq23_both_unavailable_is_lr00`
+  - `round242_eq23_left_only_is_lr10`
+  - `round242_eq23_right_only_is_lr01`
+  - `round242_eq23_both_available_is_lr11`
+  - `round242_projections_invert_derivation`
+  - `round242_as_u8_matches_eq23_formula`
+  - `round242_from_u8_round_trip`
+  - `round242_from_u8_rejects_out_of_range`
+  - `round242_suco_off_admits_only_lr00_and_lr10`
+  - `round242_suco_on_admits_every_token`
+  - `round242_discriminants_match_spec_table`
+
 ### Round 237 — §6.5.1 tile-grid iterator + §7.4.3.2 picture-tile counters
 
 #### Added
