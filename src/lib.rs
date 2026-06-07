@@ -94,6 +94,7 @@ pub mod neighbour;
 pub mod picture;
 pub mod pps;
 pub mod rpl;
+pub mod scan;
 pub mod slice_data;
 pub mod slice_header;
 pub mod sps;

@@ -7,6 +7,120 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-245 status
+
+Round 245 lands the **§6.5.3 inverse scan order 1D array
+initialization process** (eq. 34) plus the matching public §6.5.2
+forward zig-zag derivation (eq. 33), as a new `scan` module.
+
+§6.5.2 produces the forward map `ScanOrder[ sPos ] = rPos`, where
+`sPos` is the zig-zag scan position (`0 ..= blkWidth · blkHeight − 1`)
+and `rPos` is the row-major raster offset within the block. The
+walk starts at the top-left corner and visits anti-diagonals (lines
+of constant `x + y`); odd anti-diagonals are traversed from the
+top-right endpoint toward the bottom-left, even anti-diagonals the
+opposite way.
+
+§6.5.3 then inverts the §6.5.2 map (eq. 34):
+
+```text
+for( pos = 0; pos < blkWidth * blkHeight; pos++ ) {
+    inverseScan[ forwardScan[ pos ] ] = pos                       (34)
+}
+```
+
+so `InvScanOrder[ rPos ]` returns the zig-zag scan position `sPos`
+that visits raster offset `rPos`. By eq. (34), the two maps satisfy
+the round-trip identities
+
+```text
+inverseScan[ forwardScan[ pos ] ] = pos      for every pos
+forwardScan[ inverseScan[ pos ] ] = pos      for every pos
+```
+
+New surface:
+
+* `scan::zig_zag_scan(blk_w, blk_h) -> Vec<u32>` — §6.5.2 eq. 33.
+  Returns `blkWidth · blkHeight` entries, each the row-major raster
+  offset `y * blk_w + x` of the block sample visited at scan position
+  `sPos`. Pin-tested against hand-traced 4×4 / 2×2 / 4×2 walks plus
+  the §7.4.3.1 invariant that the result is a permutation of
+  `0 ..= blk_w · blk_h − 1`.
+* `scan::inverse_scan(blk_w, blk_h) -> Vec<u32>` — §6.5.3 eq. 34.
+  Returns `blkWidth · blkHeight` entries, each the zig-zag scan
+  position `sPos` whose §6.5.2 walk lands at raster offset `rPos`.
+  Pin-tested against the 4×4 / 4×2 hand-traces and against the
+  eq. (34) round-trip identity sweep across every TB size from 2×2
+  up to 16×16.
+
+### Spec usage
+
+§7.4.3.1 (page 64) directs the decoder to build
+`ScanOrder[ log2TbWidth ][ log2TbHeight ][ sPos ]` and
+`InvScanOrder[ log2TbWidth ][ log2TbHeight ][ rPos ]` for every
+`log2TbWidth, log2TbHeight ∈ 1 ..= MaxTbLog2SizeY` by invoking
+§6.5.2 / §6.5.3 with `blkWidth = 1 << log2TbWidth`,
+`blkHeight = 1 << log2TbHeight`. The round-245 entry points are
+the building blocks of that population pass; the per-TB-size table
+cache is a follow-up.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237 / 242
+helper rollout: pure functions returning owned vectors. The
+`slice_data::decode_residual_coding_rle` walker continues to call
+its in-module zig-zag builder; rebinding it to `scan::zig_zag_scan`
+is a follow-up.
+
+### Tests
+
+12 new unit tests (542 total; was 530):
+
+* `round245_zig_zag_4x4_matches_hand_trace` — pins the 16-entry
+  forward map produced by the §6.5.2 anti-diagonal walk for the
+  canonical 4×4 transform block.
+* `round245_zig_zag_2x2_matches_hand_trace` — pins the §6.5.2 walk
+  for the smallest legal §7.4.3.1 transform block (`log2TbW =
+  log2TbH = 1`).
+* `round245_zig_zag_4x2_non_square_matches_hand_trace` — pins the
+  §6.5.2 walk for a non-square block, exercising the `(line −
+  (blk_w − 1))` and `(line − (blk_h − 1))` anchor terms with
+  unequal dimensions.
+* `round245_zig_zag_is_permutation_for_every_tb_size` — sweeps
+  every `(log2TbW, log2TbH) ∈ [1, 4]^2` pair and asserts the §6.5.2
+  output is a permutation of `0 ..= blk_w · blk_h − 1`.
+* `round245_zig_zag_visits_anti_diagonals_in_order` — same sweep,
+  asserts the structural invariant that the walk visits points by
+  non-decreasing `x + y`.
+* `round245_zig_zag_empty_blocks_return_empty_vec` — defensive
+  zero-dimension behaviour.
+* `round245_inverse_scan_4x4_round_trips_forward` — eq. (34)
+  identity for the 4×4 block.
+* `round245_inverse_scan_4x4_dc_at_raster_zero_is_scan_zero` —
+  pins the DC bridge: scan position 0 lives at raster 0, so
+  `InvScanOrder[ 0 ] == 0`.
+* `round245_inverse_scan_is_bijection_with_forward` — sweeps every
+  `(log2TbW, log2TbH) ∈ [1, 4]^2` pair and asserts the two-way
+  round-trip identity.
+* `round245_inverse_scan_4x4_pins_eq34_values` — hand-applies
+  eq. (34) to the 4×4 forward map and pins all 16 inverse entries.
+* `round245_inverse_scan_4x2_pins_eq34_values` — same, for a
+  non-square block.
+* `round245_inverse_scan_empty_blocks_return_empty_vec` — defensive
+  zero-dimension behaviour mirroring §6.5.2.
+
+### Disclaimer
+
+`scan::zig_zag_scan` / `scan::inverse_scan` are derived from
+ISO/IEC 23094-1:2020 §6.5.2 eq. (33) and §6.5.3 eq. (34). All
+truth came from `docs/video/evc/evc.txt`. The §6.5.2 algorithm
+listing in the FDIS includes an even-branch typo whose corrected
+form is empirically pinned by the round-5 4×4 hand-trace (still
+checked by `slice_data::tests::zigzag_scan_4x4_matches_spec`) and
+by the round-245 `round245_zig_zag_4x4_matches_hand_trace`
+fixture, which together fix the canonical 4×4 zig-zag table from
+the anti-diagonal closed form.
+
 ## Round-242 status
 
 Round 242 lands the **§6.4.2 `availLR` derivation** (eq. 23) plus

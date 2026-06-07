@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### Round 245 — §6.5.3 inverse scan order 1D array (eq. 34) + §6.5.2 public surface
+
+#### Added
+- `scan` module — new module hosting §6.5 scanning processes.
+- `scan::zig_zag_scan(blk_w: usize, blk_h: usize) -> Vec<u32>` —
+  §6.5.2 eq. (33). Builds the forward map
+  `ScanOrder[ sPos ] = rPos` for an `(blk_w × blk_h)` transform
+  block; entry `sPos` carries the row-major raster offset
+  `y * blk_w + x` of the block sample visited at scan position
+  `sPos`. The walk proceeds along anti-diagonals (lines of constant
+  `x + y`) starting at the top-left corner: odd anti-diagonals run
+  from the top-right endpoint toward the bottom-left, even
+  anti-diagonals the opposite way.
+- `scan::inverse_scan(blk_w: usize, blk_h: usize) -> Vec<u32>` —
+  §6.5.3 eq. (34). Builds the inverse map
+  `InvScanOrder[ rPos ] = sPos` by inverting the §6.5.2 forward
+  permutation. By construction satisfies the two-way round-trip
+  identity `inverseScan[ forwardScan[ pos ] ] = pos` and
+  `forwardScan[ inverseScan[ pos ] ] = pos` for every legal `pos`.
+
+#### Notes
+- §7.4.3.1 (page 64) directs the decoder to build the
+  `ScanOrder[ log2TbW ][ log2TbH ][ sPos ]` and
+  `InvScanOrder[ log2TbW ][ log2TbH ][ rPos ]` arrays for every
+  `(log2TbW, log2TbH) ∈ [1, MaxTbLog2SizeY]^2` by invoking §6.5.2
+  / §6.5.3 with `blkWidth = 1 << log2TbW`, `blkHeight = 1 <<
+  log2TbH`. The round-245 entry points are the building blocks of
+  that population pass; the per-TB-size table cache is a follow-up.
+- The `slice_data::decode_residual_coding_rle` walker keeps its
+  in-module zig-zag builder for this round; rebinding it to
+  `scan::zig_zag_scan` is a follow-up.
+
+#### Tests
+- 12 new unit tests (542 total; was 530):
+  - `round245_zig_zag_4x4_matches_hand_trace`
+  - `round245_zig_zag_2x2_matches_hand_trace`
+  - `round245_zig_zag_4x2_non_square_matches_hand_trace`
+  - `round245_zig_zag_is_permutation_for_every_tb_size`
+  - `round245_zig_zag_visits_anti_diagonals_in_order`
+  - `round245_zig_zag_empty_blocks_return_empty_vec`
+  - `round245_inverse_scan_4x4_round_trips_forward`
+  - `round245_inverse_scan_4x4_dc_at_raster_zero_is_scan_zero`
+  - `round245_inverse_scan_is_bijection_with_forward`
+  - `round245_inverse_scan_4x4_pins_eq34_values`
+  - `round245_inverse_scan_4x2_pins_eq34_values`
+  - `round245_inverse_scan_empty_blocks_return_empty_vec`
+
 ### Round 242 — §6.4.2 `availLR` derivation (eq. 23) + `LR_xx` tokens
 
 #### Added
