@@ -120,6 +120,53 @@ impl Pps {
             next_idx: 0,
         }
     }
+
+    /// §6.5.1 eq. (24) — `ColWidth[ i ]` derivation against this PPS.
+    ///
+    /// Dispatches into [`compute_col_widths`] with this PPS's
+    /// [`uniform_tile_spacing_flag`], [`num_tile_columns_minus1`],
+    /// and [`tile_column_width_minus1`] slice. The
+    /// `PicWidthInCtbsY` input comes from §7.4.3.1
+    /// (`Ceil( pic_width_in_luma_samples / ( 1 << CtbLog2SizeY ) )`)
+    /// and lives on the SPS side, so it stays an explicit caller
+    /// argument.
+    ///
+    /// Output length is [`num_tile_columns`](Self::num_tile_columns)
+    /// (always at least `1`).
+    ///
+    /// [`uniform_tile_spacing_flag`]: Self::uniform_tile_spacing_flag
+    /// [`num_tile_columns_minus1`]: Self::num_tile_columns_minus1
+    /// [`tile_column_width_minus1`]: Self::tile_column_width_minus1
+    pub fn col_widths(&self, pic_width_in_ctbs_y: u32) -> Vec<u32> {
+        compute_col_widths(
+            self.uniform_tile_spacing_flag,
+            self.num_tile_columns_minus1,
+            &self.tile_column_width_minus1,
+            pic_width_in_ctbs_y,
+        )
+    }
+
+    /// §6.5.1 eq. (25) — `RowHeight[ j ]` derivation against this PPS.
+    ///
+    /// Symmetric to [`Self::col_widths`]. Dispatches into
+    /// [`compute_row_heights`] with this PPS's
+    /// [`uniform_tile_spacing_flag`], [`num_tile_rows_minus1`], and
+    /// [`tile_row_height_minus1`] slice.
+    ///
+    /// Output length is [`num_tile_rows`](Self::num_tile_rows)
+    /// (always at least `1`).
+    ///
+    /// [`uniform_tile_spacing_flag`]: Self::uniform_tile_spacing_flag
+    /// [`num_tile_rows_minus1`]: Self::num_tile_rows_minus1
+    /// [`tile_row_height_minus1`]: Self::tile_row_height_minus1
+    pub fn row_heights(&self, pic_height_in_ctbs_y: u32) -> Vec<u32> {
+        compute_row_heights(
+            self.uniform_tile_spacing_flag,
+            self.num_tile_rows_minus1,
+            &self.tile_row_height_minus1,
+            pic_height_in_ctbs_y,
+        )
+    }
 }
 
 /// Iterator returned by [`Pps::tile_grid_coords`]; see that method
@@ -158,6 +205,164 @@ impl Iterator for TileGridCoordIter {
 }
 
 impl ExactSizeIterator for TileGridCoordIter {}
+
+/// §6.5.1 eq. (24) — `ColWidth[ i ]` derivation.
+///
+/// Returns the per-tile-column width list in units of CTBs. Output
+/// length is `num_tile_columns_minus1 + 1`, and the entries sum to
+/// `pic_width_in_ctbs_y` by construction (uniform and explicit
+/// branches alike).
+///
+/// Inputs are taken as primitive parameters so the helper composes
+/// cleanly with both [`Pps::col_widths`] (the instance dispatch)
+/// and any future §7.4.3.1-driven derivation that needs to compute
+/// `ColWidth[ ]` from an alternative source.
+///
+/// # Spec text (eq. 24)
+///
+/// ```text
+/// if( uniform_tile_spacing_flag )
+///     for( i = 0; i <= num_tile_columns_minus1; i++ )
+///         ColWidth[ i ] = ( ( i + 1 ) * PicWidthInCtbsY ) /
+///                                  ( num_tile_columns_minus1 + 1 )
+///                       - (   i       * PicWidthInCtbsY ) /
+///                                  ( num_tile_columns_minus1 + 1 )
+/// else {
+///     ColWidth[ num_tile_columns_minus1 ] = PicWidthInCtbsY
+///     for( i = 0; i < num_tile_columns_minus1; i++ ) {
+///         ColWidth[ i ] = tile_column_width_minus1[ i ] + 1
+///         ColWidth[ num_tile_columns_minus1 ] -= ColWidth[ i ]
+///     }
+/// }
+/// ```
+///
+/// # Inputs
+///
+/// * `uniform_tile_spacing_flag` — §7.4.3.2 PPS flag; `true` picks
+///   the integer-division branch, `false` the explicit-widths
+///   branch.
+/// * `num_tile_columns_minus1` — §7.4.3.2 PPS field. The output
+///   has `num_tile_columns_minus1 + 1` entries.
+/// * `tile_column_width_minus1` — §7.4.3.2 PPS list, ignored when
+///   `uniform_tile_spacing_flag` is `true`. Length-`n` slice where
+///   `n = num_tile_columns_minus1`; the last column width is the
+///   spec's "remainder" assignment in eq. (24).
+/// * `pic_width_in_ctbs_y` — `PicWidthInCtbsY` from §7.4.3.1,
+///   `Ceil( pic_width_in_luma_samples / ( 1 << CtbLog2SizeY ) )`.
+///
+/// # Returned vector
+///
+/// Length `num_tile_columns_minus1 + 1`. Entry `i` is `ColWidth[ i ]`.
+/// In the explicit branch with a short / oversized
+/// `tile_column_width_minus1` slice, the helper saturates entries
+/// past the slice end at `0` and reports the residual at the
+/// last column; callers should validate the input lengths against
+/// the §7.3.2.2 PPS parser's contract before invoking.
+///
+/// # Caveats
+///
+/// The spec writes `ColWidth[ num_tile_columns_minus1 ] -=
+/// ColWidth[ i ]` inside the per-`i` loop, so the running residual
+/// can underflow if the encoder mis-specifies
+/// `tile_column_width_minus1[ ]`. The helper uses
+/// [`u32::saturating_sub`] for the residual update so a malformed
+/// stream produces a clamped `0` instead of panicking; the caller
+/// is responsible for treating the resulting `ColWidth` list as
+/// suspect if the explicit widths overflow `PicWidthInCtbsY`.
+pub fn compute_col_widths(
+    uniform_tile_spacing_flag: bool,
+    num_tile_columns_minus1: u32,
+    tile_column_width_minus1: &[u32],
+    pic_width_in_ctbs_y: u32,
+) -> Vec<u32> {
+    let n = (num_tile_columns_minus1 as usize) + 1;
+    let mut col_width: Vec<u32> = Vec::with_capacity(n);
+    if uniform_tile_spacing_flag {
+        // Uniform branch: ColWidth[ i ] = floor(((i+1)*W) / n)
+        //                              - floor((  i  *W) / n).
+        for i in 0..(n as u32) {
+            let lo = (i.saturating_mul(pic_width_in_ctbs_y))
+                .checked_div(n as u32)
+                .unwrap_or(0);
+            let hi = (i.saturating_add(1).saturating_mul(pic_width_in_ctbs_y))
+                .checked_div(n as u32)
+                .unwrap_or(0);
+            col_width.push(hi - lo);
+        }
+    } else {
+        // Explicit branch: prime the residual with PicWidthInCtbsY,
+        // subtract each explicit width, then store the residual at
+        // num_tile_columns_minus1.
+        let mut residual: u32 = pic_width_in_ctbs_y;
+        for i in 0..num_tile_columns_minus1 as usize {
+            let w = tile_column_width_minus1
+                .get(i)
+                .map(|m| m.saturating_add(1))
+                .unwrap_or(0);
+            col_width.push(w);
+            residual = residual.saturating_sub(w);
+        }
+        col_width.push(residual);
+    }
+    col_width
+}
+
+/// §6.5.1 eq. (25) — `RowHeight[ j ]` derivation.
+///
+/// Returns the per-tile-row height list in units of CTBs. Output
+/// length is `num_tile_rows_minus1 + 1`, and the entries sum to
+/// `pic_height_in_ctbs_y` by construction. Symmetric to
+/// [`compute_col_widths`] (eq. 24).
+///
+/// # Spec text (eq. 25)
+///
+/// ```text
+/// if( uniform_tile_spacing_flag )
+///     for( j = 0; j <= num_tile_rows_minus1; j++ )
+///         RowHeight[ j ] = ( ( j + 1 ) * PicHeightInCtbsY ) /
+///                                    ( num_tile_rows_minus1 + 1 )
+///                        - (   j       * PicHeightInCtbsY ) /
+///                                    ( num_tile_rows_minus1 + 1 )
+/// else {
+///     RowHeight[ num_tile_rows_minus1 ] = PicHeightInCtbsY
+///     for( j = 0; j < num_tile_rows_minus1; j++ ) {
+///         RowHeight[ j ] = tile_row_height_minus1[ j ] + 1
+///         RowHeight[ num_tile_rows_minus1 ] -= RowHeight[ j ]
+///     }
+/// }
+/// ```
+pub fn compute_row_heights(
+    uniform_tile_spacing_flag: bool,
+    num_tile_rows_minus1: u32,
+    tile_row_height_minus1: &[u32],
+    pic_height_in_ctbs_y: u32,
+) -> Vec<u32> {
+    let n = (num_tile_rows_minus1 as usize) + 1;
+    let mut row_height: Vec<u32> = Vec::with_capacity(n);
+    if uniform_tile_spacing_flag {
+        for j in 0..(n as u32) {
+            let lo = (j.saturating_mul(pic_height_in_ctbs_y))
+                .checked_div(n as u32)
+                .unwrap_or(0);
+            let hi = (j.saturating_add(1).saturating_mul(pic_height_in_ctbs_y))
+                .checked_div(n as u32)
+                .unwrap_or(0);
+            row_height.push(hi - lo);
+        }
+    } else {
+        let mut residual: u32 = pic_height_in_ctbs_y;
+        for j in 0..num_tile_rows_minus1 as usize {
+            let h = tile_row_height_minus1
+                .get(j)
+                .map(|m| m.saturating_add(1))
+                .unwrap_or(0);
+            row_height.push(h);
+            residual = residual.saturating_sub(h);
+        }
+        row_height.push(residual);
+    }
+    row_height
+}
 
 pub fn parse(rbsp: &[u8]) -> Result<Pps> {
     let mut br = BitReader::new(rbsp);
@@ -505,6 +710,229 @@ mod tests {
         }
         assert_eq!(iter.size_hint(), (0, Some(0)));
         assert_eq!(iter.len(), 0);
+    }
+
+    fn pps_with_explicit_cols(cols_minus1: u32, widths_minus1: &[u32]) -> Pps {
+        // Helper: build a PPS with uniform_tile_spacing_flag = false
+        // and the §7.4.3.2 tile_column_width_minus1 list populated.
+        Pps {
+            pps_pic_parameter_set_id: 0,
+            pps_seq_parameter_set_id: 0,
+            num_ref_idx_default_active_minus1: [0, 0],
+            additional_lt_poc_lsb_len: 0,
+            rpl1_idx_present_flag: false,
+            single_tile_in_pic_flag: false,
+            num_tile_columns_minus1: cols_minus1,
+            num_tile_rows_minus1: 0,
+            uniform_tile_spacing_flag: false,
+            tile_column_width_minus1: widths_minus1.to_vec(),
+            tile_row_height_minus1: Vec::new(),
+            loop_filter_across_tiles_enabled_flag: false,
+            tile_offset_len_minus1: 0,
+            tile_id_len_minus1: 0,
+            explicit_tile_id_flag: false,
+            tile_id_val: Vec::new(),
+            pic_dra_enabled_flag: false,
+            pic_dra_aps_id: 0,
+            arbitrary_slice_present_flag: false,
+            constrained_intra_pred_flag: false,
+            cu_qp_delta_enabled_flag: false,
+            log2_cu_qp_delta_area_minus6: 0,
+        }
+    }
+
+    fn pps_with_explicit_rows(rows_minus1: u32, heights_minus1: &[u32]) -> Pps {
+        // Helper: §6.5.1 eq. (25) explicit-row variant of the
+        // above. Symmetric.
+        Pps {
+            pps_pic_parameter_set_id: 0,
+            pps_seq_parameter_set_id: 0,
+            num_ref_idx_default_active_minus1: [0, 0],
+            additional_lt_poc_lsb_len: 0,
+            rpl1_idx_present_flag: false,
+            single_tile_in_pic_flag: false,
+            num_tile_columns_minus1: 0,
+            num_tile_rows_minus1: rows_minus1,
+            uniform_tile_spacing_flag: false,
+            tile_column_width_minus1: Vec::new(),
+            tile_row_height_minus1: heights_minus1.to_vec(),
+            loop_filter_across_tiles_enabled_flag: false,
+            tile_offset_len_minus1: 0,
+            tile_id_len_minus1: 0,
+            explicit_tile_id_flag: false,
+            tile_id_val: Vec::new(),
+            pic_dra_enabled_flag: false,
+            pic_dra_aps_id: 0,
+            arbitrary_slice_present_flag: false,
+            constrained_intra_pred_flag: false,
+            cu_qp_delta_enabled_flag: false,
+            log2_cu_qp_delta_area_minus6: 0,
+        }
+    }
+
+    #[test]
+    fn round249_col_widths_single_tile_returns_full_picture() {
+        // §6.5.1 eq. (24) uniform branch with n = 1: single tile
+        // spans the entire PicWidthInCtbsY (here, 10).
+        let pps = pps_with_grid(0, 0);
+        let widths = pps.col_widths(10);
+        assert_eq!(widths.as_slice(), &[10]);
+    }
+
+    #[test]
+    fn round249_col_widths_uniform_two_columns_even_split() {
+        // §6.5.1 eq. (24) uniform branch, n = 2, PicWidthInCtbsY = 10.
+        //   ColWidth[ 0 ] = ((0+1)*10)/2 - (0*10)/2 = 5 - 0 = 5
+        //   ColWidth[ 1 ] = ((1+1)*10)/2 - (1*10)/2 = 10 - 5 = 5
+        let pps = pps_with_grid(0, 1);
+        let widths = pps.col_widths(10);
+        assert_eq!(widths.as_slice(), &[5, 5]);
+    }
+
+    #[test]
+    fn round249_col_widths_uniform_three_columns_floor_division() {
+        // §6.5.1 eq. (24) uniform branch, n = 3, PicWidthInCtbsY = 10.
+        //   ColWidth[ 0 ] = ( 1*10)/3 - 0   = 3 - 0 = 3
+        //   ColWidth[ 1 ] = ( 2*10)/3 - 3   = 6 - 3 = 3
+        //   ColWidth[ 2 ] = ( 3*10)/3 - 6   = 10 - 6 = 4
+        // Sum is 10. The closed form is structurally exact-cover.
+        let pps = pps_with_grid(0, 2);
+        let widths = pps.col_widths(10);
+        assert_eq!(widths.as_slice(), &[3, 3, 4]);
+        assert_eq!(widths.iter().sum::<u32>(), 10);
+    }
+
+    #[test]
+    fn round249_col_widths_uniform_covers_pic_width_exactly() {
+        // §6.5.1 eq. (24) uniform-branch invariant: sum of
+        // ColWidth[] over the column count is PicWidthInCtbsY for
+        // every (n, W) the spec accepts. Sweep a representative
+        // grid.
+        for cols_minus1 in 0u32..=8 {
+            for w in [1u32, 2, 5, 10, 17, 32, 64, 100] {
+                let pps = pps_with_grid(0, cols_minus1);
+                let widths = pps.col_widths(w);
+                assert_eq!(widths.len(), (cols_minus1 + 1) as usize);
+                assert_eq!(widths.iter().sum::<u32>(), w);
+            }
+        }
+    }
+
+    #[test]
+    fn round249_col_widths_explicit_branch_pins_eq24_remainder() {
+        // §6.5.1 eq. (24) explicit branch: ColWidth[i] =
+        //     tile_column_width_minus1[i] + 1 for i < n-1, and
+        // ColWidth[n-1] = PicWidthInCtbsY - sum-of-others.
+        //
+        // n = 3, tile_column_width_minus1 = [2, 0],
+        // PicWidthInCtbsY = 10. Walk: ColWidth[0] = 3, ColWidth[1]
+        // = 1, residual starts at 10, → 7 → 6, so ColWidth[2] = 6.
+        let pps = pps_with_explicit_cols(2, &[2, 0]);
+        let widths = pps.col_widths(10);
+        assert_eq!(widths.as_slice(), &[3, 1, 6]);
+        assert_eq!(widths.iter().sum::<u32>(), 10);
+    }
+
+    #[test]
+    fn round249_col_widths_explicit_branch_two_cols_residual() {
+        // §6.5.1 eq. (24) explicit branch, n = 2,
+        // tile_column_width_minus1 = [3], PicWidthInCtbsY = 10.
+        //   ColWidth[ 0 ] = 4
+        //   ColWidth[ 1 ] = 10 − 4 = 6
+        let pps = pps_with_explicit_cols(1, &[3]);
+        let widths = pps.col_widths(10);
+        assert_eq!(widths.as_slice(), &[4, 6]);
+    }
+
+    #[test]
+    fn round249_col_widths_explicit_overflow_saturates_residual() {
+        // §6.5.1 eq. (24) explicit branch with malformed input:
+        // explicit widths sum past PicWidthInCtbsY. The spec's
+        // running subtraction would underflow on the residual;
+        // we clamp at 0 via saturating_sub so the function never
+        // panics on a non-conforming stream.
+        //   n = 2, tile_column_width_minus1 = [99], PicWidthInCtbsY = 5
+        //   ColWidth[ 0 ] = 100, residual = 5.saturating_sub(100) = 0
+        //   ColWidth[ 1 ] = 0
+        let pps = pps_with_explicit_cols(1, &[99]);
+        let widths = pps.col_widths(5);
+        assert_eq!(widths.as_slice(), &[100, 0]);
+    }
+
+    #[test]
+    fn round249_row_heights_uniform_two_rows_even_split() {
+        // §6.5.1 eq. (25) uniform branch, n = 2, PicHeightInCtbsY = 8.
+        //   RowHeight[ 0 ] = ((0+1)*8)/2 - 0 = 4
+        //   RowHeight[ 1 ] = ((1+1)*8)/2 - 4 = 4
+        let pps = pps_with_grid(1, 0);
+        let heights = pps.row_heights(8);
+        assert_eq!(heights.as_slice(), &[4, 4]);
+    }
+
+    #[test]
+    fn round249_row_heights_uniform_covers_pic_height_exactly() {
+        // §6.5.1 eq. (25) uniform-branch invariant mirror of the
+        // col_widths sweep. Sum over RowHeight[] is
+        // PicHeightInCtbsY for every (n, H) the spec accepts.
+        for rows_minus1 in 0u32..=8 {
+            for h in [1u32, 2, 5, 10, 17, 32, 64, 100] {
+                let pps = pps_with_grid(rows_minus1, 0);
+                let heights = pps.row_heights(h);
+                assert_eq!(heights.len(), (rows_minus1 + 1) as usize);
+                assert_eq!(heights.iter().sum::<u32>(), h);
+            }
+        }
+    }
+
+    #[test]
+    fn round249_row_heights_explicit_branch_pins_eq25_remainder() {
+        // §6.5.1 eq. (25) explicit branch: symmetric to eq. (24).
+        // n = 3, tile_row_height_minus1 = [0, 4], PicHeightInCtbsY = 10.
+        //   RowHeight[ 0 ] = 1, residual = 10 → 9
+        //   RowHeight[ 1 ] = 5, residual = 9 → 4
+        //   RowHeight[ 2 ] = 4
+        let pps = pps_with_explicit_rows(2, &[0, 4]);
+        let heights = pps.row_heights(10);
+        assert_eq!(heights.as_slice(), &[1, 5, 4]);
+        assert_eq!(heights.iter().sum::<u32>(), 10);
+    }
+
+    #[test]
+    fn round249_compute_col_widths_uniform_matches_pps_dispatch() {
+        // The free function and the Pps::col_widths instance method
+        // must agree on every input — they are the same derivation.
+        for cols_minus1 in 0u32..=4 {
+            for w in [1u32, 7, 10, 33] {
+                let pps = pps_with_grid(0, cols_minus1);
+                let direct = compute_col_widths(true, cols_minus1, &[], w);
+                let dispatched = pps.col_widths(w);
+                assert_eq!(direct, dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn round249_compute_row_heights_uniform_matches_pps_dispatch() {
+        // Mirror of the col_widths uniform-agreement sweep.
+        for rows_minus1 in 0u32..=4 {
+            for h in [1u32, 7, 10, 33] {
+                let pps = pps_with_grid(rows_minus1, 0);
+                let direct = compute_row_heights(true, rows_minus1, &[], h);
+                let dispatched = pps.row_heights(h);
+                assert_eq!(direct, dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn round249_col_widths_zero_pic_width_returns_all_zeros() {
+        // §6.5.1 eq. (24) with PicWidthInCtbsY = 0 produces a
+        // valid all-zero list of length n. The spec never accepts
+        // a zero-CTB-width picture, but the helper's behaviour
+        // matters for defensive callers.
+        let pps = pps_with_grid(0, 2);
+        let widths = pps.col_widths(0);
+        assert_eq!(widths.as_slice(), &[0, 0, 0]);
     }
 
     #[test]

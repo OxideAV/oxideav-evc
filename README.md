@@ -7,6 +7,113 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-249 status
+
+Round 249 lands the **§6.5.1 `ColWidth[ i ]` and `RowHeight[ j ]`
+tile-extent derivations** (eq. 24 / eq. 25), as new module-level
+functions and `Pps` instance methods. These are the pre-eq.(30)
+primitives the §6.5.1 `TileId[ ]` walk consumes; eq. (30)'s
+contested `tile_id_val` index ordering (docs gap #1470) is
+deliberately left untouched.
+
+§6.5.1 eq. (24) produces the per-tile-column width list
+`ColWidth[ i ]` (in CTBs) of length `num_tile_columns_minus1 + 1`,
+selecting between two branches by `uniform_tile_spacing_flag`:
+
+* **Uniform branch.** Closed-form integer-division split of
+  `PicWidthInCtbsY` across `n` columns:
+
+  ```text
+  ColWidth[ i ] = floor( ( i + 1 ) · PicWidthInCtbsY / n )
+                - floor(     i     · PicWidthInCtbsY / n )
+  ```
+
+  The differenced-floor form is exact-cover by construction: the
+  per-column widths sum to `PicWidthInCtbsY`.
+
+* **Explicit branch.** `ColWidth[ i ] = tile_column_width_minus1[ i ]
+  + 1` for `i < n − 1`, and the last column carries the residual
+  `PicWidthInCtbsY − Σ ColWidth[ < n − 1 ]`. The running residual is
+  computed with `u32::saturating_sub` so a malformed stream that
+  over-specifies the explicit widths produces a clamped `0` rather
+  than panicking.
+
+§6.5.1 eq. (25) does the symmetric thing for tile rows, against
+`PicHeightInCtbsY` and the §7.4.3.2 `tile_row_height_minus1[ ]`
+list.
+
+New surface:
+
+* `pps::compute_col_widths(uniform_tile_spacing_flag,
+  num_tile_columns_minus1, tile_column_width_minus1,
+  pic_width_in_ctbs_y) -> Vec<u32>` — §6.5.1 eq. (24). Pure
+  module-level function, primitive inputs.
+* `pps::compute_row_heights(uniform_tile_spacing_flag,
+  num_tile_rows_minus1, tile_row_height_minus1,
+  pic_height_in_ctbs_y) -> Vec<u32>` — §6.5.1 eq. (25). Symmetric.
+* `Pps::col_widths(pic_width_in_ctbs_y: u32) -> Vec<u32>` —
+  instance dispatch into `compute_col_widths` that pulls the
+  three §7.4.3.2 inputs (uniform-spacing flag, columns count,
+  explicit-widths slice) off the parsed PPS. `PicWidthInCtbsY`
+  stays an explicit argument because it derives from §7.4.3.1
+  against the SPS.
+* `Pps::row_heights(pic_height_in_ctbs_y: u32) -> Vec<u32>` —
+  instance dispatch into `compute_row_heights`, symmetric.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237 /
+242 / 245 helper rollout: pure functions returning owned vectors,
+no behaviour change to existing decoder paths.
+
+### Tests
+
+13 new unit tests (555 total; was 542):
+
+* `round249_col_widths_single_tile_returns_full_picture` — pins
+  the eq. (24) single-tile invariant: `ColWidth = [ W ]` for
+  `n = 1`.
+* `round249_col_widths_uniform_two_columns_even_split` — pins the
+  uniform branch for `n = 2, W = 10`.
+* `round249_col_widths_uniform_three_columns_floor_division` —
+  pins `n = 3, W = 10` against the hand-computed
+  `[ 3, 3, 4 ]` distribution, verifying the floor-difference form
+  hands the rounding remainder to the last column.
+* `round249_col_widths_uniform_covers_pic_width_exactly` — sweep
+  invariant: `Σ ColWidth = PicWidthInCtbsY` for every
+  `(cols_minus1, W) ∈ [0, 8] × { 1, 2, 5, 10, 17, 32, 64, 100 }`.
+* `round249_col_widths_explicit_branch_pins_eq24_remainder` —
+  pins the explicit branch for
+  `n = 3, tile_column_width_minus1 = [ 2, 0 ], W = 10` against
+  the hand-derived `[ 3, 1, 6 ]`.
+* `round249_col_widths_explicit_branch_two_cols_residual` — pins
+  `n = 2, tile_column_width_minus1 = [ 3 ], W = 10` → `[ 4, 6 ]`.
+* `round249_col_widths_explicit_overflow_saturates_residual` —
+  confirms the malformed-input saturation: with explicit width
+  `100` against `W = 5`, the residual is clamped at `0` rather
+  than underflowing.
+* `round249_row_heights_uniform_two_rows_even_split` — eq. (25)
+  mirror of the two-columns case.
+* `round249_row_heights_uniform_covers_pic_height_exactly` —
+  eq. (25) sweep invariant.
+* `round249_row_heights_explicit_branch_pins_eq25_remainder` —
+  eq. (25) hand-derivation pin.
+* `round249_compute_col_widths_uniform_matches_pps_dispatch` —
+  the free function and the `Pps::col_widths` instance method
+  agree on every uniform input.
+* `round249_compute_row_heights_uniform_matches_pps_dispatch` —
+  symmetric agreement check for `Pps::row_heights`.
+* `round249_col_widths_zero_pic_width_returns_all_zeros` —
+  defensive: zero-CTB picture width gives all-zero list of the
+  spec-mandated length.
+
+### Disclaimer
+
+`pps::compute_col_widths` / `pps::compute_row_heights` /
+`Pps::col_widths` / `Pps::row_heights` are derived from
+ISO/IEC 23094-1:2020 §6.5.1 eq. (24) and eq. (25). All truth
+came from `docs/video/evc/evc.txt`.
+
 ## Round-245 status
 
 Round 245 lands the **§6.5.3 inverse scan order 1D array

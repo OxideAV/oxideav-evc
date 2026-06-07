@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+### Round 249 — §6.5.1 eq. (24) `ColWidth[ ]` + eq. (25) `RowHeight[ ]` tile-extent derivations
+
+#### Added
+- `pps::compute_col_widths(uniform_tile_spacing_flag, num_tile_columns_minus1, tile_column_width_minus1, pic_width_in_ctbs_y) -> Vec<u32>`
+  — §6.5.1 eq. (24). Pure module-level function returning the
+  `ColWidth[ i ]` list of length `num_tile_columns_minus1 + 1` in
+  units of CTBs. Selects between the uniform branch (closed-form
+  integer-division split of `PicWidthInCtbsY` across `n` columns)
+  and the explicit branch (`tile_column_width_minus1[ i ] + 1` for
+  `i < n − 1`, residual at column `n − 1`).
+- `pps::compute_row_heights(uniform_tile_spacing_flag, num_tile_rows_minus1, tile_row_height_minus1, pic_height_in_ctbs_y) -> Vec<u32>`
+  — §6.5.1 eq. (25). Symmetric to eq. (24) for tile rows.
+- `Pps::col_widths(pic_width_in_ctbs_y: u32) -> Vec<u32>` —
+  instance dispatch into `compute_col_widths` that pulls
+  `uniform_tile_spacing_flag`, `num_tile_columns_minus1`, and the
+  `tile_column_width_minus1` slice off the parsed PPS. The
+  `PicWidthInCtbsY` argument stays explicit (it derives from
+  §7.4.3.1 against the SPS, not the PPS).
+- `Pps::row_heights(pic_height_in_ctbs_y: u32) -> Vec<u32>` —
+  instance dispatch into `compute_row_heights`, symmetric.
+
+#### Notes
+- These are the pre-eq.(30) primitives the §6.5.1 `TileId[ ]` walk
+  consumes. The contested `tile_id_val` index ordering in eq. (30)
+  (docs gap #1470) is **not** touched: eq. (24) / (25) take only
+  the uniform-spacing flag, explicit-widths/heights vectors, and
+  picture CTB counts as inputs.
+- The explicit branch saturates the running residual at `0` via
+  `u32::saturating_sub` so a malformed bitstream that
+  over-specifies `tile_column_width_minus1[ ]` /
+  `tile_row_height_minus1[ ]` produces a clamped list rather than
+  panicking. Callers should treat such a list as suspect.
+- Wiring stance unchanged from the round-218 / 223 / 229 / 232 /
+  237 / 242 / 245 rollout: pure functions returning owned vectors,
+  no behaviour change to existing decoder paths.
+
+#### Tests
+- 13 new unit tests (555 total; was 542):
+  - `round249_col_widths_single_tile_returns_full_picture`
+  - `round249_col_widths_uniform_two_columns_even_split`
+  - `round249_col_widths_uniform_three_columns_floor_division`
+  - `round249_col_widths_uniform_covers_pic_width_exactly` (sweep
+    over `(cols_minus1, PicWidthInCtbsY) ∈ [0, 8] × {1, 2, 5, 10,
+    17, 32, 64, 100}`)
+  - `round249_col_widths_explicit_branch_pins_eq24_remainder`
+  - `round249_col_widths_explicit_branch_two_cols_residual`
+  - `round249_col_widths_explicit_overflow_saturates_residual`
+  - `round249_row_heights_uniform_two_rows_even_split`
+  - `round249_row_heights_uniform_covers_pic_height_exactly`
+  - `round249_row_heights_explicit_branch_pins_eq25_remainder`
+  - `round249_compute_col_widths_uniform_matches_pps_dispatch`
+  - `round249_compute_row_heights_uniform_matches_pps_dispatch`
+  - `round249_col_widths_zero_pic_width_returns_all_zeros`
+
 ### Round 245 — §6.5.3 inverse scan order 1D array (eq. 34) + §6.5.2 public surface
 
 #### Added
