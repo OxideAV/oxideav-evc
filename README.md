@@ -7,6 +7,106 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-263 status
+
+Round 263 completes the §6.4 single-block availability quartet by
+landing the **base §6.4.1 derivation** (`derive_neighbour_availability`)
+as the natural complement to round-242's §6.4.2 `availLR` wrapper
+and round-258's §6.4.3 / §6.4.4 derivations. §6.4.1 is the
+derivation §6.4.2 invokes inline at the two left / right luma
+locations to produce its `availableL` / `availableR` booleans, and
+the lowest common shape — six bullets — shared with §6.4.3 and
+§6.4.4.
+
+§6.4.1 disqualifies a neighbour at luma location `(xNbY, yNbY)`
+when any of six bullets holds: different tile, `xNbY < 0`,
+`yNbY < 0`, `xNbY ≥ pic_width_in_luma_samples`,
+`yNbY ≥ pic_height_in_luma_samples`, or
+`IsCoded[xNbY][yNbY] == FALSE`. Otherwise the neighbour is
+available. The function takes the tile-boundary boolean and the
+`IsCoded[][]` raster lookup as inputs, matching the pre-resolved-
+predicate shape established by §6.4.3 / §6.4.4 in round 258.
+
+The structural relationship across the quartet is:
+
+* §6.4.1 — six bullets: tile + two negative-index + two
+  picture-extent + `IsCoded[][]`.
+* §6.4.3 = §6.4.1 + bullet 7 (intra / IBC neighbour disqualifies).
+* §6.4.4 = §6.4.3 − bullet 1 (ALF reaches across tile boundaries
+  when the §7.4.5 cross-tile flag permits it).
+* §6.4.2 = packed token `availableL + availableR * 2` over two
+  §6.4.1 outputs at `(xCurr − 1, yCurr)` and `(xCurr + nCbW, yCurr)`.
+
+New surface:
+
+* `neighbour::derive_neighbour_availability(x_nb_y, y_nb_y,
+  pic_width_in_luma_samples, pic_height_in_luma_samples,
+  neighbour_in_different_tile, is_coded) -> bool` — §6.4.1
+  derivation. The five geometric bullets (tile-different, two
+  negative-index bounds, two picture-extent bounds) are resolved
+  from the explicit inputs; the one raster bullet
+  (`IsCoded[][]`) is taken as an already-looked-up boolean, in
+  the same shape the §6.4.3 / §6.4.4 wrappers established.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237 /
+242 / 245 / 249 / 258 helper rollouts: pure function, no
+behaviour change to existing decoder paths. Callers that already
+inline the §6.4.1 bullets (e.g. the AMVP builder in `inter.rs`,
+the ALF classifier in `alf.rs`, anywhere the slice walker checks
+"is this neighbour available") keep doing so; a follow-up round
+can rebind them once the §6.4 helpers are exhaustively in place.
+
+### Tests
+
+11 new unit tests (584 total; was 573) plus 1 new doc-test:
+
+§6.4.1 (base neighbouring block availability):
+
+* `round263_eq641_all_good_interior_is_available` — pins the
+  baseline "all-bullets-pass" return.
+* `round263_eq641_different_tile_disqualifies` — bullet 1.
+* `round263_eq641_negative_coords_disqualify` — bullets 2-3 (each
+  axis independently, plus combined).
+* `round263_eq641_oob_picture_extent_disqualifies` — bullets 4-5,
+  pinning both the equality (inclusive `>=`) and the
+  strict-greater cases.
+* `round263_eq641_uncoded_neighbour_disqualifies` — bullet 6.
+* `round263_eq641_each_bullet_independently_disqualifies` —
+  baseline-good neighbour, flip each bullet one at a time, confirm
+  the result becomes `FALSE` in each case.
+* `round263_eq641_origin_is_in_bounds` — top-left CTB (x=0, y=0)
+  is itself in-bounds when the picture is non-empty.
+* `round263_eq641_composes_into_eq642` — drives §6.4.1 at the two
+  §6.4.2 locations (`xCurr − 1`, `xCurr + nCbW`) and feeds the
+  outputs into `derive_avail_lr`, confirming the §6.4.1 → §6.4.2
+  composition resolves to the expected `Lr10` token (left
+  in-bounds + right at picture extent, `sps_suco_flag = 0`).
+
+§6.4.1 vs §6.4.3 vs §6.4.4 structural contrast:
+
+* `round263_eq641_and_eq643_agree_when_inter_neighbour` —
+  11-tuple sweep across origin / interior / OOB / uncoded /
+  inclusive-boundary cases confirms §6.4.1 and §6.4.3 return the
+  same boolean whenever the §6.4.3 intra/IBC bullet input is
+  `false`. Pins the spec relationship §6.4.3 = §6.4.1 + bullet 7.
+* `round263_eq641_and_eq643_diverge_only_on_intra_bullet` — same
+  otherwise-good neighbour, §6.4.3 with `neighbour_is_intra_or_ibc
+  = true` returns FALSE, §6.4.1 returns TRUE. Pins the one
+  structural input difference between the two derivations.
+* `round263_eq641_and_eq644_agree_on_geometry_core` — 9-tuple
+  sweep against the five-bullet "geometry + IsCoded" core,
+  confirming §6.4.1 (tile-bullet = false) and §6.4.4 (intra-bullet
+  = false) return the same boolean. Pins the structural
+  intersection §6.4.1 ∩ §6.4.4.
+
+### Disclaimer
+
+`neighbour::derive_neighbour_availability` is derived from
+ISO/IEC 23094-1:2020 §6.4.1. All truth came from
+`docs/video/evc/evc.txt`.
+
 ## Round-258 status
 
 Round 258 lands the two companion **single-block availability

@@ -12,11 +12,22 @@
 //! "if any of the conditions hold, FALSE; otherwise TRUE" bullet
 //! lists.
 //!
-//! ## §6.4.3 vs §6.4.4 vs §6.4.1
+//! Round 263 completes the §6.4 single-block availability quartet
+//! with the **base §6.4.1 derivation** (`derive_neighbour_availability`).
+//! §6.4.1 is the derivation that §6.4.2 invokes inline at the two
+//! left / right luma locations to produce its two `availableL` /
+//! `availableR` booleans; it is also the lowest common shape — six
+//! bullets — shared with §6.4.3 and §6.4.4. Wrapping it surfaces
+//! the same caller contract as §6.4.3 / §6.4.4 (pre-resolved
+//! tile / `IsCoded[][]` booleans) so the slice walker can name
+//! "§6.4.1" by symbol instead of inlining its bullet list.
+//!
+//! ## §6.4.1 vs §6.4.3 vs §6.4.4
 //!
 //! The three "single-block availability" derivations share five
 //! common falsification conditions but differ on whether a
-//! tile-boundary check applies:
+//! tile-boundary check applies and whether intra / IBC neighbours
+//! are disqualified:
 //!
 //! | Predicate                                | §6.4.1 | §6.4.3 | §6.4.4 |
 //! |------------------------------------------|--------|--------|--------|
@@ -36,6 +47,11 @@
 //! permits it, so the §6.4.4 derivation deliberately omits the
 //! tile-different predicate. (The flag itself is consulted by the
 //! ALF caller before invoking §6.4.4, not inside it.)
+//!
+//! Equivalently: §6.4.1 ≡ §6.4.3 without bullet 7; §6.4.4 ≡ §6.4.3
+//! without bullet 1; §6.4.1 ∩ §6.4.4 is the five-bullet
+//! "geometry + IsCoded" core. This is pinned as a regression in
+//! the §6.4.1 ↔ §6.4.3 / §6.4.4 cross-tests.
 //!
 //! ## Spec scope
 //!
@@ -93,18 +109,20 @@
 //! and §8.5.3.5 derivations will consume `AvailLr` directly once
 //! they land.
 //!
-//! `§6.4.1` (neighbouring-block availability) is **not** wrapped in
-//! this round: its bullet list mixes tile-boundary lookup, the
-//! `IsCoded[][]` raster, and "coded in intra / IBC mode" predicates
-//! that the caller already has on hand. `§6.4.2` takes the two
-//! booleans as inputs, exactly as the spec invokes §6.4.1 inline.
+//! Round 263 lands [`derive_neighbour_availability`] (§6.4.1) with
+//! the same pre-resolved-input shape: the function takes the
+//! tile-boundary boolean and the `IsCoded[][]` raster lookup as
+//! inputs, mirroring the §6.4.3 / §6.4.4 contract and matching how
+//! §6.4.2 invokes §6.4.1 inline (the slice walker already has the
+//! tile map and `IsCoded[][]` on hand at the call sites).
 //!
-//! For the same reason, [`derive_mv_candidate_availability`] (§6.4.3)
-//! and [`derive_alf_availability`] (§6.4.4) take their per-bullet
-//! predicates as boolean / location-pair inputs, leaving the
-//! `IsCoded[][]` raster and the "coded in intra / IBC mode" lookup
-//! on the caller. They differ structurally only in whether they
-//! consult the tile boundary; see the table above.
+//! [`derive_mv_candidate_availability`] (§6.4.3) and
+//! [`derive_alf_availability`] (§6.4.4) take their per-bullet
+//! predicates as boolean / location-pair inputs on the same
+//! rationale, leaving the `IsCoded[][]` raster and the "coded in
+//! intra / IBC mode" lookup on the caller. The three derivations
+//! differ structurally only in whether they consult the tile
+//! boundary and the intra / IBC bullet; see the table above.
 //!
 //! All section / clause numbers refer to **ISO/IEC 23094-1:2020(E)**.
 
@@ -187,6 +205,83 @@ impl AvailLr {
     }
 }
 
+/// §6.4.1 derivation process — *Derivation process for neighbouring
+/// block availability.*
+///
+/// Returns `availableN` for the luma location `(x_nb_y, y_nb_y)`
+/// covered by a neighbouring block, per the six-bullet falsification
+/// list in §6.4.1. The spec sets `availableN = FALSE` when any of
+/// the six bullets holds, otherwise `TRUE`. The bullets are
+/// evaluated in declaration order.
+///
+/// Structurally §6.4.1 is the lowest common shape of the §6.4
+/// single-block availability quartet: §6.4.3 = §6.4.1 + the intra /
+/// IBC bullet, §6.4.4 = §6.4.3 − the tile-boundary bullet. See the
+/// module-level comparison table for the full mapping.
+///
+/// The five geometric bullets — tile-different, two negative-index
+/// bounds, two greater-than-or-equal picture-extent bounds — are
+/// resolved here from caller-supplied location + picture dimensions.
+/// The one raster bullet — `IsCoded[][] == FALSE` — is taken as
+/// an already-looked-up boolean, mirroring the §6.4.3 / §6.4.4
+/// contract. That keeps the slice walker in charge of its own
+/// `IsCoded[][]` raster and tile map, exactly as it is when §6.4.2
+/// invokes §6.4.1 inline at its two `(xNbL, yNbL)` and
+/// `(xNbR, yNbR)` locations.
+///
+/// Inputs:
+/// * `x_nb_y`, `y_nb_y` — luma location of the neighbouring block,
+///   in signed coordinates so the spec's `< 0` bullets are
+///   expressible.
+/// * `pic_width_in_luma_samples`, `pic_height_in_luma_samples` —
+///   §7.4.3.1 picture extents (in luma samples).
+/// * `neighbour_in_different_tile` — caller's resolution of the
+///   §6.4.1 first bullet (the neighbouring block sits in a different
+///   tile than the current block).
+/// * `is_coded` — caller's lookup of `IsCoded[x_nb_y][y_nb_y]`.
+///
+/// Output is the single `availableN` boolean.
+///
+/// # Examples
+///
+/// ```
+/// use oxideav_evc::neighbour::derive_neighbour_availability;
+/// // 16×16 picture, interior coded neighbour in same tile → available.
+/// assert!(derive_neighbour_availability(4, 4, 16, 16, false, true));
+/// // Same neighbour but uncoded → unavailable per §6.4.1 bullet 6.
+/// assert!(!derive_neighbour_availability(4, 4, 16, 16, false, false));
+/// ```
+#[inline]
+pub fn derive_neighbour_availability(
+    x_nb_y: i32,
+    y_nb_y: i32,
+    pic_width_in_luma_samples: u32,
+    pic_height_in_luma_samples: u32,
+    neighbour_in_different_tile: bool,
+    is_coded: bool,
+) -> bool {
+    // §6.4.1 first bullet: different tile than the current block.
+    if neighbour_in_different_tile {
+        return false;
+    }
+    // §6.4.1 bullets 2-3: x_nb_y < 0, y_nb_y < 0.
+    if x_nb_y < 0 || y_nb_y < 0 {
+        return false;
+    }
+    // §6.4.1 bullets 4-5: x_nb_y >= pic_width_in_luma_samples,
+    // y_nb_y >= pic_height_in_luma_samples. Compared in u32 after
+    // the negative-index bullets cleared.
+    if (x_nb_y as u32) >= pic_width_in_luma_samples || (y_nb_y as u32) >= pic_height_in_luma_samples
+    {
+        return false;
+    }
+    // §6.4.1 bullet 6: IsCoded[ xNbY ][ yNbY ] == FALSE.
+    if !is_coded {
+        return false;
+    }
+    true
+}
+
 /// §6.4.2 derivation process — eq. (23).
 ///
 /// Inputs are the two §6.4.1 outputs at the left
@@ -196,7 +291,8 @@ impl AvailLr {
 /// The caller is responsible for invoking §6.4.1 at those locations
 /// — that derivation needs the tile map, the `IsCoded[][]` raster
 /// and the "intra / IBC mode" predicates, all of which already live
-/// on the slice walker.
+/// on the slice walker. See [`derive_neighbour_availability`] for
+/// the pure-function form of the §6.4.1 derivation.
 #[inline]
 pub fn derive_avail_lr(available_l: bool, available_r: bool) -> AvailLr {
     // Eq. (23): availLR = availableL + availableR * 2.
@@ -466,6 +562,106 @@ mod tests {
     }
 
     // ============================================================
+    // §6.4.1 — base neighbouring block availability
+    // ============================================================
+
+    /// All-good interior neighbour: not in another tile, in-bounds,
+    /// coded → `availableN = TRUE`.
+    #[test]
+    fn round263_eq641_all_good_interior_is_available() {
+        assert!(derive_neighbour_availability(4, 4, 16, 16, false, true));
+    }
+
+    /// Bullet 1: neighbour in a different tile disqualifies.
+    #[test]
+    fn round263_eq641_different_tile_disqualifies() {
+        assert!(!derive_neighbour_availability(4, 4, 16, 16, true, true));
+    }
+
+    /// Bullets 2-3: negative x or negative y disqualifies (each axis
+    /// independently, plus combined).
+    #[test]
+    fn round263_eq641_negative_coords_disqualify() {
+        // x < 0
+        assert!(!derive_neighbour_availability(-1, 4, 16, 16, false, true));
+        // y < 0
+        assert!(!derive_neighbour_availability(4, -1, 16, 16, false, true));
+        // both
+        assert!(!derive_neighbour_availability(-3, -5, 16, 16, false, true));
+    }
+
+    /// Bullets 4-5: ≥-extent disqualifies. Pins both the equality
+    /// (inclusive `>=` boundary) and the strict-greater cases.
+    #[test]
+    fn round263_eq641_oob_picture_extent_disqualifies() {
+        // x exactly at width → unavailable
+        assert!(!derive_neighbour_availability(16, 4, 16, 16, false, true));
+        // x beyond width
+        assert!(!derive_neighbour_availability(32, 4, 16, 16, false, true));
+        // y exactly at height → unavailable
+        assert!(!derive_neighbour_availability(4, 16, 16, 16, false, true));
+        // y beyond height
+        assert!(!derive_neighbour_availability(4, 99, 16, 16, false, true));
+    }
+
+    /// Bullet 6: `IsCoded[][] == FALSE` disqualifies.
+    #[test]
+    fn round263_eq641_uncoded_neighbour_disqualifies() {
+        assert!(!derive_neighbour_availability(4, 4, 16, 16, false, false));
+    }
+
+    /// All six bullets check independently — flip any one of them
+    /// to "disqualifying" on top of an otherwise-good neighbour and
+    /// the result becomes `FALSE`.
+    #[test]
+    fn round263_eq641_each_bullet_independently_disqualifies() {
+        // Baseline good neighbour.
+        assert!(derive_neighbour_availability(4, 4, 16, 16, false, true));
+
+        // Flip bullet 1.
+        assert!(!derive_neighbour_availability(4, 4, 16, 16, true, true));
+        // Flip bullet 2 (x < 0).
+        assert!(!derive_neighbour_availability(-1, 4, 16, 16, false, true));
+        // Flip bullet 3 (y < 0).
+        assert!(!derive_neighbour_availability(4, -1, 16, 16, false, true));
+        // Flip bullet 4 (x >= pic_width).
+        assert!(!derive_neighbour_availability(16, 4, 16, 16, false, true));
+        // Flip bullet 5 (y >= pic_height).
+        assert!(!derive_neighbour_availability(4, 16, 16, 16, false, true));
+        // Flip bullet 6 (is_coded == false).
+        assert!(!derive_neighbour_availability(4, 4, 16, 16, false, false));
+    }
+
+    /// Top-left CTB (x=0, y=0) is itself in-bounds when the picture
+    /// is non-empty. Pins the zero-coordinate edge of the §6.4.1
+    /// negative-index bullets and matches the §6.4.3 / §6.4.4 origin
+    /// pins.
+    #[test]
+    fn round263_eq641_origin_is_in_bounds() {
+        assert!(derive_neighbour_availability(0, 0, 1, 1, false, true));
+    }
+
+    /// §6.4.2 invokes §6.4.1 at the two left / right luma locations.
+    /// Drive a representative pair through §6.4.1 and feed the
+    /// resulting booleans into `derive_avail_lr` to confirm the two
+    /// derivations compose into the spec's documented §6.4.2 call
+    /// shape.
+    #[test]
+    fn round263_eq641_composes_into_eq642() {
+        // 16-wide picture, current block at xCurr=8 nCbW=8.
+        // Left:  (xCurr − 1, yCurr)  = ( 7, 4)  — interior, coded → available.
+        // Right: (xCurr + nCbW, yCurr) = (16, 4) — at picture extent → NOT available.
+        let avail_l = derive_neighbour_availability(7, 4, 16, 16, false, true);
+        let avail_r = derive_neighbour_availability(16, 4, 16, 16, false, true);
+        assert!(avail_l);
+        assert!(!avail_r);
+        let lr = derive_avail_lr(avail_l, avail_r);
+        // `sps_suco_flag = 0` case: only LR_10 / LR_00 reachable.
+        assert_eq!(lr, AvailLr::Lr10);
+        assert!(lr.is_suco_consistent(0));
+    }
+
+    // ============================================================
     // §6.4.3 — neighbouring block MV candidate availability
     // ============================================================
 
@@ -729,5 +925,77 @@ mod tests {
         let alf = derive_alf_availability(4, 4, 16, 16, true, false);
         assert!(!mv);
         assert!(alf);
+    }
+
+    // ============================================================
+    // §6.4.1 vs §6.4.3 vs §6.4.4 structural contrast
+    // ============================================================
+
+    /// §6.4.1 and §6.4.3 must agree on the §6.4.1 inputs (i.e.
+    /// whenever the §6.4.3 intra/IBC bullet input is FALSE). Pins
+    /// the spec relationship: §6.4.3 = §6.4.1 + bullet 7 (intra/IBC).
+    #[test]
+    fn round263_eq641_and_eq643_agree_when_inter_neighbour() {
+        let cases: &[(i32, i32, u32, u32, bool, bool)] = &[
+            // (x, y, w, h, in_different_tile, is_coded) — all `intra_or_ibc = false`.
+            (0, 0, 16, 16, false, true),
+            (4, 4, 16, 16, false, true),
+            (4, 4, 16, 16, false, false),
+            (32, 4, 16, 16, false, true),
+            (4, 32, 16, 16, false, true),
+            (16, 0, 16, 16, false, true),
+            (0, 16, 16, 16, false, true),
+            (-1, 4, 16, 16, false, true),
+            (4, -1, 16, 16, false, true),
+            (4, 4, 16, 16, true, true),
+            (4, 4, 16, 16, true, false),
+        ];
+        for &(x, y, w, h, diff, coded) in cases {
+            let base = derive_neighbour_availability(x, y, w, h, diff, coded);
+            let mv = derive_mv_candidate_availability(x, y, w, h, diff, coded, false);
+            assert_eq!(
+                base, mv,
+                "§6.4.1 / §6.4.3(intra=false) disagreement at (x={x},y={y},w={w},h={h},diff={diff},coded={coded})",
+            );
+        }
+    }
+
+    /// §6.4.1 returns TRUE and §6.4.3 returns FALSE when the only
+    /// failing bullet on §6.4.3 is bullet 7 (intra/IBC). Pins the
+    /// one structural input difference.
+    #[test]
+    fn round263_eq641_and_eq643_diverge_only_on_intra_bullet() {
+        let base = derive_neighbour_availability(4, 4, 16, 16, false, true);
+        let mv = derive_mv_candidate_availability(4, 4, 16, 16, false, true, true);
+        assert!(base);
+        assert!(!mv);
+    }
+
+    /// §6.4.1 ∩ §6.4.4 is the five-bullet "geometry + IsCoded" core:
+    /// they must agree whenever the §6.4.1 tile-bullet input is FALSE
+    /// AND the §6.4.4 intra/IBC bullet input is FALSE. Pinned over a
+    /// sweep of representative locations.
+    #[test]
+    fn round263_eq641_and_eq644_agree_on_geometry_core() {
+        let cases: &[(i32, i32, u32, u32, bool)] = &[
+            // (x, y, w, h, is_coded) — `in_different_tile = false`, `intra_or_ibc = false`.
+            (0, 0, 16, 16, true),
+            (4, 4, 16, 16, true),
+            (4, 4, 16, 16, false),
+            (32, 4, 16, 16, true),
+            (4, 32, 16, 16, true),
+            (16, 0, 16, 16, true),
+            (0, 16, 16, 16, true),
+            (-1, 4, 16, 16, true),
+            (4, -1, 16, 16, true),
+        ];
+        for &(x, y, w, h, coded) in cases {
+            let base = derive_neighbour_availability(x, y, w, h, false, coded);
+            let alf = derive_alf_availability(x, y, w, h, coded, false);
+            assert_eq!(
+                base, alf,
+                "§6.4.1 / §6.4.4(intra=false) disagreement at (x={x},y={y},w={w},h={h},coded={coded})",
+            );
+        }
     }
 }

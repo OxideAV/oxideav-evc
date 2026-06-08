@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### Round 263 — §6.4.1 base neighbouring-block availability derivation
+
+#### Added
+- `neighbour::derive_neighbour_availability(x_nb_y, y_nb_y, pic_width_in_luma_samples, pic_height_in_luma_samples, neighbour_in_different_tile, is_coded) -> bool`
+  — §6.4.1 single-block availability derivation. Returns
+  `availableN` per the spec's six-bullet "if any condition holds,
+  FALSE; otherwise TRUE" rule. The five geometric bullets
+  (tile-different, two negative-index bounds, two picture-extent
+  bounds) are evaluated from the explicit inputs; the one raster
+  bullet (`IsCoded[][]` lookup) is taken as an already-looked-up
+  boolean, in the same shape established by `derive_mv_candidate_availability`
+  (§6.4.3) and `derive_alf_availability` (§6.4.4) in round 258.
+
+#### Notes
+- Completes the §6.4 single-block availability quartet alongside
+  §6.4.2 (round 242), §6.4.3 (round 258) and §6.4.4 (round 258).
+  Structurally: §6.4.1 = six bullets (geometry + `IsCoded[][]`);
+  §6.4.3 = §6.4.1 + the intra/IBC neighbour bullet; §6.4.4 = §6.4.3
+  − the tile-boundary bullet; §6.4.2 = packed token
+  `availableL + availableR * 2` over two §6.4.1 outputs.
+- Module-level rationale for the pre-resolved-predicate shape
+  matches §6.4.3 / §6.4.4: the slice walker already has the tile
+  map and `IsCoded[][]` raster on hand at the §6.4.1 call sites
+  (this is exactly how §6.4.2 invokes §6.4.1 inline), so the
+  derivation contract takes them as inputs rather than carrying
+  the raster around inside the function.
+- Wiring stance unchanged from the round-218 / 223 / 229 / 232 /
+  237 / 242 / 245 / 249 / 258 helper rollout: pure function, no
+  behaviour change to existing decoder paths.
+- Round 263 does **not** rebind existing callers (the §6.4.1
+  bullets remain inlined wherever the slice walker, the AMVP
+  builder, the ALF classifier, etc. need them). A follow-up round
+  can rebind them once the §6.4 helper set is exhaustively in
+  place.
+
 ### Round 258 — §6.4.3 MV-candidate + §6.4.4 ALF neighbouring-block availability derivations
 
 #### Added
