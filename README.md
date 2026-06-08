@@ -7,6 +7,117 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-258 status
+
+Round 258 lands the two companion **single-block availability
+derivations** in §6.4 — §6.4.3 (motion-vector candidate availability)
+and §6.4.4 (ALF availability) — as the natural rounders for the
+round-242 §6.4.2 `availLR` work. Both produce a single `availableN`
+boolean from the spec's bullet list, taking caller-on-hand
+predicates as inputs in the same shape the existing §6.4.2 wrapper
+does.
+
+§6.4.3 disqualifies a neighbour at luma location `(xNbY, yNbY)`
+when any of seven bullets holds: different tile, `xNbY < 0`,
+`yNbY < 0`, `xNbY ≥ pic_width_in_luma_samples`,
+`yNbY ≥ pic_height_in_luma_samples`,
+`IsCoded[xNbY][yNbY] == FALSE`, or the neighbour is coded in
+intra / IBC mode. The last bullet is the §6.4.3-defining
+predicate — an intra-coded neighbour carries no motion vector, so
+its slot in the merge / AMVP / affine candidate list is
+structurally vacant.
+
+§6.4.4 is §6.4.3 minus the tile-boundary bullet: the ALF filter
+deliberately reaches across tile boundaries when
+§7.4.5 `alf_loop_filter_across_tiles_enabled_flag` permits it, so
+§6.4.4 never disqualifies a neighbour for sitting in a different
+tile (the flag itself is consulted by the ALF caller, not inside
+§6.4.4).
+
+New surface:
+
+* `neighbour::derive_mv_candidate_availability(x_nb_y, y_nb_y,
+  pic_width_in_luma_samples, pic_height_in_luma_samples,
+  neighbour_in_different_tile, is_coded, neighbour_is_intra_or_ibc)
+  -> bool` — §6.4.3 derivation. The five geometric bullets
+  (tile-different, two negative-index bounds, two picture-extent
+  bounds) are resolved from the explicit inputs; the two raster
+  bullets (`IsCoded[][]`, intra/IBC mode flag) are taken as
+  already-looked-up booleans, mirroring the §6.4.2 contract.
+* `neighbour::derive_alf_availability(x_nb_y, y_nb_y,
+  pic_width_in_luma_samples, pic_height_in_luma_samples, is_coded,
+  neighbour_is_intra_or_ibc) -> bool` — §6.4.4 derivation. Same
+  shape as §6.4.3 minus the `neighbour_in_different_tile` input.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237 /
+242 / 245 / 249 helper rollouts: pure functions, no behaviour
+change to existing decoder paths. Callers that already inline
+their own §6.4.3 / §6.4.4 bullets (e.g. the AMVP builder in
+`inter.rs` and the ALF luma / chroma classifiers in `alf.rs`)
+keep doing so; a follow-up round can rebind them once the §6.4
+helpers are exhaustively in place.
+
+### Tests
+
+18 new unit tests (573 total; was 555) plus 2 new doc-tests:
+
+§6.4.3 (motion-vector candidate availability):
+
+* `round258_eq643_all_good_interior_is_available` — pins the
+  baseline "all-bullets-pass" return.
+* `round258_eq643_different_tile_disqualifies` — bullet 1.
+* `round258_eq643_negative_coords_disqualify` — bullets 2-3 (each
+  axis independently, plus combined).
+* `round258_eq643_oob_picture_extent_disqualifies` — bullets 4-5,
+  pinning both the equality (exclusive `<` vs inclusive `>=`
+  boundary) and the strict-greater cases.
+* `round258_eq643_uncoded_neighbour_disqualifies` — bullet 6.
+* `round258_eq643_intra_or_ibc_neighbour_disqualifies` —
+  bullet 7 (the §6.4.3-defining predicate).
+* `round258_eq643_each_bullet_independently_disqualifies` —
+  baseline-good neighbour, flip each bullet one at a time, confirm
+  the result becomes `FALSE` in each case.
+* `round258_eq643_origin_is_in_bounds` — top-left CTB (x=0, y=0)
+  is itself in-bounds when the picture is non-empty, pinning the
+  zero-coordinate edge of the negative-index bullets.
+
+§6.4.4 (ALF availability):
+
+* `round258_eq644_all_good_interior_is_available` — baseline.
+* `round258_eq644_does_not_consult_tile_boundary` — pins the
+  defining structural difference: §6.4.4 returns TRUE for the same
+  neighbour configuration that §6.4.3 returns FALSE for when the
+  only failing §6.4.3 bullet is bullet-1.
+* `round258_eq644_negative_coords_disqualify` — bullets 1-2.
+* `round258_eq644_oob_picture_extent_disqualifies` — bullets 3-4.
+* `round258_eq644_uncoded_neighbour_disqualifies` — bullet 5.
+* `round258_eq644_intra_or_ibc_neighbour_disqualifies` —
+  bullet 6.
+* `round258_eq644_each_bullet_independently_disqualifies` —
+  baseline + per-bullet flip sweep.
+* `round258_eq644_origin_is_in_bounds` — origin pin matching
+  §6.4.3.
+
+§6.4.3 vs §6.4.4 structural contrast:
+
+* `round258_eq643_and_eq644_agree_when_same_tile` — 10-tuple
+  sweep across origin / interior / OOB / intra / uncoded /
+  inclusive-boundary cases confirms §6.4.3 and §6.4.4 return the
+  same boolean whenever the §6.4.3 tile-different input is `false`.
+* `round258_eq643_and_eq644_diverge_only_on_tile_bullet` — same
+  otherwise-good neighbour, §6.4.3 with `neighbour_in_different_tile
+  = true` returns FALSE, §6.4.4 returns TRUE. Pins the one
+  structural input difference between the two derivations.
+
+### Disclaimer
+
+`neighbour::derive_mv_candidate_availability` and
+`neighbour::derive_alf_availability` are derived from
+ISO/IEC 23094-1:2020 §6.4.3 and §6.4.4 respectively. All truth
+came from `docs/video/evc/evc.txt`.
+
 ## Round-249 status
 
 Round 249 lands the **§6.5.1 `ColWidth[ i ]` and `RowHeight[ j ]`

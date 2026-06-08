@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### Round 258 — §6.4.3 MV-candidate + §6.4.4 ALF neighbouring-block availability derivations
+
+#### Added
+- `neighbour::derive_mv_candidate_availability(x_nb_y, y_nb_y, pic_width_in_luma_samples, pic_height_in_luma_samples, neighbour_in_different_tile, is_coded, neighbour_is_intra_or_ibc) -> bool`
+  — §6.4.3 single-block availability derivation. Returns
+  `availableN` per the spec's seven-bullet "if any condition holds,
+  FALSE; otherwise TRUE" rule. The five geometric bullets
+  (tile-different, two negative-index bounds, two picture-extent
+  bounds) are evaluated from the explicit inputs; the two raster
+  bullets (`IsCoded[][]` lookup and intra/IBC prediction-mode flag)
+  are taken as already-looked-up booleans, mirroring the §6.4.2
+  contract.
+- `neighbour::derive_alf_availability(x_nb_y, y_nb_y, pic_width_in_luma_samples, pic_height_in_luma_samples, is_coded, neighbour_is_intra_or_ibc) -> bool`
+  — §6.4.4 single-block availability derivation. Structurally
+  §6.4.3 minus the tile-boundary bullet: the ALF filter
+  deliberately reaches across tile boundaries when
+  §7.4.5 `alf_loop_filter_across_tiles_enabled_flag` permits it,
+  so §6.4.4 never disqualifies a neighbour for sitting in a
+  different tile. The flag itself is consulted by the ALF caller,
+  not inside §6.4.4.
+
+#### Notes
+- These are the natural rounders for the round-242 §6.4.2 `availLR`
+  work. §6.4.1 (the underlying single-block neighbouring
+  availability) remains intentionally unwrapped: its bullet list
+  mixes tile-boundary lookup, the `IsCoded[][]` raster, and the
+  per-block prediction-mode flag that callers already have on
+  hand. §6.4.3 and §6.4.4 take the same caller-on-hand booleans as
+  inputs, exactly as the spec invokes them inline.
+- Wiring stance unchanged from the round-218 / 223 / 229 / 232 /
+  237 / 242 / 245 / 249 helper rollout: pure functions, no
+  behaviour change to existing decoder paths.
+- Round 258 does **not** rebind existing callers (the AMVP builder
+  in `inter.rs` and the ALF classifiers in `alf.rs` inline their
+  own per-bullet logic today). A follow-up round can rebind them
+  once the §6.4 helper set is exhaustively in place.
+- Docs gaps #1278 (§8.9.8 eq. 1398-1409 `tableNum == 0` branch)
+  and #1470 (§6.5.1 eq. (30) vs §7.4.3.2 `tile_id_val` indexing
+  contradiction) remain unresolved upstream; this round does not
+  touch either.
+
+#### Tests
+- 18 new unit tests (573 total; was 555) plus 2 new doc-tests:
+  - §6.4.3 (eight tests + one doc-test):
+    - `round258_eq643_all_good_interior_is_available`
+    - `round258_eq643_different_tile_disqualifies`
+    - `round258_eq643_negative_coords_disqualify`
+    - `round258_eq643_oob_picture_extent_disqualifies` (pins both
+      the inclusive `>=` boundary and the strict-greater case)
+    - `round258_eq643_uncoded_neighbour_disqualifies`
+    - `round258_eq643_intra_or_ibc_neighbour_disqualifies`
+    - `round258_eq643_each_bullet_independently_disqualifies`
+      (baseline + per-bullet flip sweep)
+    - `round258_eq643_origin_is_in_bounds`
+  - §6.4.4 (eight tests + one doc-test):
+    - `round258_eq644_all_good_interior_is_available`
+    - `round258_eq644_does_not_consult_tile_boundary` (pins the
+      defining §6.4.3-vs-§6.4.4 structural difference)
+    - `round258_eq644_negative_coords_disqualify`
+    - `round258_eq644_oob_picture_extent_disqualifies`
+    - `round258_eq644_uncoded_neighbour_disqualifies`
+    - `round258_eq644_intra_or_ibc_neighbour_disqualifies`
+    - `round258_eq644_each_bullet_independently_disqualifies`
+    - `round258_eq644_origin_is_in_bounds`
+  - Structural contrast (two tests):
+    - `round258_eq643_and_eq644_agree_when_same_tile` (ten-tuple
+      sweep)
+    - `round258_eq643_and_eq644_diverge_only_on_tile_bullet`
+
 ### Round 249 — §6.5.1 eq. (24) `ColWidth[ ]` + eq. (25) `RowHeight[ ]` tile-extent derivations
 
 #### Added
