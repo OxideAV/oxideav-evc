@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Round 273 — §6.5.1 eq. (28)-(31) CTB-address conversion + `TileId[ ]` (errata #97 unblock)
+
+#### Added
+- `pps::compute_ctb_addr_rs_to_ts(col_widths, row_heights, col_bd,
+  row_bd, pic_width_in_ctbs_y) -> Vec<u32>` — §6.5.1 eq. (28).
+  Raster-scan→tile-scan CTB-address conversion. Consumes the eq.
+  (24)/(25) extents and eq. (26)/(27) boundaries; output length is
+  `PicSizeInCtbsY` and the result is a permutation of
+  `0 ..= PicSizeInCtbsY − 1`. All arithmetic is saturating so a
+  malformed extent list clamps rather than overflows.
+- `pps::compute_ctb_addr_ts_to_rs(ctb_addr_rs_to_ts) -> Vec<u32>` —
+  §6.5.1 eq. (29). Inverts the eq. (28) permutation.
+- `pps::compute_num_ctus_in_tile(col_widths, row_heights) -> Vec<u32>`
+  — §6.5.1 eq. (31). `NumCtusInTile[ tileIdx ] = ColWidth[ i ] *
+  RowHeight[ j ]` in raster-tile order (`tileIdx = j * num_cols + i`).
+- `pps::compute_tile_id(col_bd, row_bd, ctb_addr_rs_to_ts,
+  pic_width_in_ctbs_y, explicit_tile_id) -> Vec<u32>` — §6.5.1 eq.
+  (30). Builds `TileId[ ctbAddrTs ]`. Implicit branch assigns the
+  linear `tileIdx`; the explicit branch reads `tile_id_val[ i ][ j ]`
+  with `i` = column, `j` = row per the in-repo errata #97 (§7.4.3.2's
+  first-sentence row/column words are transposed), indexing the flat
+  §7.4.3.2 syntax-order table at `j * num_cols + i`.
+- `Pps::ctb_addr_rs_to_ts` / `Pps::ctb_addr_ts_to_rs` /
+  `Pps::num_ctus_in_tile` / `Pps::tile_id` instance methods —
+  derive the four §6.5.1 lists from the parsed PPS and dispatch into
+  the free functions. `PicWidthInCtbsY` / `PicHeightInCtbsY` stay
+  explicit caller arguments (they derive from §7.4.3.1 against the
+  SPS). `Pps::tile_id` selects the explicit branch automatically when
+  `explicit_tile_id_flag` is set, feeding the parsed `tile_id_val`.
+
+#### Notes
+- The eq. (30) `tile_id_val[ i ][ j ]` index ordering that rounds 237
+  / 249 / 270 deliberately deferred is now resolved by the in-repo
+  errata `evc-errata-and-clarifications.md` #97: `i` is the column
+  index, `j` the row index, matching the eq. (30) loop nest and
+  §7.4.3.2's own uniqueness constraint.
+- Wiring stance unchanged from the round-218 onward helper rollout:
+  pure functions returning owned vectors, no behaviour change to
+  existing decoder paths. The slice walker rebinds onto these once the
+  per-tile addressing path is threaded through.
+- These complete the §6.5.1 CTB-raster-and-tile-scanning chain
+  (eq. 24-31); only eq. (32) `TileIdToIdx[ ]` / `FirstCtbAddrTs[ ]`
+  remains, a follow-up that consumes `TileId[ ]`.
+
 ### Round 270 — §6.5.1 eq. (26) `ColBd[ ]` + eq. (27) `RowBd[ ]` tile-boundary derivations
 
 #### Added

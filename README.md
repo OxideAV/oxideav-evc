@@ -7,6 +7,73 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-273 status
+
+Round 273 completes the §6.5.1 **CTB raster-and-tile-scanning
+address chain** by landing the four remaining derivations
+eq. (28)-(31), now that the docs collaborator resolved the eq. (30)
+vs §7.4.3.2 `tile_id_val[ i ][ j ]` index contradiction (in-repo
+errata `evc-errata-and-clarifications.md` #97).
+
+* eq. (28) `CtbAddrRsToTs[ ]` — raster→tile-scan CTB-address map.
+  Consumes round-249's `ColWidth[ ]` / `RowHeight[ ]` and round-270's
+  `ColBd[ ]` / `RowBd[ ]`. The output is a permutation of
+  `0 ..= PicSizeInCtbsY − 1`.
+* eq. (29) `CtbAddrTsToRs[ ]` — the inverse permutation.
+* eq. (31) `NumCtusInTile[ ]` — `ColWidth[ i ] * RowHeight[ j ]` per
+  tile in raster-tile order.
+* eq. (30) `TileId[ ]` — the tile-scan-address→tile-ID map.
+  The implicit branch assigns the linear `tileIdx`; the explicit
+  branch reads `tile_id_val[ i ][ j ]` with **`i` = column, `j` =
+  row** per errata #97, indexing the §7.4.3.2 syntax-order table at
+  `j * num_tile_columns + i`.
+
+### Errata #97 (the unblock)
+
+§7.4.3.2's first sentence calls `tile_id_val[ i ][ j ]` "the i-th
+tile **row** and the j-th tile **column**", but eq. (30)'s loop nest
+and §7.4.3.2's own uniqueness constraint both bind `i` to the column
+and `j` to the row. The in-repo errata fixes the reading as a
+transposed-axis typo; the explicit `TileId[ ]` branch follows it.
+
+New surface:
+
+* `pps::compute_ctb_addr_rs_to_ts` / `pps::compute_ctb_addr_ts_to_rs`
+  / `pps::compute_num_ctus_in_tile` / `pps::compute_tile_id` — pure
+  module-level functions over the extent/boundary lists.
+* `Pps::ctb_addr_rs_to_ts` / `Pps::ctb_addr_ts_to_rs` /
+  `Pps::num_ctus_in_tile` / `Pps::tile_id` — instance dispatch that
+  derives the four §6.5.1 lists from the parsed PPS.
+  `PicWidthInCtbsY` / `PicHeightInCtbsY` stay explicit arguments
+  (they derive from §7.4.3.1 against the SPS). `Pps::tile_id` selects
+  the explicit branch automatically when `explicit_tile_id_flag` is
+  set.
+
+### Tests
+
+13 new unit tests (608 total; was 595): eq. (28) single-tile
+identity + 2×2 hand-trace + permutation sweep; eq. (29) two-way
+round-trip inversion sweep; eq. (31) 2×2 + non-uniform-remainder +
+Σ = PicSizeInCtbsY sweep; eq. (30) implicit-tileIdx + per-tile count
+cross-check against `NumCtusInTile[ ]` + the errata-#97 explicit
+indexing pin; plus `Pps` dispatch-agreement and a zero-width
+defensive case.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 onward helper rollout: pure
+functions returning owned vectors, no behaviour change to existing
+decoder paths.
+
+### Disclaimer
+
+`compute_ctb_addr_rs_to_ts` / `compute_ctb_addr_ts_to_rs` /
+`compute_num_ctus_in_tile` / `compute_tile_id` (and the matching
+`Pps` methods) are derived from ISO/IEC 23094-1:2020 §6.5.1
+eq. (28)-(31), with the eq. (30) `tile_id_val` indexing resolved by
+the in-repo errata `evc-errata-and-clarifications.md` #97. All truth
+came from `docs/video/evc/`.
+
 ## Round-270 status
 
 Round 270 continues the §6.5.1 CTB-raster-and-tile-scanning chain by

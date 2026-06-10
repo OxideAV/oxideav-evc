@@ -106,13 +106,11 @@ impl Pps {
     /// caller's responsibility once `ColBd[ ]` / `RowBd[ ]` /
     /// `CtbAddrRsToTs[ ]` are available.
     ///
-    /// **Spec note (deferred):** the explicit-id branch of
-    /// eq. (30) reads `tile_id_val[ i ][ j ]`, but the field's
-    /// own prose definition (§7.4.3.2) binds the first index to
-    /// the row and the second to the column. Until the docs
-    /// collaborator clarifies which ordering rules, this
-    /// iterator deliberately stops at `(tile_idx, j, i)` and
-    /// does **not** surface `tile_id`.
+    /// This iterator surfaces only the unambiguous
+    /// `(tile_idx, j, i)` triple; the full `TileId[ ]` map —
+    /// including the explicit `tile_id_val[ i ][ j ]` branch,
+    /// whose `i`/`j` index ordering is resolved by errata #97
+    /// (`i` = column, `j` = row) — is built by [`Self::tile_id`].
     pub fn tile_grid_coords(&self) -> TileGridCoordIter {
         TileGridCoordIter {
             num_rows: self.num_tile_rows(),
@@ -195,6 +193,95 @@ impl Pps {
     /// Output length is [`num_tile_rows`](Self::num_tile_rows)` + 1`.
     pub fn row_bd(&self, pic_height_in_ctbs_y: u32) -> Vec<u32> {
         compute_row_bd(&self.row_heights(pic_height_in_ctbs_y))
+    }
+
+    /// §6.5.1 eq. (28) — `CtbAddrRsToTs[ ]` against this PPS.
+    ///
+    /// Derives the four §6.5.1 extent/boundary lists from this PPS
+    /// (`ColWidth[ ]`, `RowHeight[ ]`, `ColBd[ ]`, `RowBd[ ]`) and
+    /// dispatches into [`compute_ctb_addr_rs_to_ts`]. `PicWidthInCtbsY`
+    /// / `PicHeightInCtbsY` come from §7.4.3.1 against the SPS and stay
+    /// explicit caller arguments.
+    ///
+    /// Output length is `PicWidthInCtbsY * PicHeightInCtbsY`.
+    pub fn ctb_addr_rs_to_ts(
+        &self,
+        pic_width_in_ctbs_y: u32,
+        pic_height_in_ctbs_y: u32,
+    ) -> Vec<u32> {
+        let col_widths = self.col_widths(pic_width_in_ctbs_y);
+        let row_heights = self.row_heights(pic_height_in_ctbs_y);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        compute_ctb_addr_rs_to_ts(
+            &col_widths,
+            &row_heights,
+            &col_bd,
+            &row_bd,
+            pic_width_in_ctbs_y,
+        )
+    }
+
+    /// §6.5.1 eq. (29) — `CtbAddrTsToRs[ ]` against this PPS.
+    ///
+    /// Builds [`Self::ctb_addr_rs_to_ts`] then inverts it via
+    /// [`compute_ctb_addr_ts_to_rs`].
+    pub fn ctb_addr_ts_to_rs(
+        &self,
+        pic_width_in_ctbs_y: u32,
+        pic_height_in_ctbs_y: u32,
+    ) -> Vec<u32> {
+        compute_ctb_addr_ts_to_rs(
+            &self.ctb_addr_rs_to_ts(pic_width_in_ctbs_y, pic_height_in_ctbs_y),
+        )
+    }
+
+    /// §6.5.1 eq. (31) — `NumCtusInTile[ ]` against this PPS.
+    ///
+    /// Dispatches into [`compute_num_ctus_in_tile`] with this PPS's
+    /// `ColWidth[ ]` / `RowHeight[ ]`. Output length is
+    /// [`num_tiles_in_pic`](Self::num_tiles_in_pic), in eq. (31)
+    /// raster-tile order.
+    pub fn num_ctus_in_tile(
+        &self,
+        pic_width_in_ctbs_y: u32,
+        pic_height_in_ctbs_y: u32,
+    ) -> Vec<u32> {
+        compute_num_ctus_in_tile(
+            &self.col_widths(pic_width_in_ctbs_y),
+            &self.row_heights(pic_height_in_ctbs_y),
+        )
+    }
+
+    /// §6.5.1 eq. (30) — `TileId[ ]` against this PPS.
+    ///
+    /// Derives `ColBd[ ]` / `RowBd[ ]` / `CtbAddrRsToTs[ ]` from this
+    /// PPS and dispatches into [`compute_tile_id`]. When
+    /// [`explicit_tile_id_flag`](Self::explicit_tile_id_flag) is set,
+    /// the parsed [`tile_id_val`](Self::tile_id_val) table feeds the
+    /// explicit branch (errata #97: `i` = column, `j` = row, table
+    /// stored in §7.4.3.2 syntax order); otherwise the implicit
+    /// `tileIdx` branch is used.
+    ///
+    /// Output length is `PicWidthInCtbsY * PicHeightInCtbsY`.
+    pub fn tile_id(&self, pic_width_in_ctbs_y: u32, pic_height_in_ctbs_y: u32) -> Vec<u32> {
+        let col_widths = self.col_widths(pic_width_in_ctbs_y);
+        let row_heights = self.row_heights(pic_height_in_ctbs_y);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(
+            &col_widths,
+            &row_heights,
+            &col_bd,
+            &row_bd,
+            pic_width_in_ctbs_y,
+        );
+        let explicit = if self.explicit_tile_id_flag {
+            Some(self.tile_id_val.as_slice())
+        } else {
+            None
+        };
+        compute_tile_id(&col_bd, &row_bd, &rs_to_ts, pic_width_in_ctbs_y, explicit)
     }
 }
 
@@ -471,6 +558,265 @@ pub fn compute_row_bd(row_heights: &[u32]) -> Vec<u32> {
         row_bd.push(acc);
     }
     row_bd
+}
+
+/// §6.5.1 eq. (28) — `CtbAddrRsToTs[ ctbAddrRs ]` raster-to-tile-scan
+/// CTB-address conversion.
+///
+/// Converts every CTB address in picture raster-scan order to its
+/// address in tile-scan order, walking tiles left-to-right then
+/// top-to-bottom and CTBs raster-scan within each tile. Consumes the
+/// `ColWidth[ ]` / `RowHeight[ ]` extents (eq. 24 / 25,
+/// [`compute_col_widths`] / [`compute_row_heights`]) and the
+/// `ColBd[ ]` / `RowBd[ ]` boundaries (eq. 26 / 27,
+/// [`compute_col_bd`] / [`compute_row_bd`]).
+///
+/// # Spec text (eq. 28)
+///
+/// ```text
+/// for( ctbAddrRs = 0; ctbAddrRs < PicSizeInCtbsY; ctbAddrRs++ ) {
+///     tbX = ctbAddrRs % PicWidthInCtbsY
+///     tbY = ctbAddrRs / PicWidthInCtbsY
+///     for( i = 0; i <= num_tile_columns_minus1; i++ )
+///         if( tbX >= ColBd[ i ] ) tileX = i
+///     for( j = 0; j <= num_tile_rows_minus1; j++ )
+///         if( tbY >= RowBd[ j ] ) tileY = j
+///     CtbAddrRsToTs[ ctbAddrRs ] = 0
+///     for( i = 0; i < tileX; i++ )
+///         CtbAddrRsToTs[ ctbAddrRs ] += RowHeight[ tileY ] * ColWidth[ i ]
+///     for( j = 0; j < tileY; j++ )
+///         CtbAddrRsToTs[ ctbAddrRs ] += PicWidthInCtbsY * RowHeight[ j ]
+///     CtbAddrRsToTs[ ctbAddrRs ] +=
+///         ( tbY − RowBd[ tileY ] ) * ColWidth[ tileX ] + tbX − ColBd[ tileX ]
+/// }
+/// ```
+///
+/// # Inputs
+///
+/// * `col_widths` — `ColWidth[ ]` (length `num_tile_columns_minus1 +
+///   1`).
+/// * `row_heights` — `RowHeight[ ]` (length `num_tile_rows_minus1 +
+///   1`).
+/// * `col_bd` — `ColBd[ ]` (length `col_widths.len() + 1`).
+/// * `row_bd` — `RowBd[ ]` (length `row_heights.len() + 1`).
+/// * `pic_width_in_ctbs_y` — `PicWidthInCtbsY` (§7.4.3.1).
+///
+/// `PicSizeInCtbsY` is taken as `PicWidthInCtbsY * Σ RowHeight[ ]`,
+/// the picture's full CTB count.
+///
+/// # Returned vector
+///
+/// Length `PicSizeInCtbsY`. Entry `ctbAddrRs` is the tile-scan address
+/// `CtbAddrRsToTs[ ctbAddrRs ]`. The result is a permutation of
+/// `0 ..= PicSizeInCtbsY − 1` whenever the boundary lists cover the
+/// picture exactly (which they do by eq. 24-27 construction).
+pub fn compute_ctb_addr_rs_to_ts(
+    col_widths: &[u32],
+    row_heights: &[u32],
+    col_bd: &[u32],
+    row_bd: &[u32],
+    pic_width_in_ctbs_y: u32,
+) -> Vec<u32> {
+    let pic_w = pic_width_in_ctbs_y;
+    let pic_h: u32 = row_heights.iter().copied().fold(0u32, u32::saturating_add);
+    let pic_size = (pic_w as u64).saturating_mul(pic_h as u64);
+    let pic_size = pic_size.min(u32::MAX as u64) as u32;
+    let mut out: Vec<u32> = Vec::with_capacity(pic_size as usize);
+    if pic_w == 0 {
+        return out;
+    }
+    for ctb_addr_rs in 0..pic_size {
+        let tb_x = ctb_addr_rs % pic_w;
+        let tb_y = ctb_addr_rs / pic_w;
+        // tileX = last column whose left boundary ColBd[i] <= tbX.
+        let mut tile_x = 0usize;
+        for (i, &bd) in col_bd.iter().enumerate() {
+            if i > col_widths.len().saturating_sub(1) {
+                break;
+            }
+            if tb_x >= bd {
+                tile_x = i;
+            }
+        }
+        let mut tile_y = 0usize;
+        for (j, &bd) in row_bd.iter().enumerate() {
+            if j > row_heights.len().saturating_sub(1) {
+                break;
+            }
+            if tb_y >= bd {
+                tile_y = j;
+            }
+        }
+        let mut acc: u32 = 0;
+        let rh_tile_y = row_heights.get(tile_y).copied().unwrap_or(0);
+        for &cw in col_widths.iter().take(tile_x) {
+            acc = acc.saturating_add(rh_tile_y.saturating_mul(cw));
+        }
+        for &rh in row_heights.iter().take(tile_y) {
+            acc = acc.saturating_add(pic_w.saturating_mul(rh));
+        }
+        let row_bd_tile_y = row_bd.get(tile_y).copied().unwrap_or(0);
+        let col_bd_tile_x = col_bd.get(tile_x).copied().unwrap_or(0);
+        let cw_tile_x = col_widths.get(tile_x).copied().unwrap_or(0);
+        let within = tb_y
+            .saturating_sub(row_bd_tile_y)
+            .saturating_mul(cw_tile_x)
+            .saturating_add(tb_x.saturating_sub(col_bd_tile_x));
+        acc = acc.saturating_add(within);
+        out.push(acc);
+    }
+    out
+}
+
+/// §6.5.1 eq. (29) — `CtbAddrTsToRs[ ctbAddrTs ]`, the inverse of
+/// [`compute_ctb_addr_rs_to_ts`].
+///
+/// # Spec text (eq. 29)
+///
+/// ```text
+/// for( ctbAddrRs = 0; ctbAddrRs < PicSizeInCtbsY; ctbAddrRs++ )
+///     CtbAddrTsToRs[ CtbAddrRsToTs[ ctbAddrRs ] ] = ctbAddrRs
+/// ```
+///
+/// # Inputs
+///
+/// * `ctb_addr_rs_to_ts` — the `CtbAddrRsToTs[ ]` permutation from
+///   eq. (28).
+///
+/// # Returned vector
+///
+/// Length `ctb_addr_rs_to_ts.len()`. Entry `ctbAddrTs` is the raster
+/// address `CtbAddrTsToRs[ ctbAddrTs ]`. Any tile-scan address not hit
+/// by the eq. (28) map (only possible for a malformed extent list that
+/// is not a clean cover) is left at `0`.
+pub fn compute_ctb_addr_ts_to_rs(ctb_addr_rs_to_ts: &[u32]) -> Vec<u32> {
+    let n = ctb_addr_rs_to_ts.len();
+    let mut out = vec![0u32; n];
+    for (ctb_addr_rs, &ctb_addr_ts) in ctb_addr_rs_to_ts.iter().enumerate() {
+        if (ctb_addr_ts as usize) < n {
+            out[ctb_addr_ts as usize] = ctb_addr_rs as u32;
+        }
+    }
+    out
+}
+
+/// §6.5.1 eq. (31) — `NumCtusInTile[ tileIdx ]`, the per-tile CTU
+/// count.
+///
+/// # Spec text (eq. 31)
+///
+/// ```text
+/// for( j = 0, tileIdx = 0; j <= num_tile_rows_minus1; j++ )
+///     for( i = 0; i <= num_tile_columns_minus1; i++, tileIdx++ )
+///         NumCtusInTile[ tileIdx ] = ColWidth[ i ] * RowHeight[ j ]
+/// ```
+///
+/// # Inputs
+///
+/// * `col_widths` — `ColWidth[ ]` (length `num_tile_columns_minus1 +
+///   1`).
+/// * `row_heights` — `RowHeight[ ]` (length `num_tile_rows_minus1 +
+///   1`).
+///
+/// # Returned vector
+///
+/// Length `col_widths.len() * row_heights.len()` = `NumTilesInPic`,
+/// in eq. (31) raster-tile order (`tileIdx = j * num_cols + i`).
+pub fn compute_num_ctus_in_tile(col_widths: &[u32], row_heights: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(col_widths.len() * row_heights.len());
+    for &rh in row_heights {
+        for &cw in col_widths {
+            out.push(cw.saturating_mul(rh));
+        }
+    }
+    out
+}
+
+/// §6.5.1 eq. (30) — `TileId[ ctbAddrTs ]`, the tile-scan-address to
+/// tile-ID map.
+///
+/// Resolves which tile each tile-scan CTB belongs to. With
+/// `explicit_tile_id_flag = 0` the ID is the linear `tileIdx`; with
+/// the flag set it is the explicit `tile_id_val[ i ][ j ]` table
+/// value.
+///
+/// # Index ordering (errata #97)
+///
+/// eq. (30) reads `tile_id_val[ i ][ j ]` with `i` the **column**
+/// index and `j` the **row** index. The §7.4.3.2 first-sentence prose
+/// has the row/column words transposed; the in-repo errata
+/// (`evc-errata-and-clarifications.md` #97) fixes the reading from the
+/// section's own uniqueness constraint and the eq. (30) loop nest. The
+/// `Pps::tile_id_val` field stores the table in §7.4.3.2 *syntax*
+/// order — outer loop over rows, inner over columns — so flat element
+/// `(row = j, col = i)` lives at index `j * num_tile_columns + i`.
+///
+/// # Spec text (eq. 30)
+///
+/// ```text
+/// for( j = 0, tileIdx = 0; j <= num_tile_rows_minus1; j++ )
+///     for( i = 0; i <= num_tile_columns_minus1; i++, tileIdx++ )
+///         for( y = RowBd[ j ]; y < RowBd[ j+1 ]; y++ )
+///             for( x = ColBd[ i ]; x < ColBd[ i+1 ]; x++ )
+///                 TileId[ CtbAddrRsToTs[ y * PicWidthInCtbsY + x ] ] =
+///                     explicit_tile_id_flag ? tile_id_val[ i ][ j ] : tileIdx
+/// ```
+///
+/// # Inputs
+///
+/// * `col_bd` / `row_bd` — `ColBd[ ]` / `RowBd[ ]` (eq. 26 / 27).
+/// * `ctb_addr_rs_to_ts` — `CtbAddrRsToTs[ ]` (eq. 28).
+/// * `pic_width_in_ctbs_y` — `PicWidthInCtbsY`.
+/// * `explicit_tile_id` — when `Some(tile_id_val)`, the flat
+///   §7.4.3.2 syntax-order table (row-major, `num_rows * num_cols`
+///   entries); when `None`, the implicit `tileIdx` branch is used.
+///
+/// # Returned vector
+///
+/// Length `ctb_addr_rs_to_ts.len()` (= `PicSizeInCtbsY`). Entry
+/// `ctbAddrTs` is `TileId[ ctbAddrTs ]`.
+pub fn compute_tile_id(
+    col_bd: &[u32],
+    row_bd: &[u32],
+    ctb_addr_rs_to_ts: &[u32],
+    pic_width_in_ctbs_y: u32,
+    explicit_tile_id: Option<&[u32]>,
+) -> Vec<u32> {
+    let n = ctb_addr_rs_to_ts.len();
+    let mut tile_id = vec![0u32; n];
+    let pic_w = pic_width_in_ctbs_y;
+    if pic_w == 0 || col_bd.len() < 2 || row_bd.len() < 2 {
+        return tile_id;
+    }
+    let num_cols = col_bd.len() - 1;
+    let num_rows = row_bd.len() - 1;
+    let mut tile_idx: u32 = 0;
+    for j in 0..num_rows {
+        for i in 0..num_cols {
+            let id = match explicit_tile_id {
+                // Errata #97: tile_id_val[ i_col ][ j_row ] stored in
+                // §7.4.3.2 syntax order (row outer, col inner), so the
+                // flat index is j * num_cols + i.
+                Some(table) => table.get(j * num_cols + i).copied().unwrap_or(tile_idx),
+                None => tile_idx,
+            };
+            for y in row_bd[j]..row_bd[j + 1] {
+                for x in col_bd[i]..col_bd[i + 1] {
+                    let rs = (y as u64)
+                        .saturating_mul(pic_w as u64)
+                        .saturating_add(x as u64);
+                    if (rs as usize) < n {
+                        let ts = ctb_addr_rs_to_ts[rs as usize] as usize;
+                        if ts < n {
+                            tile_id[ts] = id;
+                        }
+                    }
+                }
+            }
+            tile_idx += 1;
+        }
+    }
+    tile_id
 }
 
 pub fn parse(rbsp: &[u8]) -> Result<Pps> {
@@ -1174,5 +1520,275 @@ mod tests {
                 assert_eq!(direct, dispatched);
             }
         }
+    }
+
+    // ---- round 273: §6.5.1 eq. (28)-(31) CTB-address / TileId chain ----
+
+    /// Reference builder: derive all four eq. (28)-(31) lists for a
+    /// uniform `cols × rows` grid over a `pic_w × pic_h` CTB picture.
+    fn build_tile_lists(
+        pic_w: u32,
+        pic_h: u32,
+        cols_minus1: u32,
+        rows_minus1: u32,
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+        let row_heights = compute_row_heights(true, rows_minus1, &[], pic_h);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts =
+            compute_ctb_addr_rs_to_ts(&col_widths, &row_heights, &col_bd, &row_bd, pic_w);
+        let ts_to_rs = compute_ctb_addr_ts_to_rs(&rs_to_ts);
+        let num_ctus = compute_num_ctus_in_tile(&col_widths, &row_heights);
+        (rs_to_ts, ts_to_rs, num_ctus)
+    }
+
+    #[test]
+    fn round273_rs_to_ts_single_tile_is_identity() {
+        // §6.5.1 eq. (28): a single-tile picture has tile-scan order
+        // identical to raster order, so CtbAddrRsToTs is the identity.
+        let col_widths = compute_col_widths(true, 0, &[], 4);
+        let row_heights = compute_row_heights(true, 0, &[], 3);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_widths, &row_heights, &col_bd, &row_bd, 4);
+        assert_eq!(rs_to_ts, (0..12).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn round273_rs_to_ts_two_by_two_matches_hand_trace() {
+        // §6.5.1 eq. (28): 4×4 CTB picture, uniform 2×2 tile grid.
+        // ColWidth = RowHeight = [2, 2]; ColBd = RowBd = [0, 2, 4].
+        // Tile 0 (top-left) holds ts 0..=3, tile 1 (top-right) 4..=7,
+        // tile 2 (bottom-left) 8..=11, tile 3 (bottom-right) 12..=15.
+        // Raster address rs = y*4 + x.
+        let (rs_to_ts, _, _) = build_tile_lists(4, 4, 1, 1);
+        // Row y=0: x=0..3 → ts 0,1,4,5. Row y=1: 2,3,6,7.
+        // Row y=2: 8,9,12,13. Row y=3: 10,11,14,15.
+        let expected: [u32; 16] = [
+            0, 1, 4, 5, // y=0
+            2, 3, 6, 7, // y=1
+            8, 9, 12, 13, // y=2
+            10, 11, 14, 15, // y=3
+        ];
+        assert_eq!(rs_to_ts, expected.to_vec());
+    }
+
+    #[test]
+    fn round273_rs_to_ts_is_permutation_for_every_grid() {
+        // §6.5.1 eq. (28): the raster→tile-scan map is a bijection on
+        // 0..PicSizeInCtbsY for every well-formed uniform grid.
+        for pic_w in [1u32, 2, 4, 5, 8] {
+            for pic_h in [1u32, 2, 3, 6] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let (rs_to_ts, _, _) =
+                            build_tile_lists(pic_w, pic_h, cols_minus1, rows_minus1);
+                        let n = (pic_w * pic_h) as usize;
+                        assert_eq!(rs_to_ts.len(), n);
+                        let mut seen = vec![false; n];
+                        for &ts in &rs_to_ts {
+                            assert!((ts as usize) < n, "ts {ts} out of range for n={n}");
+                            assert!(!seen[ts as usize], "duplicate ts {ts}");
+                            seen[ts as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round273_ts_to_rs_inverts_rs_to_ts() {
+        // §6.5.1 eq. (29): CtbAddrTsToRs is the inverse permutation of
+        // CtbAddrRsToTs — round-trip identity on both directions.
+        for pic_w in [1u32, 2, 4, 5] {
+            for pic_h in [1u32, 2, 4] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let (rs_to_ts, ts_to_rs, _) =
+                            build_tile_lists(pic_w, pic_h, cols_minus1, rows_minus1);
+                        let n = (pic_w * pic_h) as usize;
+                        for rs in 0..n {
+                            assert_eq!(ts_to_rs[rs_to_ts[rs] as usize], rs as u32);
+                        }
+                        for ts in 0..n {
+                            assert_eq!(rs_to_ts[ts_to_rs[ts] as usize], ts as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round273_num_ctus_in_tile_two_by_two() {
+        // §6.5.1 eq. (31): 4×4 picture, uniform 2×2 grid: each tile is
+        // 2×2 = 4 CTUs.
+        let (_, _, num_ctus) = build_tile_lists(4, 4, 1, 1);
+        assert_eq!(num_ctus, vec![4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn round273_num_ctus_in_tile_non_uniform_remainder() {
+        // §6.5.1 eq. (31): 5×3 picture, uniform 2×2 grid. eq. (24)/(25)
+        // hand off the rounding remainder to the last column/row:
+        // ColWidth = [2, 3], RowHeight = [1, 2]. tileIdx raster order
+        // (j outer, i inner): (i=0,j=0)=2*1, (1,0)=3*1, (0,1)=2*2,
+        // (1,1)=3*2.
+        let (_, _, num_ctus) = build_tile_lists(5, 3, 1, 1);
+        assert_eq!(num_ctus, vec![2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn round273_num_ctus_in_tile_sums_to_pic_size() {
+        // §6.5.1 eq. (31) sweep: Σ NumCtusInTile = PicSizeInCtbsY.
+        for pic_w in [1u32, 3, 5, 8] {
+            for pic_h in [1u32, 2, 4, 7] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let (_, _, num_ctus) =
+                            build_tile_lists(pic_w, pic_h, cols_minus1, rows_minus1);
+                        let total: u32 = num_ctus.iter().sum();
+                        assert_eq!(total, pic_w * pic_h);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round273_tile_id_implicit_matches_tile_idx() {
+        // §6.5.1 eq. (30), implicit branch: TileId[ ctbAddrTs ] is the
+        // linear tileIdx. For the 4×4 / 2×2 grid, ts 0..=3 → tile 0,
+        // 4..=7 → tile 1, 8..=11 → tile 2, 12..=15 → tile 3.
+        let col_widths = compute_col_widths(true, 1, &[], 4);
+        let row_heights = compute_row_heights(true, 1, &[], 4);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_widths, &row_heights, &col_bd, &row_bd, 4);
+        let tile_id = compute_tile_id(&col_bd, &row_bd, &rs_to_ts, 4, None);
+        let expected: Vec<u32> = (0..16).map(|ts| ts / 4).collect();
+        assert_eq!(tile_id, expected);
+    }
+
+    #[test]
+    fn round273_tile_id_each_ctb_belongs_to_correct_tile() {
+        // §6.5.1 eq. (30): cross-check against NumCtusInTile — exactly
+        // NumCtusInTile[ k ] tile-scan addresses carry TileId == k.
+        for pic_w in [2u32, 4, 5] {
+            for pic_h in [2u32, 4] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+                        let row_heights = compute_row_heights(true, rows_minus1, &[], pic_h);
+                        let col_bd = compute_col_bd(&col_widths);
+                        let row_bd = compute_row_bd(&row_heights);
+                        let rs_to_ts = compute_ctb_addr_rs_to_ts(
+                            &col_widths,
+                            &row_heights,
+                            &col_bd,
+                            &row_bd,
+                            pic_w,
+                        );
+                        let tile_id = compute_tile_id(&col_bd, &row_bd, &rs_to_ts, pic_w, None);
+                        let num_ctus = compute_num_ctus_in_tile(&col_widths, &row_heights);
+                        let num_tiles = num_ctus.len();
+                        let mut counts = vec![0u32; num_tiles];
+                        for &id in &tile_id {
+                            assert!((id as usize) < num_tiles);
+                            counts[id as usize] += 1;
+                        }
+                        assert_eq!(counts, num_ctus);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round273_tile_id_explicit_branch_errata_97_indexing() {
+        // §6.5.1 eq. (30), explicit branch under errata #97: eq. (30)
+        // reads tile_id_val[ i ][ j ] with i = column, j = row. The
+        // table is stored in §7.4.3.2 syntax order (row outer, col
+        // inner), so flat element (row=j, col=i) lives at j*num_cols+i.
+        //
+        // 4×4 picture, uniform 2×2 grid. Choose a table whose values
+        // distinguish (col, row): tile_id_val[col=i][row=j] = 10 +
+        // i*2 + j. Stored row-major as [ (r0c0), (r0c1), (r1c0),
+        // (r1c1) ] = [ 10, 12, 11, 13 ].
+        //   (i=0,j=0) → 10, (i=1,j=0) → 12, (i=0,j=1) → 11,
+        //   (i=1,j=1) → 13.
+        let table = vec![10u32, 12, 11, 13];
+        let col_widths = compute_col_widths(true, 1, &[], 4);
+        let row_heights = compute_row_heights(true, 1, &[], 4);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_widths, &row_heights, &col_bd, &row_bd, 4);
+        let tile_id = compute_tile_id(&col_bd, &row_bd, &rs_to_ts, 4, Some(&table));
+        // tileIdx 0=(i0,j0)→10, 1=(i1,j0)→12, 2=(i0,j1)→11,
+        // 3=(i1,j1)→13. ts 0..=3 in tile 0, etc.
+        let expected: Vec<u32> = (0..16u32)
+            .map(|ts| match ts / 4 {
+                0 => 10,
+                1 => 12,
+                2 => 11,
+                _ => 13,
+            })
+            .collect();
+        assert_eq!(tile_id, expected);
+    }
+
+    #[test]
+    fn round273_ctb_addr_pps_dispatch_matches_free_functions() {
+        // The Pps instance methods are the same derivations as the
+        // free functions; they must agree on every uniform grid.
+        for cols_minus1 in 0u32..=3 {
+            for rows_minus1 in 0u32..=3 {
+                let pps = pps_with_grid(rows_minus1, cols_minus1);
+                let pic_w = cols_minus1 + 3;
+                let pic_h = rows_minus1 + 3;
+                let (rs_to_ts, ts_to_rs, num_ctus) =
+                    build_tile_lists(pic_w, pic_h, cols_minus1, rows_minus1);
+                assert_eq!(pps.ctb_addr_rs_to_ts(pic_w, pic_h), rs_to_ts);
+                assert_eq!(pps.ctb_addr_ts_to_rs(pic_w, pic_h), ts_to_rs);
+                assert_eq!(pps.num_ctus_in_tile(pic_w, pic_h), num_ctus);
+            }
+        }
+    }
+
+    #[test]
+    fn round273_tile_id_pps_dispatch_implicit_and_explicit() {
+        // Pps::tile_id dispatches the implicit branch when
+        // explicit_tile_id_flag is clear and the explicit branch (with
+        // the parsed tile_id_val table) when it is set.
+        let mut pps = pps_with_grid(1, 1); // 2×2 grid
+        let pic_w = 4;
+        let pic_h = 4;
+        // Implicit.
+        let implicit = pps.tile_id(pic_w, pic_h);
+        let expected_implicit: Vec<u32> = (0..16).map(|ts| ts / 4).collect();
+        assert_eq!(implicit, expected_implicit);
+        // Explicit: same table as the errata indexing test.
+        pps.explicit_tile_id_flag = true;
+        pps.tile_id_val = vec![10, 12, 11, 13];
+        let explicit = pps.tile_id(pic_w, pic_h);
+        let expected_explicit: Vec<u32> = (0..16u32)
+            .map(|ts| match ts / 4 {
+                0 => 10,
+                1 => 12,
+                2 => 11,
+                _ => 13,
+            })
+            .collect();
+        assert_eq!(explicit, expected_explicit);
+    }
+
+    #[test]
+    fn round273_rs_to_ts_zero_width_returns_empty() {
+        // Defensive: a zero-CTB-width picture yields an empty map
+        // rather than panicking.
+        let out = compute_ctb_addr_rs_to_ts(&[0], &[3], &[0, 0], &[0, 3], 0);
+        assert!(out.is_empty());
     }
 }
