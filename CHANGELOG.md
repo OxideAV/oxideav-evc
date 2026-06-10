@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### Round 270 — §6.5.1 eq. (26) `ColBd[ ]` + eq. (27) `RowBd[ ]` tile-boundary derivations
+
+#### Added
+- `pps::compute_col_bd(col_widths) -> Vec<u32>` — §6.5.1 eq. (26).
+  Pure module-level prefix-sum producing the `ColBd[ i ]` tile-column
+  boundary list (CTB-column index of each tile-column edge) from the
+  eq. (24) `ColWidth[ ]` list. Output length is `col_widths.len() + 1`
+  per the spec's inclusive `0 ..= num_tile_columns_minus1 + 1` range:
+  `ColBd[ 0 ] = 0`, final entry is the picture width in CTBs. The
+  running sum uses `u32::saturating_add` so a malformed
+  over-specified explicit-tile `ColWidth[ ]` clamps rather than
+  overflows.
+- `pps::compute_row_bd(row_heights) -> Vec<u32>` — §6.5.1 eq. (27).
+  Symmetric prefix-sum producing the `RowBd[ j ]` tile-row boundary
+  list from the eq. (25) `RowHeight[ ]` list.
+- `Pps::col_bd(pic_width_in_ctbs_y: u32) -> Vec<u32>` — instance
+  dispatch that feeds `Self::col_widths(pic_width_in_ctbs_y)` into
+  `compute_col_bd`. `PicWidthInCtbsY` stays an explicit argument (it
+  derives from §7.4.3.1 against the SPS, not the PPS).
+- `Pps::row_bd(pic_height_in_ctbs_y: u32) -> Vec<u32>` — instance
+  dispatch into `compute_row_bd`, symmetric.
+
+#### Notes
+- These are the next §6.5.1 primitives after round-249's
+  `ColWidth[ ]` / `RowHeight[ ]` (eq. 24 / 25) and the inputs the
+  eq. (28) `CtbAddrRsToTs[ ]` walk consumes via its
+  `tbX >= ColBd[ i ]` / `tbY >= RowBd[ j ]` tile-locating tests.
+- The contested eq. (30) `tile_id_val[ i ][ j ]` index ordering (docs
+  gap #1470) and the §8.9.8 eq. 1398-1409 `tableNum == 0` branch (docs
+  gap #1278) are both avoided: eq. (26) / (27) are pure prefix-sums
+  over the extent lists and reach neither.
+- Wiring stance unchanged from the round-218 / 223 / 229 / 232 / 237 /
+  242 / 245 / 249 / 258 / 263 helper rollout: pure functions
+  returning owned vectors, no behaviour change to existing decoder
+  paths.
+
+#### Tests
+- 11 new unit tests (595 total; was 584):
+  - `round270_col_bd_single_tile_is_zero_and_full_width`
+  - `round270_col_bd_prefix_sum_matches_hand_trace`
+  - `round270_col_bd_length_is_widths_plus_one`
+  - `round270_col_bd_final_entry_equals_total_width` (sweep over
+    `(cols_minus1, PicWidthInCtbsY)`)
+  - `round270_col_bd_is_strictly_monotonic_for_nonempty_tiles`
+  - `round270_col_bd_explicit_branch_matches_widths`
+  - `round270_col_bd_empty_widths_is_single_zero`
+  - `round270_row_bd_prefix_sum_matches_hand_trace`
+  - `round270_row_bd_final_entry_equals_total_height`
+  - `round270_col_bd_matches_pps_dispatch`
+  - `round270_row_bd_matches_pps_dispatch`
+
 ### Round 263 — §6.4.1 base neighbouring-block availability derivation
 
 #### Added

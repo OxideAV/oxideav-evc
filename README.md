@@ -7,6 +7,92 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-270 status
+
+Round 270 continues the §6.5.1 CTB-raster-and-tile-scanning chain by
+landing the **`ColBd[ i ]` and `RowBd[ j ]` tile-boundary derivations**
+(eq. 26 / eq. 27), the immediate prefix-sum primitives that consume
+round-249's `ColWidth[ ]` / `RowHeight[ ]` (eq. 24 / eq. 25). They are
+the next §6.5.1 list after the per-tile extents and the inputs the
+eq. (28) `CtbAddrRsToTs[ ]` walk reads via its `tbX >= ColBd[ i ]` /
+`tbY >= RowBd[ j ]` tile-locating tests.
+
+§6.5.1 eq. (26) is the running prefix-sum
+
+```text
+for( ColBd[ 0 ] = 0, i = 0; i <= num_tile_columns_minus1; i++ )
+    ColBd[ i + 1 ] = ColBd[ i ] + ColWidth[ i ]
+```
+
+so `ColBd[ ]` runs `i` from `0` to `num_tile_columns_minus1 + 1`,
+inclusive — one entry longer than `ColWidth[ ]`. `ColBd[ 0 ] = 0`,
+and `ColBd[ num_tile_columns_minus1 + 1 ]` is the right edge of the
+last tile column (= `PicWidthInCtbsY` whenever the eq. (24) widths
+cover the picture, which they do by construction). eq. (27) is the
+symmetric `RowBd[ ]` walk over `RowHeight[ ]`.
+
+New surface:
+
+* `pps::compute_col_bd(col_widths) -> Vec<u32>` — §6.5.1 eq. (26).
+  Pure module-level prefix-sum over the `ColWidth[ ]` list. Output
+  length is `col_widths.len() + 1`. The running sum uses
+  `u32::saturating_add` so a malformed over-specified explicit-tile
+  `ColWidth[ ]` clamps rather than overflows.
+* `pps::compute_row_bd(row_heights) -> Vec<u32>` — §6.5.1 eq. (27).
+  Symmetric over the `RowHeight[ ]` list.
+* `Pps::col_bd(pic_width_in_ctbs_y) -> Vec<u32>` — instance dispatch
+  that feeds `Self::col_widths(pic_width_in_ctbs_y)` into
+  `compute_col_bd`. `PicWidthInCtbsY` stays an explicit argument (it
+  derives from §7.4.3.1 against the SPS).
+* `Pps::row_bd(pic_height_in_ctbs_y) -> Vec<u32>` — instance dispatch
+  into `compute_row_bd`, symmetric.
+
+### Spec gap (untouched)
+
+The contested eq. (30) `tile_id_val[ i ][ j ]` index ordering (docs
+gap #1470) and the §8.9.8 eq. 1398-1409 `tableNum == 0` branch (docs
+gap #1278) are both avoided: eq. (26) / (27) are pure prefix-sums over
+the extent lists and reach neither.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 / 223 / 229 / 232 / 237 / 242 /
+245 / 249 / 258 / 263 helper rollout: pure functions returning owned
+vectors, no behaviour change to existing decoder paths.
+
+### Tests
+
+11 new unit tests (595 total; was 584):
+
+* `round270_col_bd_single_tile_is_zero_and_full_width` — pins the
+  `n = 1` two-entry boundary list `[ 0, PicWidthInCtbsY ]`.
+* `round270_col_bd_prefix_sum_matches_hand_trace` — pins
+  `ColWidth = [ 3, 3, 4 ]` → `ColBd = [ 0, 3, 6, 10 ]`.
+* `round270_col_bd_length_is_widths_plus_one` — pins the spec's
+  inclusive `0 ..= num_tile_columns_minus1 + 1` range as
+  `col_widths.len() + 1` entries, `ColBd[ 0 ] = 0`.
+* `round270_col_bd_final_entry_equals_total_width` — sweep confirming
+  the last boundary equals `PicWidthInCtbsY` over every
+  `(cols_minus1, W)` pair.
+* `round270_col_bd_is_strictly_monotonic_for_nonempty_tiles` — pins
+  the strictly-increasing boundary invariant for a well-formed grid.
+* `round270_col_bd_explicit_branch_matches_widths` — eq. (26) over an
+  explicit-spacing `ColWidth = [ 3, 1, 6 ]` → `[ 0, 3, 4, 10 ]`.
+* `round270_col_bd_empty_widths_is_single_zero` — defensive
+  bare-`[ 0 ]` seed.
+* `round270_row_bd_prefix_sum_matches_hand_trace` — eq. (27) mirror.
+* `round270_row_bd_final_entry_equals_total_height` — eq. (27) sweep
+  mirror.
+* `round270_col_bd_matches_pps_dispatch` /
+  `round270_row_bd_matches_pps_dispatch` — the free function and the
+  `Pps` instance method agree on every input.
+
+### Disclaimer
+
+`pps::compute_col_bd` / `pps::compute_row_bd` / `Pps::col_bd` /
+`Pps::row_bd` are derived from ISO/IEC 23094-1:2020 §6.5.1 eq. (26)
+and eq. (27). All truth came from `docs/video/evc/evc.txt`.
+
 ## Round-263 status
 
 Round 263 completes the §6.4 single-block availability quartet by

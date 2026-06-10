@@ -167,6 +167,35 @@ impl Pps {
             pic_height_in_ctbs_y,
         )
     }
+
+    /// §6.5.1 eq. (26) — `ColBd[ i ]` tile-column-boundary derivation
+    /// against this PPS.
+    ///
+    /// Dispatches into [`compute_col_bd`] with the `ColWidth[ ]` list
+    /// this PPS produces via [`Self::col_widths`]. The
+    /// `PicWidthInCtbsY` input comes from §7.4.3.1 and stays an
+    /// explicit caller argument for the same reason as
+    /// [`Self::col_widths`].
+    ///
+    /// Output length is
+    /// [`num_tile_columns`](Self::num_tile_columns)` + 1` — the spec's
+    /// boundary list runs `i` from `0` to `num_tile_columns_minus1 +
+    /// 1`, inclusive.
+    pub fn col_bd(&self, pic_width_in_ctbs_y: u32) -> Vec<u32> {
+        compute_col_bd(&self.col_widths(pic_width_in_ctbs_y))
+    }
+
+    /// §6.5.1 eq. (27) — `RowBd[ j ]` tile-row-boundary derivation
+    /// against this PPS.
+    ///
+    /// Symmetric to [`Self::col_bd`]. Dispatches into
+    /// [`compute_row_bd`] with the `RowHeight[ ]` list this PPS
+    /// produces via [`Self::row_heights`].
+    ///
+    /// Output length is [`num_tile_rows`](Self::num_tile_rows)` + 1`.
+    pub fn row_bd(&self, pic_height_in_ctbs_y: u32) -> Vec<u32> {
+        compute_row_bd(&self.row_heights(pic_height_in_ctbs_y))
+    }
 }
 
 /// Iterator returned by [`Pps::tile_grid_coords`]; see that method
@@ -362,6 +391,86 @@ pub fn compute_row_heights(
         row_height.push(residual);
     }
     row_height
+}
+
+/// §6.5.1 eq. (26) — `ColBd[ i ]` tile-column-boundary derivation.
+///
+/// Returns the running prefix-sum of the per-tile-column widths, in
+/// units of CTBs, giving the CTB-column index of each tile-column
+/// boundary. The list runs `i` from `0` to `num_tile_columns_minus1
+/// + 1`, inclusive, so the output length is
+/// `col_widths.len() + 1`: `ColBd[ 0 ] = 0`, and the final entry is
+/// the total picture width in CTBs (the running sum of every
+/// `ColWidth[ ]`).
+///
+/// # Spec text (eq. 26)
+///
+/// ```text
+/// for( ColBd[ 0 ] = 0, i = 0; i <= num_tile_columns_minus1; i++ )
+///     ColBd[ i + 1 ] = ColBd[ i ] + ColWidth[ i ]
+/// ```
+///
+/// # Inputs
+///
+/// * `col_widths` — the `ColWidth[ ]` list from §6.5.1 eq. (24)
+///   ([`compute_col_widths`]). Length `num_tile_columns_minus1 + 1`.
+///
+/// # Returned vector
+///
+/// Length `col_widths.len() + 1`. Entry `i` is `ColBd[ i ]`, the
+/// CTB-column index at the left edge of tile column `i`; the final
+/// entry `ColBd[ num_tile_columns_minus1 + 1 ]` is the right edge of
+/// the last tile column (= `PicWidthInCtbsY` when the widths cover
+/// the picture exactly).
+///
+/// The running sum uses [`u32::saturating_add`] so a malformed
+/// `ColWidth[ ]` produced by an over-specified explicit-tile stream
+/// (see [`compute_col_widths`]'s saturation note) clamps rather than
+/// overflows; the final boundary is then a clamped value the caller
+/// should treat as suspect.
+pub fn compute_col_bd(col_widths: &[u32]) -> Vec<u32> {
+    let mut col_bd: Vec<u32> = Vec::with_capacity(col_widths.len() + 1);
+    let mut acc: u32 = 0;
+    col_bd.push(acc);
+    for &w in col_widths {
+        acc = acc.saturating_add(w);
+        col_bd.push(acc);
+    }
+    col_bd
+}
+
+/// §6.5.1 eq. (27) — `RowBd[ j ]` tile-row-boundary derivation.
+///
+/// Returns the running prefix-sum of the per-tile-row heights, in
+/// units of CTBs. Symmetric to [`compute_col_bd`] (eq. 26).
+///
+/// # Spec text (eq. 27)
+///
+/// ```text
+/// for( RowBd[ 0 ] = 0, j = 0; j <= num_tile_rows_minus1; j++ )
+///     RowBd[ j + 1 ] = RowBd[ j ] + RowHeight[ j ]
+/// ```
+///
+/// # Inputs
+///
+/// * `row_heights` — the `RowHeight[ ]` list from §6.5.1 eq. (25)
+///   ([`compute_row_heights`]). Length `num_tile_rows_minus1 + 1`.
+///
+/// # Returned vector
+///
+/// Length `row_heights.len() + 1`. Entry `j` is `RowBd[ j ]`, the
+/// CTB-row index at the top edge of tile row `j`; the final entry is
+/// the bottom edge of the last tile row (= `PicHeightInCtbsY` when
+/// the heights cover the picture exactly).
+pub fn compute_row_bd(row_heights: &[u32]) -> Vec<u32> {
+    let mut row_bd: Vec<u32> = Vec::with_capacity(row_heights.len() + 1);
+    let mut acc: u32 = 0;
+    row_bd.push(acc);
+    for &h in row_heights {
+        acc = acc.saturating_add(h);
+        row_bd.push(acc);
+    }
+    row_bd
 }
 
 pub fn parse(rbsp: &[u8]) -> Result<Pps> {
@@ -945,6 +1054,125 @@ mod tests {
         let num_cols = pps.num_tile_columns();
         for c in pps.tile_grid_coords() {
             assert_eq!(c.tile_idx, c.tile_row_j * num_cols + c.tile_col_i);
+        }
+    }
+
+    #[test]
+    fn round270_col_bd_single_tile_is_zero_and_full_width() {
+        // §6.5.1 eq. (26): a single tile column (n = 1) gives the
+        // two-entry boundary list [ 0, PicWidthInCtbsY ].
+        let col_bd = compute_col_bd(&[10]);
+        assert_eq!(col_bd.as_slice(), &[0, 10]);
+    }
+
+    #[test]
+    fn round270_col_bd_prefix_sum_matches_hand_trace() {
+        // §6.5.1 eq. (26): ColBd[ i + 1 ] = ColBd[ i ] + ColWidth[ i ].
+        // For ColWidth = [ 3, 3, 4 ] (the round-249 n = 3, W = 10
+        // uniform split), ColBd = [ 0, 3, 6, 10 ].
+        let col_bd = compute_col_bd(&[3, 3, 4]);
+        assert_eq!(col_bd.as_slice(), &[0, 3, 6, 10]);
+    }
+
+    #[test]
+    fn round270_col_bd_length_is_widths_plus_one() {
+        // The spec runs i from 0 to num_tile_columns_minus1 + 1,
+        // inclusive, so ColBd has one more entry than ColWidth.
+        for n in 1usize..=8 {
+            let widths: Vec<u32> = (0..n as u32).map(|i| i + 1).collect();
+            let col_bd = compute_col_bd(&widths);
+            assert_eq!(col_bd.len(), widths.len() + 1);
+            assert_eq!(col_bd[0], 0);
+        }
+    }
+
+    #[test]
+    fn round270_col_bd_final_entry_equals_total_width() {
+        // ColBd[ num_tile_columns_minus1 + 1 ] is the running sum of
+        // every ColWidth[ ] — the picture width in CTBs when the
+        // widths cover the picture exactly (which eq. (24) guarantees).
+        for cols_minus1 in 0u32..=6 {
+            for w in [1u32, 5, 10, 17, 64, 100] {
+                let widths = compute_col_widths(true, cols_minus1, &[], w);
+                let col_bd = compute_col_bd(&widths);
+                assert_eq!(*col_bd.last().unwrap(), w);
+            }
+        }
+    }
+
+    #[test]
+    fn round270_col_bd_is_strictly_monotonic_for_nonempty_tiles() {
+        // Every ColWidth[ i ] >= 1 in a well-formed grid, so the
+        // boundaries strictly increase across the eq. (26) walk.
+        let widths = compute_col_widths(true, 4, &[], 23);
+        let col_bd = compute_col_bd(&widths);
+        for w in col_bd.windows(2) {
+            assert!(w[1] > w[0], "col_bd not strictly increasing: {col_bd:?}");
+        }
+    }
+
+    #[test]
+    fn round270_col_bd_explicit_branch_matches_widths() {
+        // §6.5.1 eq. (26) over an explicit-spacing ColWidth list:
+        // ColWidth = [ 3, 1, 6 ] (round-249 explicit n = 3 example)
+        // ⇒ ColBd = [ 0, 3, 4, 10 ].
+        let widths = compute_col_widths(false, 2, &[2, 0], 10);
+        assert_eq!(widths.as_slice(), &[3, 1, 6]);
+        let col_bd = compute_col_bd(&widths);
+        assert_eq!(col_bd.as_slice(), &[0, 3, 4, 10]);
+    }
+
+    #[test]
+    fn round270_col_bd_empty_widths_is_single_zero() {
+        // Defensive: an empty ColWidth list yields the bare
+        // ColBd[ 0 ] = 0 seed with no further boundaries.
+        let col_bd = compute_col_bd(&[]);
+        assert_eq!(col_bd.as_slice(), &[0]);
+    }
+
+    #[test]
+    fn round270_row_bd_prefix_sum_matches_hand_trace() {
+        // §6.5.1 eq. (27) mirror of the col_bd hand trace.
+        let row_bd = compute_row_bd(&[3, 3, 4]);
+        assert_eq!(row_bd.as_slice(), &[0, 3, 6, 10]);
+    }
+
+    #[test]
+    fn round270_row_bd_final_entry_equals_total_height() {
+        // §6.5.1 eq. (27) sweep mirror of the col_bd coverage check.
+        for rows_minus1 in 0u32..=6 {
+            for h in [1u32, 5, 10, 17, 64, 100] {
+                let heights = compute_row_heights(true, rows_minus1, &[], h);
+                let row_bd = compute_row_bd(&heights);
+                assert_eq!(*row_bd.last().unwrap(), h);
+            }
+        }
+    }
+
+    #[test]
+    fn round270_col_bd_matches_pps_dispatch() {
+        // The free function and the Pps::col_bd instance method are
+        // the same derivation; they must agree on every input.
+        for cols_minus1 in 0u32..=4 {
+            for w in [1u32, 7, 10, 33] {
+                let pps = pps_with_grid(0, cols_minus1);
+                let direct = compute_col_bd(&compute_col_widths(true, cols_minus1, &[], w));
+                let dispatched = pps.col_bd(w);
+                assert_eq!(direct, dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn round270_row_bd_matches_pps_dispatch() {
+        // Mirror of the col_bd dispatch-agreement sweep.
+        for rows_minus1 in 0u32..=4 {
+            for h in [1u32, 7, 10, 33] {
+                let pps = pps_with_grid(rows_minus1, 0);
+                let direct = compute_row_bd(&compute_row_heights(true, rows_minus1, &[], h));
+                let dispatched = pps.row_bd(h);
+                assert_eq!(direct, dispatched);
+            }
         }
     }
 }
