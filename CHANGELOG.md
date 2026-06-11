@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### Round 278 — §6.5.1 eq. (32) `TileIdToIdx[ ]` + `FirstCtbAddrTs[ ]` + luma-sample tile extents (§6.5.1 complete)
+
+#### Added
+- `pps::TileIndexMaps` — the two §6.5.1 eq. (32) outputs.
+  `tile_id_to_idx` carries the spec's *set* `TileIdToIdx[ tileId ]`
+  as `(tileId, tileIdx)` pairs in tile-scan first-encounter order
+  (explicit tile IDs are sparse, so a dense tileId-indexed list would
+  be unbounded); `first_ctb_addr_ts` is the list
+  `FirstCtbAddrTs[ tileIdx ]` for `tileIdx` in
+  `0 ..= NumTilesInPic − 1`. `TileIndexMaps::tile_idx_for_id` is the
+  `TileIdToIdx[ tileId ]` lookup (`None` when the ID names no tile).
+- `pps::compute_tile_index_maps(tile_id) -> TileIndexMaps` — §6.5.1
+  eq. (32). Verbatim port of the single
+  `tileStartFlag` / `tileEndFlag` walk over `TileId[ ctbAddrTs ]`:
+  each run start records the set entry + the first-CTB address, each
+  run end advances `tileIdx`. A malformed `TileId[ ]` with a repeated
+  non-contiguous ID follows the loop's assignment semantics verbatim
+  (later run overwrites the set entry, still appends its own
+  `FirstCtbAddrTs` slot); spec-derived inputs cannot hit that branch
+  because eq. (28)-(30) pack each tile contiguously in tile scan.
+- `pps::compute_column_width_in_luma_samples(col_widths,
+  ctb_log2_size_y) -> Vec<u32>` /
+  `pps::compute_row_height_in_luma_samples(row_heights,
+  ctb_log2_size_y) -> Vec<u32>` — the §6.5.1 trailing
+  `ColumnWidthInLumaSamples[ i ] = ColWidth[ i ] << CtbLog2SizeY` /
+  `RowHeightInLumaSamples[ j ] = RowHeight[ j ] << CtbLog2SizeY`
+  derivations. The shift saturates to `u32::MAX` on overflow.
+- `Pps::tile_index_maps` / `Pps::column_width_in_luma_samples` /
+  `Pps::row_height_in_luma_samples` instance methods — dispatch into
+  the free functions over this PPS's derived lists. `PicWidthInCtbsY`
+  / `PicHeightInCtbsY` / `CtbLog2SizeY` stay explicit caller
+  arguments (all derive from §7.4.3.1 against the SPS).
+
+#### Notes
+- This closes out §6.5.1 entirely: every list the subclause derives
+  (eq. 24-32 plus the two luma-sample lists) now has a pure helper +
+  `Pps` dispatch. The slice-header consumers — §7.4.5's
+  `ctbAddrInTs = FirstCtbAddrTs[ SliceTileIdx[ i ] ]` walk and the
+  §7.4.3.4 `TileIdToIdx[ first_tile_id ]` slice-tile resolution — are
+  the natural next arc.
+- 12 new unit tests (620 total; was 608): eq. (32) single-tile +
+  2×2 `FirstCtbAddrTs` hand-trace + `NumCtusInTile[ ]` prefix-sum
+  sweep + explicit-ID set round-trip + `TileId[ FirstCtbAddrTs ]`
+  inversion sweep + empty-input defensive + malformed-repeat
+  assignment-semantics pin; luma-sample hand-traces at CtbLog2SizeY
+  5/6 + picture-coverage sweep + saturation pin; `Pps` dispatch
+  agreement including the explicit-tile-ID path.
+
 ### Round 273 — §6.5.1 eq. (28)-(31) CTB-address conversion + `TileId[ ]` (errata #97 unblock)
 
 #### Added

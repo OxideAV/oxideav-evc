@@ -283,6 +283,48 @@ impl Pps {
         };
         compute_tile_id(&col_bd, &row_bd, &rs_to_ts, pic_width_in_ctbs_y, explicit)
     }
+
+    /// §6.5.1 eq. (32) — `TileIdToIdx[ ]` + `FirstCtbAddrTs[ ]`
+    /// against this PPS.
+    ///
+    /// Builds [`Self::tile_id`] and dispatches into
+    /// [`compute_tile_index_maps`]. `PicWidthInCtbsY` /
+    /// `PicHeightInCtbsY` come from §7.4.3.1 against the SPS and stay
+    /// explicit caller arguments.
+    pub fn tile_index_maps(
+        &self,
+        pic_width_in_ctbs_y: u32,
+        pic_height_in_ctbs_y: u32,
+    ) -> TileIndexMaps {
+        compute_tile_index_maps(&self.tile_id(pic_width_in_ctbs_y, pic_height_in_ctbs_y))
+    }
+
+    /// §6.5.1 — `ColumnWidthInLumaSamples[ i ]` against this PPS.
+    ///
+    /// Dispatches [`Self::col_widths`] into
+    /// [`compute_column_width_in_luma_samples`]. `CtbLog2SizeY`
+    /// derives from the SPS (`log2_ctu_size_minus5 + 5`, §7.4.3.1)
+    /// so it stays an explicit caller argument, same stance as the
+    /// picture dimensions.
+    pub fn column_width_in_luma_samples(
+        &self,
+        pic_width_in_ctbs_y: u32,
+        ctb_log2_size_y: u32,
+    ) -> Vec<u32> {
+        compute_column_width_in_luma_samples(&self.col_widths(pic_width_in_ctbs_y), ctb_log2_size_y)
+    }
+
+    /// §6.5.1 — `RowHeightInLumaSamples[ j ]` against this PPS.
+    ///
+    /// Symmetric to [`Self::column_width_in_luma_samples`] over
+    /// [`Self::row_heights`].
+    pub fn row_height_in_luma_samples(
+        &self,
+        pic_height_in_ctbs_y: u32,
+        ctb_log2_size_y: u32,
+    ) -> Vec<u32> {
+        compute_row_height_in_luma_samples(&self.row_heights(pic_height_in_ctbs_y), ctb_log2_size_y)
+    }
 }
 
 /// Iterator returned by [`Pps::tile_grid_coords`]; see that method
@@ -817,6 +859,143 @@ pub fn compute_tile_id(
         }
     }
     tile_id
+}
+
+/// The two §6.5.1 eq. (32) outputs, built by
+/// [`compute_tile_index_maps`].
+///
+/// * `tile_id_to_idx` — the set `TileIdToIdx[ tileId ]`. The spec
+///   calls it a *set* over `NumTilesInPic` tileId values (the IDs are
+///   sparse when `explicit_tile_id_flag` is set, so a dense list
+///   indexed by tileId would be unbounded); it is represented here as
+///   `(tileId, tileIdx)` pairs in first-encounter (tile-scan) order.
+///   Use [`TileIndexMaps::tile_idx_for_id`] for the
+///   `TileIdToIdx[ tileId ]` lookup.
+/// * `first_ctb_addr_ts` — the list `FirstCtbAddrTs[ tileIdx ]` for
+///   `tileIdx` from `0` to `NumTilesInPic − 1`, inclusive: the
+///   tile-scan CTB address of the first CTB in each tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileIndexMaps {
+    /// `TileIdToIdx[ tileId ]` as `(tileId, tileIdx)` pairs in
+    /// tile-scan first-encounter order. For a well-formed stream
+    /// (§7.4.3.2 requires distinct `tile_id_val` entries) the pair
+    /// order matches `tileIdx` order.
+    pub tile_id_to_idx: Vec<(u32, u32)>,
+    /// `FirstCtbAddrTs[ tileIdx ]` — length `NumTilesInPic` for a
+    /// well-formed `TileId[ ]` input.
+    pub first_ctb_addr_ts: Vec<u32>,
+}
+
+impl TileIndexMaps {
+    /// The `TileIdToIdx[ tileId ]` lookup: the tile index for a tile
+    /// ID, or `None` when the ID names no tile in the picture.
+    pub fn tile_idx_for_id(&self, tile_id: u32) -> Option<u32> {
+        self.tile_id_to_idx
+            .iter()
+            .find(|&&(id, _)| id == tile_id)
+            .map(|&(_, idx)| idx)
+    }
+}
+
+/// §6.5.1 eq. (32) — `TileIdToIdx[ ]` + `FirstCtbAddrTs[ ]`, the
+/// tile-ID→tile-index set and the per-tile first-CTB tile-scan
+/// address list.
+///
+/// # Spec text (eq. 32)
+///
+/// ```text
+/// for( ctbAddrTs = 0, tileIdx = 0, tileStartFlag = 1; ctbAddrTs < PicSizeInCtbsY; ctbAddrTs++ ) {
+///     if( tileStartFlag ) {
+///         TileIdToIdx[ TileId[ ctbAddrTs ] ] = tileIdx
+///         FirstCtbAddrTs[ tileIdx ] = ctbAddrTs
+///         tileStartFlag = 0
+///     }
+///     tileEndFlag = ctbAddrTs == PicSizeInCtbsY − 1 | |
+///                   TileId[ ctbAddrTs + 1 ] != TileId[ ctbAddrTs ]
+///     if( tileEndFlag ) {
+///         tileIdx++
+///         tileStartFlag = 1
+///     }
+/// }
+/// ```
+///
+/// # Inputs
+///
+/// * `tile_id` — `TileId[ ctbAddrTs ]` (eq. 30), length
+///   `PicSizeInCtbsY`.
+///
+/// # Returned maps
+///
+/// One [`TileIndexMaps`]. Tiles are runs of equal `TileId` in tile
+/// scan; eq. (28)-(30) make each tile a single contiguous run, so
+/// `first_ctb_addr_ts.len() == NumTilesInPic` for spec-derived
+/// inputs. A malformed `TileId[ ]` with a repeated non-contiguous ID
+/// follows the loop's assignment semantics verbatim: the later run
+/// overwrites the set entry and still appends its own
+/// `FirstCtbAddrTs` slot.
+pub fn compute_tile_index_maps(tile_id: &[u32]) -> TileIndexMaps {
+    let n = tile_id.len();
+    let mut tile_id_to_idx: Vec<(u32, u32)> = Vec::new();
+    let mut first_ctb_addr_ts: Vec<u32> = Vec::new();
+    let mut tile_idx: u32 = 0;
+    let mut tile_start_flag = true;
+    for ctb_addr_ts in 0..n {
+        if tile_start_flag {
+            let id = tile_id[ctb_addr_ts];
+            // Set assignment: a repeated ID (malformed input)
+            // overwrites the earlier entry, as the spec's
+            // `TileIdToIdx[ … ] = tileIdx` would.
+            match tile_id_to_idx.iter_mut().find(|(tid, _)| *tid == id) {
+                Some(entry) => entry.1 = tile_idx,
+                None => tile_id_to_idx.push((id, tile_idx)),
+            }
+            first_ctb_addr_ts.push(ctb_addr_ts as u32);
+            tile_start_flag = false;
+        }
+        let tile_end_flag =
+            ctb_addr_ts == n - 1 || tile_id[ctb_addr_ts + 1] != tile_id[ctb_addr_ts];
+        if tile_end_flag {
+            tile_idx += 1;
+            tile_start_flag = true;
+        }
+    }
+    TileIndexMaps {
+        tile_id_to_idx,
+        first_ctb_addr_ts,
+    }
+}
+
+/// §6.5.1 — `ColumnWidthInLumaSamples[ i ]`, the per-tile-column
+/// width in units of luma samples.
+///
+/// Spec text: "The values of ColumnWidthInLumaSamples\[ i \] […] are
+/// set equal to `ColWidth[ i ] << CtbLog2SizeY` for i ranging from 0
+/// to num_tile_columns_minus1, inclusive."
+///
+/// `CtbLog2SizeY` derives from the SPS (`log2_ctu_size_minus5 + 5`,
+/// §7.4.3.1). The shift saturates to `u32::MAX` on overflow so a
+/// malformed input clamps rather than wraps.
+pub fn compute_column_width_in_luma_samples(col_widths: &[u32], ctb_log2_size_y: u32) -> Vec<u32> {
+    let shift = ctb_log2_size_y.min(32);
+    col_widths
+        .iter()
+        .map(|&cw| u32::try_from(u64::from(cw) << shift).unwrap_or(u32::MAX))
+        .collect()
+}
+
+/// §6.5.1 — `RowHeightInLumaSamples[ j ]`, the per-tile-row height in
+/// units of luma samples.
+///
+/// Spec text: "The values of RowHeightInLumaSamples\[ j \] […] are
+/// set equal to `RowHeight[ j ] << CtbLog2SizeY` for j ranging from 0
+/// to num_tile_rows_minus1, inclusive." Symmetric to
+/// [`compute_column_width_in_luma_samples`].
+pub fn compute_row_height_in_luma_samples(row_heights: &[u32], ctb_log2_size_y: u32) -> Vec<u32> {
+    let shift = ctb_log2_size_y.min(32);
+    row_heights
+        .iter()
+        .map(|&rh| u32::try_from(u64::from(rh) << shift).unwrap_or(u32::MAX))
+        .collect()
 }
 
 pub fn parse(rbsp: &[u8]) -> Result<Pps> {
@@ -1790,5 +1969,221 @@ mod tests {
         // rather than panicking.
         let out = compute_ctb_addr_rs_to_ts(&[0], &[3], &[0, 0], &[0, 3], 0);
         assert!(out.is_empty());
+    }
+
+    /// Builds the eq. (30) `TileId[ ]` list for a uniform grid (the
+    /// round-278 eq. (32) input).
+    fn build_tile_id(
+        pic_w: u32,
+        pic_h: u32,
+        cols_minus1: u32,
+        rows_minus1: u32,
+        explicit: Option<&[u32]>,
+    ) -> Vec<u32> {
+        let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+        let row_heights = compute_row_heights(true, rows_minus1, &[], pic_h);
+        let col_bd = compute_col_bd(&col_widths);
+        let row_bd = compute_row_bd(&row_heights);
+        let rs_to_ts =
+            compute_ctb_addr_rs_to_ts(&col_widths, &row_heights, &col_bd, &row_bd, pic_w);
+        compute_tile_id(&col_bd, &row_bd, &rs_to_ts, pic_w, explicit)
+    }
+
+    #[test]
+    fn round278_tile_index_maps_single_tile() {
+        // §6.5.1 eq. (32): one tile covering the whole picture. The
+        // single run starts at ts 0 with the implicit ID 0.
+        let tile_id = build_tile_id(4, 3, 0, 0, None);
+        let maps = compute_tile_index_maps(&tile_id);
+        assert_eq!(maps.first_ctb_addr_ts, vec![0]);
+        assert_eq!(maps.tile_id_to_idx, vec![(0, 0)]);
+        assert_eq!(maps.tile_idx_for_id(0), Some(0));
+        assert_eq!(maps.tile_idx_for_id(1), None);
+    }
+
+    #[test]
+    fn round278_first_ctb_addr_ts_two_by_two_hand_trace() {
+        // §6.5.1 eq. (32): 4×4 picture, uniform 2×2 grid. Tile-scan
+        // runs are ts 0..=3 / 4..=7 / 8..=11 / 12..=15, so each tile's
+        // first CTB sits at 4*tileIdx.
+        let tile_id = build_tile_id(4, 4, 1, 1, None);
+        let maps = compute_tile_index_maps(&tile_id);
+        assert_eq!(maps.first_ctb_addr_ts, vec![0, 4, 8, 12]);
+        assert_eq!(maps.tile_id_to_idx, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn round278_first_ctb_addr_ts_is_num_ctus_prefix_sum() {
+        // §6.5.1 eq. (32) sweep: tile-scan packs each tile
+        // contiguously, so FirstCtbAddrTs[ k ] is the prefix sum of
+        // NumCtusInTile[ 0 .. k ], and the list length is
+        // NumTilesInPic.
+        for pic_w in [1u32, 3, 5, 8] {
+            for pic_h in [1u32, 2, 4] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let tile_id = build_tile_id(pic_w, pic_h, cols_minus1, rows_minus1, None);
+                        let maps = compute_tile_index_maps(&tile_id);
+                        let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+                        let row_heights = compute_row_heights(true, rows_minus1, &[], pic_h);
+                        let num_ctus = compute_num_ctus_in_tile(&col_widths, &row_heights);
+                        assert_eq!(maps.first_ctb_addr_ts.len(), num_ctus.len());
+                        let mut acc = 0u32;
+                        for (k, &first) in maps.first_ctb_addr_ts.iter().enumerate() {
+                            assert_eq!(first, acc, "tileIdx {k}");
+                            acc += num_ctus[k];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round278_tile_id_to_idx_explicit_ids() {
+        // §6.5.1 eq. (32) over an explicit-ID TileId[ ]: the set maps
+        // each sparse tile ID back to its linear tile index, in
+        // tile-scan first-encounter order. Same errata-#97 table as
+        // the round-273 explicit-branch test: tileIdx 0→10, 1→12,
+        // 2→11, 3→13.
+        let table = [10u32, 12, 11, 13];
+        let tile_id = build_tile_id(4, 4, 1, 1, Some(&table));
+        let maps = compute_tile_index_maps(&tile_id);
+        assert_eq!(
+            maps.tile_id_to_idx,
+            vec![(10, 0), (12, 1), (11, 2), (13, 3)]
+        );
+        assert_eq!(maps.first_ctb_addr_ts, vec![0, 4, 8, 12]);
+        assert_eq!(maps.tile_idx_for_id(11), Some(2));
+        assert_eq!(maps.tile_idx_for_id(13), Some(3));
+        assert_eq!(maps.tile_idx_for_id(0), None);
+    }
+
+    #[test]
+    fn round278_tile_index_maps_round_trip_with_tile_id() {
+        // §6.5.1 eq. (32) sweep: TileId[ FirstCtbAddrTs[ idx ] ] == id
+        // for every (id, idx) pair — the set inverts the per-tile ID
+        // assignment.
+        for pic_w in [2u32, 4, 5] {
+            for pic_h in [2u32, 3] {
+                for cols_minus1 in 0..pic_w {
+                    for rows_minus1 in 0..pic_h {
+                        let tile_id = build_tile_id(pic_w, pic_h, cols_minus1, rows_minus1, None);
+                        let maps = compute_tile_index_maps(&tile_id);
+                        for &(id, idx) in &maps.tile_id_to_idx {
+                            let first = maps.first_ctb_addr_ts[idx as usize];
+                            assert_eq!(tile_id[first as usize], id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round278_tile_index_maps_empty_input() {
+        // Defensive: a zero-CTB picture yields empty maps rather than
+        // panicking on the ctbAddrTs == PicSizeInCtbsY − 1 test.
+        let maps = compute_tile_index_maps(&[]);
+        assert!(maps.tile_id_to_idx.is_empty());
+        assert!(maps.first_ctb_addr_ts.is_empty());
+        assert_eq!(maps.tile_idx_for_id(0), None);
+    }
+
+    #[test]
+    fn round278_tile_index_maps_malformed_repeat_follows_assignment() {
+        // §6.5.1 eq. (32) on a malformed TileId[ ] where ID 7 appears
+        // in two non-contiguous runs: the loop's set assignment lets
+        // the later run overwrite the earlier tileIdx, while
+        // FirstCtbAddrTs still gets one slot per run.
+        let tile_id = [7u32, 7, 3, 7];
+        let maps = compute_tile_index_maps(&tile_id);
+        assert_eq!(maps.first_ctb_addr_ts, vec![0, 2, 3]);
+        assert_eq!(maps.tile_id_to_idx, vec![(7, 2), (3, 1)]);
+        assert_eq!(maps.tile_idx_for_id(7), Some(2));
+    }
+
+    #[test]
+    fn round278_column_width_in_luma_samples_shifts_extents() {
+        // §6.5.1: ColumnWidthInLumaSamples[ i ] = ColWidth[ i ] <<
+        // CtbLog2SizeY. ColWidth = [2, 3] at CtbLog2SizeY = 5 (32-px
+        // CTB) → [64, 96].
+        let out = compute_column_width_in_luma_samples(&[2, 3], 5);
+        assert_eq!(out, vec![64, 96]);
+    }
+
+    #[test]
+    fn round278_row_height_in_luma_samples_shifts_extents() {
+        // §6.5.1: RowHeightInLumaSamples[ j ] = RowHeight[ j ] <<
+        // CtbLog2SizeY. RowHeight = [1, 2] at CtbLog2SizeY = 6 (64-px
+        // CTB) → [64, 128].
+        let out = compute_row_height_in_luma_samples(&[1, 2], 6);
+        assert_eq!(out, vec![64, 128]);
+    }
+
+    #[test]
+    fn round278_luma_sample_lists_cover_picture() {
+        // §6.5.1 sweep: the eq. (24)/(25) extents cover the picture in
+        // CTBs, so the shifted lists sum to the picture dimension in
+        // luma samples.
+        for ctb_log2 in [5u32, 6, 7] {
+            for pic_w in [1u32, 3, 5, 8] {
+                for cols_minus1 in 0..pic_w {
+                    let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+                    let widths = compute_column_width_in_luma_samples(&col_widths, ctb_log2);
+                    let total: u32 = widths.iter().sum();
+                    assert_eq!(total, pic_w << ctb_log2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round278_luma_sample_shift_saturates() {
+        // Defensive: an extent whose shifted value exceeds u32 clamps
+        // to u32::MAX rather than wrapping.
+        let out = compute_column_width_in_luma_samples(&[u32::MAX, 1], 7);
+        assert_eq!(out, vec![u32::MAX, 128]);
+        let out = compute_row_height_in_luma_samples(&[1 << 30], 5);
+        assert_eq!(out, vec![u32::MAX]);
+    }
+
+    #[test]
+    fn round278_pps_dispatch_matches_free_functions() {
+        // The Pps instance methods are the same derivations as the
+        // free functions; they must agree on uniform grids, including
+        // the explicit-tile-ID path of tile_index_maps.
+        for cols_minus1 in 0u32..=2 {
+            for rows_minus1 in 0u32..=2 {
+                let pps = pps_with_grid(rows_minus1, cols_minus1);
+                let pic_w = cols_minus1 + 3;
+                let pic_h = rows_minus1 + 3;
+                let tile_id = build_tile_id(pic_w, pic_h, cols_minus1, rows_minus1, None);
+                assert_eq!(
+                    pps.tile_index_maps(pic_w, pic_h),
+                    compute_tile_index_maps(&tile_id)
+                );
+                let col_widths = compute_col_widths(true, cols_minus1, &[], pic_w);
+                let row_heights = compute_row_heights(true, rows_minus1, &[], pic_h);
+                assert_eq!(
+                    pps.column_width_in_luma_samples(pic_w, 6),
+                    compute_column_width_in_luma_samples(&col_widths, 6)
+                );
+                assert_eq!(
+                    pps.row_height_in_luma_samples(pic_h, 6),
+                    compute_row_height_in_luma_samples(&row_heights, 6)
+                );
+            }
+        }
+        // Explicit-ID dispatch: 2×2 grid with the errata-#97 table.
+        let mut pps = pps_with_grid(1, 1);
+        pps.explicit_tile_id_flag = true;
+        pps.tile_id_val = vec![10, 12, 11, 13];
+        let maps = pps.tile_index_maps(4, 4);
+        assert_eq!(
+            maps.tile_id_to_idx,
+            vec![(10, 0), (12, 1), (11, 2), (13, 3)]
+        );
+        assert_eq!(maps.first_ctb_addr_ts, vec![0, 4, 8, 12]);
     }
 }

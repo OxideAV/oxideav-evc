@@ -7,6 +7,75 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-278 status
+
+Round 278 lands §6.5.1 eq. (32) — the **`TileIdToIdx[ ]` set and the
+`FirstCtbAddrTs[ tileIdx ]` list** — plus the subclause's two trailing
+luma-sample derivations, **completing §6.5.1**: every list it derives
+(eq. 24-32 + `ColumnWidthInLumaSamples[ ]` /
+`RowHeightInLumaSamples[ ]`) now has a pure helper and a `Pps`
+dispatch.
+
+eq. (32) is a single walk over round-273's `TileId[ ctbAddrTs ]`
+with `tileStartFlag` / `tileEndFlag` run detection: each run start
+records `TileIdToIdx[ TileId[ ctbAddrTs ] ] = tileIdx` and
+`FirstCtbAddrTs[ tileIdx ] = ctbAddrTs`; each run end advances
+`tileIdx`. Because eq. (28)-(30) pack each tile contiguously in tile
+scan, `FirstCtbAddrTs[ k ]` is exactly the prefix sum of
+`NumCtusInTile[ 0 .. k ]` (pinned by a sweep test).
+
+New surface:
+
+* `pps::TileIndexMaps` — both eq. (32) outputs. The spec calls
+  `TileIdToIdx` a *set* over `NumTilesInPic` tileId values (explicit
+  tile IDs are sparse, so a dense tileId-indexed list would be
+  unbounded); it is carried as `(tileId, tileIdx)` pairs in tile-scan
+  first-encounter order with a `tile_idx_for_id` lookup.
+* `pps::compute_tile_index_maps` — the eq. (32) walk, verbatim
+  semantics including the malformed-input case (a repeated
+  non-contiguous ID overwrites the set entry and still appends its
+  own `FirstCtbAddrTs` slot, exactly as the loop's assignments do).
+* `pps::compute_column_width_in_luma_samples` /
+  `pps::compute_row_height_in_luma_samples` —
+  `ColWidth[ i ] << CtbLog2SizeY` / `RowHeight[ j ] << CtbLog2SizeY`,
+  saturating on overflow.
+* `Pps::tile_index_maps` / `Pps::column_width_in_luma_samples` /
+  `Pps::row_height_in_luma_samples` — instance dispatch.
+  `PicWidthInCtbsY` / `PicHeightInCtbsY` / `CtbLog2SizeY` stay
+  explicit caller arguments (§7.4.3.1, SPS side).
+
+### Tests
+
+12 new unit tests (620 total; was 608): eq. (32) single-tile +
+`FirstCtbAddrTs` 2×2 hand-trace + `NumCtusInTile[ ]` prefix-sum
+sweep + explicit-ID set round-trip + `TileId[ FirstCtbAddrTs ]`
+inversion sweep + empty-input + malformed-repeat assignment pin;
+luma-sample hand-traces + coverage sweep + saturation pin; `Pps`
+dispatch agreement including the explicit-tile-ID path.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 onward helper rollout: pure
+functions returning owned values, no behaviour change to existing
+decoder paths.
+
+### Next arc
+
+§6.5.1 is done; the natural consumers are the slice-header
+derivations — §7.4.5's
+`ctbAddrInTs = FirstCtbAddrTs[ SliceTileIdx[ i ] ]` walk and the
+§7.4.3.4 `TileIdToIdx[ first_tile_id ]` / `last_tile_id` slice-tile
+resolution (eq. around 82).
+
+### Disclaimer
+
+`TileIndexMaps` / `compute_tile_index_maps` /
+`compute_column_width_in_luma_samples` /
+`compute_row_height_in_luma_samples` (and the matching `Pps`
+methods) are derived from ISO/IEC 23094-1:2020 §6.5.1 eq. (32) and
+the subclause's trailing luma-sample paragraphs. All truth came from
+`docs/video/evc/`.
+
 ## Round-273 status
 
 Round 273 completes the §6.5.1 **CTB raster-and-tile-scanning
