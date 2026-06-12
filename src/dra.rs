@@ -4719,4 +4719,86 @@ mod tests {
         assert_eq!(out_8.out_ranges_c[num_ranges_c_8], 1i64 << 8);
         assert_eq!(out_10.out_ranges_c[num_ranges_c_10], 1i64 << 10);
     }
+
+    // ------------------------------------------------------------------
+    // Round 284 — §8.9.8 tableNum == 0 branch pins (spec page 308).
+    //
+    // The spec's "If tableNum is equal to 0, the variable qpDraFrac is
+    // set equal to 0, and the variable qpDraInt is decreased by 1"
+    // sentence leaves qpDraFracAdj and draChromaQpShift (eq. 1408/1409,
+    // printed inside the "otherwise" arm) underivable by literal
+    // reading. The in-repo errata file carries no §8.9.8 entry yet
+    // (docs task #1278), so these tests pin the documented in-tree
+    // reading: qpDraFracAdj = 0 (eq. 1418 then adds exactly
+    // (1 << 8) >> 9 = 0) and draChromaQpShift =
+    // ChromaQpTable[cIdx][dra_table_idx] − qp0 − qpDraInt with the
+    // decremented qpDraInt and idx0 = Clip3(−QpBdOffsetC, 57,
+    // dra_table_idx − qpDraInt). Under that reading the whole branch
+    // collapses to the closed form asserted below.
+    // ------------------------------------------------------------------
+
+    /// The tableNum == 0 closed form: chromaScale =
+    /// (scaleDra * QpScale[Clip3(0, 24, shift + 12)] + (1 << 17)) >> 18
+    /// with shift = ChromaQpTable[dra_table_idx] − ChromaQpTable[idx0]
+    /// − qpDraInt and qpDraInt = 2 * IndexScaleQP − 61.
+    fn table_num_zero_closed_form(
+        scale_dra: i64,
+        index_scale_qp: i64,
+        dra_table_idx: i32,
+        t: &ChromaQpTable,
+        cidx: ChromaIdx,
+    ) -> i64 {
+        let qp_dra_int = 2 * index_scale_qp - 60 - 1;
+        let lo = -t.cb.qp_bd_offset_c as i64;
+        let idx0 = (dra_table_idx as i64 - qp_dra_int).clamp(lo, 57);
+        let shift =
+            t.lookup(cidx, dra_table_idx) as i64 - t.lookup(cidx, idx0 as i32) as i64 - qp_dra_int;
+        let scale_shift = QP_SCALE[(shift + 12).clamp(0, 24) as usize];
+        ((scale_dra * scale_shift) + (1i64 << 17)) >> 18
+    }
+
+    #[test]
+    fn round284_table_num_zero_knot_1448_closed_form() {
+        // lumaScale 2896 × Cb scale 256 → scaleDra = 741376,
+        // scaleDraNorm = (741376 + 256) >> 9 = 1448 = ScaleQP[35]
+        // exactly, so tableNum = 0 with IndexScaleQP = 35.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let got = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let want = table_num_zero_closed_form(2896 * 256, 35, 30, &t, ChromaIdx::Cb);
+        assert_eq!(got, want);
+        assert!(got > 0);
+    }
+
+    #[test]
+    fn round284_table_num_zero_knot_724_closed_form() {
+        // lumaScale 1448 × Cb scale 256 → scaleDra = 370688,
+        // scaleDraNorm = (370688 + 256) >> 9 = 724 = ScaleQP[32]
+        // exactly: a second knot with a different (and small) qpDraInt
+        // (2 * 32 − 61 = 3), exercising the idx0 clip away from the
+        // qpDraInt = 9 case.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        for cidx in [ChromaIdx::Cb, ChromaIdx::Cr] {
+            let (cb, cr) = (256u16, 256u16);
+            let got = chroma_scale_joined(1448, cb, cr, cidx, 30, &t);
+            let want = table_num_zero_closed_form(1448 * 256, 32, 30, &t, cidx);
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn round284_table_num_zero_neighbour_takes_otherwise_branch() {
+        // One scaleDraNorm step past the 1448 knot (lumaScale 2897 →
+        // scaleDra = 741632, norm = 1449) lands in the eq. 1400-1411
+        // arm; it must stay positive and within the same ballpark as
+        // the knot value (the QP-domain shift moves by well under one
+        // QpScale octave for a single norm step).
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let at_knot = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let past_knot = chroma_scale_joined(2897, 256, 1024, ChromaIdx::Cb, 30, &t);
+        assert!(past_knot > 0);
+        assert!(
+            past_knot > at_knot / 2 && past_knot < at_knot * 2,
+            "branch seam should not jump an octave: {at_knot} vs {past_knot}"
+        );
+    }
 }

@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### Round 284 — §7.3.4 entry points + eq. (88)/(89) tile subsets; errata-#97 / §8.9.8 pins
+
+#### Added
+- `slice_header::parse_entry_point_offsets(br, num_tiles_in_slice,
+  tile_offset_len_minus1)` — the §7.3.4 `entry_point_offset_minus1[ i ]`
+  loop at the tail of `slice_header( )` (present when
+  `single_tile_in_slice_flag == 0`): `NumTilesInSlice − 1` elements of
+  `tile_offset_len_minus1 + 1` bits. Rejects
+  `tile_offset_len_minus1 > 31` (§7.4.3.2 range).
+- `slice_header::compute_tile_subset_byte_ranges(entry_point_offset_minus1,
+  slice_data_len)` — §7.4.5 eq. (88)/(89): the per-tile subset byte
+  ranges of the coded slice data, returned half-open
+  (`end = lastByte + 1`), with the prefix sum carried in `u64` so
+  32-bit offsets cannot wrap. A subset overrunning the data or an
+  empty trailing subset errors (each subset must carry one tile's
+  coded CTU bits).
+- `SliceHeader::parse_entry_points(...)` — dispatch consuming the
+  entry-point loop off the reader `parse_consume` leaves positioned
+  past `slice_cr_qp_offset`, deriving `NumTilesInSlice` via the
+  round-281 eq. (78)/(80) chain; a no-op (no bits read) for
+  `single_tile_in_slice_flag == 1` slices.
+
+#### Tests
+- **Errata-#97 ↔ §7.4.5 reconciliation:** a §7.4.3.2-conformant
+  explicit-tile-ID PPS (sparse IDs strictly increasing along the
+  raster flat index `j * cols + i`) drives the full chain — eq. (30)
+  `TileId[ ]` → eq. (32) `TileIdToIdx[ ]`/`FirstCtbAddrTs[ ]` →
+  eq. (78)/(79) rectangular and eq. (81)/(82) arbitrary slice-tile
+  resolution. A transposition guard pins that the rejected
+  §7.4.3.2 first-sentence reading (column-major flat-packing) is
+  observably different on a non-square grid.
+- **Synthetic bitstream walks:** rectangular and arbitrary multi-tile
+  slice headers followed by their entry-point loops, parsed
+  end-to-end (`parse_consume` + `parse_entry_points`) and resolved to
+  eq. (88)/(89) subset ranges; a single-tile-slice no-op pin;
+  malformed-range rejections (overrun, empty last subset, zero-length
+  data, `u32::MAX` wrap).
+- **§8.9.8 `tableNum == 0` pins:** the spec's page-308 branch sentence
+  leaves `qpDraFracAdj` / `draChromaQpShift` underivable by literal
+  reading and the staged errata file still carries no §8.9.8 entry
+  (docs task #1278), so three tests pin the documented in-tree
+  reading via its closed form — `chromaScale = (scaleDra *
+  QpScale[Clip3(0, 24, shift + 12)] + (1 << 17)) >> 18` with
+  `qpDraInt = 2 * IndexScaleQP − 61` — at two `ScaleQP` knots
+  (`scaleDraNorm` 724 and 1448, both chroma components), plus a
+  branch-seam continuity check one norm step past the knot.
+- 15 new unit tests (655 total; was 640).
+
 ### Round 281 — §7.4.5 eq. (78)-(82) slice-tile resolution over `TileIdToIdx[ ]`
 
 #### Added

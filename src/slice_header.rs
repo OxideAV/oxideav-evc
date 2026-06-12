@@ -173,6 +173,13 @@ pub fn parse(
 /// reader positioned just past the last `se(v)` field. Useful for callers
 /// that need to recover the byte offset of `slice_data()` (which is
 /// byte-aligned right after the header — see §7.3.4 / §7.4.5).
+///
+/// Multi-tile slices (`single_tile_in_slice_flag == 0`) carry one more
+/// syntax block after `slice_cr_qp_offset`: the §7.3.4
+/// `entry_point_offset_minus1[ i ]` loop, whose count
+/// (`NumTilesInSlice − 1`) needs the active PPS's tile maps. Call
+/// [`SliceHeader::parse_entry_points`] on the same reader to consume
+/// it before the `byte_alignment( )` that precedes `slice_data( )`.
 pub fn parse_consume(
     br: &mut BitReader,
     nal_unit_type: NalUnitType,
@@ -673,6 +680,99 @@ pub fn compute_slice_tile_indices_arbitrary(
     Ok(slice_tile_idx)
 }
 
+/// §7.3.4 — the `entry_point_offset_minus1[ i ]` loop at the tail of
+/// `slice_header( )`, present only when `single_tile_in_slice_flag == 0`:
+///
+/// ```text
+/// if( !single_tile_in_slice_flag )
+///     for( i = 0; i < NumTilesInSlice − 1; i++ )
+///         entry_point_offset_minus1[ i ]                u(v)
+/// byte_alignment( )
+/// ```
+///
+/// Each element is `tile_offset_len_minus1 + 1` bits (§7.4.3.2;
+/// `tile_offset_len_minus1` shall be in `[0, 31]`). The caller supplies
+/// `NumTilesInSlice` from the §7.4.5 eq. (78)/(80) derivation
+/// ([`SliceHeader::num_tiles_in_slice`]); zero or one tile in the slice
+/// reads nothing.
+pub fn parse_entry_point_offsets(
+    br: &mut BitReader,
+    num_tiles_in_slice: u32,
+    tile_offset_len_minus1: u32,
+) -> Result<Vec<u32>> {
+    if tile_offset_len_minus1 > 31 {
+        return Err(Error::invalid(format!(
+            "evc slice: tile_offset_len_minus1 {tile_offset_len_minus1} > 31 (§7.4.3.2)"
+        )));
+    }
+    let bits = tile_offset_len_minus1 + 1;
+    let count = num_tiles_in_slice.saturating_sub(1);
+    let mut offsets = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        offsets.push(br.u(bits)?);
+    }
+    Ok(offsets)
+}
+
+/// §7.4.5 eq. (88)/(89) — the per-tile subset byte ranges of the coded
+/// slice data.
+///
+/// The slice data following the header consists of `NumTilesInSlice`
+/// subsets; with `n = entry_point_offset_minus1.len() + 1` subsets:
+///
+/// * subset `0` is bytes `0` to `entry_point_offset_minus1[ 0 ]`,
+///   inclusive;
+/// * subset `k` for `k ∈ [1, n − 2]` is bytes `firstByte[ k ]` to
+///   `lastByte[ k ]`, inclusive, with
+///
+/// ```text
+/// firstByte[ k ] = Σ_{m=1}^{k} ( entry_point_offset_minus1[ m − 1 ] + 1 )   (88)
+/// lastByte[ k ]  = firstByte[ k ] + entry_point_offset_minus1[ k ]          (89)
+/// ```
+///
+/// * the last subset (`k = n − 1`) is the remaining bytes.
+///
+/// Returned as half-open `start..end` ranges (`end = lastByte + 1`),
+/// length `n`. §7.4.5 requires each subset to carry all coded bits of
+/// the CTUs of one tile, so a subset that overruns `slice_data_len` or
+/// an empty trailing subset is rejected as malformed.
+pub fn compute_tile_subset_byte_ranges(
+    entry_point_offset_minus1: &[u32],
+    slice_data_len: usize,
+) -> Result<Vec<core::ops::Range<usize>>> {
+    let mut ranges = Vec::with_capacity(entry_point_offset_minus1.len() + 1);
+    // Running firstByte[ k ] — eq. (88)'s prefix sum, carried in u64 so
+    // 32-bit offsets cannot wrap.
+    let mut first_byte: u64 = 0;
+    for &epo in entry_point_offset_minus1 {
+        // eq. (89): lastByte = firstByte + entry_point_offset_minus1;
+        // half-open end is one past it.
+        let end = first_byte + u64::from(epo) + 1;
+        if end > slice_data_len as u64 {
+            return Err(Error::invalid(format!(
+                "evc slice: tile subset {} ends at byte {} past the {} coded \
+                 slice-data bytes (§7.4.5 eq. 88/89)",
+                ranges.len(),
+                end - 1,
+                slice_data_len
+            )));
+        }
+        ranges.push(first_byte as usize..end as usize);
+        first_byte = end;
+    }
+    // Last subset: the remaining bytes of the coded slice data. An
+    // exhausted (or zero-length) data buffer leaves it empty —
+    // malformed, since the subset must carry a tile's coded CTU bits.
+    if first_byte >= slice_data_len as u64 {
+        return Err(Error::invalid(format!(
+            "evc slice: last tile subset is empty (entry points consume \
+             {first_byte} of {slice_data_len} coded slice-data bytes, §7.4.5)"
+        )));
+    }
+    ranges.push(first_byte as usize..slice_data_len);
+    Ok(ranges)
+}
+
 impl SliceHeader {
     /// `NumTilesInSlice` (§7.4.5) — eq. (78) product for rectangular
     /// slices (covering the single-tile case via the `last_tile_id =
@@ -732,6 +832,34 @@ impl SliceHeader {
                 &dims,
             )
         }
+    }
+
+    /// §7.3.4 — consume this header's `entry_point_offset_minus1[ i ]`
+    /// loop off the reader [`parse_consume`] left positioned just past
+    /// `slice_cr_qp_offset`.
+    ///
+    /// Single-tile slices (`single_tile_in_slice_flag == 1`) carry no
+    /// entry points: nothing is read and the list is empty. Otherwise
+    /// the loop count is `NumTilesInSlice − 1`
+    /// ([`Self::num_tiles_in_slice`], §7.4.5 eq. (78)/(80)) and each
+    /// element is `tile_offset_len_minus1 + 1` bits (the active PPS's
+    /// `tile_offset_len_minus1`, §7.4.3.2). Feed the result to
+    /// [`compute_tile_subset_byte_ranges`] for the eq. (88)/(89)
+    /// per-tile subset ranges of the byte-aligned `slice_data( )`.
+    pub fn parse_entry_points(
+        &self,
+        br: &mut BitReader,
+        tile_index_maps: &TileIndexMaps,
+        num_tile_columns_minus1: u32,
+        num_tiles_in_pic: u32,
+        tile_offset_len_minus1: u32,
+    ) -> Result<Vec<u32>> {
+        if self.single_tile_in_slice_flag {
+            return Ok(Vec::new());
+        }
+        let num_tiles_in_slice =
+            self.num_tiles_in_slice(tile_index_maps, num_tile_columns_minus1, num_tiles_in_pic)?;
+        parse_entry_point_offsets(br, num_tiles_in_slice, tile_offset_len_minus1)
     }
 }
 
@@ -1436,5 +1564,230 @@ mod tests {
             num_tiles_in_slice: 1,
         };
         assert!(compute_slice_tile_indices(0, &maps, 0, 0, &dims).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Round 284 — §7.3.4 entry_point_offset_minus1 + §7.4.5 eq. (88)/(89)
+    // tile-subset byte ranges, and errata-#97 explicit-ID reconciliation
+    // with the eq. (78)-(82) chain.
+    // ------------------------------------------------------------------
+
+    /// The §6.5.1 eq. (32) maps of a 3-column × 2-row picture whose PPS
+    /// signals explicit tile IDs under the errata-#97 reading
+    /// (`tile_id_val[ i ][ j ]`, `i` = column, `j` = row): sparse IDs
+    /// 4 / 8 / 15 / 16 / 23 / 42 in tile-raster order, each tile 2×2
+    /// CTBs (see the matching `pps::tests` round-284 derivation test).
+    fn errata97_explicit_maps() -> TileIndexMaps {
+        TileIndexMaps {
+            tile_id_to_idx: vec![(4, 0), (8, 1), (15, 2), (16, 3), (23, 4), (42, 5)],
+            first_ctb_addr_ts: vec![0, 4, 8, 12, 16, 20],
+        }
+    }
+
+    #[test]
+    fn round284_eq78_eq79_resolve_errata97_explicit_ids() {
+        // Rectangular slice from tile ID 8 (idx 1) to tile ID 42
+        // (idx 5): the 2×2 right rectangle. The slice header signals
+        // tile *IDs*; eq. (78)/(79) operate on tile *indices* via the
+        // eq. (32) set built over the errata-#97 eq. (30) TileId[ ].
+        let maps = errata97_explicit_maps();
+        let dims = compute_slice_tile_dims(8, 42, &maps, 2, 6).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 2);
+        assert_eq!(dims.num_tile_columns_in_slice, 2);
+        let idx = compute_slice_tile_indices(8, &maps, 2, 6, &dims).unwrap();
+        assert_eq!(idx, vec![1, 2, 4, 5]);
+        // Arbitrary slice: first_tile_id 4, deltas [3, 6] → running
+        // sliceTileId 4, 8, 15 (eq. 81) → tile indices 0, 1, 2 (eq. 82).
+        let idx = compute_slice_tile_indices_arbitrary(4, &[3, 6], &maps).unwrap();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn round284_parse_entry_point_offsets_reads_count_minus_one() {
+        // §7.3.4: NumTilesInSlice − 1 elements of
+        // tile_offset_len_minus1 + 1 bits each.
+        let mut e = BitEmitter::new();
+        e.u(8, 9);
+        e.u(8, 19);
+        e.u(8, 29);
+        e.finish_with_trailing_bits();
+        let bytes = e.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let epo = parse_entry_point_offsets(&mut br, 4, 7).unwrap();
+        assert_eq!(epo, vec![9, 19, 29]);
+        assert_eq!(br.bit_position(), 24, "exactly 3 × 8 bits consumed");
+    }
+
+    #[test]
+    fn round284_parse_entry_point_offsets_none_for_single_tile() {
+        // NumTilesInSlice ≤ 1 → the loop body never runs and no bits
+        // are consumed (0 is the defensive saturating case).
+        let bytes = [0xFFu8; 4];
+        for n in [0u32, 1] {
+            let mut br = BitReader::new(&bytes);
+            assert!(parse_entry_point_offsets(&mut br, n, 7).unwrap().is_empty());
+            assert_eq!(br.bit_position(), 0);
+        }
+    }
+
+    #[test]
+    fn round284_parse_entry_point_offsets_rejects_oversize_len() {
+        // §7.4.3.2: tile_offset_len_minus1 shall be in [0, 31].
+        let bytes = [0u8; 16];
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_entry_point_offsets(&mut br, 2, 32).is_err());
+    }
+
+    #[test]
+    fn round284_eq88_eq89_subset_ranges_hand_trace() {
+        // entry_point_offset_minus1 = [9, 19, 29], 64 data bytes:
+        //   subset 0 = bytes 0..=9            → 0..10
+        //   firstByte[1] = 10, lastByte[1] = 10 + 19 = 29 → 10..30
+        //   firstByte[2] = 30, lastByte[2] = 30 + 29 = 59 → 30..60
+        //   subset 3 = remaining bytes        → 60..64
+        let ranges = compute_tile_subset_byte_ranges(&[9, 19, 29], 64).unwrap();
+        assert_eq!(ranges, vec![0..10, 10..30, 30..60, 60..64]);
+        // Single-tile slice: no entry points, one subset = whole data.
+        let ranges = compute_tile_subset_byte_ranges(&[], 7).unwrap();
+        assert_eq!(ranges, vec![0..7]);
+    }
+
+    #[test]
+    fn round284_eq88_eq89_subset_ranges_reject_malformed() {
+        // Subset 0 overruns the data.
+        assert!(compute_tile_subset_byte_ranges(&[20], 5).is_err());
+        // Entry points consume every byte → empty last subset.
+        assert!(compute_tile_subset_byte_ranges(&[4], 5).is_err());
+        // Zero-length slice data cannot carry any tile.
+        assert!(compute_tile_subset_byte_ranges(&[], 0).is_err());
+        // u32::MAX offsets must not wrap the prefix sum.
+        assert!(compute_tile_subset_byte_ranges(&[u32::MAX, u32::MAX], 64).is_err());
+    }
+
+    #[test]
+    fn round284_parser_entry_points_after_rect_multi_tile_header() {
+        // Synthetic bitstream walk: a rectangular multi-tile slice
+        // header over the errata-#97 explicit-ID picture, followed by
+        // the §7.3.4 entry-point loop. first_tile_id 8 / last_tile_id
+        // 42 span 4 tiles (eq. 78), so 3 entry points follow
+        // slice_cr_qp_offset; 8-bit elements (tile_offset_len_minus1 =
+        // 7).
+        let maps = errata97_explicit_maps();
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: false,
+            arbitrary_slice_present_flag: true,
+            tile_id_len_minus1: 5, // 6-bit tile IDs (max ID 42)
+            num_tile_columns_minus1: 2,
+            num_tile_rows_minus1: 1,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // slice_pic_parameter_set_id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(6, 8); // first_tile_id = 8
+        e.u(1, 0); // arbitrary_slice_flag = 0
+        e.u(6, 42); // last_tile_id = 42
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // slice_cb_qp_offset (se: 0)
+        e.ue(0); // slice_cr_qp_offset
+        e.u(8, 9); // entry_point_offset_minus1[0]
+        e.u(8, 19); // entry_point_offset_minus1[1]
+        e.u(8, 29); // entry_point_offset_minus1[2]
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let mut br = BitReader::new(&rbsp);
+        let sh = parse_consume(&mut br, NalUnitType::Idr, &ctx).unwrap();
+        assert_eq!(sh.first_tile_id, 8);
+        assert_eq!(sh.last_tile_id, 42);
+        assert_eq!(sh.num_tiles_in_slice(&maps, 2, 6).unwrap(), 4);
+        assert_eq!(
+            sh.slice_tile_indices(&maps, 2, 6).unwrap(),
+            vec![1, 2, 4, 5]
+        );
+        let epo = sh.parse_entry_points(&mut br, &maps, 2, 6, 7).unwrap();
+        assert_eq!(epo, vec![9, 19, 29]);
+        // eq. (88)/(89) against a notional 64-byte slice_data().
+        let ranges = compute_tile_subset_byte_ranges(&epo, 64).unwrap();
+        assert_eq!(ranges, vec![0..10, 10..30, 30..60, 60..64]);
+    }
+
+    #[test]
+    fn round284_parser_entry_points_arbitrary_slice() {
+        // Arbitrary slice over the same explicit-ID picture: eq. (80)
+        // NumTilesInSlice = minus1 + 2 = 3 → 2 entry points, 4-bit
+        // elements (tile_offset_len_minus1 = 3).
+        let maps = errata97_explicit_maps();
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: false,
+            arbitrary_slice_present_flag: true,
+            tile_id_len_minus1: 5,
+            num_tile_columns_minus1: 2,
+            num_tile_rows_minus1: 1,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(6, 4); // first_tile_id = 4
+        e.u(1, 1); // arbitrary_slice_flag = 1
+        e.ue(1); // num_remaining_tiles_in_slice_minus1 = 1 → 3 tiles
+        e.ue(3); // delta_tile_id_minus1[0] = 3 → sliceTileId 8
+        e.ue(6); // delta_tile_id_minus1[1] = 6 → sliceTileId 15
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // cb offset
+        e.ue(0); // cr offset
+        e.u(4, 5); // entry_point_offset_minus1[0]
+        e.u(4, 8); // entry_point_offset_minus1[1]
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let mut br = BitReader::new(&rbsp);
+        let sh = parse_consume(&mut br, NalUnitType::Idr, &ctx).unwrap();
+        assert_eq!(sh.slice_tile_indices(&maps, 2, 6).unwrap(), vec![0, 1, 2]);
+        let epo = sh.parse_entry_points(&mut br, &maps, 2, 6, 3).unwrap();
+        assert_eq!(epo, vec![5, 8]);
+        let ranges = compute_tile_subset_byte_ranges(&epo, 20).unwrap();
+        assert_eq!(ranges, vec![0..6, 6..15, 15..20]);
+    }
+
+    #[test]
+    fn round284_parse_entry_points_noop_for_single_tile_slice() {
+        // §7.3.4 gate: single_tile_in_slice_flag == 1 slices carry no
+        // entry-point loop — the dispatch reads nothing.
+        let maps = errata97_explicit_maps();
+        let ctx = SliceParseContext {
+            single_tile_in_pic_flag: false,
+            arbitrary_slice_present_flag: true,
+            tile_id_len_minus1: 5,
+            num_tile_columns_minus1: 2,
+            num_tile_rows_minus1: 1,
+            chroma_array_type: 1,
+            ..Default::default()
+        };
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 1); // single_tile_in_slice_flag = 1
+        e.u(6, 15); // first_tile_id = 15
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // cb offset
+        e.ue(0); // cr offset
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let mut br = BitReader::new(&rbsp);
+        let sh = parse_consume(&mut br, NalUnitType::Idr, &ctx).unwrap();
+        let pos = br.bit_position();
+        let epo = sh.parse_entry_points(&mut br, &maps, 2, 6, 7).unwrap();
+        assert!(epo.is_empty());
+        assert_eq!(br.bit_position(), pos, "no bits consumed");
     }
 }

@@ -2186,4 +2186,89 @@ mod tests {
         );
         assert_eq!(maps.first_ctb_addr_ts, vec![0, 4, 8, 12]);
     }
+
+    // ------------------------------------------------------------------
+    // Round 284 — errata-#97 reconciliation with the §7.4.5 eq. (78)-(82)
+    // slice-tile resolution chain.
+    // ------------------------------------------------------------------
+
+    /// A §7.4.3.2-conformant explicit-ID PPS: 6×4 CTB picture, uniform
+    /// 3-column × 2-row grid, sparse IDs 4 / 8 / 15 / 16 / 23 / 42
+    /// strictly increasing along the raster flat index
+    /// `j * (num_tile_columns_minus1 + 1) + i` the section's ordering
+    /// constraint quantifies (errata-#97 reading: `i` = column, `j` =
+    /// row).
+    fn errata97_conformant_pps() -> Pps {
+        let mut pps = pps_with_grid(1, 2);
+        pps.explicit_tile_id_flag = true;
+        pps.tile_id_len_minus1 = 5;
+        pps.tile_id_val = vec![4, 8, 15, 16, 23, 42];
+        pps
+    }
+
+    #[test]
+    fn round284_errata97_conformant_table_maps_raster_order() {
+        // Under the errata-#97 reading a §7.4.3.2-conformant table maps
+        // straight onto tile-scan order: eq. (32)'s set pairs the k-th
+        // raster-flat table element with tileIdx k, and each 2×2-CTB
+        // tile starts 4 tile-scan addresses after the previous one.
+        let pps = errata97_conformant_pps();
+        let maps = pps.tile_index_maps(6, 4);
+        assert_eq!(
+            maps.tile_id_to_idx,
+            vec![(4, 0), (8, 1), (15, 2), (16, 3), (23, 4), (42, 5)]
+        );
+        assert_eq!(maps.first_ctb_addr_ts, vec![0, 4, 8, 12, 16, 20]);
+        // Every CTB of tile k carries the k-th table ID.
+        let tile_id = pps.tile_id(6, 4);
+        let expected: Vec<u32> = (0..24).map(|ts| pps.tile_id_val[ts / 4]).collect();
+        assert_eq!(tile_id, expected);
+    }
+
+    #[test]
+    fn round284_errata97_transposed_reading_diverges() {
+        // The rejected §7.4.3.2 first-sentence reading ("i-th tile row
+        // and j-th tile column") corresponds to flat-packing the same
+        // six IDs column-major. On the non-square 3×2 grid that
+        // produces a different TileId[ ] — pinning that the errata-#97
+        // axis choice is observable, not a relabeling.
+        let row_major = vec![4u32, 8, 15, 16, 23, 42];
+        let column_major = vec![4u32, 16, 8, 23, 15, 42];
+        let correct = build_tile_id(6, 4, 2, 1, Some(&row_major));
+        let transposed = build_tile_id(6, 4, 2, 1, Some(&column_major));
+        assert_ne!(correct, transposed);
+        // And the divergence shows up exactly where the axes disagree:
+        // tileIdx 1 (column 1, row 0) must carry tile_id_val[i=1][j=0]
+        // = 8, not the transposed 16.
+        assert_eq!(correct[4], 8);
+        assert_eq!(transposed[4], 16);
+    }
+
+    #[test]
+    fn round284_errata97_maps_feed_slice_tile_resolution() {
+        // End-to-end reconciliation: the §7.4.5 eq. (78)/(79) walk over
+        // the eq. (32) maps of an explicit-ID (errata #97) PPS resolves
+        // slice-signalled tile IDs to the geometric tile rectangle.
+        use crate::slice_header::{
+            compute_slice_tile_dims, compute_slice_tile_indices,
+            compute_slice_tile_indices_arbitrary,
+        };
+        let pps = errata97_conformant_pps();
+        let maps = pps.tile_index_maps(6, 4);
+        let cols_minus1 = pps.num_tile_columns_minus1;
+        let n_tiles = pps.num_tiles_in_pic();
+        assert_eq!(n_tiles, 6);
+        // Rectangular slice from ID 8 (tile idx 1) to ID 42 (tile idx
+        // 5): the right 2×2 rectangle, walked row-major.
+        let dims = compute_slice_tile_dims(8, 42, &maps, cols_minus1, n_tiles).unwrap();
+        assert_eq!(dims.num_tiles_in_slice, 4);
+        let idx = compute_slice_tile_indices(8, &maps, cols_minus1, n_tiles, &dims).unwrap();
+        assert_eq!(idx, vec![1, 2, 4, 5]);
+        // Arbitrary slice: eq. (81) running IDs 4 → 8 → 15 resolve via
+        // eq. (82) to tile indices 0, 1, 2.
+        let idx = compute_slice_tile_indices_arbitrary(4, &[3, 6], &maps).unwrap();
+        assert_eq!(idx, vec![0, 1, 2]);
+        // A tile ID that names no picture tile is the eq. (82) error.
+        assert!(compute_slice_tile_indices_arbitrary(4, &[0], &maps).is_err());
+    }
 }

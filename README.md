@@ -7,6 +7,83 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-284 status
+
+Round 284 consumes the staged errata file head-on and completes the
+slice-header syntax tail the tile chain unblocks.
+
+**Errata check.** `docs/video/evc/evc-errata-and-clarifications.md`
+still carries only entry **#97** (the §6.5.1 eq. (30) vs §7.4.3.2
+`tile_id_val[ i ][ j ]` axis swap — `i` is the **column** index, `j`
+the **row** index). Rounds 273/278 already implemented that reading;
+this round *reconciles* it against round-281's §7.4.5 eq. (78)-(82)
+slice-tile resolution with end-to-end pins:
+
+* a §7.4.3.2-conformant explicit-ID PPS (sparse IDs 4/8/15/16/23/42,
+  strictly increasing along the raster flat index `j * cols + i` the
+  section's own ordering constraint quantifies) drives eq. (30) →
+  eq. (32) → eq. (78)/(79) (rectangular) and eq. (81)/(82)
+  (arbitrary) — slice-signalled tile *IDs* resolve to the geometric
+  tile-index rectangle;
+* a transposition guard pins that the rejected first-sentence reading
+  (column-major flat-packing of the same six IDs) produces a
+  *different* `TileId[ ]` on the non-square 3×2 grid — the errata
+  choice is observable, not a relabeling.
+
+**§8.9.8 `tableNum == 0` (eq. 1398-1409).** The staged errata file has
+**no** §8.9.8 entry (docs task #1278 stands): the page-308 sentence
+"qpDraFrac is set equal to 0, and … qpDraInt is decreased by 1" never
+says how `qpDraFracAdj` / `draChromaQpShift` (printed inside the
+"otherwise" arm) are obtained in that branch. Three new tests pin the
+documented in-tree reading via its closed form (`qpDraFracAdj = 0`
+makes eq. 1418 add exactly `(1 << 8) >> 9 = 0`, so `chromaScale =
+(scaleDra * QpScale[Clip3(0, 24, draChromaQpShift + 12)] + (1 << 17))
+>> 18` with `qpDraInt = 2 * IndexScaleQP − 61`), at the `ScaleQP`
+knots 724 and 1448 for both chroma components, plus a branch-seam
+continuity check one `scaleDraNorm` step past the knot. If a future
+erratum lands a different derivation, these are the tests to flip.
+
+**New surface — §7.3.4 entry points + §7.4.5 eq. (88)/(89)** (the
+slice-header tail that consumes `NumTilesInSlice`):
+
+* `slice_header::parse_entry_point_offsets` — the
+  `entry_point_offset_minus1[ i ]` loop (`NumTilesInSlice − 1`
+  elements of `tile_offset_len_minus1 + 1` bits;
+  `tile_offset_len_minus1 > 31` rejected per §7.4.3.2).
+* `slice_header::compute_tile_subset_byte_ranges` — eq. (88)/(89):
+  the per-tile subset byte ranges of the coded slice data, half-open,
+  `u64` prefix sum (no 32-bit wrap), overrun / empty-last-subset /
+  zero-length-data rejected.
+* `SliceHeader::parse_entry_points` — dispatch off the reader
+  `parse_consume` leaves past `slice_cr_qp_offset`; no-op for
+  single-tile slices.
+
+### Tests
+
+15 new unit tests (655 total; was 640): the two errata-#97
+reconciliation pins + the conformant-table raster-order map pin;
+rectangular + arbitrary synthetic bitstream walks (header →
+entry points → eq. (88)/(89) ranges); entry-point loop count /
+no-bits-for-single-tile / oversize-length pins; eq. (88)/(89)
+hand-trace + four malformed rejections; the three §8.9.8
+`tableNum == 0` closed-form / seam pins.
+
+### Next arc
+
+Unchanged from round 281: `SliceTileIdx[ ]` + `FirstCtbAddrTs[ ]` /
+`NumCtusInTile[ ]` — now joined by the eq. (88)/(89) subset ranges —
+are exactly the inputs of the §7.3.8.1 `slice_data( )` tile walk;
+wiring the slice walker to them (multi-tile decode) is the natural
+consumer round.
+
+### Disclaimer
+
+`parse_entry_point_offsets` / `compute_tile_subset_byte_ranges` /
+`SliceHeader::parse_entry_points` are derived from ISO/IEC
+23094-1:2020 §7.3.4, §7.4.3.2 and §7.4.5 eq. (88)/(89); the test
+pins from §6.5.1 eq. (30)/(32), §7.4.5 eq. (78)-(82), §8.9.8 and the
+in-repo errata file entry #97. All truth came from `docs/video/evc/`.
+
 ## Round-281 status
 
 Round 281 lands the **§7.4.5 slice-tile resolution** — eq. (78)-(82),
