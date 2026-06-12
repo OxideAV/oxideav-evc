@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### Round 281 — §7.4.5 eq. (78)-(82) slice-tile resolution over `TileIdToIdx[ ]`
+
+#### Added
+- `slice_header::SliceTileDims` — the §7.4.5 eq. (78) outputs
+  `numTileRowsInSlice` / `numTileColumnsInSlice` / `NumTilesInSlice`
+  for a rectangular (`arbitrary_slice_flag == 0`) slice.
+- `slice_header::compute_slice_tile_dims(first_tile_id, last_tile_id,
+  tile_index_maps, num_tile_columns_minus1, num_tiles_in_pic)` —
+  §7.4.5 eq. (78) verbatim, including both wrap arms (bottom edge:
+  `lastTileIdx < firstTileIdx` adds `NumTilesInPic`; right edge:
+  `firstTileColumnIdx > lastTileColumnIdx` adds one tile row).
+  `deltaTileIdx` is carried in `i64` because the row-wrap path makes
+  it transiently negative. Tile IDs that name no picture tile error.
+- `slice_header::compute_slice_tile_indices(...)` — §7.4.5 eq. (79):
+  the `SliceTileIdx[ cIdx ]` walk, with the row-loop-head
+  `tileIdx % NumTilesInPic` bottom wrap and the inner-row
+  `currTileIdx − (num_tile_columns_minus1 + 1)` right wrap.
+- `slice_header::compute_num_tiles_in_slice_arbitrary(...)` —
+  §7.4.5 eq. (80) (`num_remaining_tiles_in_slice_minus1 + 2`).
+- `slice_header::compute_slice_tile_indices_arbitrary(first_tile_id,
+  delta_tile_id_minus1, tile_index_maps)` — §7.4.5 eq. (81)/(82): the
+  running `sliceTileId[ i ]` chain resolved through
+  `TileIdToIdx[ ]`. (The printed eq. (82) reads "liceTileIdx" — a
+  dropped leading character of `SliceTileIdx`.)
+- `SliceHeader::num_tiles_in_slice` / `SliceHeader::slice_tile_indices`
+  — instance dispatch selecting the rectangular (eq. 78+79) or
+  arbitrary (eq. 80-82) derivation from the parsed header, consuming
+  `pps::TileIndexMaps` (round-278 §6.5.1 eq. 32) + `NumTilesInPic`.
+- `SliceHeader::delta_tile_id_minus1` — the §7.4.5
+  `delta_tile_id_minus1[ i ]` list is now surfaced (previously parsed
+  and discarded).
+
+#### Fixed
+- **Arbitrary-slice header mis-parse:** the §7.3.4 delta loop runs
+  `i < NumTilesInSlice − 1` with `NumTilesInSlice =
+  num_remaining_tiles_in_slice_minus1 + 2` (eq. 80) — i.e.
+  `minus1 + 1` entries. The parser previously read only `minus1`
+  deltas, shifting every field after the tile block by one ue(v) for
+  any `arbitrary_slice_flag == 1` slice.
+- `last_tile_id` is now inferred equal to `first_tile_id` when not
+  present (§7.4.5), instead of defaulting to 0 — single-tile and
+  arbitrary slices previously surfaced a bogus `last_tile_id = 0`.
+- `num_remaining_tiles_in_slice_minus1` is now bounded by
+  `NumTilesInPic − 1` per §7.4.5 (rejects malformed headers instead
+  of reserving unbounded memory).
+
 ### Round 278 — §6.5.1 eq. (32) `TileIdToIdx[ ]` + `FirstCtbAddrTs[ ]` + luma-sample tile extents (§6.5.1 complete)
 
 #### Added

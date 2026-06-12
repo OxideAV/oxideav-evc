@@ -7,6 +7,95 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-281 status
+
+Round 281 lands the **§7.4.5 slice-tile resolution** — eq. (78)-(82),
+the slice-header derivations that consume round-278's §6.5.1 eq. (32)
+`TileIdToIdx[ ]` — and fixes two slice-header parser defects found
+while grounding them.
+
+The docs collaborator's staged errata file
+(`docs/video/evc/evc-errata-and-clarifications.md`) was re-checked
+this round: it carries only entry #97 (the §6.5.1 eq. 30 vs §7.4.3.2
+`tile_id_val` index swap), which rounds 273/278 already consumed. The
+§8.9.8 eq. 1398-1409 `tableNum == 0` `draChromaQpShift` ambiguity
+(docs task #1278) is **still unaddressed** by any staged erratum and
+remains the crate's standing docs gap.
+
+New surface (all in `slice_header`):
+
+* `SliceTileDims` — eq. (78)'s `numTileRowsInSlice` /
+  `numTileColumnsInSlice` / `NumTilesInSlice` triple.
+* `compute_slice_tile_dims` — eq. (78) verbatim, including both wrap
+  arms: `lastTileIdx < firstTileIdx` wraps the slice rectangle around
+  the bottom picture edge (`+= NumTilesInPic`), and
+  `firstTileColumnIdx > lastTileColumnIdx` wraps it around the right
+  edge (`+= num_tile_columns_minus1 + 1`); the row-wrap path makes
+  `deltaTileIdx` transiently negative, so it is carried in `i64`.
+* `compute_slice_tile_indices` — eq. (79), the rectangular
+  `SliceTileIdx[ cIdx ]` walk (`tileIdx % NumTilesInPic` bottom wrap
+  at each row-loop head; `currTileIdx − cols` right wrap when the
+  inner walk crosses a tile-row boundary).
+* `compute_num_tiles_in_slice_arbitrary` — eq. (80).
+* `compute_slice_tile_indices_arbitrary` — eq. (81)/(82), the running
+  `sliceTileId[ i ]` chain resolved through `TileIdToIdx[ ]`. The
+  printed eq. (82) reads "liceTileIdx" — a dropped leading character
+  of `SliceTileIdx`, the variable the surrounding prose introduces;
+  no erratum needed.
+* `SliceHeader::num_tiles_in_slice` / `SliceHeader::slice_tile_indices`
+  — dispatch by `arbitrary_slice_flag`, taking the active PPS's
+  `TileIndexMaps` + `NumTilesInPic`.
+* `SliceHeader::delta_tile_id_minus1` — the §7.4.5 delta list is now
+  surfaced (previously parsed and discarded).
+
+### Parser fixes (same commit)
+
+* **Arbitrary-slice delta-loop count.** §7.3.4 runs the delta loop
+  `i < NumTilesInSlice − 1` times, and eq. (80) makes that
+  `num_remaining_tiles_in_slice_minus1 + 1` — the parser read only
+  `minus1` deltas, shifting every following field by one ue(v) on any
+  `arbitrary_slice_flag == 1` slice. Pinned by a parse test asserting
+  both deltas and the realigned trailing fields.
+* **`last_tile_id` inference.** §7.4.5: "When not present, the value
+  of last_tile_id is inferred to be equal to first_tile_id." The
+  parser previously left it 0 for single-tile and arbitrary slices.
+* `num_remaining_tiles_in_slice_minus1` is now bounded by
+  `NumTilesInPic − 1` per §7.4.5.
+
+### Tests
+
+20 new unit tests (640 total; was 620): eq. (78) single-tile /
+full-picture / sub-rectangle / row-wrap / column-wrap / unknown-ID
+pins; eq. (79) identity + sub-rectangle + both wrap hand-traces + an
+exhaustive (first, last) sweep pinning count-vs-eq.(78), walk start,
+in-picture bounds and (for in-grid rectangles) distinctness; eq. (80)
+pin; eq. (81)/(82) explicit-ID resolution + unknown-ID errors; the
+two parser-fix pins + the bound rejection; rectangular + arbitrary
+dispatch agreement; a zero-tiles defensive case.
+
+### Wiring stance
+
+Same opt-in posture as the round-218 onward helper rollout: pure
+functions + dispatch methods, no behaviour change to existing decoder
+paths (no current caller consumed `delta_tile_id_minus1` or
+`last_tile_id` on the affected paths).
+
+### Next arc
+
+`SliceTileIdx[ ]` + round-278's `FirstCtbAddrTs[ ]` /
+`NumCtusInTile[ ]` are exactly the inputs of the §7.3.8.1
+`slice_data( )` tile walk (`ctbAddrInTs =
+FirstCtbAddrTs[ SliceTileIdx[ i ] ]`, line-2596 loop) — wiring the
+slice walker to them is the natural consumer round.
+
+### Disclaimer
+
+`SliceTileDims` / `compute_slice_tile_dims` /
+`compute_slice_tile_indices` / `compute_num_tiles_in_slice_arbitrary`
+/ `compute_slice_tile_indices_arbitrary` (and the `SliceHeader`
+dispatch methods) are derived from ISO/IEC 23094-1:2020 §7.3.4 and
+§7.4.5 eq. (78)-(82). All truth came from `docs/video/evc/`.
+
 ## Round-278 status
 
 Round 278 lands §6.5.1 eq. (32) — the **`TileIdToIdx[ ]` set and the

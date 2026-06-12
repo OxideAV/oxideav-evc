@@ -14,6 +14,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::nal::NalUnitType;
+use crate::pps::TileIndexMaps;
 use crate::rpl::{parse_ref_pic_list_struct, RefPicListStruct};
 
 /// Slice type values from §7.4.5 Table 8.
@@ -84,6 +85,12 @@ pub struct SliceHeader {
     pub last_tile_id: u32,
     pub arbitrary_slice_flag: bool,
     pub num_remaining_tiles_in_slice_minus1: u32,
+    /// `delta_tile_id_minus1[ i ]` (§7.4.5) — the per-tile ID deltas of
+    /// an `arbitrary_slice_flag == 1` slice. Length `NumTilesInSlice − 1`
+    /// (= `num_remaining_tiles_in_slice_minus1 + 1` by eq. 80); empty for
+    /// rectangular slices. Feeds the eq. (81)/(82) `SliceTileIdx[ ]`
+    /// derivation.
+    pub delta_tile_id_minus1: Vec<u32>,
     pub slice_type: SliceType,
     pub no_output_of_prior_pics_flag: bool,
     pub mmvd_group_enable_flag: bool,
@@ -188,9 +195,10 @@ fn parse_from_bitreader(
 
     let mut single_tile_in_slice_flag = true;
     let mut first_tile_id = 0;
-    let mut last_tile_id = 0;
+    let mut last_tile_id = None;
     let mut arbitrary_slice_flag = false;
     let mut num_remaining_tiles_in_slice_minus1 = 0;
+    let mut delta_tile_id_minus1 = Vec::new();
     let id_bits = ctx.tile_id_len_minus1 + 1;
     if !ctx.single_tile_in_pic_flag {
         single_tile_in_slice_flag = br.u1()? != 0;
@@ -201,16 +209,33 @@ fn parse_from_bitreader(
             arbitrary_slice_flag = br.u1()? != 0;
         }
         if !arbitrary_slice_flag {
-            last_tile_id = br.u(id_bits)?;
+            last_tile_id = Some(br.u(id_bits)?);
         } else {
             num_remaining_tiles_in_slice_minus1 = br.ue()?;
-            // Skip the delta tile-id loop: round-1 has no need to materialise
-            // it, but we still consume the bits so trailing fields parse.
-            for _ in 0..num_remaining_tiles_in_slice_minus1 {
-                let _delta = br.ue()?;
+            // §7.4.5: num_remaining_tiles_in_slice_minus1 shall be in the
+            // range 0 to NumTilesInPic − 1, inclusive.
+            let num_tiles_in_pic =
+                (ctx.num_tile_columns_minus1 + 1) * (ctx.num_tile_rows_minus1 + 1);
+            if num_remaining_tiles_in_slice_minus1 > num_tiles_in_pic.saturating_sub(1) {
+                return Err(Error::invalid(format!(
+                    "evc slice: num_remaining_tiles_in_slice_minus1 \
+                     {num_remaining_tiles_in_slice_minus1} > NumTilesInPic - 1 \
+                     ({num_tiles_in_pic} tiles, §7.4.5)"
+                )));
+            }
+            // §7.3.4: the loop runs i < NumTilesInSlice − 1, with
+            // NumTilesInSlice = num_remaining_tiles_in_slice_minus1 + 2
+            // (eq. 80) — i.e. minus1 + 1 entries.
+            let num_deltas = num_remaining_tiles_in_slice_minus1 + 1;
+            delta_tile_id_minus1.reserve_exact(num_deltas as usize);
+            for _ in 0..num_deltas {
+                delta_tile_id_minus1.push(br.ue()?);
             }
         }
     }
+    // §7.4.5: when not present, last_tile_id is inferred equal to
+    // first_tile_id (single-tile slices and arbitrary slices).
+    let last_tile_id = last_tile_id.unwrap_or(first_tile_id);
 
     let slice_type_raw = br.ue()?;
     let slice_type = SliceType::from_u32(slice_type_raw)?;
@@ -421,6 +446,7 @@ fn parse_from_bitreader(
         last_tile_id,
         arbitrary_slice_flag,
         num_remaining_tiles_in_slice_minus1,
+        delta_tile_id_minus1,
         slice_type,
         no_output_of_prior_pics_flag,
         mmvd_group_enable_flag,
@@ -457,6 +483,255 @@ fn ceil_log2(n: u32) -> u32 {
         0
     } else {
         32 - (n - 1).leading_zeros()
+    }
+}
+
+/// §7.4.5 eq. (78) outputs — the per-slice tile-grid dimensions of an
+/// `arbitrary_slice_flag == 0` (rectangular) slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SliceTileDims {
+    /// `numTileRowsInSlice`.
+    pub num_tile_rows_in_slice: u32,
+    /// `numTileColumnsInSlice`.
+    pub num_tile_columns_in_slice: u32,
+    /// `NumTilesInSlice = numTileRowsInSlice * numTileColumnsInSlice`.
+    pub num_tiles_in_slice: u32,
+}
+
+/// The `TileIdToIdx[ tileId ]` lookup with the §7.4.5 well-formedness
+/// expectation surfaced as an error: every slice-signalled tile ID must
+/// name a tile of the picture.
+fn tile_idx_for_id_checked(maps: &TileIndexMaps, tile_id: u32, role: &str) -> Result<u32> {
+    maps.tile_idx_for_id(tile_id).ok_or_else(|| {
+        Error::invalid(format!(
+            "evc slice: {role} {tile_id} names no tile in the picture (§7.4.5 TileIdToIdx)"
+        ))
+    })
+}
+
+/// §7.4.5 eq. (78) — `numTileRowsInSlice` / `numTileColumnsInSlice` /
+/// `NumTilesInSlice` for an `arbitrary_slice_flag == 0` slice.
+///
+/// ```text
+/// firstTileIdx = TileIdToIdx[ first_tile_id ]
+/// firstTileColumnIdx = firstTileIdx % ( num_tile_columns_minus1 + 1 )
+/// lastTileIdx = TileIdToIdx[ last_tile_id ]
+/// lastTileColumnIdx = lastTileIdx % ( num_tile_columns_minus1 + 1 )
+/// deltaTileIdx = lastTileIdx − firstTileIdx
+/// if( lastTileIdx < firstTileIdx ) {
+///     if( firstTileColumnIdx > lastTileColumnIdx )
+///         deltaTileIdx += NumTilesInPic + num_tile_columns_minus1 + 1
+///     else
+///         deltaTileIdx += NumTilesInPic                                (78)
+/// } else if( firstTileColumnIdx > lastTileColumnIdx )
+///     deltaTileIdx += num_tile_columns_minus1 + 1
+/// numTileRowsInSlice = ( deltaTileIdx / ( num_tile_columns_minus1 + 1 ) ) + 1
+/// numTileColumnsInSlice = ( deltaTileIdx % ( num_tile_columns_minus1 + 1 ) ) + 1
+/// NumTilesInSlice = numTileRowsInSlice * numTileColumnsInSlice
+/// ```
+///
+/// The two `+=` arms wrap the slice's tile rectangle around the bottom
+/// (`lastTileIdx < firstTileIdx`) and/or right (`firstTileColumnIdx >
+/// lastTileColumnIdx`) picture edges. `deltaTileIdx` is carried in `i64`
+/// because it is transiently negative on the row-wrap path.
+pub fn compute_slice_tile_dims(
+    first_tile_id: u32,
+    last_tile_id: u32,
+    tile_index_maps: &TileIndexMaps,
+    num_tile_columns_minus1: u32,
+    num_tiles_in_pic: u32,
+) -> Result<SliceTileDims> {
+    let cols = i64::from(num_tile_columns_minus1) + 1;
+    let first_tile_idx = i64::from(tile_idx_for_id_checked(
+        tile_index_maps,
+        first_tile_id,
+        "first_tile_id",
+    )?);
+    let first_tile_column_idx = first_tile_idx % cols;
+    let last_tile_idx = i64::from(tile_idx_for_id_checked(
+        tile_index_maps,
+        last_tile_id,
+        "last_tile_id",
+    )?);
+    let last_tile_column_idx = last_tile_idx % cols;
+
+    let mut delta_tile_idx = last_tile_idx - first_tile_idx;
+    if last_tile_idx < first_tile_idx {
+        if first_tile_column_idx > last_tile_column_idx {
+            delta_tile_idx += i64::from(num_tiles_in_pic) + cols;
+        } else {
+            delta_tile_idx += i64::from(num_tiles_in_pic);
+        }
+    } else if first_tile_column_idx > last_tile_column_idx {
+        delta_tile_idx += cols;
+    }
+
+    let num_tile_rows_in_slice = (delta_tile_idx / cols + 1) as u32;
+    let num_tile_columns_in_slice = (delta_tile_idx % cols + 1) as u32;
+    Ok(SliceTileDims {
+        num_tile_rows_in_slice,
+        num_tile_columns_in_slice,
+        num_tiles_in_slice: num_tile_rows_in_slice * num_tile_columns_in_slice,
+    })
+}
+
+/// §7.4.5 eq. (79) — `SliceTileIdx[ i ]`, the tile index of the i-th
+/// tile of an `arbitrary_slice_flag == 0` slice, in slice-tile order.
+///
+/// ```text
+/// tileIdx = TileIdToIdx[ first_tile_id ]
+/// for( j = 0, cIdx = 0; j < numTileRowsInSlice; j++, tileIdx += num_tile_columns_minus1 + 1 ) {
+///     tileIdx = tileIdx % NumTilesInPic
+///     for( i = 0, currTileIdx = tileIdx; i < numTileColumnsInSlice; i++, currTileIdx++, cIdx++ ) {
+///         if( currTileIdx / ( num_tile_columns_minus1 + 1 ) >
+///                            tileIdx / ( num_tile_columns_minus1 + 1 ) )      (79)
+///             SliceTileIdx[ cIdx ] = currTileIdx − ( num_tile_columns_minus1 + 1 )
+///         else
+///             SliceTileIdx[ cIdx ] = currTileIdx
+///     }
+/// }
+/// ```
+///
+/// The `tileIdx % NumTilesInPic` at each row-loop head realises the
+/// bottom-edge wrap; the inner-row branch (`currTileIdx` crossing into
+/// the next tile row) realises the right-edge wrap by stepping back one
+/// full row of tiles. The subtraction never underflows: the branch is
+/// only taken when `currTileIdx` is at least one full row past zero.
+pub fn compute_slice_tile_indices(
+    first_tile_id: u32,
+    tile_index_maps: &TileIndexMaps,
+    num_tile_columns_minus1: u32,
+    num_tiles_in_pic: u32,
+    dims: &SliceTileDims,
+) -> Result<Vec<u32>> {
+    if num_tiles_in_pic == 0 {
+        return Err(Error::invalid(
+            "evc slice: NumTilesInPic == 0 in SliceTileIdx derivation (§7.4.5 eq. 79)",
+        ));
+    }
+    let cols = num_tile_columns_minus1 + 1;
+    let mut tile_idx = tile_idx_for_id_checked(tile_index_maps, first_tile_id, "first_tile_id")?;
+    let mut slice_tile_idx = Vec::with_capacity(dims.num_tiles_in_slice as usize);
+    for _j in 0..dims.num_tile_rows_in_slice {
+        tile_idx %= num_tiles_in_pic;
+        // eq. (79) inner loop: currTileIdx runs from tileIdx for
+        // numTileColumnsInSlice steps.
+        for i in 0..dims.num_tile_columns_in_slice {
+            let curr_tile_idx = tile_idx + i;
+            if curr_tile_idx / cols > tile_idx / cols {
+                slice_tile_idx.push(curr_tile_idx - cols);
+            } else {
+                slice_tile_idx.push(curr_tile_idx);
+            }
+        }
+        tile_idx += cols;
+    }
+    Ok(slice_tile_idx)
+}
+
+/// §7.4.5 eq. (80) — `NumTilesInSlice` for an `arbitrary_slice_flag == 1`
+/// slice: `num_remaining_tiles_in_slice_minus1 + 2`.
+pub fn compute_num_tiles_in_slice_arbitrary(num_remaining_tiles_in_slice_minus1: u32) -> u32 {
+    num_remaining_tiles_in_slice_minus1.saturating_add(2)
+}
+
+/// §7.4.5 eq. (81) / (82) — `SliceTileIdx[ i ]` for an
+/// `arbitrary_slice_flag == 1` slice.
+///
+/// ```text
+/// sliceTileId[ i ] = i > 0 ? ( sliceTileId[ i − 1 ] + delta_tile_id_minus1[ i − 1 ] + 1 )
+///                          : first_tile_id                                    (81)
+/// SliceTileIdx[ i ] = TileIdToIdx[ sliceTileId[ i ] ]                         (82)
+/// ```
+///
+/// `i` ranges over `0 ..= NumTilesInSlice − 1`, so the output carries
+/// `delta_tile_id_minus1.len() + 1` entries. (The printed eq. (82) reads
+/// "liceTileIdx" — a dropped leading character of `SliceTileIdx`, the
+/// variable eq. (81)'s prose sentence introduces.) The running tile ID
+/// uses saturating adds; a malformed delta that pushes the ID past every
+/// picture tile surfaces as the eq. (82) lookup error.
+pub fn compute_slice_tile_indices_arbitrary(
+    first_tile_id: u32,
+    delta_tile_id_minus1: &[u32],
+    tile_index_maps: &TileIndexMaps,
+) -> Result<Vec<u32>> {
+    let mut slice_tile_id = first_tile_id;
+    let mut slice_tile_idx = Vec::with_capacity(delta_tile_id_minus1.len() + 1);
+    slice_tile_idx.push(tile_idx_for_id_checked(
+        tile_index_maps,
+        slice_tile_id,
+        "first_tile_id",
+    )?);
+    for &delta in delta_tile_id_minus1 {
+        slice_tile_id = slice_tile_id.saturating_add(delta).saturating_add(1);
+        slice_tile_idx.push(tile_idx_for_id_checked(
+            tile_index_maps,
+            slice_tile_id,
+            "sliceTileId",
+        )?);
+    }
+    Ok(slice_tile_idx)
+}
+
+impl SliceHeader {
+    /// `NumTilesInSlice` (§7.4.5) — eq. (78) product for rectangular
+    /// slices (covering the single-tile case via the `last_tile_id =
+    /// first_tile_id` inference), eq. (80) for arbitrary slices.
+    pub fn num_tiles_in_slice(
+        &self,
+        tile_index_maps: &TileIndexMaps,
+        num_tile_columns_minus1: u32,
+        num_tiles_in_pic: u32,
+    ) -> Result<u32> {
+        if self.arbitrary_slice_flag {
+            Ok(compute_num_tiles_in_slice_arbitrary(
+                self.num_remaining_tiles_in_slice_minus1,
+            ))
+        } else {
+            Ok(compute_slice_tile_dims(
+                self.first_tile_id,
+                self.last_tile_id,
+                tile_index_maps,
+                num_tile_columns_minus1,
+                num_tiles_in_pic,
+            )?
+            .num_tiles_in_slice)
+        }
+    }
+
+    /// `SliceTileIdx[ i ]` (§7.4.5) — eq. (78)+(79) for rectangular
+    /// slices, eq. (81)+(82) for arbitrary slices. `tile_index_maps` is
+    /// the active PPS's §6.5.1 eq. (32) output
+    /// ([`crate::pps::Pps::tile_index_maps`]); `num_tiles_in_pic` is
+    /// `NumTilesInPic` ([`crate::pps::Pps::num_tiles_in_pic`]).
+    pub fn slice_tile_indices(
+        &self,
+        tile_index_maps: &TileIndexMaps,
+        num_tile_columns_minus1: u32,
+        num_tiles_in_pic: u32,
+    ) -> Result<Vec<u32>> {
+        if self.arbitrary_slice_flag {
+            compute_slice_tile_indices_arbitrary(
+                self.first_tile_id,
+                &self.delta_tile_id_minus1,
+                tile_index_maps,
+            )
+        } else {
+            let dims = compute_slice_tile_dims(
+                self.first_tile_id,
+                self.last_tile_id,
+                tile_index_maps,
+                num_tile_columns_minus1,
+                num_tiles_in_pic,
+            )?;
+            compute_slice_tile_indices(
+                self.first_tile_id,
+                tile_index_maps,
+                num_tile_columns_minus1,
+                num_tiles_in_pic,
+                &dims,
+            )
+        }
     }
 }
 
@@ -842,5 +1117,324 @@ mod tests {
         e.finish_with_trailing_bits();
         let rbsp = e.into_bytes();
         assert!(parse(&rbsp, NalUnitType::Idr, &idr_ctx()).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Round 281 — §7.4.5 eq. (78)-(82) slice-tile resolution over the
+    // §6.5.1 eq. (32) TileIdToIdx map.
+    // ------------------------------------------------------------------
+
+    /// An implicit-tile-ID picture (`explicit_tile_id_flag == 0`): the
+    /// eq. (30) implicit branch makes `TileId[ ] == tileIdx`, so the
+    /// eq. (32) set is the identity over `0 .. num_tiles`.
+    fn implicit_id_maps(num_tiles: u32) -> TileIndexMaps {
+        TileIndexMaps {
+            tile_id_to_idx: (0..num_tiles).map(|k| (k, k)).collect(),
+            // FirstCtbAddrTs is irrelevant to eq. (78)-(82); a 1-CTB-per-
+            // tile placeholder keeps the struct well-formed.
+            first_ctb_addr_ts: (0..num_tiles).collect(),
+        }
+    }
+
+    #[test]
+    fn round281_eq78_single_tile_slice_is_one_by_one() {
+        // last_tile_id inferred equal to first_tile_id → deltaTileIdx = 0.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(2, 2, &maps, 2, 6).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 1);
+        assert_eq!(dims.num_tile_columns_in_slice, 1);
+        assert_eq!(dims.num_tiles_in_slice, 1);
+    }
+
+    #[test]
+    fn round281_eq78_full_picture_2x2() {
+        let maps = implicit_id_maps(4);
+        let dims = compute_slice_tile_dims(0, 3, &maps, 1, 4).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 2);
+        assert_eq!(dims.num_tile_columns_in_slice, 2);
+        assert_eq!(dims.num_tiles_in_slice, 4);
+    }
+
+    #[test]
+    fn round281_eq78_sub_rectangle_3x2() {
+        // 3-column × 2-row grid, slice from tileIdx 1 to tileIdx 5:
+        // deltaTileIdx = 4 (no wrap arm taken) → 2 rows × 2 columns.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(1, 5, &maps, 2, 6).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 2);
+        assert_eq!(dims.num_tile_columns_in_slice, 2);
+        assert_eq!(dims.num_tiles_in_slice, 4);
+    }
+
+    #[test]
+    fn round281_eq78_row_wrap_adds_num_tiles_in_pic() {
+        // lastTileIdx (1) < firstTileIdx (4), equal column indices:
+        // deltaTileIdx = 1 − 4 + 6 = 3 → 2 rows × 1 column. Pins the
+        // bottom-edge wrap arm (the transiently-negative i64 path).
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(4, 1, &maps, 2, 6).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 2);
+        assert_eq!(dims.num_tile_columns_in_slice, 1);
+        assert_eq!(dims.num_tiles_in_slice, 2);
+    }
+
+    #[test]
+    fn round281_eq78_column_wrap_adds_one_tile_row() {
+        // firstTileColumnIdx (1) > lastTileColumnIdx (0) with
+        // lastTileIdx ≥ firstTileIdx: deltaTileIdx = 2 + 3 = 5 →
+        // 2 rows × 3 columns. Pins the right-edge wrap arm.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(1, 3, &maps, 2, 6).unwrap();
+        assert_eq!(dims.num_tile_rows_in_slice, 2);
+        assert_eq!(dims.num_tile_columns_in_slice, 3);
+        assert_eq!(dims.num_tiles_in_slice, 6);
+    }
+
+    #[test]
+    fn round281_eq78_unknown_tile_id_errors() {
+        let maps = implicit_id_maps(4);
+        assert!(compute_slice_tile_dims(9, 0, &maps, 1, 4).is_err());
+        assert!(compute_slice_tile_dims(0, 9, &maps, 1, 4).is_err());
+    }
+
+    #[test]
+    fn round281_eq79_full_picture_2x2_identity() {
+        let maps = implicit_id_maps(4);
+        let dims = compute_slice_tile_dims(0, 3, &maps, 1, 4).unwrap();
+        let idx = compute_slice_tile_indices(0, &maps, 1, 4, &dims).unwrap();
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn round281_eq79_sub_rectangle_3x2() {
+        // 2×2 slice rectangle anchored at tileIdx 1 in a 3-column grid:
+        // row 0 covers tiles 1, 2; row 1 covers tiles 4, 5.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(1, 5, &maps, 2, 6).unwrap();
+        let idx = compute_slice_tile_indices(1, &maps, 2, 6, &dims).unwrap();
+        assert_eq!(idx, vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn round281_eq79_column_wrap_steps_back_one_row() {
+        // The right-edge wrap of round281_eq78_column_wrap_adds_one_tile_row:
+        // when currTileIdx crosses into the next tile row, eq. (79)
+        // steps it back by one full row (− 3), wrapping the slice's
+        // columns around the right picture edge.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(1, 3, &maps, 2, 6).unwrap();
+        let idx = compute_slice_tile_indices(1, &maps, 2, 6, &dims).unwrap();
+        assert_eq!(idx, vec![1, 2, 0, 4, 5, 3]);
+    }
+
+    #[test]
+    fn round281_eq79_row_wrap_mods_into_picture() {
+        // The bottom-edge wrap of round281_eq78_row_wrap…: the second
+        // row's tileIdx (4 + 3 = 7) is reduced mod NumTilesInPic to 1.
+        let maps = implicit_id_maps(6);
+        let dims = compute_slice_tile_dims(4, 1, &maps, 2, 6).unwrap();
+        let idx = compute_slice_tile_indices(4, &maps, 2, 6, &dims).unwrap();
+        assert_eq!(idx, vec![4, 1]);
+    }
+
+    #[test]
+    fn round281_eq79_count_matches_eq78_and_values_are_in_pic() {
+        // Sweep every (first, last) pair on the 3×2 implicit grid: the
+        // eq. (79) list always carries NumTilesInSlice tile indices
+        // inside the picture, starting at firstTileIdx. Distinctness is
+        // additionally pinned for every pair whose eq. (78) rectangle
+        // fits the tile grid (a double-edge wrap pair like first = 2,
+        // last = 0 derives 3 slice rows in the 2-row picture — a
+        // non-conformant slice whose walk necessarily revisits tiles).
+        let maps = implicit_id_maps(6);
+        for first in 0..6u32 {
+            for last in 0..6u32 {
+                let dims = compute_slice_tile_dims(first, last, &maps, 2, 6).unwrap();
+                let idx = compute_slice_tile_indices(first, &maps, 2, 6, &dims).unwrap();
+                assert_eq!(idx.len() as u32, dims.num_tiles_in_slice);
+                assert_eq!(idx[0], first, "slice walk starts at firstTileIdx");
+                assert!(idx.iter().all(|&t| t < 6), "tile indices stay in-pic");
+                if dims.num_tile_rows_in_slice <= 2 && dims.num_tile_columns_in_slice <= 3 {
+                    let mut seen = idx.clone();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    assert_eq!(seen.len(), idx.len(), "tile indices are distinct");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round281_eq80_adds_two() {
+        assert_eq!(compute_num_tiles_in_slice_arbitrary(0), 2);
+        assert_eq!(compute_num_tiles_in_slice_arbitrary(3), 5);
+    }
+
+    #[test]
+    fn round281_eq81_eq82_explicit_ids_resolve_in_order() {
+        // Explicit tile IDs 7 / 9 / 12 at tile indices 0 / 1 / 2.
+        // first_tile_id = 7, deltas [1, 2] → sliceTileId 7, 9, 12 →
+        // SliceTileIdx [0, 1, 2].
+        let maps = TileIndexMaps {
+            tile_id_to_idx: vec![(7, 0), (9, 1), (12, 2)],
+            first_ctb_addr_ts: vec![0, 4, 8],
+        };
+        let idx = compute_slice_tile_indices_arbitrary(7, &[1, 2], &maps).unwrap();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn round281_eq82_unknown_slice_tile_id_errors() {
+        let maps = implicit_id_maps(4);
+        // first OK, but 0 + (5 + 1) = 6 names no tile.
+        assert!(compute_slice_tile_indices_arbitrary(0, &[5], &maps).is_err());
+        // unknown first_tile_id.
+        assert!(compute_slice_tile_indices_arbitrary(9, &[], &maps).is_err());
+    }
+
+    fn tiled_ctx() -> SliceParseContext {
+        SliceParseContext {
+            single_tile_in_pic_flag: false,
+            arbitrary_slice_present_flag: true,
+            tile_id_len_minus1: 3, // 4-bit tile IDs
+            num_tile_columns_minus1: 2,
+            num_tile_rows_minus1: 1, // 3×2 = 6 tiles
+            chroma_array_type: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn round281_parser_arbitrary_slice_reads_num_tiles_minus_one_deltas() {
+        // §7.3.4: the delta loop runs i < NumTilesInSlice − 1 =
+        // num_remaining_tiles_in_slice_minus1 + 1 times (eq. 80). With
+        // minus1 = 1 the header carries TWO deltas; the parser must
+        // consume both for the trailing fields to line up.
+        let mut e = BitEmitter::new();
+        e.ue(0); // slice_pic_parameter_set_id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(4, 0); // first_tile_id = 0
+        e.u(1, 1); // arbitrary_slice_flag = 1
+        e.ue(1); // num_remaining_tiles_in_slice_minus1 = 1
+        e.ue(1); // delta_tile_id_minus1[0] = 1
+        e.ue(0); // delta_tile_id_minus1[1] = 0
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // slice_cb_qp_offset (se: 0)
+        e.ue(0); // slice_cr_qp_offset
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &tiled_ctx()).unwrap();
+        assert!(sh.arbitrary_slice_flag);
+        assert_eq!(sh.num_remaining_tiles_in_slice_minus1, 1);
+        assert_eq!(sh.delta_tile_id_minus1, vec![1, 0]);
+        // Trailing fields stayed aligned — the old minus1-count read
+        // would have shifted everything after the delta loop.
+        assert_eq!(sh.slice_type, SliceType::I);
+        assert_eq!(sh.slice_qp, 26);
+        // last_tile_id not present → inferred equal to first_tile_id.
+        assert_eq!(sh.last_tile_id, sh.first_tile_id);
+    }
+
+    #[test]
+    fn round281_parser_rejects_num_remaining_tiles_over_pic() {
+        // §7.4.5: minus1 shall be ≤ NumTilesInPic − 1 (= 5 here).
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(4, 0); // first_tile_id
+        e.u(1, 1); // arbitrary_slice_flag = 1
+        e.ue(6); // num_remaining_tiles_in_slice_minus1 = 6 > 5
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        assert!(parse(&rbsp, NalUnitType::Idr, &tiled_ctx()).is_err());
+    }
+
+    #[test]
+    fn round281_parser_infers_last_tile_id_for_single_tile_slice() {
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 1); // single_tile_in_slice_flag = 1
+        e.u(4, 3); // first_tile_id = 3
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0); // cb offset
+        e.ue(0); // cr offset
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &tiled_ctx()).unwrap();
+        assert!(sh.single_tile_in_slice_flag);
+        assert_eq!(sh.first_tile_id, 3);
+        assert_eq!(sh.last_tile_id, 3, "§7.4.5 inference");
+        assert!(sh.delta_tile_id_minus1.is_empty());
+    }
+
+    #[test]
+    fn round281_dispatch_rectangular_matches_free_functions() {
+        // A parsed rectangular multi-tile slice: first_tile_id 1,
+        // last_tile_id 5 on the 3×2 implicit grid.
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(4, 1); // first_tile_id = 1
+        e.u(1, 0); // arbitrary_slice_flag = 0
+        e.u(4, 5); // last_tile_id = 5
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0);
+        e.ue(0);
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &tiled_ctx()).unwrap();
+        let maps = implicit_id_maps(6);
+        assert_eq!(sh.num_tiles_in_slice(&maps, 2, 6).unwrap(), 4);
+        assert_eq!(
+            sh.slice_tile_indices(&maps, 2, 6).unwrap(),
+            vec![1, 2, 4, 5]
+        );
+    }
+
+    #[test]
+    fn round281_dispatch_arbitrary_matches_free_functions() {
+        let maps = implicit_id_maps(6);
+        let mut e = BitEmitter::new();
+        e.ue(0); // pps id
+        e.u(1, 0); // single_tile_in_slice_flag = 0
+        e.u(4, 0); // first_tile_id = 0
+        e.u(1, 1); // arbitrary_slice_flag = 1
+        e.ue(1); // num_remaining_tiles_in_slice_minus1 = 1 → 3 tiles
+        e.ue(1); // delta[0] = 1 → sliceTileId 2
+        e.ue(2); // delta[1] = 2 → sliceTileId 5
+        e.ue(2); // slice_type = I
+        e.u(1, 1); // no_output_of_prior_pics_flag
+        e.u(1, 1); // slice_deblocking_filter_flag
+        e.u(6, 26); // slice_qp
+        e.ue(0);
+        e.ue(0);
+        e.finish_with_trailing_bits();
+        let rbsp = e.into_bytes();
+        let sh = parse(&rbsp, NalUnitType::Idr, &tiled_ctx()).unwrap();
+        assert_eq!(
+            sh.num_tiles_in_slice(&maps, 2, 6).unwrap(),
+            compute_num_tiles_in_slice_arbitrary(1)
+        );
+        assert_eq!(sh.slice_tile_indices(&maps, 2, 6).unwrap(), vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn round281_eq79_zero_tiles_in_pic_errors() {
+        let maps = implicit_id_maps(1);
+        let dims = SliceTileDims {
+            num_tile_rows_in_slice: 1,
+            num_tile_columns_in_slice: 1,
+            num_tiles_in_slice: 1,
+        };
+        assert!(compute_slice_tile_indices(0, &maps, 0, 0, &dims).is_err());
     }
 }
