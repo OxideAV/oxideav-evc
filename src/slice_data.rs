@@ -772,6 +772,165 @@ fn decode_residual_coding_rle(
 }
 
 // =====================================================================
+// §7.3.8.1 multi-tile CTU-iteration order.
+// =====================================================================
+
+/// One tile's contribution to the §7.3.8.1 `slice_data()` walk.
+///
+/// The `slice_data()` loop (ISO/IEC 23094-1 §7.3.8.1, line-2596 syntax
+/// table) visits the slice's tiles in order, and within each tile walks
+/// `NumCtusInTile[ SliceTileIdx[ i ] ]` consecutive tile-scan CTU
+/// addresses starting at `FirstCtbAddrTs[ SliceTileIdx[ i ] ]`, mapping
+/// each through `CtbAddrTsToRs[ ]` to the raster address `CtbAddrInRs`
+/// that `coding_tree_unit( )` consumes:
+///
+/// ```text
+/// for( i = 0; i < NumTilesInSlice; i++ ) {
+///     ctbAddrInTs = FirstCtbAddrTs[ SliceTileIdx[ i ] ]
+///     for( j = 0; j < NumCtusInTile[ SliceTileIdx[ i ] ]; j++, ctbAddrInTs++ ) {
+///         CtbAddrInRs = CtbAddrTsToRs[ ctbAddrInTs ]
+///         coding_tree_unit( )
+///     }
+///     end_of_tile_one_bit                                              (ae)
+///     if( i < NumTilesInSlice − 1 )
+///         byte_alignment( )
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SliceTileWalkSegment {
+    /// `SliceTileIdx[ i ]` — the geometric tile index this segment walks.
+    pub tile_idx: u32,
+    /// `FirstCtbAddrTs[ SliceTileIdx[ i ] ]` — the tile's first
+    /// tile-scan CTU address.
+    pub first_ctb_addr_ts: u32,
+    /// `NumCtusInTile[ SliceTileIdx[ i ] ]` — the tile's CTU count.
+    pub num_ctus: u32,
+    /// The raster `CtbAddrInRs` addresses this tile contributes, in
+    /// tile-scan order: `CtbAddrTsToRs[ ctbAddrInTs ]` for
+    /// `ctbAddrInTs` in `first_ctb_addr_ts ..< first_ctb_addr_ts + num_ctus`.
+    pub ctb_addr_in_rs: Vec<u32>,
+    /// `true` for every segment except the last (`i < NumTilesInSlice −
+    /// 1`), pinning the §7.3.8.1 `byte_alignment( )` that follows this
+    /// tile's `end_of_tile_one_bit`. The final tile's `end_of_tile_one_bit`
+    /// is the slice's own terminate decision and carries no trailing
+    /// `byte_alignment( )`.
+    pub byte_align_after: bool,
+}
+
+/// The §7.3.8.1 `slice_data()` CTU-iteration order for a multi-tile slice.
+///
+/// One [`SliceTileWalkSegment`] per slice tile, in `i` order; the
+/// concatenation of every segment's `ctb_addr_in_rs` is the exact
+/// sequence of raster CTU addresses the slice walker decodes.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SliceTileWalkOrder {
+    /// The per-tile segments, indexed by the §7.3.8.1 loop variable `i`
+    /// (`0 ..< NumTilesInSlice`).
+    pub segments: Vec<SliceTileWalkSegment>,
+}
+
+impl SliceTileWalkOrder {
+    /// Total CTU count across all segments — the number of
+    /// `coding_tree_unit( )` invocations the slice decodes.
+    #[must_use]
+    pub fn total_ctus(&self) -> u32 {
+        self.segments.iter().map(|s| s.num_ctus).sum()
+    }
+
+    /// The flat raster `CtbAddrInRs` sequence, every segment
+    /// concatenated in §7.3.8.1 `i` order.
+    #[must_use]
+    pub fn ctb_addr_in_rs_flat(&self) -> Vec<u32> {
+        self.segments
+            .iter()
+            .flat_map(|s| s.ctb_addr_in_rs.iter().copied())
+            .collect()
+    }
+}
+
+/// Resolve the §7.3.8.1 `slice_data()` CTU-iteration order from the
+/// slice-tile list and the §6.5.1 per-picture tile derivations.
+///
+/// This is the pure multi-tile backbone of the `slice_data()` walk: it
+/// turns `SliceTileIdx[ ]` (§7.4.5 eq. (79)/(81)/(82)) together with the
+/// §6.5.1 `FirstCtbAddrTs[ ]` (eq. (32)), `NumCtusInTile[ ]` (eq. (31))
+/// and `CtbAddrTsToRs[ ]` (eq. (29)) lists into the ordered raster
+/// `CtbAddrInRs` sequence the CABAC walker consumes, plus the per-tile
+/// `byte_alignment( )` boundary markers.
+///
+/// # Arguments
+///
+/// * `slice_tile_idx` — `SliceTileIdx[ i ]` for `i` in
+///   `0 ..< NumTilesInSlice`. A single-tile slice passes a one-element
+///   list; the §7.3.8.1 loop then runs exactly once with no trailing
+///   `byte_alignment( )`.
+/// * `first_ctb_addr_ts` — `FirstCtbAddrTs[ tileIdx ]`, length
+///   `NumTilesInPic`.
+/// * `num_ctus_in_tile` — `NumCtusInTile[ tileIdx ]`, indexed by the
+///   geometric tile index in raster-tile order.
+/// * `ctb_addr_ts_to_rs` — `CtbAddrTsToRs[ ctbAddrTs ]`, length
+///   `PicSizeInCtbsY`.
+///
+/// # Errors
+///
+/// Rejects a malformed slice/PPS combination rather than panicking:
+/// * a `SliceTileIdx[ i ]` outside `first_ctb_addr_ts` /
+///   `num_ctus_in_tile` range;
+/// * a tile whose `FirstCtbAddrTs + NumCtusInTile` overruns
+///   `ctb_addr_ts_to_rs` (the §7.3.8.1 inner loop would index past
+///   `CtbAddrTsToRs[ ]`).
+pub fn resolve_slice_tile_walk_order(
+    slice_tile_idx: &[u32],
+    first_ctb_addr_ts: &[u32],
+    num_ctus_in_tile: &[u32],
+    ctb_addr_ts_to_rs: &[u32],
+) -> Result<SliceTileWalkOrder> {
+    let num_tiles_in_slice = slice_tile_idx.len();
+    let mut segments = Vec::with_capacity(num_tiles_in_slice);
+    let ts_len = ctb_addr_ts_to_rs.len() as u64;
+    for (i, &tile_idx) in slice_tile_idx.iter().enumerate() {
+        let ti = tile_idx as usize;
+        let first = *first_ctb_addr_ts.get(ti).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: SliceTileIdx[{i}] = {tile_idx} out of \
+                 FirstCtbAddrTs range (len {})",
+                first_ctb_addr_ts.len()
+            ))
+        })?;
+        let num_ctus = *num_ctus_in_tile.get(ti).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: SliceTileIdx[{i}] = {tile_idx} out of \
+                 NumCtusInTile range (len {})",
+                num_ctus_in_tile.len()
+            ))
+        })?;
+        // §7.3.8.1 inner loop runs ctbAddrInTs from first to
+        // first + num_ctus − 1; the last address indexes
+        // CtbAddrTsToRs[ first + num_ctus − 1 ], so the half-open end
+        // first + num_ctus must not exceed ts_len.
+        let end = u64::from(first) + u64::from(num_ctus);
+        if end > ts_len {
+            return Err(Error::invalid(format!(
+                "evc slice_data: tile {tile_idx} CTU range \
+                 [{first}, {end}) overruns CtbAddrTsToRs (len {ts_len})"
+            )));
+        }
+        let mut ctb_addr_in_rs = Vec::with_capacity(num_ctus as usize);
+        for ts in first..first + num_ctus {
+            ctb_addr_in_rs.push(ctb_addr_ts_to_rs[ts as usize]);
+        }
+        segments.push(SliceTileWalkSegment {
+            tile_idx,
+            first_ctb_addr_ts: first,
+            num_ctus,
+            ctb_addr_in_rs,
+            byte_align_after: i + 1 < num_tiles_in_slice,
+        });
+    }
+    Ok(SliceTileWalkOrder { segments })
+}
+
+// =====================================================================
 // Round-3 pixel-emission pipeline.
 // =====================================================================
 
@@ -5636,5 +5795,205 @@ mod tests {
                 assert_eq!(pic.y[row * stride + col], 128, "right CTB untouched");
             }
         }
+    }
+
+    // =================================================================
+    // §7.3.8.1 multi-tile CTU-iteration order
+    // (resolve_slice_tile_walk_order).
+    // =================================================================
+
+    use crate::pps::{
+        compute_col_bd, compute_col_widths, compute_ctb_addr_rs_to_ts, compute_ctb_addr_ts_to_rs,
+        compute_num_ctus_in_tile, compute_row_bd, compute_row_heights, compute_tile_index_maps,
+    };
+
+    /// Build the §6.5.1 per-picture tile derivations for a uniform tile
+    /// grid: returns (`FirstCtbAddrTs`, `NumCtusInTile`, `CtbAddrTsToRs`,
+    /// `PicWidthInCtbsY`).
+    fn uniform_tile_lists(
+        cols_minus1: u32,
+        rows_minus1: u32,
+        pic_w_ctbs: u32,
+        pic_h_ctbs: u32,
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>, u32) {
+        let col_w = compute_col_widths(true, cols_minus1, &[], pic_w_ctbs);
+        let row_h = compute_row_heights(true, rows_minus1, &[], pic_h_ctbs);
+        let col_bd = compute_col_bd(&col_w);
+        let row_bd = compute_row_bd(&row_h);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_w, &row_h, &col_bd, &row_bd, pic_w_ctbs);
+        let ts_to_rs = compute_ctb_addr_ts_to_rs(&rs_to_ts);
+        let num_ctus = compute_num_ctus_in_tile(&col_w, &row_h);
+        // implicit tile IDs (no explicit_tile_id) → TileId[ts] = tileIdx
+        let tile_id: Vec<u32> = {
+            // eq. (30) implicit branch: tile-scan addresses pack each tile
+            // contiguously, so build TileId via NumCtusInTile prefix runs.
+            let mut v = Vec::new();
+            for (idx, &n) in num_ctus.iter().enumerate() {
+                for _ in 0..n {
+                    v.push(idx as u32);
+                }
+            }
+            v
+        };
+        let maps = compute_tile_index_maps(&tile_id);
+        (maps.first_ctb_addr_ts, num_ctus, ts_to_rs, pic_w_ctbs)
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_single_tile_is_raster_order() {
+        // 1 tile covering a 3x2 CTB picture: tile-scan order == raster
+        // order, no trailing byte_alignment.
+        let (first, num_ctus, ts_to_rs, _pw) = uniform_tile_lists(0, 0, 3, 2);
+        let order = resolve_slice_tile_walk_order(&[0], &first, &num_ctus, &ts_to_rs).unwrap();
+        assert_eq!(order.segments.len(), 1);
+        let seg = &order.segments[0];
+        assert_eq!(seg.tile_idx, 0);
+        assert_eq!(seg.first_ctb_addr_ts, 0);
+        assert_eq!(seg.num_ctus, 6);
+        assert_eq!(seg.ctb_addr_in_rs, vec![0, 1, 2, 3, 4, 5]);
+        assert!(
+            !seg.byte_align_after,
+            "last (only) tile has no byte_alignment"
+        );
+        assert_eq!(order.total_ctus(), 6);
+        assert_eq!(order.ctb_addr_in_rs_flat(), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_full_picture_3x2_grid_hand_trace() {
+        // 3x2 tile grid over a 6x4 CTB picture → each tile is 2x2 CTBs.
+        // Tile raster-tile order: t0=(c0,r0) t1=(c1,r0) t2=(c2,r0)
+        //                         t3=(c0,r1) t4=(c1,r1) t5=(c2,r1).
+        // FirstCtbAddrTs = [0,4,8,12,16,20], each NumCtusInTile = 4.
+        let (first, num_ctus, ts_to_rs, pw) = uniform_tile_lists(2, 1, 6, 4);
+        assert_eq!(pw, 6);
+        assert_eq!(first, vec![0, 4, 8, 12, 16, 20]);
+        assert_eq!(num_ctus, vec![4, 4, 4, 4, 4, 4]);
+        // Slice covering all 6 tiles in tile order.
+        let slice_tile_idx = vec![0, 1, 2, 3, 4, 5];
+        let order =
+            resolve_slice_tile_walk_order(&slice_tile_idx, &first, &num_ctus, &ts_to_rs).unwrap();
+        assert_eq!(order.segments.len(), 6);
+        assert_eq!(order.total_ctus(), 24);
+        // Tile 0 occupies raster CTBs (0,0)(1,0)(0,1)(1,1) = rs 0,1,6,7.
+        assert_eq!(order.segments[0].ctb_addr_in_rs, vec![0, 1, 6, 7]);
+        // Tile 1 = columns 2,3 rows 0,1 = rs 2,3,8,9.
+        assert_eq!(order.segments[1].ctb_addr_in_rs, vec![2, 3, 8, 9]);
+        // Tile 5 (bottom-right) = columns 4,5 rows 2,3 = rs 16,17,22,23.
+        assert_eq!(order.segments[5].ctb_addr_in_rs, vec![16, 17, 22, 23]);
+        // Every segment but the last carries a byte_alignment.
+        for (i, seg) in order.segments.iter().enumerate() {
+            assert_eq!(seg.byte_align_after, i + 1 < 6, "segment {i} byte_align");
+        }
+        // The flat raster sequence is a permutation of 0..24.
+        let mut flat = order.ctb_addr_in_rs_flat();
+        assert_eq!(flat.len(), 24);
+        flat.sort_unstable();
+        assert_eq!(flat, (0..24).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_sub_rectangle_two_tiles() {
+        // Same 3x2 grid; a slice that covers only tiles 1 and 4
+        // (middle column, both rows) in tile order.
+        let (first, num_ctus, ts_to_rs, _pw) = uniform_tile_lists(2, 1, 6, 4);
+        let order = resolve_slice_tile_walk_order(&[1, 4], &first, &num_ctus, &ts_to_rs).unwrap();
+        assert_eq!(order.segments.len(), 2);
+        assert_eq!(order.total_ctus(), 8);
+        assert_eq!(order.segments[0].tile_idx, 1);
+        assert_eq!(order.segments[0].ctb_addr_in_rs, vec![2, 3, 8, 9]);
+        assert!(order.segments[0].byte_align_after);
+        assert_eq!(order.segments[1].tile_idx, 4);
+        // Tile 4 = column 2,3 rows 2,3 = rs 14,15,20,21.
+        assert_eq!(order.segments[1].ctb_addr_in_rs, vec![14, 15, 20, 21]);
+        assert!(!order.segments[1].byte_align_after);
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_matches_single_tile_raster_walker() {
+        // Cross-check: a single-tile slice's CtbAddrInRs sequence equals
+        // the raster CTU order the existing single-tile walker iterates
+        // (ctu_idx 0..n_ctus over the whole picture).
+        let (first, num_ctus, ts_to_rs, _pw) = uniform_tile_lists(0, 0, 4, 3);
+        let order = resolve_slice_tile_walk_order(&[0], &first, &num_ctus, &ts_to_rs).unwrap();
+        let expected: Vec<u32> = (0..12).collect();
+        assert_eq!(order.ctb_addr_in_rs_flat(), expected);
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_consumes_slice_header_indices() {
+        // Drive resolve_slice_tile_walk_order from the §7.4.5 SliceTileIdx[]
+        // derivation (eq. 79) rather than a hand-written list, closing the
+        // round-281 → round-292 loop end-to-end on the 3x2 grid.
+        use crate::slice_header::{compute_slice_tile_dims, compute_slice_tile_indices};
+        let cols_minus1 = 2u32;
+        let rows_minus1 = 1u32;
+        let pic_w_ctbs = 6u32;
+        let pic_h_ctbs = 4u32;
+        let col_w = compute_col_widths(true, cols_minus1, &[], pic_w_ctbs);
+        let row_h = compute_row_heights(true, rows_minus1, &[], pic_h_ctbs);
+        let col_bd = compute_col_bd(&col_w);
+        let row_bd = compute_row_bd(&row_h);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_w, &row_h, &col_bd, &row_bd, pic_w_ctbs);
+        let ts_to_rs = compute_ctb_addr_ts_to_rs(&rs_to_ts);
+        let num_ctus = compute_num_ctus_in_tile(&col_w, &row_h);
+        let mut tile_id = Vec::new();
+        for (idx, &n) in num_ctus.iter().enumerate() {
+            for _ in 0..n {
+                tile_id.push(idx as u32);
+            }
+        }
+        let maps = compute_tile_index_maps(&tile_id);
+        let num_tiles_in_pic = (cols_minus1 + 1) * (rows_minus1 + 1);
+        // Rectangular slice spanning tiles first_tile=1 .. last_tile=4
+        // (the middle column, both rows) — eq. (78)/(79).
+        let dims = compute_slice_tile_dims(1, 4, &maps, cols_minus1, num_tiles_in_pic).unwrap();
+        let slice_tile_idx =
+            compute_slice_tile_indices(1, &maps, cols_minus1, num_tiles_in_pic, &dims).unwrap();
+        assert_eq!(slice_tile_idx, vec![1, 4]);
+        let order = resolve_slice_tile_walk_order(
+            &slice_tile_idx,
+            &maps.first_ctb_addr_ts,
+            &num_ctus,
+            &ts_to_rs,
+        )
+        .unwrap();
+        assert_eq!(order.total_ctus(), 8);
+        assert_eq!(order.segments[0].ctb_addr_in_rs, vec![2, 3, 8, 9]);
+        assert_eq!(order.segments[1].ctb_addr_in_rs, vec![14, 15, 20, 21]);
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_rejects_out_of_range_tile_idx() {
+        let (first, num_ctus, ts_to_rs, _pw) = uniform_tile_lists(0, 0, 3, 2);
+        // SliceTileIdx references tile 1 but there is only tile 0.
+        let err = resolve_slice_tile_walk_order(&[1], &first, &num_ctus, &ts_to_rs).unwrap_err();
+        assert!(
+            format!("{err}").contains("out of FirstCtbAddrTs range"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_rejects_ts_overrun() {
+        // FirstCtbAddrTs + NumCtusInTile overruns CtbAddrTsToRs: a
+        // malformed combination where the tile claims more CTUs than the
+        // tile-scan map can supply.
+        let first = vec![0u32];
+        let num_ctus = vec![10u32];
+        let ts_to_rs = vec![0u32, 1, 2, 3]; // only 4 entries
+        let err = resolve_slice_tile_walk_order(&[0], &first, &num_ctus, &ts_to_rs).unwrap_err();
+        assert!(
+            format!("{err}").contains("overruns CtbAddrTsToRs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round292_slice_tile_walk_empty_slice_is_empty_order() {
+        let order = resolve_slice_tile_walk_order(&[], &[0], &[1], &[0]).unwrap();
+        assert!(order.segments.is_empty());
+        assert_eq!(order.total_ctus(), 0);
+        assert!(order.ctb_addr_in_rs_flat().is_empty());
     }
 }

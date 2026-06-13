@@ -7,6 +7,79 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-292 status
+
+Round 292 lands the **§7.3.8.1 multi-tile CTU-iteration order** — the
+`slice_data()` line-2596 loop nest that every prior tile round has
+named as the natural consumer. It turns round-281's `SliceTileIdx[ ]`
+(§7.4.5 eq. (79)/(81)/(82)) plus round-278's `FirstCtbAddrTs[ ]`
+(§6.5.1 eq. (32)), round-273's `NumCtusInTile[ ]` (eq. (31)) and
+`CtbAddrTsToRs[ ]` (eq. (29)) into the ordered raster `CtbAddrInRs`
+sequence the CABAC walker consumes.
+
+```text
+for( i = 0; i < NumTilesInSlice; i++ ) {
+    ctbAddrInTs = FirstCtbAddrTs[ SliceTileIdx[ i ] ]
+    for( j = 0; j < NumCtusInTile[ SliceTileIdx[ i ] ]; j++, ctbAddrInTs++ ) {
+        CtbAddrInRs = CtbAddrTsToRs[ ctbAddrInTs ]
+        coding_tree_unit( )
+    }
+    end_of_tile_one_bit
+    if( i < NumTilesInSlice − 1 )
+        byte_alignment( )
+}
+```
+
+New surface (all in `slice_data`):
+
+* `resolve_slice_tile_walk_order(slice_tile_idx, first_ctb_addr_ts,
+  num_ctus_in_tile, ctb_addr_ts_to_rs) -> Result<SliceTileWalkOrder>`
+  — the §7.3.8.1 walk as a pure function. A single-tile slice passes a
+  one-element `SliceTileIdx[ ]` and the outer loop runs once with no
+  trailing `byte_alignment( )`.
+* `SliceTileWalkOrder` — the per-slice result: one
+  `SliceTileWalkSegment` per tile in `i` order, plus `total_ctus()`
+  and `ctb_addr_in_rs_flat()` views.
+* `SliceTileWalkSegment` — one tile's `tile_idx`, `first_ctb_addr_ts`,
+  `num_ctus`, the ordered `ctb_addr_in_rs` raster addresses, and
+  `byte_align_after` (true for every tile but the last — the §7.3.8.1
+  `byte_alignment( )` follows each non-final `end_of_tile_one_bit`).
+
+Malformed combinations are rejected, not panicked: an out-of-range
+`SliceTileIdx[ i ]` against `FirstCtbAddrTs[ ]` / `NumCtusInTile[ ]`,
+or a tile whose `FirstCtbAddrTs + NumCtusInTile` overruns
+`CtbAddrTsToRs[ ]` (the inner loop would index past the map).
+
+### Wiring stance
+
+Same opt-in posture as the round-218 onward helper rollout: a pure
+function returning owned values, no behaviour change to the existing
+single-tile raster walkers. Rebinding `walk_baseline_idr_slice` /
+`decode_baseline_idr_slice` / `decode_baseline_inter_slice` to drive
+their CTU loop off this order (so multi-tile slices decode) is the
+natural consumer round — each currently iterates `ctu_idx` in raster
+order over the whole picture, which equals this order's flat sequence
+for the single-tile case (pinned by
+`round292_slice_tile_walk_matches_single_tile_raster_walker`).
+
+### Tests
+
+8 new unit tests (663 total; was 655): single-tile raster identity;
+a 3×2-grid full-picture hand-trace grounded against the real §6.5.1
+`compute_*` derivations (tile 0 → rs 0,1,6,7; tile 5 → rs
+16,17,22,23; flat = permutation of 0..24); a middle-column
+sub-rectangle two-tile walk; the single-tile-vs-raster cross-check;
+an end-to-end pin driving the walk straight from round-281's
+`compute_slice_tile_dims` + `compute_slice_tile_indices`; the two
+malformed rejections; and an empty-slice defensive case.
+
+### Disclaimer
+
+`resolve_slice_tile_walk_order` / `SliceTileWalkOrder` /
+`SliceTileWalkSegment` are derived from ISO/IEC 23094-1:2020 §7.3.8.1
+(consuming §6.5.1 eq. (29)/(31)/(32) and §7.4.5 eq. (79)/(81)/(82)).
+All truth came from `docs/video/evc/`.
+
 ## Round-284 status
 
 Round 284 consumes the staged errata file head-on and completes the

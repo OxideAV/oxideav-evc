@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Round 292 — §7.3.8.1 multi-tile CTU-iteration order
+
+#### Added
+- `slice_data::resolve_slice_tile_walk_order(slice_tile_idx,
+  first_ctb_addr_ts, num_ctus_in_tile, ctb_addr_ts_to_rs)` — the
+  §7.3.8.1 `slice_data()` CTU-iteration order (line-2596 syntax table)
+  as a pure function. For each slice tile `i`, it walks
+  `NumCtusInTile[ SliceTileIdx[ i ] ]` tile-scan CTU addresses from
+  `FirstCtbAddrTs[ SliceTileIdx[ i ] ]`, mapping each through
+  `CtbAddrTsToRs[ ]` to the raster `CtbAddrInRs` the
+  `coding_tree_unit( )` consumes. This is the multi-tile backbone the
+  round-2 single-tile raster walker generalizes to.
+- `slice_data::SliceTileWalkOrder` — the per-slice result, one
+  `SliceTileWalkSegment` per tile (in §7.3.8.1 `i` order) with
+  `total_ctus()` and `ctb_addr_in_rs_flat()` views.
+- `slice_data::SliceTileWalkSegment` — one tile's contribution: its
+  geometric `tile_idx`, `first_ctb_addr_ts`, `num_ctus`, the ordered
+  `ctb_addr_in_rs` raster sequence, and `byte_align_after` (true for
+  every tile but the last, pinning the §7.3.8.1 `byte_alignment( )`
+  that trails each non-final `end_of_tile_one_bit`).
+- Malformed slice/PPS combinations are rejected (out-of-range
+  `SliceTileIdx[ i ]`; a `FirstCtbAddrTs + NumCtusInTile` overrun of
+  `CtbAddrTsToRs[ ]`) rather than panicking.
+
+8 new unit tests (663 total; was 655): single-tile raster identity,
+3×2-grid full-picture hand-trace, sub-rectangle two-tile walk,
+single-tile-vs-raster cross-check, an end-to-end pin driving the walk
+from the round-281 §7.4.5 `SliceTileIdx[ ]` derivation, the two
+malformed rejections, and an empty-slice defensive case.
+
 ### Round 284 — §7.3.4 entry points + eq. (88)/(89) tile subsets; errata-#97 / §8.9.8 pins
 
 #### Added
