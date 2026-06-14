@@ -7,6 +7,39 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-305 status
+
+Round 305 lands the **§7.3.8.2 `NumHmvpCand = 0` reset** (lines
+2624-2625) inside `coding_tree_unit()`. The spec resets the
+history-based MV predictor list at the start of every CTB row within a
+tile — the condition is `xCtb == xFirstCtb`, where `xFirstCtb` is the
+luma-sample column of the **tile's** first CTB
+(`(firstCtbAddrRs % PicWidthInCtbsY) << CtbLog2SizeY`, §7.3.8.2 lines
+2622-2623). This keeps HMVP candidates from carrying across a row (or
+tile) boundary.
+
+* `walk_single_ctu(.., x_first_ctb)` now takes the tile's first-CTB
+  column and bumps `SliceWalkStats::hmvp_resets` whenever
+  `xCtb == x_first_ctb`. No bitstream syntax is consumed; the reset is
+  pure decoder state surfaced for the structural walk.
+* The single-tile raster walker passes `x_first_ctb = 0` (the sole tile
+  starts at the picture origin). The multi-tile walker derives each
+  segment's `x_first_ctb` from its own `firstCtbAddrRs`
+  (`seg.ctb_addr_in_rs[0]`), so a tile not anchored at the picture's
+  left edge still resets on **its own** left column, not column 0.
+
+For a single-tile slice `hmvp_resets == PicHeightInCtbsY`; right-of-tile
+columns never reset.
+
+### Tests
+
+4 new unit tests (673 lib; was 669): single-tile reset once per CTB row
+(2×3 CTB grid → 3 resets); single-row resets exactly once; multi-tile
+reset keyed on each tile's own `xFirstCtb` (two vertical tiles, the
+right tile resets on column 32 → 4 total); and a multi-column tile that
+resets per-row not per-CTB (2×3 grid → 3, cross-checked against the
+raster walker).
+
 ## Round-298 status
 
 Round 298 lands the **§7.3.8.1 multi-tile `slice_data()` walk** — the

@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Round 305 — §7.3.8.2 `NumHmvpCand = 0` reset
+
+#### Added
+- `SliceWalkStats::hmvp_resets` — count of §7.3.8.2 (lines 2624-2625)
+  history-based MV predictor list resets. The reset fires for every CTB
+  whose luma column equals its tile's first-CTB column
+  (`xCtb == xFirstCtb`, the leftmost CTB of each CTB row within each
+  tile), so HMVP candidates never cross a row or tile boundary. For a
+  single-tile slice this equals `PicHeightInCtbsY`.
+
+#### Changed
+- `slice_data::walk_single_ctu` now takes `x_first_ctb` (the tile's
+  first-CTB luma column, §7.3.8.2 line 2623) and bumps `hmvp_resets`
+  when `xCtb == x_first_ctb`. The single-tile raster walker passes 0
+  (tile anchored at the picture origin); the multi-tile walker derives
+  each tile's `x_first_ctb` from its own `firstCtbAddrRs`, so a tile not
+  at the picture's left edge resets on its own column. No bitstream
+  syntax is consumed by the reset.
+
 ### Round 298 — §7.3.8.1 multi-tile `slice_data()` walk
 
 #### Added

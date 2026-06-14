@@ -280,6 +280,15 @@ pub struct SliceWalkStats {
     /// `NumTilesInSlice − 1` (zero for a single-tile slice): the
     /// alignment follows every non-final tile's `end_of_tile_one_bit`.
     pub tile_byte_alignments: u32,
+    /// `NumHmvpCand = 0` resets performed in `coding_tree_unit()`
+    /// (§7.3.8.2 lines 2624-2625). The reset fires for every CTB whose
+    /// luma-sample column equals its tile's first-CTB column
+    /// (`xCtb == xFirstCtb`) — i.e. the leftmost CTB of each CTB row
+    /// within each tile — clearing the history-based MV predictor list at
+    /// the start of every new row so HMVP candidates never cross a row (or
+    /// tile) boundary. One reset per CTB row per tile; for a single-tile
+    /// slice this equals `PicHeightInCtbsY`.
+    pub hmvp_resets: u32,
 }
 
 /// Predicate marking which kind of `coding_unit()` invocation we're in.
@@ -336,7 +345,10 @@ pub fn walk_baseline_idr_slice(rbsp: &[u8], inputs: SliceWalkInputs) -> Result<S
         // `CtbAddrInRs == ctu_idx`. This is exactly the flat sequence the
         // §7.3.8.1 walk produces for a one-element `SliceTileIdx[ ]` (pinned
         // by `round292_slice_tile_walk_matches_single_tile_raster_walker`).
-        walk_single_ctu(&mut eng, &mut stats, &inputs, ctu_idx)?;
+        // Single-tile slice: the sole tile starts at the picture origin, so
+        // §7.3.8.2's xFirstCtb is 0 — the NumHmvpCand reset fires on every
+        // leftmost-column CTB (CtbAddrInRs % PicWidthInCtbsY == 0).
+        walk_single_ctu(&mut eng, &mut stats, &inputs, ctu_idx, 0)?;
     }
     // §7.3.8.1: end_of_tile_one_bit (single tile = single iteration).
     let term = eng.decode_terminate()?;
@@ -360,14 +372,30 @@ pub fn walk_baseline_idr_slice(rbsp: &[u8], inputs: SliceWalkInputs) -> Result<S
 /// CtbLog2SizeY`, `y = (rs / PicWidthInCtbsY) << CtbLog2SizeY` — so the
 /// single-tile raster walk and the §7.3.8.1 multi-tile walk share one
 /// per-CTU body. Bumps `stats.ctus`.
+///
+/// `x_first_ctb` is the luma-sample x-coordinate of the **first CTB of
+/// the tile this CTU belongs to** — `xFirstCtb` in §7.3.8.2 line 2623,
+/// `(firstCtbAddrRs % PicWidthInCtbsY) << CtbLog2SizeY`. It drives the
+/// §7.3.8.2 lines 2624-2625 `NumHmvpCand = 0` reset: when this CTB's
+/// column equals the tile's first column (the leftmost CTB of a CTB row
+/// within the tile) the history-based MV predictor list is cleared, so
+/// HMVP candidates never carry across a row or tile boundary.
 fn walk_single_ctu(
     eng: &mut CabacEngine,
     stats: &mut SliceWalkStats,
     inputs: &SliceWalkInputs,
     ctb_addr_in_rs: u32,
+    x_first_ctb: u32,
 ) -> Result<()> {
     let x_ctb = (ctb_addr_in_rs % inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
     let y_ctb = (ctb_addr_in_rs / inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
+    // §7.3.8.2 lines 2624-2625: NumHmvpCand = 0 at the start of every CTB
+    // row within the tile (xCtb == xFirstCtb). No bitstream syntax is
+    // consumed; the reset is pure decoder state. Surfaced for the
+    // structural walk via stats.hmvp_resets.
+    if x_ctb == x_first_ctb {
+        stats.hmvp_resets += 1;
+    }
     // §7.3.8.2 coding_tree_unit(): decode the per-CTU ALF
     // applicability map (`alf_ctb_flag` + chroma variants) before
     // recursing into split_unit(). The flags are absent (inferred)
@@ -474,6 +502,17 @@ pub fn walk_baseline_idr_slice_tiled(
         // §9.3.1: the arithmetic engine restarts at the first CTU of each
         // tile — a fresh 14-bit ivl_offset window over the tile's subset.
         let mut eng = CabacEngine::new(subset)?;
+        // §7.3.8.2 lines 2622-2623: firstCtbAddrRs is the tile's first CTB
+        // in raster scan — exactly the first element of the segment's
+        // tile-scan CtbAddrInRs list — and xFirstCtb is its luma column.
+        let first_ctb_addr_rs = *seg.ctb_addr_in_rs.first().ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: tile {} has no CTUs (empty CtbAddrInRs)",
+                seg.tile_idx
+            ))
+        })?;
+        let x_first_ctb =
+            (first_ctb_addr_rs % inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
         for &rs in &seg.ctb_addr_in_rs {
             // §7.3.8.1: each tile's CTUs are addressed by raster
             // CtbAddrInRs; a value outside the picture grid is malformed.
@@ -483,7 +522,7 @@ pub fn walk_baseline_idr_slice_tiled(
                     seg.tile_idx
                 )));
             }
-            walk_single_ctu(&mut eng, &mut stats, &inputs, rs)?;
+            walk_single_ctu(&mut eng, &mut stats, &inputs, rs, x_first_ctb)?;
         }
         // §7.3.8.1: end_of_tile_one_bit closes every tile's subset.
         let term = eng.decode_terminate()?;
@@ -6357,5 +6396,180 @@ mod tests {
             format!("{err}").contains("empty tile walk order"),
             "got: {err}"
         );
+    }
+
+    // =================================================================
+    // §7.3.8.2 lines 2624-2625 NumHmvpCand reset (xCtb == xFirstCtb).
+    // =================================================================
+
+    /// Encode one CTU's bins into `enc` (no terminate): a 32×32 CTB
+    /// (`min_cb_log2 == 4`) that splits into four 16×16 dual-tree leaves,
+    /// each leaf carrying `intra_pred_mode`/`cbf_luma`/`cbf_cb`/`cbf_cr`
+    /// = 0. This is the same per-CTU bin sequence as the proven
+    /// `encode_one_split_ctu_tile_subset` fixture (17 regular bins, one of
+    /// them an MPS-flipping `1`), so chaining several round-trips cleanly
+    /// through the CABAC engine. The caller closes the slice/tile with
+    /// `encode_terminate`. All such CTUs decode under `min_cb_log2 == 4`.
+    fn encode_one_split_ctu(enc: &mut crate::cabac::CabacEncoder) {
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode
+            enc.encode_decision(0, 0, 0); // cbf_luma
+            enc.encode_decision(0, 0, 0); // cbf_cb
+            enc.encode_decision(0, 0, 0); // cbf_cr
+        }
+    }
+
+    /// Inputs for a CTB=32, `min_cb_log2 == 4` picture so each CTU's bins
+    /// match `encode_one_split_ctu` (a split CTB with four 16x16 leaves).
+    fn hmvp_inputs(pic_width: u32, pic_height: u32) -> SliceWalkInputs {
+        SliceWalkInputs {
+            pic_width,
+            pic_height,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Single-tile slice spanning several CTB rows: the §7.3.8.2 reset
+    /// fires once per row (the leftmost CTB of each row has
+    /// `xCtb == xFirstCtb == 0`), so `hmvp_resets == PicHeightInCtbsY`.
+    #[test]
+    fn round305_single_tile_hmvp_reset_once_per_row() {
+        use crate::cabac::CabacEncoder;
+        // 64x96 picture, CTB=32 -> 2 cols x 3 rows = 6 CTUs, raster order.
+        let inputs = hmvp_inputs(64, 96);
+        let mut enc = CabacEncoder::new();
+        for _ in 0..6 {
+            encode_one_split_ctu(&mut enc);
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.ctus, 6);
+        // 3 CTB rows -> 3 resets (one leftmost-column CTB per row).
+        assert_eq!(stats.hmvp_resets, 3, "one NumHmvpCand reset per CTB row");
+    }
+
+    /// A single-row picture resets exactly once (only the first CTB has
+    /// `xCtb == 0`); subsequent same-row CTBs do not reset.
+    #[test]
+    fn round305_single_row_resets_once() {
+        use crate::cabac::CabacEncoder;
+        // 96x32 picture, CTB=32 -> 3 cols x 1 row = 3 CTUs.
+        let inputs = hmvp_inputs(96, 32);
+        let mut enc = CabacEncoder::new();
+        for _ in 0..3 {
+            encode_one_split_ctu(&mut enc);
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.ctus, 3);
+        assert_eq!(stats.hmvp_resets, 1, "only the first CTB has xCtb == 0");
+    }
+
+    /// Multi-tile slice: each tile resets at the start of every one of its
+    /// own CTB rows, keyed on **its own** `xFirstCtb` (§7.3.8.2 line 2623),
+    /// not the picture origin. Two side-by-side tiles each 1 col x 2 rows:
+    /// every tile's CTBs are all leftmost-of-tile, so each CTB resets ->
+    /// 4 resets total (2 rows x 2 tiles).
+    #[test]
+    fn round305_multi_tile_hmvp_reset_keyed_on_tile_first_column() {
+        use crate::cabac::CabacEncoder;
+        // 64x64 picture, CTB=32 -> 2 cols x 2 rows. Two tiles split the
+        // picture vertically: tile 0 = left column (rs 0, 2), tile 1 =
+        // right column (rs 1, 3). xFirstCtb tile0 = 0, tile1 = 32.
+        let inputs = hmvp_inputs(64, 64);
+        let mut e0 = CabacEncoder::new();
+        encode_one_split_ctu(&mut e0);
+        encode_one_split_ctu(&mut e0);
+        e0.encode_terminate(true);
+        let sub0 = e0.finish();
+        let mut e1 = CabacEncoder::new();
+        encode_one_split_ctu(&mut e1);
+        encode_one_split_ctu(&mut e1);
+        e1.encode_terminate(true);
+        let sub1 = e1.finish();
+        let split = sub0.len();
+        let mut rbsp = sub0;
+        rbsp.extend_from_slice(&sub1);
+        let subset_ranges = vec![0..split, split..rbsp.len()];
+
+        let order = SliceTileWalkOrder {
+            segments: vec![
+                SliceTileWalkSegment {
+                    tile_idx: 0,
+                    first_ctb_addr_ts: 0,
+                    num_ctus: 2,
+                    ctb_addr_in_rs: vec![0, 2], // left column, both rows
+                    byte_align_after: true,
+                },
+                SliceTileWalkSegment {
+                    tile_idx: 1,
+                    first_ctb_addr_ts: 2,
+                    num_ctus: 2,
+                    ctb_addr_in_rs: vec![1, 3], // right column, both rows
+                    byte_align_after: false,
+                },
+            ],
+        };
+
+        let stats = walk_baseline_idr_slice_tiled(&rbsp, inputs, &order, &subset_ranges).unwrap();
+        assert_eq!(stats.ctus, 4);
+        // Tile 0: both CTBs are in column 0 == xFirstCtb(0) -> 2 resets.
+        // Tile 1: both CTBs are in column 32 == xFirstCtb(32) -> 2 resets.
+        // Total 4: the per-tile xFirstCtb keying is what makes tile 1's
+        // CTBs (xCtb == 32, not 0) reset at all.
+        assert_eq!(
+            stats.hmvp_resets, 4,
+            "reset keyed on each tile's own xFirstCtb"
+        );
+        assert_eq!(stats.end_of_tile_bits, 2);
+        assert_eq!(stats.tile_byte_alignments, 1);
+    }
+
+    /// A multi-column tile resets only on its leftmost column: a single
+    /// tile that is the whole 2-col x 3-row picture resets three times
+    /// (once per row), not six -- the right-column CTBs
+    /// (xCtb == 32 != xFirstCtb 0) do not reset. Pinned through the tiled
+    /// walker and cross-checked against the raster walker on the same RBSP.
+    #[test]
+    fn round305_multi_column_tile_resets_per_row_not_per_ctb() {
+        use crate::cabac::CabacEncoder;
+        // 64x96, CTB=32 -> 2 cols x 3 rows = 6 CTUs (rs 0..5 in raster).
+        let inputs = hmvp_inputs(64, 96);
+        let mut enc = CabacEncoder::new();
+        for _ in 0..6 {
+            encode_one_split_ctu(&mut enc);
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        // One tile covering all six CTBs in raster order.
+        let order = SliceTileWalkOrder {
+            segments: vec![SliceTileWalkSegment {
+                tile_idx: 0,
+                first_ctb_addr_ts: 0,
+                num_ctus: 6,
+                ctb_addr_in_rs: vec![0, 1, 2, 3, 4, 5],
+                byte_align_after: false,
+            }],
+        };
+        let range = 0..rbsp.len();
+        let ranges = core::slice::from_ref(&range);
+        let stats = walk_baseline_idr_slice_tiled(&rbsp, inputs, &order, ranges).unwrap();
+        assert_eq!(stats.ctus, 6);
+        // rs 0, 2, 4 (col 0) reset; rs 1, 3, 5 (col 32) do not -> 3 resets.
+        assert_eq!(stats.hmvp_resets, 3, "leftmost-column CTBs only");
+        // Matches the single-tile raster walker on the same RBSP.
+        let raster = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.hmvp_resets, raster.hmvp_resets);
     }
 }
