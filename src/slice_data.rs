@@ -272,6 +272,14 @@ pub struct SliceWalkStats {
     /// (§7.3.8.2). Zero unless the slice signals an ALF applicability
     /// map (`slice_alf_map_flag` for luma, etc.).
     pub alf_ctb: AlfCtbStats,
+    /// `end_of_tile_one_bit` terminate decisions consumed (§7.3.8.1).
+    /// One per tile in the slice walk — `1` for a single-tile slice,
+    /// `NumTilesInSlice` for a multi-tile slice.
+    pub end_of_tile_bits: u32,
+    /// `byte_alignment()` invocations between tiles (§7.3.8.1). Equal to
+    /// `NumTilesInSlice − 1` (zero for a single-tile slice): the
+    /// alignment follows every non-final tile's `end_of_tile_one_bit`.
+    pub tile_byte_alignments: u32,
 }
 
 /// Predicate marking which kind of `coding_unit()` invocation we're in.
@@ -324,23 +332,11 @@ pub fn walk_baseline_idr_slice(rbsp: &[u8], inputs: SliceWalkInputs) -> Result<S
         )));
     }
     for ctu_idx in 0..n_ctus {
-        let x_ctb = (ctu_idx % inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
-        let y_ctb = (ctu_idx / inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
-        // §7.3.8.2 coding_tree_unit(): decode the per-CTU ALF
-        // applicability map (`alf_ctb_flag` + chroma variants) before
-        // recursing into split_unit(). The flags are absent (inferred)
-        // unless the slice signals the corresponding map.
-        let _alf = decode_coding_tree_unit_alf(&mut eng, &inputs, &mut stats.alf_ctb)?;
-        walk_split_unit(
-            &mut eng,
-            &mut stats,
-            &inputs,
-            x_ctb,
-            y_ctb,
-            inputs.ctb_log2_size_y,
-            inputs.ctb_log2_size_y,
-        )?;
-        stats.ctus += 1;
+        // Single-tile slice: the CTU iteration order is plain raster, so
+        // `CtbAddrInRs == ctu_idx`. This is exactly the flat sequence the
+        // §7.3.8.1 walk produces for a one-element `SliceTileIdx[ ]` (pinned
+        // by `round292_slice_tile_walk_matches_single_tile_raster_walker`).
+        walk_single_ctu(&mut eng, &mut stats, &inputs, ctu_idx)?;
     }
     // §7.3.8.1: end_of_tile_one_bit (single tile = single iteration).
     let term = eng.decode_terminate()?;
@@ -349,9 +345,167 @@ pub fn walk_baseline_idr_slice(rbsp: &[u8], inputs: SliceWalkInputs) -> Result<S
             "evc slice_data: end_of_tile_one_bit must terminate engine",
         ));
     }
+    stats.end_of_tile_bits += 1;
     // The terminate decision consumed rbsp_stop_one_bit. The remaining
     // bits in the byte are zero padding; no further alignment needed since
     // CABAC consumed the byte-aligned terminate.
+    Ok(stats)
+}
+
+/// Walk one CTU of a Baseline IDR slice at raster address `ctb_addr_in_rs`:
+/// the §7.3.8.2 `coding_tree_unit()` ALF prefix followed by the
+/// §7.3.8.3 `split_unit()` recursion. The luma-sample top-left
+/// (`x_ctb`, `y_ctb`) is derived from the raster address exactly as the
+/// per-picture raster scan does — `x = (rs % PicWidthInCtbsY) <<
+/// CtbLog2SizeY`, `y = (rs / PicWidthInCtbsY) << CtbLog2SizeY` — so the
+/// single-tile raster walk and the §7.3.8.1 multi-tile walk share one
+/// per-CTU body. Bumps `stats.ctus`.
+fn walk_single_ctu(
+    eng: &mut CabacEngine,
+    stats: &mut SliceWalkStats,
+    inputs: &SliceWalkInputs,
+    ctb_addr_in_rs: u32,
+) -> Result<()> {
+    let x_ctb = (ctb_addr_in_rs % inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
+    let y_ctb = (ctb_addr_in_rs / inputs.pic_width_in_ctus()) << inputs.ctb_log2_size_y;
+    // §7.3.8.2 coding_tree_unit(): decode the per-CTU ALF
+    // applicability map (`alf_ctb_flag` + chroma variants) before
+    // recursing into split_unit(). The flags are absent (inferred)
+    // unless the slice signals the corresponding map.
+    let _alf = decode_coding_tree_unit_alf(eng, inputs, &mut stats.alf_ctb)?;
+    walk_split_unit(
+        eng,
+        stats,
+        inputs,
+        x_ctb,
+        y_ctb,
+        inputs.ctb_log2_size_y,
+        inputs.ctb_log2_size_y,
+    )?;
+    stats.ctus += 1;
+    Ok(())
+}
+
+/// Walk a Baseline-profile IDR slice's `slice_data()` over a **multi-tile**
+/// CTU-iteration order (§7.3.8.1). This is the consumer the tile chain
+/// (rounds 273/278/281/292) has named: it drives the per-CTU CABAC walk
+/// off the resolved [`SliceTileWalkOrder`] rather than a flat picture
+/// raster, so a slice spanning several tiles decodes in the spec's
+/// tile-major order.
+///
+/// Per §7.3.8.1 the outer loop runs once per tile in `SliceTileIdx[ ]`
+/// order; within each tile the CTUs are walked in tile-scan order
+/// (`CtbAddrInRs = CtbAddrTsToRs[ ctbAddrInTs ]`, already materialised in
+/// each [`SliceTileWalkSegment::ctb_addr_in_rs`]). After every tile an
+/// `end_of_tile_one_bit` terminate decision is consumed; for every tile
+/// but the last it is followed by `byte_alignment( )` — the same
+/// boundary the §7.4.5 eq. (88)/(89) entry-point subsets describe.
+///
+/// Each tile's coded bits live in a separate subset of the slice data, and
+/// §9.3.1 restarts the arithmetic decoding engine at the first CTU of
+/// every tile. Accordingly `subset_ranges` (one half-open `start..end`
+/// byte range per tile, exactly the
+/// [`crate::slice_header::compute_tile_subset_byte_ranges`] output) is
+/// indexed in `i` order, and a **fresh** [`CabacEngine`] is constructed
+/// over each tile's subset slice of `rbsp`. The single-tile case
+/// (`subset_ranges == [0..rbsp.len()]`, one segment) reduces to one engine
+/// over the whole RBSP and one terminate — bit-identical to
+/// [`walk_baseline_idr_slice`].
+///
+/// # Errors
+///
+/// * the same toolset-range guards as [`walk_baseline_idr_slice`];
+/// * `subset_ranges.len() != order.segments.len()`, an empty walk order,
+///   or a subset range outside `rbsp`;
+/// * an `end_of_tile_one_bit` that fails to terminate a tile's engine;
+/// * a tile whose raster CTU address maps outside the picture grid.
+pub fn walk_baseline_idr_slice_tiled(
+    rbsp: &[u8],
+    inputs: SliceWalkInputs,
+    order: &SliceTileWalkOrder,
+    subset_ranges: &[core::ops::Range<usize>],
+) -> Result<SliceWalkStats> {
+    if inputs.ctb_log2_size_y < 5 || inputs.ctb_log2_size_y > 7 {
+        return Err(Error::invalid(format!(
+            "evc slice_data: CtbLog2SizeY {} out of Baseline range [5, 7]",
+            inputs.ctb_log2_size_y
+        )));
+    }
+    if inputs.min_cb_log2_size_y < 2 || inputs.min_cb_log2_size_y > inputs.ctb_log2_size_y {
+        return Err(Error::invalid(format!(
+            "evc slice_data: MinCbLog2SizeY {} invalid (CtbLog2SizeY={})",
+            inputs.min_cb_log2_size_y, inputs.ctb_log2_size_y
+        )));
+    }
+    if order.segments.is_empty() {
+        return Err(Error::invalid(
+            "evc slice_data: empty tile walk order (no tiles in slice)",
+        ));
+    }
+    if subset_ranges.len() != order.segments.len() {
+        return Err(Error::invalid(format!(
+            "evc slice_data: {} tile subset ranges for {} walk segments \
+             (§7.4.5 eq. 88/89 must yield one subset per tile)",
+            subset_ranges.len(),
+            order.segments.len()
+        )));
+    }
+    let n_ctus = inputs
+        .pic_width_in_ctus()
+        .checked_mul(inputs.pic_height_in_ctus())
+        .ok_or_else(|| Error::invalid("evc slice_data: ctu count overflow"))?;
+    if n_ctus == 0 {
+        return Err(Error::invalid("evc slice_data: no CTUs in slice"));
+    }
+    let mut stats = SliceWalkStats::default();
+    let num_tiles = order.segments.len();
+    for (i, (seg, range)) in order.segments.iter().zip(subset_ranges.iter()).enumerate() {
+        // §7.4.5 eq. (88)/(89): this tile's coded bits are exactly
+        // rbsp[range]. A range outside the RBSP is malformed.
+        let subset = rbsp.get(range.clone()).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: tile {} subset range {}..{} outside slice data (len {})",
+                seg.tile_idx,
+                range.start,
+                range.end,
+                rbsp.len()
+            ))
+        })?;
+        // §9.3.1: the arithmetic engine restarts at the first CTU of each
+        // tile — a fresh 14-bit ivl_offset window over the tile's subset.
+        let mut eng = CabacEngine::new(subset)?;
+        for &rs in &seg.ctb_addr_in_rs {
+            // §7.3.8.1: each tile's CTUs are addressed by raster
+            // CtbAddrInRs; a value outside the picture grid is malformed.
+            if rs >= n_ctus {
+                return Err(Error::invalid(format!(
+                    "evc slice_data: tile {} CtbAddrInRs {rs} >= picture CTU count {n_ctus}",
+                    seg.tile_idx
+                )));
+            }
+            walk_single_ctu(&mut eng, &mut stats, &inputs, rs)?;
+        }
+        // §7.3.8.1: end_of_tile_one_bit closes every tile's subset.
+        let term = eng.decode_terminate()?;
+        if !term {
+            return Err(Error::invalid(format!(
+                "evc slice_data: end_of_tile_one_bit for tile {} must terminate engine",
+                seg.tile_idx
+            )));
+        }
+        stats.end_of_tile_bits += 1;
+        // §7.3.8.1: byte_alignment( ) follows every non-final tile's
+        // end_of_tile_one_bit. The subset boundary already lands the next
+        // tile's engine at a byte-aligned start (eq. 88/89), so the
+        // alignment is accounted for here without re-reading the current
+        // subset's trailing padding.
+        if i + 1 < num_tiles {
+            debug_assert!(seg.byte_align_after);
+            stats.tile_byte_alignments += 1;
+        } else {
+            debug_assert!(!seg.byte_align_after);
+        }
+    }
     Ok(stats)
 }
 
@@ -5995,5 +6149,213 @@ mod tests {
         assert!(order.segments.is_empty());
         assert_eq!(order.total_ctus(), 0);
         assert!(order.ctb_addr_in_rs_flat().is_empty());
+    }
+
+    // =================================================================
+    // §7.3.8.1 multi-tile slice_data() walk
+    // (walk_baseline_idr_slice_tiled).
+    // =================================================================
+
+    /// Encode one tile's coded CTUs as a self-contained CABAC subset: a
+    /// single 32×32 CTU split into four 16×16 dual-tree leaves, each leaf
+    /// carrying `intra_pred_mode` / `cbf_luma` / `cbf_cb` / `cbf_cr` = 0,
+    /// closed by `end_of_tile_one_bit`. Returns the byte-aligned subset.
+    fn encode_one_split_ctu_tile_subset() -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode
+            enc.encode_decision(0, 0, 0); // cbf_luma
+            enc.encode_decision(0, 0, 0); // cbf_cb
+            enc.encode_decision(0, 0, 0); // cbf_cr
+        }
+        enc.encode_terminate(true);
+        enc.finish()
+    }
+
+    fn two_tile_inputs() -> SliceWalkInputs {
+        // 64×32 picture, CTB=32 → 2×1 = 2 CTUs in raster order.
+        SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn round298_tiled_walk_two_tiles_decodes_both_subsets() {
+        // §7.3.8.1: two tiles, each one CTU, in their own §7.4.5 eq. (88)/
+        // (89) byte subsets. Tile 0 → raster CTB rs 0, tile 1 → rs 1.
+        let sub0 = encode_one_split_ctu_tile_subset();
+        let sub1 = encode_one_split_ctu_tile_subset();
+        let split = sub0.len();
+        let mut rbsp = sub0;
+        rbsp.extend_from_slice(&sub1);
+        let subset_ranges = vec![0..split, split..rbsp.len()];
+
+        // SliceTileIdx[] = [0, 1]; each tile owns one tile-scan CTU which
+        // maps to raster rs 0 and rs 1 respectively.
+        let order = SliceTileWalkOrder {
+            segments: vec![
+                SliceTileWalkSegment {
+                    tile_idx: 0,
+                    first_ctb_addr_ts: 0,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![0],
+                    byte_align_after: true,
+                },
+                SliceTileWalkSegment {
+                    tile_idx: 1,
+                    first_ctb_addr_ts: 1,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![1],
+                    byte_align_after: false,
+                },
+            ],
+        };
+
+        let stats = walk_baseline_idr_slice_tiled(&rbsp, two_tile_inputs(), &order, &subset_ranges)
+            .unwrap();
+        // Both CTUs visited, both subsets fully consumed.
+        assert_eq!(stats.ctus, 2);
+        assert_eq!(stats.split_cu_flag_bins, 2); // one per CTB
+        assert_eq!(stats.coding_units, 16); // 2 CTUs × 4 leaves × (luma+chroma)
+        assert_eq!(stats.intra_pred_mode_bins, 8);
+        assert_eq!(stats.cbf_luma_bins, 8);
+        assert_eq!(stats.cbf_chroma_bins, 16);
+        // §7.3.8.1 structure: one end_of_tile_one_bit per tile, one
+        // byte_alignment between them.
+        assert_eq!(stats.end_of_tile_bits, 2);
+        assert_eq!(stats.tile_byte_alignments, 1);
+    }
+
+    #[test]
+    fn round298_tiled_walk_single_tile_matches_raster_walker() {
+        // A one-tile order over the whole picture must produce the same
+        // stats as the existing single-tile raster walker on the same RBSP.
+        let inputs = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let rbsp = encode_one_split_ctu_tile_subset();
+        let raster = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
+
+        let order = SliceTileWalkOrder {
+            segments: vec![SliceTileWalkSegment {
+                tile_idx: 0,
+                first_ctb_addr_ts: 0,
+                num_ctus: 1,
+                ctb_addr_in_rs: vec![0],
+                byte_align_after: false,
+            }],
+        };
+        let range = 0..rbsp.len();
+        let ranges = core::slice::from_ref(&range);
+        let tiled = walk_baseline_idr_slice_tiled(&rbsp, inputs, &order, ranges).unwrap();
+
+        assert_eq!(tiled.ctus, raster.ctus);
+        assert_eq!(tiled.split_cu_flag_bins, raster.split_cu_flag_bins);
+        assert_eq!(tiled.coding_units, raster.coding_units);
+        assert_eq!(tiled.cbf_luma_bins, raster.cbf_luma_bins);
+        assert_eq!(tiled.cbf_chroma_bins, raster.cbf_chroma_bins);
+        assert_eq!(tiled.end_of_tile_bits, raster.end_of_tile_bits);
+        assert_eq!(tiled.end_of_tile_bits, 1);
+        assert_eq!(tiled.tile_byte_alignments, 0);
+    }
+
+    #[test]
+    fn round298_tiled_walk_rejects_subset_count_mismatch() {
+        let order = SliceTileWalkOrder {
+            segments: vec![
+                SliceTileWalkSegment {
+                    tile_idx: 0,
+                    first_ctb_addr_ts: 0,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![0],
+                    byte_align_after: true,
+                },
+                SliceTileWalkSegment {
+                    tile_idx: 1,
+                    first_ctb_addr_ts: 1,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![1],
+                    byte_align_after: false,
+                },
+            ],
+        };
+        // Two segments but only one subset range.
+        let range = 0..8;
+        let ranges = core::slice::from_ref(&range);
+        let err = walk_baseline_idr_slice_tiled(&[0u8; 8], two_tile_inputs(), &order, ranges)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("tile subset ranges for"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round298_tiled_walk_rejects_subset_range_out_of_bounds() {
+        let order = SliceTileWalkOrder {
+            segments: vec![SliceTileWalkSegment {
+                tile_idx: 0,
+                first_ctb_addr_ts: 0,
+                num_ctus: 1,
+                ctb_addr_in_rs: vec![0],
+                byte_align_after: false,
+            }],
+        };
+        // Range overruns the 4-byte RBSP.
+        let range = 0..16;
+        let ranges = core::slice::from_ref(&range);
+        let err = walk_baseline_idr_slice_tiled(&[0u8; 4], two_tile_inputs(), &order, ranges)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("outside slice data"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round298_tiled_walk_rejects_ctb_addr_outside_picture() {
+        let sub = encode_one_split_ctu_tile_subset();
+        // The walk claims raster CTB 99 which is past the 2-CTU picture.
+        let order = SliceTileWalkOrder {
+            segments: vec![SliceTileWalkSegment {
+                tile_idx: 0,
+                first_ctb_addr_ts: 0,
+                num_ctus: 1,
+                ctb_addr_in_rs: vec![99],
+                byte_align_after: false,
+            }],
+        };
+        let range = 0..sub.len();
+        let ranges = core::slice::from_ref(&range);
+        let err =
+            walk_baseline_idr_slice_tiled(&sub, two_tile_inputs(), &order, ranges).unwrap_err();
+        assert!(format!("{err}").contains("CtbAddrInRs 99"), "got: {err}");
+    }
+
+    #[test]
+    fn round298_tiled_walk_rejects_empty_order() {
+        let order = SliceTileWalkOrder { segments: vec![] };
+        let err =
+            walk_baseline_idr_slice_tiled(&[0u8; 4], two_tile_inputs(), &order, &[]).unwrap_err();
+        assert!(
+            format!("{err}").contains("empty tile walk order"),
+            "got: {err}"
+        );
     }
 }

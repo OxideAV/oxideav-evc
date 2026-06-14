@@ -7,6 +7,50 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-298 status
+
+Round 298 lands the **§7.3.8.1 multi-tile `slice_data()` walk** — the
+consumer every tile round (273/278/281/292) named. Round 292 turned the
+tile derivations into an ordered `SliceTileWalkOrder`; this round drives
+the per-CTU CABAC walk off it, so a Baseline IDR slice spanning several
+tiles decodes in the spec's tile-major order.
+
+New surface (in `slice_data`):
+
+* `walk_baseline_idr_slice_tiled(rbsp, inputs, order, subset_ranges) ->
+  Result<SliceWalkStats>` — the §7.3.8.1 outer loop. For each tile in
+  `SliceTileIdx[ ]` order it constructs a **fresh** `CabacEngine` over
+  that tile's coded subset (§9.3.1: the arithmetic engine restarts at
+  the first CTU of every tile), walks the tile's `CtbAddrInRs` CTUs
+  (§7.3.8.2 `coding_tree_unit()` → §7.3.8.3 `split_unit()`), then
+  consumes `end_of_tile_one_bit`. The per-tile subsets are the §7.4.5
+  eq. (88)/(89) byte ranges (`compute_tile_subset_byte_ranges`), so the
+  `byte_alignment( )` that follows every non-final tile is the subset
+  boundary itself.
+* `walk_single_ctu(...)` — the shared per-CTU body the single-tile
+  raster walker and the multi-tile walk both call; the luma top-left is
+  derived from `CtbAddrInRs` identically in both paths.
+
+`SliceWalkStats` gains `end_of_tile_bits` (one per tile) and
+`tile_byte_alignments` (`NumTilesInSlice − 1`). The single-tile
+`walk_baseline_idr_slice` is unchanged behaviourally — it now sets
+`end_of_tile_bits = 1` and shares `walk_single_ctu`.
+
+### Tests
+
+6 new unit tests (669 lib; was 663): a two-tile end-to-end decode
+(two CABAC subsets concatenated, tile 0 → rs 0, tile 1 → rs 1, all bin
+counts pinned, `end_of_tile_bits == 2`, one byte-alignment); a
+single-tile order cross-checked stat-for-stat against the raster
+walker; and four malformed rejections (subset-count mismatch,
+out-of-bounds subset range, out-of-picture `CtbAddrInRs`, empty order).
+
+### Disclaimer
+
+`walk_baseline_idr_slice_tiled` / `walk_single_ctu` are derived from
+ISO/IEC 23094-1:2020 §7.3.8.1 (consuming §7.3.8.2/§7.3.8.3, §9.3.1 and
+§7.4.5 eq. (88)/(89)). All truth came from `docs/video/evc/`.
+
 ## Round-292 status
 
 Round 292 lands the **§7.3.8.1 multi-tile CTU-iteration order** — the

@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Round 298 — §7.3.8.1 multi-tile `slice_data()` walk
+
+#### Added
+- `slice_data::walk_baseline_idr_slice_tiled(rbsp, inputs, order,
+  subset_ranges)` — the §7.3.8.1 multi-tile `slice_data()` walk: drives
+  the per-CTU CABAC walk off a round-292 `SliceTileWalkOrder`. For each
+  tile in `SliceTileIdx[ ]` order it builds a fresh `CabacEngine` over
+  that tile's §7.4.5 eq. (88)/(89) coded subset (§9.3.1 engine restart
+  at the first CTU of each tile), walks the tile's `CtbAddrInRs` CTUs,
+  and consumes `end_of_tile_one_bit`; `byte_alignment( )` between tiles
+  is the subset boundary. The single-tile order reduces to the existing
+  raster walk bit-for-bit.
+- `SliceWalkStats::end_of_tile_bits` / `tile_byte_alignments` — the
+  §7.3.8.1 per-tile terminate count and inter-tile alignment count.
+
+#### Changed
+- `slice_data::walk_baseline_idr_slice` shares the new internal
+  `walk_single_ctu` per-CTU body with the multi-tile walk and records
+  `end_of_tile_bits = 1`; behaviour is otherwise unchanged.
+
 ### Round 292 — §7.3.8.1 multi-tile CTU-iteration order
 
 #### Added
