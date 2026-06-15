@@ -7,6 +7,51 @@ zero `*-sys`.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Round-309 status
+
+Round 309 closes the **§7.3.8.2 `coding_tree_unit( )` `xFirstCtb`
+derivation** (lines 2620-2623) — the preamble round 305's
+`NumHmvpCand = 0` reset (lines 2624-2625) consumes. Round 305 wired the
+`xCtb == xFirstCtb` reset by passing `xFirstCtb` in from the caller; this
+round implements the spec derivation itself:
+
+```text
+tileIndex      = TileIdToIdx[ TileId[ CtbAddrRsToTs[ CtbAddrInRs ] ] ]
+firstCtbAddrRs = CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]
+xFirstCtb      = ( firstCtbAddrRs % PicWidthInCtbsY ) << CtbLog2SizeY
+```
+
+* `slice_data::derive_x_first_ctb(..)` is a pure function consuming the
+  five §6.5.1 maps the spec names — `CtbAddrRsToTs[ ]` (eq. 28),
+  `TileId[ ]` (eq. 30), `TileIdToIdx[ ]` / `FirstCtbAddrTs[ ]` (eq. 32)
+  and `CtbAddrTsToRs[ ]` (eq. 29), all already built in `crate::pps`.
+* For a CTB it locates the owning tile, resolves that tile's first CTB's
+  raster address, and returns its luma column. The result equals the
+  multi-tile walk's segment shortcut by construction — a segment's first
+  raster CTU **is** `CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]` — so
+  the two paths agree on every CTU of every tile.
+
+Opt-in posture (same as the round-218 onward helper rollout): no
+behaviour change to existing decoder paths. Rebinding
+`walk_baseline_idr_slice_tiled` to derive `xFirstCtb` through this helper
+(rather than the segment shortcut) is the natural consumer follow-up.
+
+### Tests
+
+8 new unit tests (681 lib; was 673): single-tile left-column pin; a
+3×2-grid multi-tile hand-trace (10 raster addresses → tile-column luma
+edges 0/64/128); `CtbLog2SizeY` 6 column scaling; full-grid agreement
+with the `walk_baseline_idr_slice_tiled` segment shortcut; explicit
+sparse-tile-ID resolution through `TileIdToIdx[ ]` (errata #97 indexing);
+and three malformed rejections (out-of-range `CtbAddrInRs`, zero
+`PicWidthInCtbsY`, unknown `TileId`).
+
+### Disclaimer
+
+`derive_x_first_ctb` is derived from ISO/IEC 23094-1:2020 §7.3.8.2
+(lines 2620-2623), consuming §6.5.1 eq. (28)/(29)/(30)/(32). All truth
+came from `docs/video/evc/`.
+
 ## Round-305 status
 
 Round 305 lands the **§7.3.8.2 `NumHmvpCand = 0` reset** (lines

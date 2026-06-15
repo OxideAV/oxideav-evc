@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Round 309 — §7.3.8.2 `xFirstCtb` derivation (coding_tree_unit preamble)
+
+#### Added
+- `slice_data::derive_x_first_ctb(ctb_addr_in_rs, ctb_addr_rs_to_ts,
+  tile_id, tile_index_maps, ctb_addr_ts_to_rs, pic_width_in_ctbs_y,
+  ctb_log2_size_y)` — the §7.3.8.2 `coding_tree_unit( )` opening
+  derivation (lines 2620-2623):
+
+  ```text
+  tileIndex      = TileIdToIdx[ TileId[ CtbAddrRsToTs[ CtbAddrInRs ] ] ]
+  firstCtbAddrRs = CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]
+  xFirstCtb      = ( firstCtbAddrRs % PicWidthInCtbsY ) << CtbLog2SizeY
+  ```
+
+  Round 305 wired the `xCtb == xFirstCtb` `NumHmvpCand = 0` reset by
+  passing `xFirstCtb` from the caller (single-tile raster walk
+  hard-codes 0; multi-tile walk reads the segment's first CTU). This
+  closes the preamble itself by consuming the §6.5.1 maps the spec names
+  — `CtbAddrRsToTs[ ]` (eq. 28), `TileId[ ]` (eq. 30), `TileIdToIdx[ ]`
+  / `FirstCtbAddrTs[ ]` (eq. 32) and `CtbAddrTsToRs[ ]` (eq. 29), all
+  already built in `crate::pps`. The derived `xFirstCtb` equals the
+  multi-tile walk's segment shortcut by construction (a segment's first
+  raster CTU **is** `CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]`),
+  pinned by a full-grid cross-check.
+
+#### Notes
+- Opt-in posture (same as the round-218 onward helper rollout): a pure
+  function returning an owned value, no behaviour change to existing
+  decoder paths. Rebinding `walk_baseline_idr_slice_tiled` to derive
+  `xFirstCtb` through this helper (rather than the segment shortcut) is
+  the natural consumer follow-up.
+- Malformed slice/PPS combinations are rejected, not panicked:
+  out-of-range `CtbAddrInRs`, out-of-range tile-scan address, a
+  `TileId` naming no tile, a `tileIndex` out of `FirstCtbAddrTs`
+  range, and `PicWidthInCtbsY == 0`.
+
+#### Tests
+- 8 new unit tests (681 total; was 673): single-tile left-column pin;
+  3×2-grid multi-tile hand-trace (10 raster addresses → tile-column
+  luma edges 0/64/128); `CtbLog2SizeY` 6 scaling; full-grid agreement
+  with the `walk_baseline_idr_slice_tiled` segment shortcut; explicit
+  sparse-tile-ID resolution through `TileIdToIdx[ ]` (errata #97
+  indexing); and three malformed rejections.
+
 ### Round 305 — §7.3.8.2 `NumHmvpCand = 0` reset
 
 #### Added

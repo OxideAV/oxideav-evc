@@ -1123,6 +1123,116 @@ pub fn resolve_slice_tile_walk_order(
     Ok(SliceTileWalkOrder { segments })
 }
 
+/// Derive `xFirstCtb` for a CTB at raster address `CtbAddrInRs`, per the
+/// §7.3.8.2 `coding_tree_unit( )` preamble (lines 2620-2623).
+///
+/// `coding_tree_unit( )` opens by locating the tile that owns the current
+/// CTB and resolving that tile's first CTB's luma column, which the
+/// `NumHmvpCand = 0` reset (lines 2624-2625) then compares against
+/// `xCtb`:
+///
+/// ```text
+/// tileIndex      = TileIdToIdx[ TileId[ CtbAddrRsToTs[ CtbAddrInRs ] ] ]
+/// firstCtbAddrRs = CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]
+/// xFirstCtb      = ( firstCtbAddrRs % PicWidthInCtbsY ) << CtbLog2SizeY
+/// ```
+///
+/// Round 305 wired the `xCtb == xFirstCtb` reset by passing `xFirstCtb`
+/// from the caller (the single-tile raster walk hard-codes 0; the
+/// multi-tile walk reads the segment's first CTU). This function closes
+/// the preamble itself: it consumes the §6.5.1 maps the spec names —
+/// `CtbAddrRsToTs[ ]` (eq. 28), `TileId[ ]` (eq. 30),
+/// `TileIdToIdx[ ]` / `FirstCtbAddrTs[ ]` (eq. 32) and
+/// `CtbAddrTsToRs[ ]` (eq. 29) — all already built in
+/// [`crate::pps`]. With it, the multi-tile walk can derive `xFirstCtb`
+/// from the spec derivation rather than the segment shortcut, and the
+/// two agree by construction (the segment's first raster CTU **is**
+/// `CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]`).
+///
+/// # Arguments
+///
+/// * `ctb_addr_in_rs` — `CtbAddrInRs`, the current CTB's raster address.
+/// * `ctb_addr_rs_to_ts` — `CtbAddrRsToTs[ ]` (eq. 28), length
+///   `PicSizeInCtbsY`.
+/// * `tile_id` — `TileId[ ctbAddrTs ]` (eq. 30), length `PicSizeInCtbsY`.
+/// * `tile_index_maps` — the eq. (32) `TileIdToIdx[ ]` /
+///   `FirstCtbAddrTs[ ]` pair.
+/// * `ctb_addr_ts_to_rs` — `CtbAddrTsToRs[ ]` (eq. 29), length
+///   `PicSizeInCtbsY`.
+/// * `pic_width_in_ctbs_y` — `PicWidthInCtbsY` (§7.4.3.1).
+/// * `ctb_log2_size_y` — `CtbLog2SizeY` (§7.4.3.1).
+///
+/// # Errors
+///
+/// Rejects a malformed slice/PPS combination rather than panicking:
+/// * `CtbAddrInRs` outside `CtbAddrRsToTs[ ]`;
+/// * the resolved tile-scan address outside `TileId[ ]`;
+/// * a `TileId` value that names no tile in `TileIdToIdx[ ]`;
+/// * a `tileIndex` outside `FirstCtbAddrTs[ ]`;
+/// * a `FirstCtbAddrTs[ tileIndex ]` outside `CtbAddrTsToRs[ ]`;
+/// * `pic_width_in_ctbs_y == 0` (a degenerate picture has no CTB grid).
+pub fn derive_x_first_ctb(
+    ctb_addr_in_rs: u32,
+    ctb_addr_rs_to_ts: &[u32],
+    tile_id: &[u32],
+    tile_index_maps: &crate::pps::TileIndexMaps,
+    ctb_addr_ts_to_rs: &[u32],
+    pic_width_in_ctbs_y: u32,
+    ctb_log2_size_y: u32,
+) -> Result<u32> {
+    if pic_width_in_ctbs_y == 0 {
+        return Err(Error::invalid(
+            "evc slice_data: PicWidthInCtbsY == 0 has no CTB grid for xFirstCtb",
+        ));
+    }
+    // ctbAddrTs = CtbAddrRsToTs[ CtbAddrInRs ]
+    let ctb_addr_ts = *ctb_addr_rs_to_ts
+        .get(ctb_addr_in_rs as usize)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: CtbAddrInRs {ctb_addr_in_rs} out of \
+                 CtbAddrRsToTs range (len {})",
+                ctb_addr_rs_to_ts.len()
+            ))
+        })?;
+    // TileId[ ctbAddrTs ]
+    let id = *tile_id.get(ctb_addr_ts as usize).ok_or_else(|| {
+        Error::invalid(format!(
+            "evc slice_data: ctbAddrTs {ctb_addr_ts} out of TileId range (len {})",
+            tile_id.len()
+        ))
+    })?;
+    // tileIndex = TileIdToIdx[ TileId[ ctbAddrTs ] ]
+    let tile_index = tile_index_maps.tile_idx_for_id(id).ok_or_else(|| {
+        Error::invalid(format!(
+            "evc slice_data: TileId {id} names no tile in TileIdToIdx"
+        ))
+    })?;
+    // FirstCtbAddrTs[ tileIndex ]
+    let first_ctb_addr_ts = *tile_index_maps
+        .first_ctb_addr_ts
+        .get(tile_index as usize)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: tileIndex {tile_index} out of \
+                 FirstCtbAddrTs range (len {})",
+                tile_index_maps.first_ctb_addr_ts.len()
+            ))
+        })?;
+    // firstCtbAddrRs = CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ]
+    let first_ctb_addr_rs = *ctb_addr_ts_to_rs
+        .get(first_ctb_addr_ts as usize)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "evc slice_data: FirstCtbAddrTs {first_ctb_addr_ts} out of \
+                 CtbAddrTsToRs range (len {})",
+                ctb_addr_ts_to_rs.len()
+            ))
+        })?;
+    // xFirstCtb = ( firstCtbAddrRs % PicWidthInCtbsY ) << CtbLog2SizeY
+    Ok((first_ctb_addr_rs % pic_width_in_ctbs_y) << ctb_log2_size_y)
+}
+
 // =====================================================================
 // Round-3 pixel-emission pipeline.
 // =====================================================================
@@ -6188,6 +6298,198 @@ mod tests {
         assert!(order.segments.is_empty());
         assert_eq!(order.total_ctus(), 0);
         assert!(order.ctb_addr_in_rs_flat().is_empty());
+    }
+
+    // =================================================================
+    // §7.3.8.2 coding_tree_unit() xFirstCtb derivation
+    // (derive_x_first_ctb).
+    // =================================================================
+
+    /// Build the full §6.5.1 per-picture map set for a uniform implicit-ID
+    /// tile grid: returns (`CtbAddrRsToTs`, `TileId`, `TileIndexMaps`,
+    /// `CtbAddrTsToRs`, `PicWidthInCtbsY`). Companion to
+    /// `uniform_tile_lists` but exposing the two maps the §7.3.8.2 preamble
+    /// reads directly (`CtbAddrRsToTs[ ]`, `TileId[ ]`).
+    fn uniform_tile_maps(
+        cols_minus1: u32,
+        rows_minus1: u32,
+        pic_w_ctbs: u32,
+        pic_h_ctbs: u32,
+    ) -> (Vec<u32>, Vec<u32>, crate::pps::TileIndexMaps, Vec<u32>, u32) {
+        let col_w = compute_col_widths(true, cols_minus1, &[], pic_w_ctbs);
+        let row_h = compute_row_heights(true, rows_minus1, &[], pic_h_ctbs);
+        let col_bd = compute_col_bd(&col_w);
+        let row_bd = compute_row_bd(&row_h);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_w, &row_h, &col_bd, &row_bd, pic_w_ctbs);
+        let ts_to_rs = compute_ctb_addr_ts_to_rs(&rs_to_ts);
+        // §6.5.1 eq. (30) implicit branch: TileId[ ctbAddrTs ] = tileIdx.
+        let tile_id = crate::pps::compute_tile_id(&col_bd, &row_bd, &rs_to_ts, pic_w_ctbs, None);
+        let maps = compute_tile_index_maps(&tile_id);
+        (rs_to_ts, tile_id, maps, ts_to_rs, pic_w_ctbs)
+    }
+
+    #[test]
+    fn round309_x_first_ctb_single_tile_is_left_column() {
+        // 1 tile over a 3×2 CTB picture, CtbLog2SizeY = 5 (32-luma CTBs).
+        // The sole tile starts at the picture origin, so xFirstCtb == 0 for
+        // every CTB — exactly the constant the single-tile raster walker
+        // hard-codes.
+        let (rs_to_ts, tile_id, maps, ts_to_rs, pw) = uniform_tile_maps(0, 0, 3, 2);
+        for rs in 0..6u32 {
+            let x_first =
+                derive_x_first_ctb(rs, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 5).unwrap();
+            assert_eq!(x_first, 0, "single-tile CtbAddrInRs {rs} → xFirstCtb 0");
+        }
+    }
+
+    #[test]
+    fn round309_x_first_ctb_multi_tile_hand_trace() {
+        // 3×2 tile grid over a 6×4 CTB picture → each tile is 2×2 CTBs.
+        // Tile columns start at CTB-column 0, 2, 4. With CtbLog2SizeY = 5,
+        // the tile-column luma origins are 0, 64, 128. Every CTB resolves
+        // its own tile-column's left luma edge as xFirstCtb.
+        let (rs_to_ts, tile_id, maps, ts_to_rs, pw) = uniform_tile_maps(2, 1, 6, 4);
+        assert_eq!(pw, 6);
+        // (raster CtbAddrInRs, expected tile-column luma origin).
+        // Picture columns 0,1 → tile col 0 (x 0); 2,3 → tile col 1 (x 64);
+        // 4,5 → tile col 2 (x 128). Rows do not affect xFirstCtb.
+        let cases = [
+            (0u32, 0u32), // (col0,row0) tile 0
+            (1, 0),       // (col1,row0) tile 0
+            (2, 64),      // (col2,row0) tile 1
+            (3, 64),      // (col3,row0) tile 1
+            (4, 128),     // (col4,row0) tile 2
+            (5, 128),     // (col5,row0) tile 2
+            (6, 0),       // (col0,row1) tile 0
+            (9, 64),      // (col3,row1) tile 1
+            (16, 128),    // (col4,row2) tile 5
+            (23, 128),    // (col5,row3) tile 5
+        ];
+        for (rs, expected) in cases {
+            let x_first =
+                derive_x_first_ctb(rs, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 5).unwrap();
+            assert_eq!(x_first, expected, "CtbAddrInRs {rs}");
+        }
+    }
+
+    #[test]
+    fn round309_x_first_ctb_ctb_log2_scales_the_column() {
+        // The same 3×2 grid at CtbLog2SizeY = 6 (64-luma CTBs): the
+        // tile-column origins scale to 0, 128, 256.
+        let (rs_to_ts, tile_id, maps, ts_to_rs, pw) = uniform_tile_maps(2, 1, 6, 4);
+        assert_eq!(
+            derive_x_first_ctb(2, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 6).unwrap(),
+            128
+        );
+        assert_eq!(
+            derive_x_first_ctb(4, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 6).unwrap(),
+            256
+        );
+    }
+
+    #[test]
+    fn round309_x_first_ctb_agrees_with_tiled_walk_segment_shortcut() {
+        // The §7.3.8.2 derivation must agree with the shortcut
+        // `walk_baseline_idr_slice_tiled` uses: the first raster CTU of a
+        // segment IS CtbAddrTsToRs[ FirstCtbAddrTs[ tileIndex ] ], so its
+        // luma column equals the derived xFirstCtb for every CTU in the
+        // tile. Cross-check across a full 3×2-grid multi-tile slice.
+        let (rs_to_ts, tile_id, maps, ts_to_rs, pw) = uniform_tile_maps(2, 1, 6, 4);
+        let col_w = compute_col_widths(true, 2, &[], 6);
+        let row_h = compute_row_heights(true, 1, &[], 4);
+        let num_ctus = compute_num_ctus_in_tile(&col_w, &row_h);
+        let slice_tile_idx = vec![0u32, 1, 2, 3, 4, 5];
+        let order = resolve_slice_tile_walk_order(
+            &slice_tile_idx,
+            &maps.first_ctb_addr_ts,
+            &num_ctus,
+            &ts_to_rs,
+        )
+        .unwrap();
+        for seg in &order.segments {
+            // The segment shortcut: first raster CTU's luma column.
+            let first_rs = *seg.ctb_addr_in_rs.first().unwrap();
+            let shortcut_x_first = (first_rs % pw) << 5;
+            for &rs in &seg.ctb_addr_in_rs {
+                let derived =
+                    derive_x_first_ctb(rs, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 5).unwrap();
+                assert_eq!(
+                    derived, shortcut_x_first,
+                    "tile {} CtbAddrInRs {rs}: derived xFirstCtb must match segment shortcut",
+                    seg.tile_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round309_x_first_ctb_explicit_tile_ids_resolve_through_tile_id_to_idx() {
+        // Explicit, sparse tile IDs (errata #97 indexing): the derivation
+        // must route TileId[ ctbAddrTs ] → TileIdToIdx → FirstCtbAddrTs and
+        // still land each CTB on its own tile-column luma edge. A 3×2 grid
+        // with strictly-increasing IDs along the §7.4.3.2 raster flat index
+        // j*cols+i: [10, 20, 30, 40, 50, 60].
+        let col_w = compute_col_widths(true, 2, &[], 6);
+        let row_h = compute_row_heights(true, 1, &[], 4);
+        let col_bd = compute_col_bd(&col_w);
+        let row_bd = compute_row_bd(&row_h);
+        let rs_to_ts = compute_ctb_addr_rs_to_ts(&col_w, &row_h, &col_bd, &row_bd, 6);
+        let ts_to_rs = compute_ctb_addr_ts_to_rs(&rs_to_ts);
+        let explicit = [10u32, 20, 30, 40, 50, 60];
+        let tile_id = crate::pps::compute_tile_id(&col_bd, &row_bd, &rs_to_ts, 6, Some(&explicit));
+        let maps = compute_tile_index_maps(&tile_id);
+        // Column 2 (raster CtbAddrInRs 2) is tile column 1 → luma edge 64.
+        assert_eq!(
+            derive_x_first_ctb(2, &rs_to_ts, &tile_id, &maps, &ts_to_rs, 6, 5).unwrap(),
+            64
+        );
+        // Column 4 (raster CtbAddrInRs 4) is tile column 2 → luma edge 128.
+        assert_eq!(
+            derive_x_first_ctb(4, &rs_to_ts, &tile_id, &maps, &ts_to_rs, 6, 5).unwrap(),
+            128
+        );
+        // Bottom-right CTB (rs 23) is in tile column 2 → luma edge 128.
+        assert_eq!(
+            derive_x_first_ctb(23, &rs_to_ts, &tile_id, &maps, &ts_to_rs, 6, 5).unwrap(),
+            128
+        );
+    }
+
+    #[test]
+    fn round309_x_first_ctb_rejects_out_of_range_raster_address() {
+        let (rs_to_ts, tile_id, maps, ts_to_rs, pw) = uniform_tile_maps(0, 0, 3, 2);
+        // 6-CTB picture; CtbAddrInRs 6 is past the end.
+        let err = derive_x_first_ctb(6, &rs_to_ts, &tile_id, &maps, &ts_to_rs, pw, 5).unwrap_err();
+        assert!(
+            format!("{err}").contains("out of CtbAddrRsToTs range"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round309_x_first_ctb_rejects_zero_pic_width() {
+        let (rs_to_ts, tile_id, maps, ts_to_rs, _pw) = uniform_tile_maps(0, 0, 3, 2);
+        let err = derive_x_first_ctb(0, &rs_to_ts, &tile_id, &maps, &ts_to_rs, 0, 5).unwrap_err();
+        assert!(
+            format!("{err}").contains("PicWidthInCtbsY == 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn round309_x_first_ctb_rejects_unknown_tile_id() {
+        // A TileId[ ] entry that names no tile in TileIdToIdx: feed a
+        // tile_id list whose first tile-scan entry is an ID absent from the
+        // (separately-built) maps.
+        let (rs_to_ts, _tile_id, _maps, ts_to_rs, pw) = uniform_tile_maps(0, 0, 3, 2);
+        let bogus_tile_id = vec![99u32; 6];
+        let empty_maps = compute_tile_index_maps(&[]); // no tiles → no IDs
+        let err = derive_x_first_ctb(0, &rs_to_ts, &bogus_tile_id, &empty_maps, &ts_to_rs, pw, 5)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("names no tile in TileIdToIdx"),
+            "got: {err}"
+        );
     }
 
     // =================================================================
