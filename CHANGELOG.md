@@ -4,6 +4,7 @@
 
 ### Other
 
+- §7.4.8.3 BTT split-geometry layer (`split` module): `allowSplitBtVer`/`BtHor`/`TtVer`/`TtHor` derivations, `btt_split_dir`/`type` signalling + inference predicates, and the `SplitMode` derivation incl. picture-boundary implicit-split rules; §7.3.2.2 BTT size limits (eqs. 43/44/62-67). Documents the §7.4.8.3 `SplitMode`-table horizontal-ternary typo (lines 5459-5469 list SPLIT_TT_VER; recursion-consistent reading is SPLIT_TT_HOR)
 - Cargo.toml `description` updated to reflect the working Baseline IDR/P/B 8-bit 4:2:0 pixel decoder (was the stale round-1 "scaffold: pixel decode pending" string)
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-evc/compare/v0.0.2...v0.0.3) - 2026-06-15

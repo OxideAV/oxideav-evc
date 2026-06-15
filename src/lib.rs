@@ -97,6 +97,7 @@ pub mod rpl;
 pub mod scan;
 pub mod slice_data;
 pub mod slice_header;
+pub mod split;
 pub mod sps;
 pub mod transform;
 

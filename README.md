@@ -30,7 +30,12 @@ The Main-profile CABAC infrastructure is in place — the §9.3.5 init
 tables (Tables 40-90), the §9.3.2.2 init pipeline, and the §9.3.4.2
 per-syntax-element ctxInc helpers — together with a large body of pure
 §6.5.1 / §7.4.5 tile-geometry and §6.4 neighbour-availability helpers and
-the §7.3.8.1 multi-tile `slice_data()` CTU-walk driver. The remaining
+the §7.3.8.1 multi-tile `slice_data()` CTU-walk driver. The §7.4.8.3
+binary/ternary-tree (BTT) split-geometry layer (`split` module) supplies
+the `allowSplit{Bt,Tt}{Ver,Hor}` derivations, the `btt_split_dir`/`type`
+signalling + inference predicates, and the `SplitMode` derivation
+(including the picture-boundary implicit-split rules), all driven by the
+§7.3.2.2 BTT size limits (eqs. 43/44/62-67). The remaining
 Main-profile syntax-decode tools (BTT / SUCO / ADMVP / EIPD / IBC / ATS /
 ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
 `Error::Unsupported`.
