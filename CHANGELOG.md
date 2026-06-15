@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Other
+
+- Cargo.toml `description` updated to reflect the working Baseline IDR/P/B 8-bit 4:2:0 pixel decoder (was the stale round-1 "scaffold: pixel decode pending" string)
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-evc/compare/v0.0.2...v0.0.3) - 2026-06-15
 
 ### Other

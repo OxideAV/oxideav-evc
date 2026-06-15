@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-evc"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust EVC (MPEG-5 Essential Video Coding, ISO/IEC 23094-1) decoder — baseline + main profile. Round-1 scaffold: NAL + parameter-set parsing only; pixel decode pending."
+description = "Pure-Rust EVC (MPEG-5 Essential Video Coding, ISO/IEC 23094-1) decoder. Baseline profile: IDR/P/B slices, 8-bit 4:2:0 pixel decode (residual, intra, inter, deblocking, multi-reference DPB); Main-profile CABAC infrastructure in progress."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-evc"
