@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-evc/compare/v0.0.2...v0.0.3) - 2026-06-15
+
+### Other
+
+- §7.3.8.2 xFirstCtb derivation (coding_tree_unit preamble, lines 2620-2623)
+- §7.3.8.2 NumHmvpCand=0 reset (lines 2624-2625) keyed on xFirstCtb
+- §7.3.8.1 multi-tile slice_data() walk (walk_baseline_idr_slice_tiled)
+- §7.3.8.1 multi-tile CTU-iteration order (resolve_slice_tile_walk_order)
+- §7.3.4 entry points + §7.4.5 eq. (88)/(89) tile subsets; errata-#97 reconciliation + §8.9.8 tableNum==0 pins
+- §7.4.5 eq. (78)-(82) slice-tile resolution + arbitrary-slice parser fixes
+- §6.5.1 eq. (32) TileIdToIdx + FirstCtbAddrTs + luma-sample tile extents
+- §6.5.1 eq. (28)-(31) CTB-address conversion + TileId[] (errata #97)
+- §6.5.1 ColBd (eq. 26) + RowBd (eq. 27) tile-boundary derivations
+- §6.4.1 base neighbouring-block availability derivation
+- §6.4.3 MV-candidate + §6.4.4 ALF availability derivations
+- §6.5.1 ColWidth (eq. 24) + RowHeight (eq. 25) tile-extent derivations
+- §6.5.3 inverse scan order (eq. 34) + §6.5.2 public surface
+- §6.4.2 availLR derivation (eq. 23) + LR_xx tokens
+- §6.5.1 tile-grid iterator + §7.4.3.2 picture-tile counters
+- §8.5.2.3.10 MV prediction redundancy check
+- §8.5.2.3.9 entry-process signed POC scaling primitives
+- §8.5.2.3.9 bipred MMVD offset distribution (eqs. 591-616)
+- §7.4.7 MMVD distance / sign / offset derivation + §9.3.4 ctxInc
+- §8.5 AMVR (Adaptive Motion Vector Resolution) helper trio
+- derive_dra_chroma_state_for_sps SPS adapter (joined + unjoined dispatch)
+- §7.4.3.1 page-67 "Otherwise" identity ChromaQpTable + SPS->table adapter
+- §7.4.3.1 SPS-signalled ChromaQpTable (eq. 74) parse + populate
+
 ### Round 309 — §7.3.8.2 `xFirstCtb` derivation (coding_tree_unit preamble)
 
 #### Added
