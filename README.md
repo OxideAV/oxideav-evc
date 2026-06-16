@@ -40,6 +40,16 @@ Main-profile syntax-decode tools (BTT / SUCO / ADMVP / EIPD / IBC / ATS /
 ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
 `Error::Unsupported`.
 
+The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
+§7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
+inverse mapping and the §8.9.6/§8.9.7/§8.9.8 chroma scale derivation
+(including the §8.9.8 joined path via `ChromaQpTable` and the
+eq. 1398-1409 `tableNum == 0` pivot-boundary sub-case). The chroma
+*apply* now uses the §8.9.4 eqs. 1377-1382 magnitude scale
+(`map_one_chroma_sample` / `apply_chroma_inverse_mapping_u8`) driven
+by the per-luma-sample `chromaScale`, superseding the round-11
+per-segment QP-offset approximation.
+
 ### Not yet supported
 
 - 10-bit / high-bit-depth pixel decode.

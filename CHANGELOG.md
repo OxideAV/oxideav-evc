@@ -4,6 +4,7 @@
 
 ### Other
 
+- §8.9.4 spec-faithful chroma inverse-mapping apply (eqs. 1377-1382): `map_one_chroma_sample` (per-sample magnitude scale: abs-multiply, `>> 9` truncate, restore sign, re-pivot, `Clip1C`) + `apply_chroma_inverse_mapping_u8` (whole-plane apply driven by the §8.9.6/§8.9.7/§8.9.8 `DraChromaDerived` `chromaScale` per co-located pre-mapping luma sample). Supersedes the round-11 per-segment chroma QP-offset approximation for the spec-faithful DRA path. 8 new tests.
 - §7.4.8.3 BTT split-geometry layer (`split` module): `allowSplitBtVer`/`BtHor`/`TtVer`/`TtHor` derivations, `btt_split_dir`/`type` signalling + inference predicates, and the `SplitMode` derivation incl. picture-boundary implicit-split rules; §7.3.2.2 BTT size limits (eqs. 43/44/62-67). Documents the §7.4.8.3 `SplitMode`-table horizontal-ternary typo (lines 5459-5469 list SPLIT_TT_VER; recursion-consistent reading is SPLIT_TT_HOR)
 - Cargo.toml `description` updated to reflect the working Baseline IDR/P/B 8-bit 4:2:0 pixel decoder (was the stale round-1 "scaffold: pixel decode pending" string)
 

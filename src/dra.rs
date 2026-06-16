@@ -1371,6 +1371,106 @@ pub fn chroma_scale_for_luma_sample(luma_sample: i64, chroma_derived: &DraChroma
         + ((chroma_derived.out_scales_c[range_idx] * inc_value + (1i64 << 9)) >> 10)
 }
 
+/// Apply §8.9.4 (eqs. 1377-1382) to a single chroma sample, given the
+/// §8.9.6 `chromaScale` already derived for the co-located luma sample
+/// via [`chroma_scale_for_luma_sample`].
+///
+/// Spec text (§8.9.4, with `BitDepthC = bit_depth_chroma`):
+///
+/// ```text
+/// signedValue   = chromaSample − 2^(BitDepthC − 1)                       (1377)
+/// unsignedValue = (signedValue < 0) ? −signedValue * chromaScale
+///                                    :  signedValue * chromaScale        (1378)
+/// scaledSample  = (unsignedValue + (1 << 8)) >> 9                        (1379)
+/// scaledSample  = (signedValue < 0) ? −scaledSample : scaledSample       (1380)
+/// scaledSample  = scaledSample + 2^(BitDepthC − 1)                       (1381)
+/// invChromaSample = Clip1C(scaledSample)                                 (1382)
+/// ```
+///
+/// `Clip1C(x) = Clip3(0, (1 << BitDepthC) − 1, x)`.
+///
+/// Note that eq. 1378 takes the **absolute value** of `signedValue`
+/// before the multiply and re-applies the sign at eq. 1380 — this is a
+/// round-toward-zero (truncating) magnitude scale, *not* an arithmetic
+/// `>> 9` of a signed product. The two differ for negative
+/// `signedValue` (arithmetic shift rounds toward −∞, the spec's
+/// magnitude form rounds toward 0), so the sign dance is load-bearing.
+#[inline]
+pub fn map_one_chroma_sample(chroma_sample: i64, chroma_scale: i64, bit_depth_chroma: u32) -> i64 {
+    // Mid-level pivot 2^(BitDepthC − 1).
+    let mid = 1i64 << (bit_depth_chroma - 1);
+    // Eq. 1377.
+    let signed_value = chroma_sample - mid;
+    // Eq. 1378 — magnitude multiply (abs before, sign restored at 1380).
+    let unsigned_value = signed_value.abs() * chroma_scale;
+    // Eq. 1379.
+    let mut scaled_sample = (unsigned_value + (1i64 << 8)) >> 9;
+    // Eq. 1380 — restore sign.
+    if signed_value < 0 {
+        scaled_sample = -scaled_sample;
+    }
+    // Eq. 1381.
+    scaled_sample += mid;
+    // Eq. 1382 — Clip1C.
+    let max_c = (1i64 << bit_depth_chroma) - 1;
+    scaled_sample.clamp(0, max_c)
+}
+
+/// Apply §8.9.4 (eqs. 1377-1382) across an entire 8-bit chroma plane
+/// using the spec-faithful §8.9.6/§8.9.7/§8.9.8 [`DraChromaDerived`]
+/// state, rather than the legacy round-11 per-segment QP-offset
+/// approximation in [`apply_dra`].
+///
+/// For each chroma position `(x, y)` the co-located **pre-mapping** luma
+/// sample is read from `pre_luma` (the decoded luma plane *before* the
+/// §8.9.3 inverse mapping — §8.9.2's input contract), the §8.9.6
+/// `chromaScale` is derived for that luma value via
+/// [`chroma_scale_for_luma_sample`], and eqs. 1377-1382 are applied to
+/// the chroma sample in place.
+///
+/// * `plane` — the chroma plane (`chroma_w * chroma_h` samples), modified
+///   in place.
+/// * `pre_luma` — the pre-DRA luma plane (`luma_w * luma_h` samples).
+/// * `sub_w` / `sub_h` — chroma subsampling factors (e.g. 2/2 for 4:2:0).
+/// * `chroma_derived` — the per-component state from
+///   [`derive_dra_chroma_state`] or [`derive_dra_chroma_state_joined`].
+/// * `bit_depth_chroma` — `BitDepthC`, drives the eq. 1377/1381 pivot
+///   and the eq. 1382 `Clip1C` upper bound.
+///
+/// No-ops when `chroma_derived.num_ranges_l == 0` (empty state).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_chroma_inverse_mapping_u8(
+    plane: &mut [u8],
+    pre_luma: &[u8],
+    luma_w: usize,
+    luma_h: usize,
+    chroma_w: usize,
+    chroma_h: usize,
+    sub_w: usize,
+    sub_h: usize,
+    chroma_derived: &DraChromaDerived,
+    bit_depth_chroma: u32,
+) {
+    if chroma_derived.num_ranges_l == 0 {
+        return;
+    }
+    debug_assert_eq!(plane.len(), chroma_w * chroma_h);
+    debug_assert_eq!(pre_luma.len(), luma_w * luma_h);
+    for y in 0..chroma_h {
+        let luma_y = (y * sub_h).min(luma_h.saturating_sub(1));
+        let row_off_luma = luma_y * luma_w;
+        let row_off_chroma = y * chroma_w;
+        for x in 0..chroma_w {
+            let luma_x = (x * sub_w).min(luma_w.saturating_sub(1));
+            let luma_sample = pre_luma[row_off_luma + luma_x] as i64;
+            let chroma_scale = chroma_scale_for_luma_sample(luma_sample, chroma_derived);
+            let chroma_sample = plane[row_off_chroma + x] as i64;
+            plane[row_off_chroma + x] =
+                map_one_chroma_sample(chroma_sample, chroma_scale, bit_depth_chroma) as u8;
+        }
+    }
+}
+
 // =====================================================================
 // Round 193 — §8.9.8 DraJoinedScaleFlag = 1 (joined chroma scale via
 // ChromaQpTable) + default Table 5/6 ChromaQpTable builder.
@@ -4800,5 +4900,159 @@ mod tests {
             past_knot > at_knot / 2 && past_knot < at_knot * 2,
             "branch seam should not jump an octave: {at_knot} vs {past_knot}"
         );
+    }
+
+    // =================================================================
+    // Round 321 — §8.9.4 (eqs. 1377-1382) spec-faithful chroma apply:
+    // `map_one_chroma_sample` + `apply_chroma_inverse_mapping_u8`.
+    // =================================================================
+
+    #[test]
+    fn round321_map_one_chroma_identity_scale_is_noop() {
+        // chromaScale = 512 (Q9 = 1.0): the §8.9.4 chain reduces to
+        // identity for every sample, since
+        //   signed * 512, +256, >>9 == signed (for the magnitude form).
+        // Verify across the full 8-bit range (BitDepthC = 8, pivot 128).
+        for s in 0..=255i64 {
+            let out = map_one_chroma_sample(s, 512, 8);
+            assert_eq!(out, s, "identity scale must be a no-op at sample {s}");
+        }
+    }
+
+    #[test]
+    fn round321_map_one_chroma_pivot_is_fixed_point() {
+        // chromaSample == 2^(BitDepthC−1) ⇒ signedValue == 0 ⇒ output is
+        // exactly the pivot for ANY chromaScale (the multiply annihilates).
+        for &scale in &[0i64, 1, 512, 1024, 4096] {
+            assert_eq!(map_one_chroma_sample(128, scale, 8), 128);
+        }
+        // 10-bit pivot 512 likewise.
+        assert_eq!(map_one_chroma_sample(512, 4096, 10), 512);
+    }
+
+    #[test]
+    fn round321_map_one_chroma_sign_is_magnitude_truncating() {
+        // The eq. 1378/1380 abs-then-sign dance is a magnitude
+        // (toward-zero) scale: abs(signedValue) is multiplied, the >> 9
+        // truncates the magnitude, then the sign is restored.
+        //
+        // sample = 120, pivot 128 ⇒ signedValue = −8, scale = 130:
+        //   abs: 8 * 130 = 1040; (1040 + 256) >> 9 = 1296 >> 9 = 2;
+        //   restore sign ⇒ −2; + pivot ⇒ 126.
+        assert_eq!(map_one_chroma_sample(120, 130, 8), 126);
+
+        // The chain is exactly antisymmetric about the pivot: samples
+        // equidistant above and below 128 map to outputs equidistant
+        // above and below 128 (magnitude form, not arithmetic shift).
+        let lo = map_one_chroma_sample(120, 700, 8); // signedValue −8
+        let hi = map_one_chroma_sample(136, 700, 8); // signedValue +8
+        assert_eq!(lo - 128, -(hi - 128), "magnitude scale is sign-symmetric");
+        assert_eq!(lo, 117);
+        assert_eq!(hi, 139);
+    }
+
+    #[test]
+    fn round321_map_one_chroma_clip1c_upper_bound() {
+        // A large scale on a high sample must clip to (1 << BitDepthC) − 1.
+        // sample 255, scale 4096 (Q9 = 8.0), pivot 128 ⇒ signed 127,
+        //   scaled = (127*4096 + 256) >> 9 = 520192 >> 9 = 1016; +128 =
+        //   1144 ⇒ Clip1C(8) = 255.
+        assert_eq!(map_one_chroma_sample(255, 4096, 8), 255);
+        // And the lower bound: sample 0, scale 4096 ⇒ symmetric ⇒ 0.
+        assert_eq!(map_one_chroma_sample(0, 4096, 8), 0);
+    }
+
+    #[test]
+    fn round321_apply_chroma_plane_empty_state_is_noop() {
+        // num_ranges_l == 0 ⇒ the apply must leave the plane untouched.
+        let derived = DraChromaDerived::empty(ChromaIdx::Cb);
+        let pre_luma = vec![100u8; 4 * 4];
+        let mut plane = vec![60u8; 2 * 2];
+        let before = plane.clone();
+        apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &derived, 8);
+        assert_eq!(plane, before);
+    }
+
+    #[test]
+    fn round321_apply_chroma_plane_identity_scale_unjoined() {
+        // Build a real DraChromaDerived (unjoined) with Cb scale = 512
+        // (Q9 = 1.0) ⇒ every OutScalesC/OutOffsetsC collapses to the
+        // identity chromaScale = 512, so the whole-plane apply is a
+        // no-op for ANY luma/chroma content. This exercises the full
+        // chroma_scale_for_luma_sample → map_one_chroma_sample pipeline.
+        let mut syn = three_range_unjoined_chroma_syntax(8);
+        syn.dra_cb_scale_value = 512; // Q9 = 1.0 (helper default is 256)
+        let der = derive_dra_state(&syn, 8).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 8).unwrap();
+        // Sanity: the derived chromaScale is the identity 512.
+        assert_eq!(chroma_scale_for_luma_sample(50, &c), 512);
+
+        let pre_luma: Vec<u8> = (0..(4 * 4)).map(|i| (i * 7) as u8).collect();
+        let mut plane: Vec<u8> = (0..(2 * 2)).map(|i| (i * 30 + 10) as u8).collect();
+        let before = plane.clone();
+        apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &c, 8);
+        assert_eq!(plane, before, "identity chromaScale ⇒ plane unchanged");
+    }
+
+    #[test]
+    fn round321_apply_chroma_plane_doubled_scale_moves_away_from_pivot() {
+        // §8.9.6 produces the INVERSE chroma scale (eq. 1386:
+        // invChromaScales = ((1<<18) + chromaScales/2) / chromaScales).
+        // A forward Cb scale of 256 (Q9 = 0.5) therefore yields a §8.9.6
+        // chromaScale of ((1<<18) + 128) / 256 = 1024 — so the inverse
+        // map AT eq. 1377-1382 doubles each sample's distance from the
+        // pivot 128 (subject to >> 9 rounding + Clip1C). The helper's
+        // default Cb scale already is 256.
+        let syn = three_range_unjoined_chroma_syntax(8);
+        let der = derive_dra_state(&syn, 8).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 8).unwrap();
+        let scale = chroma_scale_for_luma_sample(50, &c);
+        assert_eq!(scale, 1024, "forward 256 ⇒ inverse chromaScale 1024");
+
+        // 2×2 chroma plane; luma constant so the scale is uniform.
+        let pre_luma = vec![40u8; 4 * 4];
+        // Samples: 138 (above pivot), 118 (below), 128 (pivot), 200.
+        let mut plane = vec![138u8, 118u8, 128u8, 200u8];
+        apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &c, 8);
+
+        // Hand-evaluate eq. 1377-1382 with chromaScale = 1024, pivot 128.
+        let expect = |s: i64| map_one_chroma_sample(s, 1024, 8);
+        assert_eq!(plane[0] as i64, expect(138)); // signed +10 ⇒ ~+20 ⇒ 148
+        assert_eq!(plane[1] as i64, expect(118)); // signed −10 ⇒ ~−20 ⇒ 108
+        assert_eq!(plane[2] as i64, 128); // pivot fixed point
+        assert_eq!(plane[3] as i64, expect(200)); // clips toward 255
+        assert_eq!(plane[0], 148);
+        assert_eq!(plane[1], 108);
+    }
+
+    #[test]
+    fn round321_apply_chroma_plane_per_range_scale_picks_by_luma() {
+        // A genuinely piecewise state: under DraJoinedScaleFlag = 0 the
+        // chromaScale is constant across ranges, so to exercise the
+        // luma-driven range selection we assert that the SAME chroma
+        // sample maps identically regardless of co-located luma (the
+        // unjoined invariant) — and that swapping luma values does NOT
+        // change the output, confirming the range lookup is wired but
+        // collapses correctly for the unjoined path.
+        let mut syn = three_range_unjoined_chroma_syntax(8);
+        syn.dra_cb_scale_value = 768; // Q9 = 1.5
+        let der = derive_dra_state(&syn, 8).unwrap();
+        let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 8).unwrap();
+
+        // Two luma planes with different content, same chroma plane.
+        let pre_luma_lo = vec![10u8; 4 * 4];
+        let pre_luma_hi = vec![240u8; 4 * 4];
+        let chroma_src = vec![160u8, 96u8, 128u8, 50u8];
+
+        let mut a = chroma_src.clone();
+        let mut b = chroma_src.clone();
+        apply_chroma_inverse_mapping_u8(&mut a, &pre_luma_lo, 4, 4, 2, 2, 2, 2, &c, 8);
+        apply_chroma_inverse_mapping_u8(&mut b, &pre_luma_hi, 4, 4, 2, 2, 2, 2, &c, 8);
+        assert_eq!(
+            a, b,
+            "unjoined chromaScale is luma-independent ⇒ outputs match"
+        );
+        // And it actually changed the samples (scale != identity).
+        assert_ne!(a, chroma_src);
     }
 }
