@@ -17,13 +17,22 @@
 //!   picture-boundary implicit-split rules) into one of the five split
 //!   shapes.
 //!
-//! No bitstream is consumed here — the CABAC `btt_split_*` reads + their
-//! ctxInc derivations live in [`crate::cabac_init`]; this module is the
-//! geometry that decides *whether* those reads happen and *what shape*
-//! the result has. Keeping it a leaf module of pure functions makes the
-//! whole BTT decision surface independently testable.
+//! The pure geometry above consumes no bitstream — the per-syntax-element
+//! ctxInc derivations live in [`crate::cabac_init`]. On top of that this
+//! module also exposes [`decode_btt_split`], the §7.3.8.3 CABAC-driven
+//! split-syntax reader that consumes the `btt_split_flag` /
+//! `btt_split_dir` / `btt_split_type` bins from a [`CabacEngine`], applies
+//! the §7.3.8.3 presence gating + §7.4.8.3 inference rules, and resolves
+//! the final [`SplitMode`]. The geometry helpers stay pure so the whole
+//! BTT decision surface remains independently testable; the decoder is the
+//! thin glue that ties them to the arithmetic engine.
 //!
 //! All clause / equation numbers cite ISO/IEC 23094-1:2020(E).
+
+use oxideav_core::Result;
+
+use crate::cabac::CabacEngine;
+use crate::cabac_init::{ctx_inc_btt_split_flag, MainCtxTable};
 
 /// The five coding-tree split shapes (§7.4.8.3, `SplitMode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,6 +381,170 @@ pub fn derive_split_mode(
     SplitMode::NoSplit
 }
 
+/// Tallies of the BTT split-syntax bins consumed by [`decode_btt_split`].
+/// Threaded back so fixture tests can assert the §7.3.8.3 presence gating
+/// fired exactly as the spec requires.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BttSplitStats {
+    /// `btt_split_flag` regular bins decoded (one per BTT decision point
+    /// where at least one split is allowed).
+    pub flag_bins: u32,
+    /// `btt_split_dir` regular bins decoded (one per split where both a
+    /// vertical and a horizontal split were possible).
+    pub dir_bins: u32,
+    /// `btt_split_type` regular bins decoded (one per split where both a
+    /// binary and a ternary split were possible in the chosen direction).
+    pub type_bins: u32,
+}
+
+/// Resolved outcome of a §7.3.8.3 `split_unit()` BTT split decision: the
+/// final [`SplitMode`] plus the raw (parsed-or-inferred) flag values that
+/// produced it. Returned by [`decode_btt_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BttSplit {
+    /// The resolved coding-tree split shape.
+    pub mode: SplitMode,
+    /// `btt_split_flag` (parsed or inferred to 0 when not present).
+    pub flag: bool,
+    /// `btt_split_dir` (parsed or inferred per §7.4.8.3).
+    pub dir: u32,
+    /// `btt_split_type` (parsed or inferred per §7.4.8.3).
+    pub split_type: u32,
+}
+
+/// §7.3.8.3 — CABAC-driven `split_unit()` BTT split-syntax reader for the
+/// `sps_btt_flag == 1` path.
+///
+/// Given a coding block of size `2^log2_cb_width × 2^log2_cb_height` at
+/// luma position (`x0`, `y0`), the precomputed [`AllowedSplits`] (from
+/// [`derive_allowed_splits`]), and the picture dimensions, this consumes
+/// the 0–3 `btt_split_*` bins the spec syntax (lines 2650–2658) signals,
+/// applies the §7.4.8.3 inference for any absent element, and returns the
+/// resolved [`SplitMode`] via [`derive_split_mode`].
+///
+/// Bin/context wiring (§9.3.3 binarization + Table 95 ctxInc):
+///
+/// * `btt_split_flag` — present only when `allowed.any()`. FL(cMax = 1),
+///   context Table 42. ctxInc is 0 under `sps_cm_init_flag == 0`; under
+///   `== 1` it is the §9.3.4.2.5 eq. (1440) value
+///   `Min(numSmaller, 2) + 3 * ctxSetIdx` ([`ctx_inc_btt_split_flag`]),
+///   where `num_smaller` (eq. 1439) is supplied by the caller from the
+///   L/A/R neighbour block sizes.
+/// * `btt_split_dir` — present only when [`btt_split_dir_present`]. FL(cMax
+///   = 1), context Table 43. ctxInc is 0 under `sps_cm_init_flag == 0`;
+///   under `== 1` it is `log2CbWidth − log2CbHeight + 2` (Table 95),
+///   clamped into the table's 0..=4 range. Inferred via
+///   [`infer_btt_split_dir`] when absent.
+/// * `btt_split_type` — present only when [`btt_split_type_present`] for
+///   the chosen direction. FL(cMax = 1), context Table 44, ctxInc 0
+///   unconditionally. Inferred via [`infer_btt_split_type`] when absent.
+///
+/// `cm_init` is `sps_cm_init_flag`; `num_smaller` is the eq. (1439)
+/// neighbour count (ignored when `cm_init` is `false`).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_btt_split(
+    eng: &mut CabacEngine,
+    allowed: &AllowedSplits,
+    cm_init: bool,
+    num_smaller: u32,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    pic_width: u32,
+    pic_height: u32,
+    stats: &mut BttSplitStats,
+) -> Result<BttSplit> {
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
+
+    // --- btt_split_flag (spec lines 2650-2651) ---
+    // Present only when at least one BTT split is allowed; otherwise it is
+    // inferred to 0 (spec line 5424).
+    let flag = if allowed.any() {
+        let ctx_inc = if cm_init {
+            ctx_inc_btt_split_flag(num_smaller, n_cb_w, n_cb_h)
+        } else {
+            0
+        };
+        let bin = eng.decode_decision(MainCtxTable::BttSplitFlag as usize, ctx_inc)?;
+        stats.flag_bins += 1;
+        bin != 0
+    } else {
+        false
+    };
+
+    if !flag {
+        // No BTT split here — SplitMode comes from the picture-boundary
+        // implicit-split rules (or NO_SPLIT) via derive_split_mode.
+        let mode = derive_split_mode(
+            false,
+            0,
+            0,
+            allowed,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            pic_width,
+            pic_height,
+        );
+        return Ok(BttSplit {
+            mode,
+            flag: false,
+            dir: 0,
+            split_type: 0,
+        });
+    }
+
+    // --- btt_split_dir (spec lines 2653-2655) ---
+    let dir = if btt_split_dir_present(allowed) {
+        let ctx_inc = if cm_init {
+            // Table 95: log2CbWidth − log2CbHeight + 2, clamped to the
+            // Table 43 range (5 entries per init_type: indices 0..=4).
+            let raw = log2_cb_width as i32 - log2_cb_height as i32 + 2;
+            raw.clamp(0, 4) as usize
+        } else {
+            0
+        };
+        let bin = eng.decode_decision(MainCtxTable::BttSplitDir as usize, ctx_inc)?;
+        stats.dir_bins += 1;
+        bin as u32
+    } else {
+        infer_btt_split_dir(allowed)
+    };
+
+    // --- btt_split_type (spec lines 2656-2658) ---
+    let split_type = if btt_split_type_present(allowed, dir) {
+        // Table 44 / Table 95: single context, ctxInc 0 unconditionally.
+        let bin = eng.decode_decision(MainCtxTable::BttSplitType as usize, 0)?;
+        stats.type_bins += 1;
+        bin as u32
+    } else {
+        infer_btt_split_type(allowed, dir)
+    };
+
+    let mode = derive_split_mode(
+        true,
+        dir,
+        split_type,
+        allowed,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        pic_width,
+        pic_height,
+    );
+
+    Ok(BttSplit {
+        mode,
+        flag: true,
+        dir,
+        split_type,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +800,224 @@ mod tests {
             derive_split_mode(false, 0, 0, &no_bh, 0, 192, 6, 6, 256, 200),
             SplitMode::SplitBtVer
         );
+    }
+
+    // -----------------------------------------------------------------
+    // decode_btt_split — §7.3.8.3 CABAC-driven split-syntax reader.
+    // Each test encodes the exact bin sequence the spec syntax signals
+    // with the symmetric in-test CabacEncoder, then asserts the decoder
+    // consumes precisely those bins (presence gating) and resolves the
+    // expected SplitMode. cm_init == false, so every ctxInc is 0 and the
+    // engine + encoder share the default (256, 0) context slot.
+    // -----------------------------------------------------------------
+
+    use crate::cabac::{CabacEncoder, CabacEngine};
+
+    const ALL_ALLOWED: AllowedSplits = AllowedSplits {
+        bt_ver: true,
+        bt_hor: true,
+        tt_ver: true,
+        tt_hor: true,
+    };
+
+    /// Encode `bins` against `(ctx_table, 0)` slots, terminate, and build a
+    /// fresh decode engine over the produced RBSP.
+    fn engine_for(bins: &[(usize, u8)]) -> Vec<u8> {
+        let mut enc = CabacEncoder::new();
+        for &(ctx_table, bin) in bins {
+            enc.encode_decision(ctx_table, 0, bin);
+        }
+        enc.encode_terminate(true);
+        enc.finish()
+    }
+
+    #[test]
+    fn decode_btt_split_binary_horizontal() {
+        // 32×32 block, all splits allowed. Encode flag=1, dir=0, type=0 →
+        // SPLIT_BT_HOR. All three elements present (both axes + both
+        // shapes available).
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let dir_t = MainCtxTable::BttSplitDir as usize;
+        let type_t = MainCtxTable::BttSplitType as usize;
+        let rbsp = engine_for(&[(flag_t, 1), (dir_t, 0), (type_t, 0)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng,
+            &ALL_ALLOWED,
+            false,
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::SplitBtHor);
+        assert!(out.flag);
+        assert_eq!(out.dir, 0);
+        assert_eq!(out.split_type, 0);
+        assert_eq!(stats.flag_bins, 1);
+        assert_eq!(stats.dir_bins, 1);
+        assert_eq!(stats.type_bins, 1);
+    }
+
+    #[test]
+    fn decode_btt_split_ternary_vertical() {
+        // flag=1, dir=1 (vertical), type=1 (ternary) → SPLIT_TT_VER.
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let dir_t = MainCtxTable::BttSplitDir as usize;
+        let type_t = MainCtxTable::BttSplitType as usize;
+        let rbsp = engine_for(&[(flag_t, 1), (dir_t, 1), (type_t, 1)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng,
+            &ALL_ALLOWED,
+            false,
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::SplitTtVer);
+        assert_eq!(out.dir, 1);
+        assert_eq!(out.split_type, 1);
+        assert_eq!(stats.dir_bins, 1);
+        assert_eq!(stats.type_bins, 1);
+    }
+
+    #[test]
+    fn decode_btt_split_type1_horizontal_is_tt_hor() {
+        // flag=1, dir=0, type=1 → SPLIT_TT_HOR (errata-corrected branch).
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let dir_t = MainCtxTable::BttSplitDir as usize;
+        let type_t = MainCtxTable::BttSplitType as usize;
+        let rbsp = engine_for(&[(flag_t, 1), (dir_t, 0), (type_t, 1)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng,
+            &ALL_ALLOWED,
+            false,
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::SplitTtHor);
+    }
+
+    #[test]
+    fn decode_btt_split_flag_zero_in_picture_is_no_split() {
+        // flag=0 with the block fully inside the picture → NO_SPLIT, and
+        // only the single flag bin is consumed (no dir/type reads).
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let rbsp = engine_for(&[(flag_t, 0)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng,
+            &ALL_ALLOWED,
+            false,
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::NoSplit);
+        assert!(!out.flag);
+        assert_eq!(stats.flag_bins, 1);
+        assert_eq!(stats.dir_bins, 0);
+        assert_eq!(stats.type_bins, 0);
+    }
+
+    #[test]
+    fn decode_btt_split_dir_inferred_no_bin() {
+        // Only vertical splits possible (both bt+tt vertical) → dir not
+        // signalled (inferred 1), but type IS signalled (both vertical
+        // shapes). Encode flag=1, type=0 → SPLIT_BT_VER.
+        let allowed = AllowedSplits {
+            bt_ver: true,
+            bt_hor: false,
+            tt_ver: true,
+            tt_hor: false,
+        };
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let type_t = MainCtxTable::BttSplitType as usize;
+        let rbsp = engine_for(&[(flag_t, 1), (type_t, 0)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng, &allowed, false, 0, 0, 0, 5, 5, 256, 256, &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::SplitBtVer);
+        assert_eq!(out.dir, 1, "dir inferred to 1 (vertical-only)");
+        assert_eq!(stats.dir_bins, 0, "dir not signalled");
+        assert_eq!(stats.type_bins, 1, "type signalled (both vertical shapes)");
+    }
+
+    #[test]
+    fn decode_btt_split_type_inferred_no_bin() {
+        // Only BT-horizontal possible → dir inferred 0, type inferred 0
+        // (no TT horizontal). Encode flag=1 only → SPLIT_BT_HOR.
+        let allowed = AllowedSplits {
+            bt_ver: false,
+            bt_hor: true,
+            tt_ver: false,
+            tt_hor: false,
+        };
+        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let rbsp = engine_for(&[(flag_t, 1)]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out = decode_btt_split(
+            &mut eng, &allowed, false, 0, 0, 0, 5, 5, 256, 256, &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out.mode, SplitMode::SplitBtHor);
+        assert_eq!(out.dir, 0);
+        assert_eq!(out.split_type, 0);
+        assert_eq!(stats.dir_bins, 0);
+        assert_eq!(stats.type_bins, 0);
+    }
+
+    #[test]
+    fn decode_btt_split_no_allowed_infers_flag_zero_no_bins() {
+        // No split allowed at all → btt_split_flag not present (inferred
+        // 0); zero bins consumed before terminate.
+        let none = AllowedSplits {
+            bt_ver: false,
+            bt_hor: false,
+            tt_ver: false,
+            tt_hor: false,
+        };
+        let rbsp = engine_for(&[]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut stats = BttSplitStats::default();
+        let out =
+            decode_btt_split(&mut eng, &none, false, 0, 0, 0, 4, 4, 256, 256, &mut stats).unwrap();
+        assert_eq!(out.mode, SplitMode::NoSplit);
+        assert!(!out.flag);
+        assert_eq!(stats.flag_bins, 0);
     }
 }

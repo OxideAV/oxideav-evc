@@ -35,8 +35,13 @@ binary/ternary-tree (BTT) split-geometry layer (`split` module) supplies
 the `allowSplit{Bt,Tt}{Ver,Hor}` derivations, the `btt_split_dir`/`type`
 signalling + inference predicates, and the `SplitMode` derivation
 (including the picture-boundary implicit-split rules), all driven by the
-§7.3.2.2 BTT size limits (eqs. 43/44/62-67). The remaining
-Main-profile syntax-decode tools (BTT / SUCO / ADMVP / EIPD / IBC / ATS /
+§7.3.2.2 BTT size limits (eqs. 43/44/62-67). On top of that geometry the
+§7.3.8.3 `decode_btt_split` CABAC reader consumes the
+`btt_split_flag`/`dir`/`type` bins (Tables 42/43/44 + the §9.3.4.2.5 /
+Table 95 ctxInc derivations), applies the §7.3.8.3 presence gating and
+§7.4.8.3 inference for any absent element, and resolves the final
+`SplitMode`. The remaining
+Main-profile syntax-decode tools (full BTT recursion / SUCO / ADMVP / EIPD / IBC / ATS /
 ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
 `Error::Unsupported`.
 
