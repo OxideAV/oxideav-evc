@@ -545,6 +545,325 @@ pub fn decode_btt_split(
     })
 }
 
+/// One child `split_unit()` invocation produced by [`split_unit_children`].
+///
+/// Carries the six geometry arguments the §7.3.8.3 recursion passes to each
+/// recursive `split_unit(...)` call: luma position (`x0`, `y0`), the child
+/// log2 dimensions, the child coding-tree depth `ctDepth`, and the
+/// `splitUnitOrder` argument threaded into the child (which equals the
+/// parent's `split_unit_coding_order_flag` for the quad / BT-HOR / TT-HOR
+/// shapes and `0` / `1` per-position for the SUCO-reorderable shapes — see
+/// the spec syntax).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitChild {
+    /// Child luma x position.
+    pub x0: u32,
+    /// Child luma y position.
+    pub y0: u32,
+    /// Child block width as a log2 luma-sample count.
+    pub log2_cb_width: u32,
+    /// Child block height as a log2 luma-sample count.
+    pub log2_cb_height: u32,
+    /// Child coding-tree depth `ctDepth` (parent depth + 1 for the binary /
+    /// half children, parent depth + 2 for the quarter children of a
+    /// ternary split).
+    pub ct_depth: u32,
+    /// `splitUnitOrder` argument passed to the child `split_unit()`.
+    pub split_unit_order: u32,
+}
+
+/// §7.3.8.3 — enumerate the ordered child `split_unit()` invocations a
+/// non-leaf `split_unit()` makes for a given resolved [`SplitMode`].
+///
+/// This is the pure geometry skeleton of the §7.3.8.3 recursion body (spec
+/// lines 2690-2787): given the parent block at (`x0`, `y0`) of size
+/// `2^log2_cb_width × 2^log2_cb_height` at depth `ct_depth`, the resolved
+/// `mode`, the parent `split_unit_coding_order_flag` (`suco_order`, only
+/// meaningful for the SUCO-reorderable `SPLIT_CU` / `SPLIT_BT_VER` /
+/// `SPLIT_TT_VER` shapes), and the picture dimensions, it returns the
+/// children in decode order. It does **not** consume any CABAC bins; it is
+/// the recursion-geometry layer the CABAC-driven tree walker drives.
+///
+/// Picture-boundary child gating mirrors the spec exactly:
+///
+/// * Quad split (`split_cu_flag == 1`): the top-left child is always
+///   present; the right / bottom / bottom-right children are emitted only
+///   when their origin falls strictly inside the picture (`x1 < pic_width`,
+///   `y1 < pic_height`), per lines 2696-2704.
+/// * `SPLIT_BT_VER`: left child always present, right child only when
+///   `x1 < pic_width` (lines 2730-2732).
+/// * `SPLIT_BT_HOR`: top child always present, bottom child only when
+///   `y1 < pic_height` (lines 2745-2747).
+/// * Ternary splits (`SPLIT_TT_VER` / `SPLIT_TT_HOR`): all three children
+///   are always emitted — the spec passes no boundary guard on the ternary
+///   recursion (lines 2752-2786), because a ternary split is only *allowed*
+///   when the whole parent fits inside the picture (§7.4.8.3
+///   `allowSplitTt*`).
+///
+/// SUCO reordering: when `suco_order == 1`, the spec emits the columns /
+/// quad quadrants in the mirrored order with `splitUnitOrder = 1` (lines
+/// 2706-2715 / 2734-2738 / 2760-2766). For [`SplitMode::NoSplit`] this
+/// returns an empty list — the block is a `coding_unit()` leaf.
+///
+/// `suco_order` is ignored for `SPLIT_BT_HOR` / `SPLIT_TT_HOR`, which the
+/// spec never reorders (the children carry the parent's `splitUnitOrder`
+/// unchanged).
+#[allow(clippy::too_many_arguments)]
+pub fn split_unit_children(
+    mode: SplitMode,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    ct_depth: u32,
+    suco_order: u32,
+    parent_split_unit_order: u32,
+    pic_width: u32,
+    pic_height: u32,
+) -> Vec<SplitChild> {
+    match mode {
+        SplitMode::NoSplit => Vec::new(),
+
+        SplitMode::SplitBtVer => {
+            // Quad split is signalled via split_cu_flag, never reaches here
+            // as a SplitMode value — but BT_VER halves the width. Lines
+            // 2717-2740.
+            let x1 = x0 + (1 << (log2_cb_width - 1));
+            let cw = log2_cb_width - 1;
+            let ch = log2_cb_height;
+            let d = ct_depth + 1;
+            if suco_order == 0 {
+                let mut out = vec![SplitChild {
+                    x0,
+                    y0,
+                    log2_cb_width: cw,
+                    log2_cb_height: ch,
+                    ct_depth: d,
+                    split_unit_order: 0,
+                }];
+                if x1 < pic_width {
+                    out.push(SplitChild {
+                        x0: x1,
+                        y0,
+                        log2_cb_width: cw,
+                        log2_cb_height: ch,
+                        ct_depth: d,
+                        split_unit_order: 0,
+                    });
+                }
+                out
+            } else {
+                // Mirrored: right column first, both unconditional (the
+                // spec's else-branch emits both without a boundary guard).
+                vec![
+                    SplitChild {
+                        x0: x1,
+                        y0,
+                        log2_cb_width: cw,
+                        log2_cb_height: ch,
+                        ct_depth: d,
+                        split_unit_order: 1,
+                    },
+                    SplitChild {
+                        x0,
+                        y0,
+                        log2_cb_width: cw,
+                        log2_cb_height: ch,
+                        ct_depth: d,
+                        split_unit_order: 1,
+                    },
+                ]
+            }
+        }
+
+        SplitMode::SplitBtHor => {
+            // Lines 2741-2748: top child unconditional, bottom child only
+            // when y1 < pic_height. Carries the parent splitUnitOrder.
+            let y1 = y0 + (1 << (log2_cb_height - 1));
+            let cw = log2_cb_width;
+            let ch = log2_cb_height - 1;
+            let d = ct_depth + 1;
+            let mut out = vec![SplitChild {
+                x0,
+                y0,
+                log2_cb_width: cw,
+                log2_cb_height: ch,
+                ct_depth: d,
+                split_unit_order: parent_split_unit_order,
+            }];
+            if y1 < pic_height {
+                out.push(SplitChild {
+                    x0,
+                    y0: y1,
+                    log2_cb_width: cw,
+                    log2_cb_height: ch,
+                    ct_depth: d,
+                    split_unit_order: parent_split_unit_order,
+                });
+            }
+            out
+        }
+
+        SplitMode::SplitTtVer => {
+            // Lines 2749-2768: ¼ | ½ | ¼ width children. Outer children are
+            // depth + 2, the centre child is depth + 1. No boundary guard.
+            let x1 = x0 + (1 << (log2_cb_width - 2));
+            let x2 = x1 + (1 << (log2_cb_width - 1));
+            let quarter_w = log2_cb_width - 2;
+            let half_w = log2_cb_width - 1;
+            let ch = log2_cb_height;
+            let d_outer = ct_depth + 2;
+            let d_centre = ct_depth + 1;
+            if suco_order == 0 {
+                vec![
+                    SplitChild {
+                        x0,
+                        y0,
+                        log2_cb_width: quarter_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_outer,
+                        split_unit_order: 0,
+                    },
+                    SplitChild {
+                        x0: x1,
+                        y0,
+                        log2_cb_width: half_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_centre,
+                        split_unit_order: 0,
+                    },
+                    SplitChild {
+                        x0: x2,
+                        y0,
+                        log2_cb_width: quarter_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_outer,
+                        split_unit_order: 0,
+                    },
+                ]
+            } else {
+                vec![
+                    SplitChild {
+                        x0: x2,
+                        y0,
+                        log2_cb_width: quarter_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_outer,
+                        split_unit_order: 1,
+                    },
+                    SplitChild {
+                        x0: x1,
+                        y0,
+                        log2_cb_width: half_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_centre,
+                        split_unit_order: 1,
+                    },
+                    SplitChild {
+                        x0,
+                        y0,
+                        log2_cb_width: quarter_w,
+                        log2_cb_height: ch,
+                        ct_depth: d_outer,
+                        split_unit_order: 1,
+                    },
+                ]
+            }
+        }
+
+        SplitMode::SplitTtHor => {
+            // Lines 2769-2786: ¼ | ½ | ¼ height children, top→bottom. Outer
+            // children depth + 2, centre depth + 1. Carries the parent
+            // splitUnitOrder (never reordered). No boundary guard.
+            let y1 = y0 + (1 << (log2_cb_height - 2));
+            let y2 = y1 + (1 << (log2_cb_height - 1));
+            let cw = log2_cb_width;
+            let quarter_h = log2_cb_height - 2;
+            let half_h = log2_cb_height - 1;
+            let d_outer = ct_depth + 2;
+            let d_centre = ct_depth + 1;
+            vec![
+                SplitChild {
+                    x0,
+                    y0,
+                    log2_cb_width: cw,
+                    log2_cb_height: quarter_h,
+                    ct_depth: d_outer,
+                    split_unit_order: parent_split_unit_order,
+                },
+                SplitChild {
+                    x0,
+                    y0: y1,
+                    log2_cb_width: cw,
+                    log2_cb_height: half_h,
+                    ct_depth: d_centre,
+                    split_unit_order: parent_split_unit_order,
+                },
+                SplitChild {
+                    x0,
+                    y0: y2,
+                    log2_cb_width: cw,
+                    log2_cb_height: quarter_h,
+                    ct_depth: d_outer,
+                    split_unit_order: parent_split_unit_order,
+                },
+            ]
+        }
+    }
+}
+
+/// §7.3.8.3 — enumerate the four child `split_unit()` invocations of a
+/// quad split (`split_cu_flag == 1`, spec lines 2690-2716).
+///
+/// Quad split is signalled by `split_cu_flag` rather than carried in the
+/// [`SplitMode`] array, so it has its own enumerator. The children are the
+/// four quadrants of `2^(log2_cb_width − 1) × 2^(log2_cb_height − 1)` at
+/// depth `ct_depth + 1`. Under `suco_order == 0` the order is TL, TR, BL,
+/// BR with each non-TL quadrant gated on its origin being strictly inside
+/// the picture (`x1 < pic_width`, `y1 < pic_height`); under `suco_order ==
+/// 1` the spec emits TR, TL, BR, BL unconditionally with
+/// `splitUnitOrder = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn quad_split_children(
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    ct_depth: u32,
+    suco_order: u32,
+    pic_width: u32,
+    pic_height: u32,
+) -> Vec<SplitChild> {
+    let x1 = x0 + (1 << (log2_cb_width - 1));
+    let y1 = y0 + (1 << (log2_cb_height - 1));
+    let cw = log2_cb_width - 1;
+    let ch = log2_cb_height - 1;
+    let d = ct_depth + 1;
+    let mk = |x: u32, y: u32, order: u32| SplitChild {
+        x0: x,
+        y0: y,
+        log2_cb_width: cw,
+        log2_cb_height: ch,
+        ct_depth: d,
+        split_unit_order: order,
+    };
+    if suco_order == 0 {
+        let mut out = vec![mk(x0, y0, 0)];
+        if x1 < pic_width {
+            out.push(mk(x1, y0, 0));
+        }
+        if y1 < pic_height {
+            out.push(mk(x0, y1, 0));
+        }
+        if x1 < pic_width && y1 < pic_height {
+            out.push(mk(x1, y1, 0));
+        }
+        out
+    } else {
+        vec![mk(x1, y0, 1), mk(x0, y0, 1), mk(x1, y1, 1), mk(x0, y1, 1)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1338,155 @@ mod tests {
         assert_eq!(out.mode, SplitMode::NoSplit);
         assert!(!out.flag);
         assert_eq!(stats.flag_bins, 0);
+    }
+
+    // --- split_unit_children / quad_split_children geometry ---
+
+    #[test]
+    fn no_split_yields_no_children() {
+        let c = split_unit_children(SplitMode::NoSplit, 0, 0, 6, 6, 0, 0, 0, 256, 256);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn bt_ver_two_half_width_children_in_picture() {
+        // 64×64 (log2 6×6) at (0,0): two 32×64 children at x=0 and x=32,
+        // both depth 1, splitUnitOrder 0.
+        let c = split_unit_children(SplitMode::SplitBtVer, 0, 0, 6, 6, 0, 0, 0, 256, 256);
+        assert_eq!(
+            c,
+            vec![
+                SplitChild {
+                    x0: 0,
+                    y0: 0,
+                    log2_cb_width: 5,
+                    log2_cb_height: 6,
+                    ct_depth: 1,
+                    split_unit_order: 0,
+                },
+                SplitChild {
+                    x0: 32,
+                    y0: 0,
+                    log2_cb_width: 5,
+                    log2_cb_height: 6,
+                    ct_depth: 1,
+                    split_unit_order: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bt_ver_right_child_gated_by_picture_width() {
+        // pic_width = 48: the right child origin x1 = 32 < 48 -> present.
+        // pic_width = 32: x1 = 32 is NOT < 32 -> only the left child.
+        let present = split_unit_children(SplitMode::SplitBtVer, 0, 0, 6, 6, 0, 0, 0, 48, 256);
+        assert_eq!(present.len(), 2);
+        let gated = split_unit_children(SplitMode::SplitBtVer, 0, 0, 6, 6, 0, 0, 0, 32, 256);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].x0, 0);
+    }
+
+    #[test]
+    fn bt_ver_suco_mirrors_order_and_emits_both() {
+        // suco_order == 1: right column first, both unconditional,
+        // splitUnitOrder 1.
+        let c = split_unit_children(SplitMode::SplitBtVer, 0, 0, 6, 6, 0, 1, 0, 256, 256);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].x0, 32);
+        assert_eq!(c[1].x0, 0);
+        assert!(c.iter().all(|ch| ch.split_unit_order == 1));
+    }
+
+    #[test]
+    fn bt_hor_bottom_child_gated_by_picture_height_and_carries_order() {
+        // BT_HOR carries the parent splitUnitOrder unchanged (here 1).
+        let c = split_unit_children(SplitMode::SplitBtHor, 0, 0, 6, 6, 2, 0, 1, 256, 256);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].y0, 0);
+        assert_eq!(c[1].y0, 32);
+        assert!(c.iter().all(|ch| ch.split_unit_order == 1));
+        assert!(c.iter().all(|ch| ch.ct_depth == 3));
+        // y1 = 32 not < 32 -> bottom child gated out.
+        let gated = split_unit_children(SplitMode::SplitBtHor, 0, 0, 6, 6, 0, 0, 0, 256, 32);
+        assert_eq!(gated.len(), 1);
+    }
+
+    #[test]
+    fn tt_ver_quarter_half_quarter_depths_and_positions() {
+        // 64-wide (log2 6) TT_VER: children at x=0 (16), x=16 (32), x=48
+        // (16). Outer depth +2, centre depth +1.
+        let c = split_unit_children(SplitMode::SplitTtVer, 0, 0, 6, 6, 4, 0, 0, 256, 256);
+        assert_eq!(c.len(), 3);
+        assert_eq!((c[0].x0, c[0].log2_cb_width, c[0].ct_depth), (0, 4, 6));
+        assert_eq!((c[1].x0, c[1].log2_cb_width, c[1].ct_depth), (16, 5, 5));
+        assert_eq!((c[2].x0, c[2].log2_cb_width, c[2].ct_depth), (48, 4, 6));
+    }
+
+    #[test]
+    fn tt_ver_suco_reverses_columns() {
+        let c = split_unit_children(SplitMode::SplitTtVer, 0, 0, 6, 6, 0, 1, 0, 256, 256);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].x0, 48);
+        assert_eq!(c[1].x0, 16);
+        assert_eq!(c[2].x0, 0);
+        assert!(c.iter().all(|ch| ch.split_unit_order == 1));
+    }
+
+    #[test]
+    fn tt_hor_quarter_half_quarter_carries_parent_order() {
+        // TT_HOR is never reordered; children carry the parent order (here 0)
+        // and span ¼ | ½ | ¼ of the height top→bottom.
+        let c = split_unit_children(SplitMode::SplitTtHor, 0, 0, 6, 6, 0, 0, 0, 256, 256);
+        assert_eq!(c.len(), 3);
+        assert_eq!((c[0].y0, c[0].log2_cb_height, c[0].ct_depth), (0, 4, 2));
+        assert_eq!((c[1].y0, c[1].log2_cb_height, c[1].ct_depth), (16, 5, 1));
+        assert_eq!((c[2].y0, c[2].log2_cb_height, c[2].ct_depth), (48, 4, 2));
+        assert!(c.iter().all(|ch| ch.split_unit_order == 0));
+    }
+
+    #[test]
+    fn quad_split_four_quadrants_in_picture() {
+        // 64×64 quad split at (0,0): TL, TR, BL, BR each 32×32 depth 1.
+        let c = quad_split_children(0, 0, 6, 6, 0, 0, 256, 256);
+        assert_eq!(c.len(), 4);
+        assert_eq!((c[0].x0, c[0].y0), (0, 0));
+        assert_eq!((c[1].x0, c[1].y0), (32, 0));
+        assert_eq!((c[2].x0, c[2].y0), (0, 32));
+        assert_eq!((c[3].x0, c[3].y0), (32, 32));
+        assert!(c
+            .iter()
+            .all(|ch| ch.log2_cb_width == 5 && ch.log2_cb_height == 5 && ch.ct_depth == 1));
+    }
+
+    #[test]
+    fn quad_split_boundary_gates_right_bottom_and_corner() {
+        // pic 48×48: x1 = 32 < 48, y1 = 32 < 48 -> all four present.
+        assert_eq!(quad_split_children(0, 0, 6, 6, 0, 0, 48, 48).len(), 4);
+        // pic 32×48: x1 = 32 not < 32 -> drop TR and BR, keep TL + BL.
+        let cw = quad_split_children(0, 0, 6, 6, 0, 0, 32, 48);
+        assert_eq!(cw.len(), 2);
+        assert_eq!((cw[0].x0, cw[0].y0), (0, 0));
+        assert_eq!((cw[1].x0, cw[1].y0), (0, 32));
+        // pic 48×32: y1 = 32 not < 32 -> drop BL and BR, keep TL + TR.
+        let ch = quad_split_children(0, 0, 6, 6, 0, 0, 48, 32);
+        assert_eq!(ch.len(), 2);
+        assert_eq!((ch[0].x0, ch[0].y0), (0, 0));
+        assert_eq!((ch[1].x0, ch[1].y0), (32, 0));
+        // pic 32×32: only the top-left quadrant.
+        assert_eq!(quad_split_children(0, 0, 6, 6, 0, 0, 32, 32).len(), 1);
+    }
+
+    #[test]
+    fn quad_split_suco_mirrors_quadrants_unconditional() {
+        // suco_order == 1: TR, TL, BR, BL, all four unconditional,
+        // splitUnitOrder 1.
+        let c = quad_split_children(0, 0, 6, 6, 0, 1, 32, 32);
+        assert_eq!(c.len(), 4);
+        assert_eq!((c[0].x0, c[0].y0), (32, 0));
+        assert_eq!((c[1].x0, c[1].y0), (0, 0));
+        assert_eq!((c[2].x0, c[2].y0), (32, 32));
+        assert_eq!((c[3].x0, c[3].y0), (0, 32));
+        assert!(c.iter().all(|ch| ch.split_unit_order == 1));
     }
 }

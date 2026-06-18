@@ -40,8 +40,15 @@ signalling + inference predicates, and the `SplitMode` derivation
 `btt_split_flag`/`dir`/`type` bins (Tables 42/43/44 + the §9.3.4.2.5 /
 Table 95 ctxInc derivations), applies the §7.3.8.3 presence gating and
 §7.4.8.3 inference for any absent element, and resolves the final
-`SplitMode`. The remaining
-Main-profile syntax-decode tools (full BTT recursion / SUCO / ADMVP / EIPD / IBC / ATS /
+`SplitMode`. On top of that the §7.3.8.3 recursion-geometry layer
+(`split_unit_children` + `quad_split_children`) enumerates the ordered child
+`split_unit()` invocations for every resolved `SplitMode` and for the
+`split_cu_flag == 1` quad split — the new child positions / log2 dimensions /
+`ctDepth` / `splitUnitOrder` tuples, with the spec's exact picture-boundary
+child gating (`x1 < pic_width` / `y1 < pic_height` for quad + BT, no guard for
+the bounds-constrained ternary shapes) and the §7.3.8.3 `sps_suco_flag`
+mirrored-order reordering. The remaining
+Main-profile syntax-decode tools (CABAC-driven BTT tree walk / SUCO / ADMVP / EIPD / IBC / ATS /
 ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
 `Error::Unsupported`.
 
