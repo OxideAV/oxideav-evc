@@ -47,7 +47,11 @@ Table 95 ctxInc derivations), applies the §7.3.8.3 presence gating and
 `ctDepth` / `splitUnitOrder` tuples, with the spec's exact picture-boundary
 child gating (`x1 < pic_width` / `y1 < pic_height` for quad + BT, no guard for
 the bounds-constrained ternary shapes) and the §7.3.8.3 `sps_suco_flag`
-mirrored-order reordering. The remaining
+mirrored-order reordering. The §7.4.9.3 SUCO-availability layer
+(`SucoSizeLimits` eqs. 68/69 + `allow_split_unit_coding_order`) derives the
+`MaxSucoLog2Size` / `MinSucoLog2Size` window and the four-condition
+`allowSplitUnitCodingOrder` predicate that, with `sps_suco_flag`, gates
+whether `split_unit_coding_order_flag` is signalled. The remaining
 Main-profile syntax-decode tools (CABAC-driven BTT tree walk / SUCO / ADMVP / EIPD / IBC / ATS /
 ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
 `Error::Unsupported`.

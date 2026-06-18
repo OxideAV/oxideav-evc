@@ -142,6 +142,121 @@ impl BttSizeLimits {
     }
 }
 
+/// The §7.4.9.3 SUCO (split-unit-coding-order) size limits derived once
+/// per active SPS from the `sps_suco_flag == 1` syntax elements (eqs. 68 /
+/// 69). Both fields are log2 sizes in luma samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SucoSizeLimits {
+    /// `MaxSucoLog2Size` (eq. 68).
+    pub max_suco_log2_size: u32,
+    /// `MinSucoLog2Size` (eq. 69).
+    pub min_suco_log2_size: u32,
+}
+
+impl SucoSizeLimits {
+    /// Derive the §7.4.9.3 SUCO size limits (eqs. 68 / 69) from the raw SPS
+    /// syntax. `ctb_log2_size_y` is `CtbLog2SizeY` (eq. 41);
+    /// `min_cb_log2_size_y` is `MinCbLog2SizeY` (eq. 57). The two
+    /// `log2_diff_*` values are read from the SPS when `sps_suco_flag == 1`.
+    ///
+    /// Note the §7.4.4.1 default for `log2_diff_ctu_size_max_suco_cb_size`
+    /// when absent is `CtbLog2SizeY − MinCbLog2SizeY` (not 0) — callers that
+    /// pass the SPS value directly must apply that inference themselves; this
+    /// constructor takes the already-resolved value.
+    pub fn derive(
+        ctb_log2_size_y: u32,
+        min_cb_log2_size_y: u32,
+        log2_diff_ctu_size_max_suco_cb_size: u32,
+        log2_diff_max_suco_min_suco_cb_size: u32,
+    ) -> Self {
+        // eq. 68: Min( CtbLog2SizeY − log2_diff_ctu_size_max_suco_cb_size, 6 ).
+        // The §7.4.4.1 syntax range bounds the subtrahend to
+        // [0, CtbLog2SizeY − MinCbLog2SizeY], so it never wraps;
+        // saturating_sub is defence in depth against malformed input.
+        let max_suco_log2_size = ctb_log2_size_y
+            .saturating_sub(log2_diff_ctu_size_max_suco_cb_size)
+            .min(6);
+
+        // eq. 69: Max( MaxSucoLog2Size − log2_diff_max_suco_min_suco_cb_size,
+        //              Max( 4, MinCbLog2SizeY ) ).
+        let min_suco_log2_size = max_suco_log2_size
+            .saturating_sub(log2_diff_max_suco_min_suco_cb_size)
+            .max(min_cb_log2_size_y.max(4));
+
+        Self {
+            max_suco_log2_size,
+            min_suco_log2_size,
+        }
+    }
+}
+
+/// §7.4.9.3 — derive `allowSplitUnitCodingOrder` for the current coding
+/// block. This is the predicate that, together with `sps_suco_flag`, gates
+/// whether `split_unit_coding_order_flag` is signalled (spec line 2685:
+/// `if( sps_suco_flag && allowSplitUnitCodingOrder )`).
+///
+/// The block is at luma position (`x0`, `y0`) with size
+/// `2^log2_cb_width × 2^log2_cb_height`; `pic_width` / `pic_height` are
+/// `pic_{width,height}_in_luma_samples`. `split_cu_flag` is the quad-split
+/// flag for this block (relevant only to the two `split_cu_flag == 0`
+/// conditions); `split_mode` is the resolved [`SplitMode`].
+///
+/// `allowSplitUnitCodingOrder` is `false` when any of these hold (spec
+/// lines 5505–5521):
+///
+/// 1. `log2CbSizeLongerSide > MaxSucoLog2Size` or
+///    `log2CbSizeShorterSide < MinSucoLog2Size`.
+/// 2. the block straddles a picture edge
+///    (`x0 + (1 << log2CbWidth) > pic_width` or
+///    `y0 + (1 << log2CbHeight) > pic_height`).
+/// 3. `log2CbWidth <= log2CbHeight` and `split_cu_flag == 0`.
+/// 4. `SplitMode` is `SPLIT_BT_HOR` / `SPLIT_TT_HOR` / `NO_SPLIT` and
+///    `split_cu_flag == 0`.
+///
+/// Otherwise it is `true`.
+#[allow(clippy::too_many_arguments)]
+pub fn allow_split_unit_coding_order(
+    suco: &SucoSizeLimits,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    split_cu_flag: bool,
+    split_mode: SplitMode,
+    pic_width: u32,
+    pic_height: u32,
+) -> bool {
+    let log2_longer = log2_cb_width.max(log2_cb_height);
+    let log2_shorter = log2_cb_width.min(log2_cb_height);
+
+    // Condition 1: outside the SUCO size window.
+    if log2_longer > suco.max_suco_log2_size || log2_shorter < suco.min_suco_log2_size {
+        return false;
+    }
+
+    // Condition 2: block straddles a picture boundary.
+    if x0 + (1 << log2_cb_width) > pic_width || y0 + (1 << log2_cb_height) > pic_height {
+        return false;
+    }
+
+    // Condition 3: not wider than tall, and not quad-split.
+    if log2_cb_width <= log2_cb_height && !split_cu_flag {
+        return false;
+    }
+
+    // Condition 4: a horizontal/no-split shape with no quad-split — the
+    // resulting children stack vertically, so column reordering is moot.
+    if matches!(
+        split_mode,
+        SplitMode::SplitBtHor | SplitMode::SplitTtHor | SplitMode::NoSplit
+    ) && !split_cu_flag
+    {
+        return false;
+    }
+
+    true
+}
+
 /// The four §7.4.8.3 `allowSplit*` decisions for the current block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowedSplits {
@@ -1488,5 +1603,212 @@ mod tests {
         assert_eq!((c[2].x0, c[2].y0), (32, 32));
         assert_eq!((c[3].x0, c[3].y0), (0, 32));
         assert!(c.iter().all(|ch| ch.split_unit_order == 1));
+    }
+
+    // --- §7.4.9.3 SUCO size limits + allowSplitUnitCodingOrder ---
+
+    #[test]
+    fn suco_size_limits_match_eqs_68_69() {
+        // CtbLog2SizeY=6, MinCbLog2SizeY=2, both diffs 0.
+        // eq. 68: Min(6 - 0, 6) = 6.
+        // eq. 69: Max(6 - 0, Max(4, 2)) = Max(6, 4) = 6.
+        let s = SucoSizeLimits::derive(6, 2, 0, 0);
+        assert_eq!(s.max_suco_log2_size, 6);
+        assert_eq!(s.min_suco_log2_size, 6);
+
+        // Non-zero diffs: ctb=6, minCb=2, diffMax=2, diffMaxMin=3.
+        // eq. 68: Min(6 - 2, 6) = 4.
+        // eq. 69: Max(4 - 3, Max(4, 2)) = Max(1, 4) = 4.
+        let s = SucoSizeLimits::derive(6, 2, 2, 3);
+        assert_eq!(s.max_suco_log2_size, 4);
+        assert_eq!(s.min_suco_log2_size, 4);
+    }
+
+    #[test]
+    fn suco_min_honours_max_4_mincb_floor() {
+        // MinCbLog2SizeY=5 raises the floor above 4.
+        // eq. 68: Min(6 - 0, 6) = 6. eq. 69: Max(6, Max(4, 5)) = 6.
+        let s = SucoSizeLimits::derive(6, 5, 0, 6);
+        // 6 - 6 = 0, but floor Max(4,5)=5 wins.
+        assert_eq!(s.min_suco_log2_size, 5);
+    }
+
+    #[test]
+    fn suco_max_clamps_at_six() {
+        // A hypothetical 128 CTU (ctb=7) clamps MaxSucoLog2Size to 6.
+        let s = SucoSizeLimits::derive(7, 2, 0, 0);
+        assert_eq!(s.max_suco_log2_size, 6);
+    }
+
+    /// SUCO window [4, 6] (the default 64-CTU MinCb=2 config gives [6,6];
+    /// widen with diffs so a 32-wide block is in-window for the geometry
+    /// tests).
+    fn suco_window_4_6() -> SucoSizeLimits {
+        // eq. 68: Min(6, 6) = 6. eq. 69: Max(6 - 2, Max(4,2)) = 4.
+        SucoSizeLimits::derive(6, 2, 0, 2)
+    }
+
+    #[test]
+    fn suco_order_allowed_for_wide_vertical_split() {
+        // 64×32 block (log2 6×5): wider than tall, BT_VER, in-window,
+        // in-picture → allowed.
+        let s = suco_window_4_6();
+        assert!(allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            5,
+            false,
+            SplitMode::SplitBtVer,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn suco_order_disallowed_outside_size_window() {
+        let s = suco_window_4_6(); // window [4, 6]
+                                   // Longer side 7 > MaxSuco 6 → condition 1.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            7,
+            6,
+            true,
+            SplitMode::SplitBtVer,
+            256,
+            256,
+        ));
+        // Shorter side 3 < MinSuco 4 → condition 1.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            3,
+            true,
+            SplitMode::SplitBtVer,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn suco_order_disallowed_at_picture_boundary() {
+        let s = suco_window_4_6();
+        // 64-wide block at x0=192 in a 200-wide picture: right edge 256 >
+        // 200 → condition 2.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            192,
+            0,
+            6,
+            6,
+            true,
+            SplitMode::SplitBtVer,
+            200,
+            256,
+        ));
+        // Same shape fully in-picture is fine (BT_VER, wider-or-equal).
+        assert!(allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            6,
+            true,
+            SplitMode::SplitBtVer,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn suco_order_disallowed_when_not_wider_and_no_quad() {
+        let s = suco_window_4_6();
+        // 32×64 (log2 5×6): width <= height, split_cu_flag == 0 →
+        // condition 3.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            5,
+            6,
+            false,
+            SplitMode::SplitBtVer,
+            256,
+            256,
+        ));
+        // Same block but quad-split (split_cu_flag == 1) escapes condition 3
+        // (and condition 4, since the quad split overrides the shape test).
+        assert!(allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            5,
+            6,
+            true,
+            SplitMode::NoSplit,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn suco_order_disallowed_for_horizontal_or_no_split_without_quad() {
+        let s = suco_window_4_6();
+        // 64×64 BT_HOR, no quad → condition 4 (horizontal stack).
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            6,
+            false,
+            SplitMode::SplitBtHor,
+            256,
+            256,
+        ));
+        // TT_HOR likewise.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            6,
+            false,
+            SplitMode::SplitTtHor,
+            256,
+            256,
+        ));
+        // NO_SPLIT likewise.
+        assert!(!allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            6,
+            false,
+            SplitMode::NoSplit,
+            256,
+            256,
+        ));
+        // TT_VER (a vertical/column shape) is NOT excluded by condition 4.
+        // Use a wider-than-tall 64×32 block so condition 3
+        // (`log2CbWidth <= log2CbHeight`) does not also fire — leaving
+        // condition 4 as the sole discriminator, which TT_VER passes.
+        assert!(allow_split_unit_coding_order(
+            &s,
+            0,
+            0,
+            6,
+            5,
+            false,
+            SplitMode::SplitTtVer,
+            256,
+            256,
+        ));
     }
 }
