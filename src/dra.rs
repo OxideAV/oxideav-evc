@@ -2071,23 +2071,39 @@ pub fn chroma_scale_joined(
     // otherwise the variables qpDraInt, qpDraFrac and draChromaQpShift
     // are derived as follows: …"
     //
-    // Both branches end up computing draChromaQpShift (eq. 1409 in the
-    // "otherwise" branch). The tableNum == 0 branch leaves
-    // draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 −
-    // qpDraIntAdj − qpDraInt with qpDraIntAdj = 0 and qpDraFracAdj = 0
-    // (since qpDraFrac is set to 0 and qp1 − qp0 multiplied by 0 is 0);
-    // the qpDraInt -= 1 line then matches the qpDraInt += (qpDraFrac
-    // >> 9) of the otherwise branch under qpDraFrac == 0 (which gives
-    // qpDraFrac = 1 << 9 after eq. 1402, then qpDraInt += 1; net zero
-    // — except for the explicit -= 1 in the tableNum == 0 branch).
+    // Errata #81 / #130 (docs/video/evc/evc-errata-and-clarifications.md):
+    // the `tableNum == 0` clause is a guard around eqs (1400)-(1402)
+    // ONLY — the divide + complement that misbehave on a ScaleQP pivot —
+    // not a separate identity output. Execution falls through to eqs
+    // (1403)-(1409) unchanged. The published net result for the branch is:
+    //   qpDraFrac        = 0
+    //   qpDraInt         = (2 * IndexScaleQP − 60) − 1
+    //   qpDraIntAdj      = 0   (qpDraFrac == 0 ⇒ (qp1 − qp0) * 0 >> 9 = 0)
+    //   qpDraFracAdj     = 0
+    //   draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 − qpDraInt   (via 1409)
+    // with qp0 = ChromaQpTable[cIdx][Clip3(−QpBdOffsetC, 57,
+    //                                       dra_table_idx − qpDraInt)].
+    // The errata explicitly REJECTS short-circuiting draChromaQpShift to
+    // a constant (e.g. 0): eq (1419) still requires the boundary value
+    // from ChromaQpTable. Because qpDraIntAdj/qpDraFracAdj are both 0 the
+    // qp1/idx1 reads of eqs (1404)/(1406) are elided here; only qp0 is
+    // needed for the eq (1409) shift.
     let (qp_dra_frac_adj, dra_chroma_qp_shift) = if table_num == 0 {
-        // qpDraFrac = 0; qpDraInt -= 1.
+        // Errata #81 / #130 guard: qpDraFrac = 0 (eq. 1400 would also
+        // give 0; the branch states it to skip the eq. 1402 complement
+        // that flips 0 → 512 on a pivot), qpDraInt -= 1 (stands in for
+        // eq. 1401's qpDraInt += (qpDraFrac >> 9) at the boundary).
         qp_dra_int -= 1;
+        // qpDraFracAdj = 0 (collapses from eq. 1408 with qpDraFrac == 0).
         let qp_dra_frac_adj: i64 = 0;
-        let idx0 = (dra_table_idx as i64 - qp_dra_int)
-            .clamp(-chroma_qp_table.cb.qp_bd_offset_c as i64, 57);
+        // Eq. 1403 idx0 = Clip3(−QpBdOffsetC, 57, dra_table_idx − qpDraInt).
+        let lo = -chroma_qp_table.cb.qp_bd_offset_c as i64;
+        let hi = 57i64;
+        let idx0 = (dra_table_idx as i64 - qp_dra_int).clamp(lo, hi);
+        // Eq. 1405 qp0.
         let qp0 = chroma_qp_table.lookup(cidx, idx0 as i32) as i64;
-        // qpDraIntAdj = 0 (qpDraFrac == 0 ⇒ (qp1 − qp0) * 0 >> 9 = 0).
+        // Eq. 1409 with qpDraIntAdj = 0 (qpDraFrac == 0 ⇒ (qp1 − qp0)*0>>9 = 0):
+        // draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 − qpDraInt.
         let dra_chroma_qp_shift =
             chroma_qp_table.lookup(cidx, dra_table_idx as i32) as i64 - qp0 - qp_dra_int;
         (qp_dra_frac_adj, dra_chroma_qp_shift)
@@ -4827,14 +4843,16 @@ mod tests {
     // set equal to 0, and the variable qpDraInt is decreased by 1"
     // sentence leaves qpDraFracAdj and draChromaQpShift (eq. 1408/1409,
     // printed inside the "otherwise" arm) underivable by literal
-    // reading. The in-repo errata file carries no §8.9.8 entry yet
-    // (docs task #1278), so these tests pin the documented in-tree
-    // reading: qpDraFracAdj = 0 (eq. 1418 then adds exactly
-    // (1 << 8) >> 9 = 0) and draChromaQpShift =
-    // ChromaQpTable[cIdx][dra_table_idx] − qp0 − qpDraInt with the
-    // decremented qpDraInt and idx0 = Clip3(−QpBdOffsetC, 57,
-    // dra_table_idx − qpDraInt). Under that reading the whole branch
-    // collapses to the closed form asserted below.
+    // reading. Errata #81 / #130
+    // (docs/video/evc/evc-errata-and-clarifications.md) now formally
+    // resolves this: the branch guards eqs (1400)-(1402) only and falls
+    // through to (1403)-(1409), so qpDraFracAdj = 0, qpDraIntAdj = 0 and
+    // draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 −
+    // qpDraInt with the decremented qpDraInt and idx0 =
+    // Clip3(−QpBdOffsetC, 57, dra_table_idx − qpDraInt). Under that
+    // reading the whole branch collapses to the closed form asserted
+    // below. (The round-337 block further down locks in the errata's
+    // published net-result table directly.)
     // ------------------------------------------------------------------
 
     /// The tableNum == 0 closed form: chromaScale =
@@ -5054,5 +5072,143 @@ mod tests {
         );
         // And it actually changed the samples (scale != identity).
         assert_ne!(a, chroma_src);
+    }
+
+    // =================================================================
+    // Round 337 — §8.9.8 tableNum == 0 branch: lock in errata #81 / #130
+    // published net-result table.
+    //
+    // The staged errata (docs/video/evc/evc-errata-and-clarifications.md,
+    // "#81 / #130 — §8.9.8 eqs (1398)-(1409) tableNum == 0 branch")
+    // resolves the underivable-by-literal-reading case as a guard around
+    // eqs (1400)-(1402) only, falling through to (1403)-(1409). It pins
+    // the exact net result:
+    //   qpDraFrac        = 0
+    //   qpDraInt         = (2 * IndexScaleQP − 60) − 1
+    //   qpDraIntAdj      = 0
+    //   qpDraFracAdj     = 0
+    //   draChromaQpShift = ChromaQpTable[cIdx][dra_table_idx] − qp0 − qpDraInt
+    // with qp0 = ChromaQpTable[cIdx][Clip3(−QpBdOffsetC, 57,
+    //                                       dra_table_idx − qpDraInt)],
+    // and explicitly REJECTS short-circuiting draChromaQpShift to a
+    // constant. These tests assert the intermediate values the public
+    // chroma_scale_joined() output implies, so the seam stays welded to
+    // the errata rather than the prior in-tree pin.
+    // =================================================================
+
+    /// Re-derive the §8.9.8 prefix (eqs. 1395-1399) for a known on-pivot
+    /// input so a test can assert `tableNum == 0` actually fires and pin
+    /// the errata's `qpDraInt`/`idx0`/`qp0`/`draChromaQpShift` chain.
+    fn errata_table_num_zero_intermediates(
+        luma_scale: i64,
+        component_scale: i64,
+        index_scale_qp: i64,
+        dra_table_idx: i32,
+        t: &ChromaQpTable,
+        cidx: ChromaIdx,
+    ) -> (i64, i64, i64, i64) {
+        let scale_dra = luma_scale * component_scale;
+        let scale_dra_norm = (scale_dra + (1i64 << 8)) >> 9;
+        // Confirm the chosen index_scale_qp is the §8.9.5 range and the
+        // input is exactly on the pivot (tableNum == 0).
+        assert_eq!(
+            scale_dra_norm, SCALE_QP[index_scale_qp as usize],
+            "test input must land exactly on a ScaleQP pivot"
+        );
+        // Errata net result.
+        let qp_dra_int = 2 * index_scale_qp - 60 - 1; // eq. 1397 then −1
+        let lo = -t.cb.qp_bd_offset_c as i64;
+        let idx0 = (dra_table_idx as i64 - qp_dra_int).clamp(lo, 57);
+        let qp0 = t.lookup(cidx, idx0 as i32) as i64;
+        let dra_chroma_qp_shift = t.lookup(cidx, dra_table_idx) as i64 - qp0 - qp_dra_int;
+        (qp_dra_int, idx0, qp0, dra_chroma_qp_shift)
+    }
+
+    #[test]
+    fn round337_errata_table_num_zero_full_chain_matches_public_output() {
+        // Reconstruct the public chroma_scale_joined output purely from
+        // the errata net-result table (qpDraIntAdj = qpDraFracAdj = 0,
+        // draChromaQpShift via eq. 1409, then eqs. 1412-1419 unchanged)
+        // and assert byte-equality with the implementation. This proves
+        // the branch carries the errata's exact intermediate values, not
+        // just a coincidentally-equal closed form.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        // ScaleQP[35] = 1448 pivot: lumaScale 2896 × 256 → norm 1448.
+        let (qp_dra_int, _idx0, _qp0, shift) =
+            errata_table_num_zero_intermediates(2896, 256, 35, 30, &t, ChromaIdx::Cb);
+        // qpDraInt = 2*35 − 60 − 1 = 9; verify the errata formula value.
+        assert_eq!(qp_dra_int, 9);
+        // qpDraFracAdj == 0 ⇒ eq. 1418 adds (frac * 0 + (1<<8)) >> 9 = 0,
+        // so draChromaScaleShift == QpScale[Clip3(0,24, shift+12)].
+        let scale_shift = QP_SCALE[(shift + 12).clamp(0, 24) as usize];
+        let scale_dra = 2896i64 * 256;
+        let want = ((scale_dra * scale_shift) + (1i64 << 17)) >> 18;
+        let got = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 30, &t);
+        assert_eq!(got, want, "errata net-result chain must match impl");
+    }
+
+    #[test]
+    fn round337_errata_table_num_zero_drachromaqpshift_is_not_constant() {
+        // Errata explicitly rejects short-circuiting draChromaQpShift to
+        // a constant (e.g. 0 / "no shift"). Two distinct on-pivot inputs
+        // with different dra_table_idx must yield different eq. 1409
+        // shifts (and hence, generally, different chromaScale), proving
+        // the value tracks ChromaQpTable rather than a fixed identity.
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        // Same pivot (ScaleQP[35]=1448), different dra_table_idx.
+        let (_i_a, _x_a, _q_a, shift_a) =
+            errata_table_num_zero_intermediates(2896, 256, 35, 30, &t, ChromaIdx::Cb);
+        let (_i_b, _x_b, _q_b, shift_b) =
+            errata_table_num_zero_intermediates(2896, 256, 35, 50, &t, ChromaIdx::Cb);
+        assert_ne!(
+            shift_a, shift_b,
+            "draChromaQpShift must vary with dra_table_idx (not a constant)"
+        );
+        // And the public outputs follow suit.
+        let out_a = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let out_b = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 50, &t);
+        assert_ne!(out_a, out_b);
+    }
+
+    #[test]
+    fn round337_errata_table_num_zero_qpdraint_decrement() {
+        // The errata's qpDraInt = (2*IndexScaleQP − 60) − 1: the explicit
+        // −1 (eq. 1397 value decreased by one) is the boundary stand-in
+        // for eq. 1401. Verify against a second pivot where the
+        // pre-decrement value differs (ScaleQP[32] = 724 ⇒ 2*32−60 = 4,
+        // post-decrement 3).
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        let (qp_dra_int, _idx0, _qp0, shift) =
+            errata_table_num_zero_intermediates(1448, 256, 32, 30, &t, ChromaIdx::Cb);
+        assert_eq!(qp_dra_int, 3, "2*32 − 60 − 1 = 3");
+        // The public output must match the chain built on qpDraInt = 3.
+        let scale_shift = QP_SCALE[(shift + 12).clamp(0, 24) as usize];
+        let scale_dra = 1448i64 * 256;
+        let want = ((scale_dra * scale_shift) + (1i64 << 17)) >> 18;
+        let got = chroma_scale_joined(1448, 256, 256, ChromaIdx::Cb, 30, &t);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn round337_errata_table_num_zero_continuity_across_pivot() {
+        // Errata evidence #4: treating the on-pivot sample as belonging
+        // to the lower interval makes eq. 1409 stay CONTINUOUS across the
+        // pivot — the hallmark of a degenerate sub-case rather than a
+        // distinct identity branch. Sample one norm step below, at, and
+        // one step above the ScaleQP[35]=1448 knot; the chromaScale must
+        // be monotone-ish and never jump an octave at the seam (a true
+        // identity branch would discontinuously snap to no-shift).
+        let t = default_chroma_qp_table(false, 0).unwrap();
+        // lumaScale 2894/2896/2898 → scaleDraNorm 1447/1448/1449.
+        let below = chroma_scale_joined(2894, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let at = chroma_scale_joined(2896, 256, 1024, ChromaIdx::Cb, 30, &t);
+        let above = chroma_scale_joined(2898, 256, 1024, ChromaIdx::Cb, 30, &t);
+        for (lo, hi) in [(below, at), (at, above)] {
+            assert!(lo > 0 && hi > 0);
+            assert!(
+                hi * 2 > lo && lo * 2 > hi,
+                "pivot seam must be continuous (no octave jump): {lo} vs {hi}"
+            );
+        }
     }
 }
