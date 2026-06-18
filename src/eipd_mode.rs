@@ -61,6 +61,61 @@ pub enum ModeSelector {
     Rem(usize),
 }
 
+/// §8.4.3 — derive the chroma intra prediction mode `IntraPredModeC`
+/// from the signalled `intra_chroma_pred_mode` and the co-located luma
+/// mode `IntraPredModeY`.
+///
+/// `intra_chroma_pred_mode == 0` reuses the luma mode (DM); the
+/// remaining values index a small set offset around any of
+/// `{INTRA_DC, INTRA_HOR, INTRA_VER, INTRA_BI}` that the luma mode might
+/// already occupy (Table 16 + the `modeIdx` skip rule). For `MODE_IBC`
+/// blocks the spec first forces `IntraPredModeY := INTRA_DC`, so callers
+/// pass that in.
+pub fn derive_chroma_mode(intra_chroma_pred_mode: i32, intra_pred_mode_y: i32) -> i32 {
+    if intra_chroma_pred_mode == 0 {
+        return intra_pred_mode_y;
+    }
+    // The luma mode collides with one of {BI, DC, HOR, VER} → skip-index.
+    if intra_pred_mode_y == INTRA_DC
+        || intra_pred_mode_y == INTRA_HOR
+        || intra_pred_mode_y == INTRA_VER
+        || intra_pred_mode_y == INTRA_BI
+    {
+        let mode_idx = if intra_pred_mode_y == INTRA_BI {
+            1
+        } else if intra_pred_mode_y == INTRA_DC {
+            2
+        } else if intra_pred_mode_y == INTRA_HOR {
+            3
+        } else {
+            // INTRA_VER
+            4
+        };
+        if intra_chroma_pred_mode >= mode_idx {
+            chroma_table_16(intra_chroma_pred_mode + 1)
+        } else {
+            chroma_table_16(intra_chroma_pred_mode)
+        }
+    } else {
+        chroma_table_16(intra_chroma_pred_mode)
+    }
+}
+
+/// Table 16 — map a (possibly +1-skipped) chroma mode index to the
+/// concrete `IntraPredModeC`. Index 0 (DM / luma reuse) is handled by
+/// the caller; here only 1..4 are meaningful.
+fn chroma_table_16(idx: i32) -> i32 {
+    match idx {
+        1 => INTRA_BI,
+        2 => INTRA_DC,
+        3 => INTRA_HOR,
+        4 => INTRA_VER,
+        // Out of the Table 16 range (should not occur after the
+        // mode_idx skip); clamp to VER, the last entry.
+        _ => INTRA_VER,
+    }
+}
+
 /// The fully-derived EIPD mode lists for one luma block.
 #[derive(Clone, Debug)]
 pub struct EipdModeLists {
@@ -624,6 +679,42 @@ mod tests {
             lists.ext_cand_mode_list[3]
         );
         assert_eq!(lists.select(ModeSelector::Rem(0)), lists.rem_mode_list[10]);
+    }
+
+    /// §8.4.3 chroma DM: intra_chroma_pred_mode == 0 reuses the luma
+    /// mode regardless of what it is.
+    #[test]
+    fn chroma_dm_reuses_luma() {
+        for luma in [INTRA_DC, INTRA_PLN, 18, 30, INTRA_HOR] {
+            assert_eq!(derive_chroma_mode(0, luma), luma);
+        }
+    }
+
+    /// §8.4.3 + Table 16: when the luma mode is NOT one of
+    /// {DC, HOR, VER, BI}, the chroma index maps straight through Table
+    /// 16 with no skip.
+    #[test]
+    fn chroma_no_skip_for_directional_luma() {
+        // luma = 18 (INTRA_DIA_R) — not in the skip set.
+        assert_eq!(derive_chroma_mode(1, 18), INTRA_BI);
+        assert_eq!(derive_chroma_mode(2, 18), INTRA_DC);
+        assert_eq!(derive_chroma_mode(3, 18), INTRA_HOR);
+        assert_eq!(derive_chroma_mode(4, 18), INTRA_VER);
+    }
+
+    /// §8.4.3 skip rule: when the luma mode collides with a Table 16
+    /// entry, indices >= modeIdx are bumped by one so the chroma mode
+    /// never duplicates the (already-available-as-DM) luma mode.
+    #[test]
+    fn chroma_skip_rule() {
+        // luma = INTRA_DC → modeIdx = 2. chroma_pred_mode 2 maps to
+        // index 3 (INTRA_HOR), skipping the duplicate DC.
+        assert_eq!(derive_chroma_mode(1, INTRA_DC), INTRA_BI); // 1 < 2: no skip
+        assert_eq!(derive_chroma_mode(2, INTRA_DC), INTRA_HOR); // 2 >= 2: +1 → HOR
+        assert_eq!(derive_chroma_mode(3, INTRA_DC), INTRA_VER); // 3 >= 2: +1 → VER
+                                                                // luma = INTRA_BI → modeIdx = 1: every index bumps.
+        assert_eq!(derive_chroma_mode(1, INTRA_BI), INTRA_DC); // 1 >= 1: +1 → DC
+        assert_eq!(derive_chroma_mode(2, INTRA_BI), INTRA_HOR); // 2 >= 1: +1 → HOR
     }
 
     /// validC pruning: A == B forces candB := candC and validC := false.
