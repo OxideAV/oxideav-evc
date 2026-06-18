@@ -51,10 +51,32 @@ mirrored-order reordering. The §7.4.9.3 SUCO-availability layer
 (`SucoSizeLimits` eqs. 68/69 + `allow_split_unit_coding_order`) derives the
 `MaxSucoLog2Size` / `MinSucoLog2Size` window and the four-condition
 `allowSplitUnitCodingOrder` predicate that, with `sps_suco_flag`, gates
-whether `split_unit_coding_order_flag` is signalled. The remaining
-Main-profile syntax-decode tools (CABAC-driven BTT tree walk / SUCO / ADMVP / EIPD / IBC / ATS /
-ADCC / ALF / DRA / AMVR / MMVD / affine / DMVR) still surface
-`Error::Unsupported`.
+whether `split_unit_coding_order_flag` is signalled.
+
+The **EIPD** (extended intra prediction, `sps_eipd_flag == 1`) toolset is
+now implemented end-to-end at the prediction-and-mode-derivation layer
+(`eipd` + `eipd_mode` modules). The §8.4.4.8/.9/.10 sample kernels cover
+the full mode set of Table 15 — `INTRA_DC` (eqs. 286-288 aspect-ratio
+average), `INTRA_BI` bilinear (eqs. 297-311 with the `divScaleMult` /
+`weightFactor` Tables 17/18), `INTRA_PLN` planar (eqs. 314-325 with the
+`mult`/`shift` Table 19), and the 33-direction angular set (§8.4.4.10
+Table 20 `dirXYSign`/`divDxy`/`divDyx`, the two-step
+`iOffset`/`iX`/`iY`/`refPosition` derivation + 4-tap fractional filter,
+eqs. 326-385) — driven by an `EipdRefSamples` neighbourhood that exposes
+`p[x][-1]` / `p[-1][y]` / `p[nCbW][y]` with the spec's `-1` origin and the
+`AvailLr` (eq. 23) left/right availability codes. The §8.4.2 luma
+mode-derivation builds the three ranked lists (`candModeList` /
+`extCandModeList` / `remModeList`, eqs. 172-278) across all six
+validC×planar/directional branches with the dedup-fill loops, and the
+§8.4.3 chroma derivation maps `intra_chroma_pred_mode` through Table 16
+with the `modeIdx` skip rule. The CABAC syntax reads that feed these
+(`mpm_flag`/`idx`, `pims_flag`/`idx`, `rem_mode`, `intra_chroma_pred_mode`)
+and the §8.4.4.1/.2 reference construction/substitution are the next
+follow-ups.
+
+The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
+walk / SUCO / ADMVP / IBC / ATS / ADCC / ALF / DRA / AMVR / MMVD /
+affine / DMVR) still surface `Error::Unsupported`.
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
 §7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
