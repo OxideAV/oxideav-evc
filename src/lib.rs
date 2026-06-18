@@ -85,6 +85,7 @@ pub mod deblock;
 pub mod decoder;
 pub mod dequant;
 pub mod dra;
+pub mod eipd;
 pub mod hmvp;
 pub mod ibc;
 pub mod inter;
