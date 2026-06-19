@@ -87,6 +87,7 @@ pub mod dequant;
 pub mod dra;
 pub mod eipd;
 pub mod eipd_mode;
+pub mod eipd_syntax;
 pub mod hmvp;
 pub mod ibc;
 pub mod inter;
