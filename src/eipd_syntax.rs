@@ -49,7 +49,7 @@ use oxideav_core::Result;
 
 use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
-use crate::eipd_mode::ModeSelector;
+use crate::eipd_mode::{derive_chroma_mode, derive_mode_lists, ModeSelector, NeighbourMode};
 
 /// Resolves the `(ctxTable, ctxIdx)` pair for a single-context EIPD
 /// syntax element, honouring `sps_cm_init_flag`.
@@ -170,6 +170,45 @@ pub fn read_intra_chroma_pred_mode(
     }
 }
 
+/// §7.3.8.4 + §8.4.2 — read the luma intra-mode syntax group from the
+/// bitstream and resolve it to the concrete `IntraPredModeY` for the
+/// block.
+///
+/// Composes [`read_luma_mode_selector`] (the CABAC reads) with
+/// [`crate::eipd_mode::derive_mode_lists`] (the three ranked candidate
+/// lists built from the §6.4.1 neighbour modes A/B/C) and the §8.4.2
+/// step-6 selection. The caller supplies the three already-derived
+/// neighbour candidates; this is the single entry point a `coding_unit()`
+/// walker calls to turn the EIPD luma syntax into the mode that
+/// [`crate::eipd::predict_eipd`] consumes.
+pub fn resolve_eipd_luma_mode(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    stats: &mut EipdSyntaxStats,
+    a: NeighbourMode,
+    b: NeighbourMode,
+    c: NeighbourMode,
+) -> Result<i32> {
+    let selector = read_luma_mode_selector(eng, ctx, stats)?;
+    let lists = derive_mode_lists(a, b, c);
+    Ok(lists.select(selector))
+}
+
+/// §7.3.8.4 + §8.4.3 — read `intra_chroma_pred_mode` and resolve it to
+/// the concrete `IntraPredModeC`, given the co-located luma mode
+/// `IntraPredModeY` (already resolved via [`resolve_eipd_luma_mode`] for
+/// the matching luma cell, or forced to `INTRA_DC` for `MODE_IBC` blocks
+/// per §8.4.3).
+pub fn resolve_eipd_chroma_mode(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    stats: &mut EipdSyntaxStats,
+    intra_pred_mode_y: i32,
+) -> Result<i32> {
+    let raw = read_intra_chroma_pred_mode(eng, ctx, stats)?;
+    Ok(derive_chroma_mode(raw, intra_pred_mode_y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +326,68 @@ mod tests {
             };
             assert_eq!(v, *expected, "Table 93 bin string {bins:?}");
         }
+    }
+
+    /// End-to-end luma: `mpm_flag=1, mpm_idx=0` against three valid
+    /// neighbour modes resolves to `candModeList[0]` — i.e. the smaller of
+    /// the (deduplicated) A/B modes (§8.4.2 eqs. 172-175).
+    #[test]
+    fn resolve_luma_mpm_picks_cand_list() {
+        use crate::eipd_mode::derive_mode_lists;
+        // bins: mpm_flag=1, mpm_idx=0.
+        let bs = engine_with_regular_bins(&[1, 0]);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = EipdSyntaxStats::default();
+        let a = NeighbourMode::valid(18);
+        let b = NeighbourMode::valid(12);
+        let c = NeighbourMode::invalid();
+        let mode =
+            resolve_eipd_luma_mode(&mut eng, EipdCtx::new(false), &mut stats, a, b, c).unwrap();
+        let expected = derive_mode_lists(a, b, c).cand_mode_list[0];
+        assert_eq!(mode, expected);
+        assert_eq!(mode, 12, "candModeList[0] = min(18, 12)");
+    }
+
+    /// End-to-end chroma DM: `intra_chroma_pred_mode == 0` reuses the
+    /// resolved luma mode regardless of value (§8.4.3).
+    #[test]
+    fn resolve_chroma_dm_reuses_luma() {
+        let bs = engine_with_regular_bins(&[1]); // chroma bin0=1 → value 0
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = EipdSyntaxStats::default();
+        let mode = resolve_eipd_chroma_mode(&mut eng, EipdCtx::new(false), &mut stats, 18).unwrap();
+        assert_eq!(mode, 18);
+    }
+
+    /// Full pipeline: resolve the luma mode from the bitstream, then run
+    /// the §8.4.4 prediction kernel for that mode over a flat reference
+    /// neighbourhood. A flat DC neighbourhood predicts the constant value,
+    /// proving the syntax → derivation → kernel chain executes coherently.
+    #[test]
+    fn resolve_then_predict_runs_kernel() {
+        use crate::eipd::{predict_eipd, AvailLr, EipdRefSamples, INTRA_DC};
+        // Neighbours all DC → candModeList collapses to {DC, BI}; mpm_idx=0
+        // selects DC.
+        let bs = engine_with_regular_bins(&[1, 0]);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = EipdSyntaxStats::default();
+        let n = NeighbourMode::valid(INTRA_DC);
+        let mode =
+            resolve_eipd_luma_mode(&mut eng, EipdCtx::new(false), &mut stats, n, n, n).unwrap();
+        assert_eq!(mode, INTRA_DC);
+
+        // Build a flat reference neighbourhood at value 128 and predict.
+        let (w, h) = (4usize, 4usize);
+        let mut refs = EipdRefSamples::unavailable(w, h, 8);
+        for x in 0..w as i32 {
+            refs.set_top(x, 128);
+        }
+        for y in 0..h as i32 {
+            refs.set_left(y, 128);
+        }
+        let mut dst = vec![0i32; w * h];
+        predict_eipd(mode, &refs, w, h, 8, AvailLr::Lr11, &mut dst);
+        // DC over a flat 128 neighbourhood → all 128.
+        assert!(dst.iter().all(|&p| p == 128), "DC of flat 128 must be 128");
     }
 }
