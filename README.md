@@ -19,8 +19,9 @@ reference-picture-list parsing for non-IDR slices.
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
-`slice_data`, `intra`, `inter`, `transform`, `dequant`, `deblock`,
-`hmvp`, `rpl`, `neighbour`, `picture`, and the registered `decoder`
+`slice_data`, `intra`, `inter`, `eipd` / `eipd_mode` / `eipd_syntax`,
+`ats`, `transform`, `dequant`, `deblock`, `hmvp`, `rpl`, `neighbour`,
+`picture`, and the registered `decoder`
 factory. All clause / equation / table numbers cite ISO/IEC
 23094-1:2020(E) directly.
 
@@ -69,13 +70,36 @@ mode-derivation builds the three ranked lists (`candModeList` /
 `extCandModeList` / `remModeList`, eqs. 172-278) across all six
 validC×planar/directional branches with the dedup-fill loops, and the
 §8.4.3 chroma derivation maps `intra_chroma_pred_mode` through Table 16
-with the `modeIdx` skip rule. The CABAC syntax reads that feed these
-(`mpm_flag`/`idx`, `pims_flag`/`idx`, `rem_mode`, `intra_chroma_pred_mode`)
-and the §8.4.4.1/.2 reference construction/substitution are the next
-follow-ups.
+with the `modeIdx` skip rule. The CABAC syntax reads that feed these are now wired (`eipd_syntax`
+module): `read_luma_mode_selector` consumes the §7.3.8.4 luma group —
+`intra_luma_pred_mpm_flag`/`idx` (FL cMax=1, ctxInc 0, Tables 63/64),
+`intra_luma_pred_pims_flag` (bypass), `intra_luma_pred_pims_idx`
+(FL cMax=7 bypass), `intra_luma_pred_rem_mode` (TB cMax=22 bypass via the
+new §9.3.3.6 `decode_tb_bypass` primitive) per Table 95 — and
+`read_intra_chroma_pred_mode` decodes the §9.3.3.7 Table 93 bin string
+(bin0 ctxInc 0 Table 65, rest bypass). `resolve_eipd_luma_mode` /
+`resolve_eipd_chroma_mode` compose those reads with the §8.4.2/.3
+derivation and selection, producing the concrete `IntraPredModeY` /
+`IntraPredModeC` the §8.4.4 kernels consume; the `EipdCtx` selector
+honours `sps_cm_init_flag` (collapse-to-`(0,0)` under Baseline vs the
+per-element Main-profile context tables). The §8.4.4.1/.2 reference
+construction/substitution remains the next intra follow-up.
+
+The **ATS-intra** (Adaptive Transform Selection, `sps_ats_flag == 1`,
+intra path) toolset is implemented at the syntax + transform-kernel layer
+(`ats` module): `read_ats_intra` consumes the §7.3.8.5 group
+(`ats_cu_intra_flag` bypass; `ats_hor_mode`/`ats_ver_mode` ctxInc 0,
+Table 79) and applies the Table 30 derivation
+(`trType{Hor,Ver} = 1 + ats_{hor,ver}_mode`), and `inverse_transform_ats`
+runs the trType-parameterized two-stage inverse with the §8.7.4.3
+DST-VII (eqs. 1077/1078) and DCT-VIII (eqs. 1084/1085) 4×4 + 8×8 kernels
+(16/32 sizes deferred). The §8.5 inter toolset (ADMVP / ATS-inter /
+affine / MMVD / AMVR / DMVR) and the picture-level wiring of the EIPD +
+ATS-intra layers into a full Main-profile `coding_unit()` reconstruction
+(needs the §6.4.1 neighbour-mode grid) remain follow-ups.
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
-walk / SUCO / ADMVP / IBC / ATS / ADCC / ALF / DRA / AMVR / MMVD /
+walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
 affine / DMVR) still surface `Error::Unsupported`.
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
