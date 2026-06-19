@@ -71,6 +71,14 @@ impl EipdCtx {
         }
     }
 
+    /// Whether `sps_cm_init_flag == 1` (Main-profile per-element contexts).
+    /// Used by sibling syntax readers (e.g. [`crate::ats`]) that share the
+    /// same Baseline-collapse-to-`(0, 0)` discipline.
+    #[inline]
+    pub fn is_cm_init(self) -> bool {
+        self.cm_init
+    }
+
     /// `(ctxTable, ctxIdx)` for the named Main-profile context table.
     #[inline]
     fn ctx(self, table: MainCtxTable) -> (usize, usize) {

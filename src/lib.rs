@@ -78,6 +78,7 @@
 pub mod alf;
 pub mod alf_tables;
 pub mod aps;
+pub mod ats;
 pub mod bitreader;
 pub mod cabac;
 pub mod cabac_init;

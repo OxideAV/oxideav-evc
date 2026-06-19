@@ -82,6 +82,91 @@ fn is_supported_size(n: usize) -> bool {
     matches!(n, 2 | 4 | 8 | 16 | 32 | 64)
 }
 
+/// §8.7.4.1 ATS-intra inverse transform: like [`inverse_transform`] but
+/// each 1-D stage selects its kernel by transform type
+/// (`tr_type_ver` for the column stage, `tr_type_hor` for the row stage),
+/// per §8.7.4.2. `trType ∈ {0 = DCT-II, 1 = DST-VII, 2 = DCT-VIII}`. The
+/// non-DCT-II kernels (DST-VII / DCT-VIII) are defined for `nTbS ∈ {4, 8,
+/// 16, 32}`; the §7.3.8.5 presence predicate already constrains an
+/// ATS-intra luma TB to `log2 <= 5` (`nTbS <= 32`).
+///
+/// chroma always passes `trType = 0` (§8.7.4.1: "trType set equal to … if
+/// cIdx is equal to 0, otherwise 0"), so chroma callers use the plain
+/// [`inverse_transform`].
+pub fn inverse_transform_ats(
+    coeffs: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    tr_type_hor: u32,
+    tr_type_ver: u32,
+) -> Result<()> {
+    if coeffs.len() != n_tb_w * n_tb_h {
+        return Err(Error::invalid(format!(
+            "evc inverse_transform_ats: buffer len {} != {}*{}",
+            coeffs.len(),
+            n_tb_w,
+            n_tb_h
+        )));
+    }
+    if !is_supported_size(n_tb_w) || !is_supported_size(n_tb_h) {
+        return Err(Error::unsupported(format!(
+            "evc inverse_transform_ats: nTbS ∈ {{2,4,8,16,32,64}}; got {n_tb_w}x{n_tb_h}"
+        )));
+    }
+    let m_v = trans_matrix_typed(n_tb_h, tr_type_ver)?;
+    let m_h = trans_matrix_typed(n_tb_w, tr_type_hor)?;
+    // Step 1: vertical 1-D transform per column with trTypeVer.
+    let mut e = vec![0i32; n_tb_w * n_tb_h];
+    let mut col = vec![0i32; n_tb_h];
+    let mut out_v = vec![0i32; n_tb_h];
+    for x in 0..n_tb_w {
+        for y in 0..n_tb_h {
+            col[y] = coeffs[y * n_tb_w + x];
+        }
+        transform_1d(&col, &mut out_v, m_v, n_tb_h);
+        for y in 0..n_tb_h {
+            e[y * n_tb_w + x] = out_v[y];
+        }
+    }
+    // Step 2 (sps_iqt_flag = 0, eq. 1061): g = e.
+    let g = e;
+    // Step 3: horizontal 1-D transform per row with trTypeHor.
+    let mut out_h = vec![0i32; n_tb_w];
+    for y in 0..n_tb_h {
+        transform_1d(&g[y * n_tb_w..y * n_tb_w + n_tb_w], &mut out_h, m_h, n_tb_w);
+        for x in 0..n_tb_w {
+            coeffs[y * n_tb_w + x] = out_h[x];
+        }
+    }
+    Ok(())
+}
+
+/// Look up the transform matrix for `(n_tb_s, tr_type)`. trType 0 reuses
+/// the DCT-II matrices; trType 1 (DST-VII) / trType 2 (DCT-VIII) are
+/// available for `nTbS ∈ {4, 8, 16, 32}` (§8.7.4.3 eqs. 1077-1090).
+fn trans_matrix_typed(n_tb_s: usize, tr_type: u32) -> Result<&'static [i16]> {
+    match tr_type {
+        0 => Ok(trans_matrix(n_tb_s)),
+        1 => match n_tb_s {
+            4 => Ok(&DST7_4),
+            8 => Ok(&DST7_8),
+            _ => Err(Error::unsupported(format!(
+                "evc ATS DST-VII: nTbS ∈ {{4,8}} implemented; got {n_tb_s}"
+            ))),
+        },
+        2 => match n_tb_s {
+            4 => Ok(&DCT8_4),
+            8 => Ok(&DCT8_8),
+            _ => Err(Error::unsupported(format!(
+                "evc ATS DCT-VIII: nTbS ∈ {{4,8}} implemented; got {n_tb_s}"
+            ))),
+        },
+        _ => Err(Error::invalid(format!(
+            "evc ATS: trType ∈ {{0,1,2}}; got {tr_type}"
+        ))),
+    }
+}
+
 /// 1-D transform: `y[i] = Σ_j transMatrix[i][j] * x[j]` (§8.7.4.2 eq.
 /// 1062). `mat` is row-major `n_tb_s × n_tb_s`.
 fn transform_1d(x: &[i32], y: &mut [i32], mat: &[i16], n_tb_s: usize) {
@@ -160,6 +245,56 @@ static MAT_16: [i16; 256] = [
     26, -70, 90, -80, 43,  9, -57, 87, -87, 57, -9, -43, 80, -90, 70, -26,
     18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18,
      9, -26, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 26, -9,
+];
+
+// -------------------------------------------------------------------
+// ATS-intra kernels — trType = 1 (DST-VII) and trType = 2 (DCT-VIII),
+// §8.7.4.3 eqs. 1077/1078 (DST-VII 4/8) and 1084/1085 (DCT-VIII 4/8).
+// Row m, column n stored as `m * n_tb_s + n`.
+// -------------------------------------------------------------------
+
+/// DST-VII 4×4 — §8.7.4.3 eq. 1077.
+#[rustfmt::skip]
+static DST7_4: [i16; 16] = [
+    29,  55,  74,  84,
+    74,  74,   0, -74,
+    84, -29, -74,  55,
+    55, -84,  74, -29,
+];
+
+/// DST-VII 8×8 — §8.7.4.3 eq. 1078.
+#[rustfmt::skip]
+static DST7_8: [i16; 64] = [
+    16,  32,  46,  59,  70,  79,  84,  87,
+    46,  79,  87,  70,  32, -16, -59, -84,
+    70,  84,  32, -46, -87, -59,  16,  79,
+    84,  46, -59, -79,  16,  87,  32, -70,
+    87, -16, -84,  32,  79, -46, -70,  59,
+    79, -70, -16,  84, -59, -32,  87, -46,
+    59, -87,  70, -16, -46,  84, -79,  32,
+    32, -59,  79, -87,  84, -70,  46, -16,
+];
+
+/// DCT-VIII 4×4 — §8.7.4.3 eq. 1084.
+#[rustfmt::skip]
+static DCT8_4: [i16; 16] = [
+    84,  74,  55,  29,
+    74,   0, -74, -74,
+    55, -74, -29,  84,
+    29, -74,  84, -55,
+];
+
+/// DCT-VIII 8×8 — §8.7.4.3 eq. 1085.
+#[rustfmt::skip]
+static DCT8_8: [i16; 64] = [
+    87,  84,  79,  70,  59,  46,  32,  16,
+    84,  59,  16, -32, -70, -87, -79, -46,
+    79,  16, -59, -87, -46,  32,  84,  70,
+    70, -32, -87, -16,  79,  59, -46, -84,
+    59, -70, -46,  79,  32, -84, -16,  87,
+    46, -87,  32,  59, -84,  16,  70, -79,
+    32, -79,  84, -46, -16,  70, -87,  59,
+    16, -46,  70, -84,  87, -79,  59, -32,
 ];
 
 // 32x32 matrix from §8.7.4.3 eq. 1067 onward — rebuilt from the spec's
@@ -322,6 +457,83 @@ mod tests {
         assert_eq!(coeffs[1], 5376);
         assert_eq!(coeffs[4], 5376);
         assert_eq!(coeffs[5], 7056);
+    }
+
+    /// ATS trType 0/0 must reproduce the plain DCT-II inverse exactly
+    /// (the trType-0 lookup reuses the same matrices).
+    #[test]
+    fn ats_trtype0_matches_plain() {
+        let mut a = vec![0i32; 16];
+        a[0] = 1;
+        a[5] = 3;
+        let mut b = a.clone();
+        inverse_transform(&mut a, 4, 4).unwrap();
+        inverse_transform_ats(&mut b, 4, 4, 0, 0).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// DST-VII 4×4 single-DC. Both stages DST-VII (trType 1). Vertical pass
+    /// on col0 = [1,0,0,0] yields DST-VII column 0 = [29,74,84,55] into the
+    /// intermediate's column 0. Each row stage is `out[i] = DST7[i][0] *
+    /// e_row0_val`. coeffs[0] = 29*29, coeffs[1] = 74*29, coeffs[4] = 29*74,
+    /// coeffs[5] = 74*74.
+    #[test]
+    fn ats_dst7_4x4_dc() {
+        let mut coeffs = vec![0i32; 16];
+        coeffs[0] = 1;
+        inverse_transform_ats(&mut coeffs, 4, 4, 1, 1).unwrap();
+        assert_eq!(coeffs[0], 29 * 29);
+        assert_eq!(coeffs[1], 74 * 29);
+        assert_eq!(coeffs[4], 29 * 74);
+        assert_eq!(coeffs[5], 74 * 74);
+    }
+
+    /// DCT-VIII 4×4 single-DC. Both stages DCT-VIII (trType 2), column 0 =
+    /// [84,74,55,29]. coeffs[0] = 84*84, coeffs[1] = 74*84, coeffs[4] =
+    /// 84*74, coeffs[5] = 74*74.
+    #[test]
+    fn ats_dct8_4x4_dc() {
+        let mut coeffs = vec![0i32; 16];
+        coeffs[0] = 1;
+        inverse_transform_ats(&mut coeffs, 4, 4, 2, 2).unwrap();
+        assert_eq!(coeffs[0], 84 * 84);
+        assert_eq!(coeffs[1], 74 * 84);
+        assert_eq!(coeffs[4], 84 * 74);
+        assert_eq!(coeffs[5], 74 * 74);
+    }
+
+    /// Mixed kernels: trTypeHor = DST-VII (1), trTypeVer = DCT-VIII (2).
+    /// Vertical (col) stage uses DCT-VIII → its column 0 is [84,74,55,29],
+    /// so e[row0] = 84. Horizontal (row) stage uses DST-VII →
+    /// `out[i] = DST7[i][0] * 84` with DST-VII column 0 = [29,74,84,55].
+    /// coeffs[0] = 84*29, coeffs[1] = 84*74, coeffs[4] = 74*29.
+    #[test]
+    fn ats_mixed_kernels_dc() {
+        let mut coeffs = vec![0i32; 16];
+        coeffs[0] = 1;
+        inverse_transform_ats(&mut coeffs, 4, 4, 1, 2).unwrap();
+        assert_eq!(coeffs[0], 84 * 29);
+        assert_eq!(coeffs[1], 84 * 74);
+        assert_eq!(coeffs[4], 74 * 29);
+    }
+
+    /// 8×8 DST-VII / DCT-VIII zero input → zero output (matrix integrity).
+    #[test]
+    fn ats_8x8_zero() {
+        for (h, v) in [(1u32, 1u32), (2, 2), (1, 2), (2, 1)] {
+            let mut coeffs = vec![0i32; 64];
+            inverse_transform_ats(&mut coeffs, 8, 8, h, v).unwrap();
+            assert!(coeffs.iter().all(|&c| c == 0));
+        }
+    }
+
+    /// DST-VII / DCT-VIII at unimplemented sizes surface Unsupported (the
+    /// matrices for 16/32 are deferred); never a panic.
+    #[test]
+    fn ats_unsupported_size_errors() {
+        let mut coeffs = vec![0i32; 16 * 16];
+        assert!(inverse_transform_ats(&mut coeffs, 16, 16, 1, 1).is_err());
+        assert!(inverse_transform_ats(&mut coeffs, 16, 16, 2, 0).is_err());
     }
 
     /// 8x8 zero coefficients yield zero residuals.
