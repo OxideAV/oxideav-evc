@@ -86,14 +86,20 @@ per-element Main-profile context tables). The §8.4.4.1/.2 reference
 construction/substitution remains the next intra follow-up.
 
 The **ATS-intra** (Adaptive Transform Selection, `sps_ats_flag == 1`,
-intra path) toolset is implemented at the syntax + transform-kernel layer
-(`ats` module): `read_ats_intra` consumes the §7.3.8.5 group
+intra path) toolset is implemented end-to-end at the syntax + transform
+layer (`ats` module): `read_ats_intra` consumes the §7.3.8.5 group
 (`ats_cu_intra_flag` bypass; `ats_hor_mode`/`ats_ver_mode` ctxInc 0,
 Table 79) and applies the Table 30 derivation
-(`trType{Hor,Ver} = 1 + ats_{hor,ver}_mode`), and `inverse_transform_ats`
-runs the trType-parameterized two-stage inverse with the §8.7.4.3
-DST-VII (eqs. 1077/1078) and DCT-VIII (eqs. 1084/1085) 4×4 + 8×8 kernels
-(16/32 sizes deferred).
+(`trType{Hor,Ver} = 1 + ats_{hor,ver}_mode`); `AtsIntra::apply_inverse`
+bridges that decision to `inverse_transform_ats`, the trType-parameterized
+§8.7.4.2 two-stage inverse. The DST-VII (eqs. 1077-1083) and DCT-VIII
+(eqs. 1084-1090) kernels now span the **full §8.7.4.3 size set
+`nTbS ∈ {4, 8, 16, 32}`** matching the §7.3.8.5 `log2 <= 5` presence
+predicate. The two transcribed kernel families per size are cross-checked
+against each other by the spec-derivable reflection identity
+`DCT8[m][n] = (m&1?-1:1)·DST7[m][N-1-n]`, and an end-to-end test decodes
+a synthesised CABAC bin sequence through to the dispatched kernel for
+every size.
 
 The **§8.5.2.3 ADMVP merge-mode** candidate-list derivation
 (`merge` module, `sps_admvp_flag == 1`) is now implemented at the
