@@ -93,10 +93,30 @@ Table 79) and applies the Table 30 derivation
 (`trType{Hor,Ver} = 1 + ats_{hor,ver}_mode`), and `inverse_transform_ats`
 runs the trType-parameterized two-stage inverse with the §8.7.4.3
 DST-VII (eqs. 1077/1078) and DCT-VIII (eqs. 1084/1085) 4×4 + 8×8 kernels
-(16/32 sizes deferred). The §8.5 inter toolset (ADMVP / ATS-inter /
-affine / MMVD / AMVR / DMVR) and the picture-level wiring of the EIPD +
-ATS-intra layers into a full Main-profile `coding_unit()` reconstruction
-(needs the §6.4.1 neighbour-mode grid) remain follow-ups.
+(16/32 sizes deferred).
+
+The **§8.5.2.3 ADMVP merge-mode** candidate-list derivation
+(`merge` module, `sps_admvp_flag == 1`) is now implemented at the
+derivation layer as pure spec functions over a §6.4.3 neighbour-MV
+lookup closure (mirroring the `inter::build_amvp_list_baseline` purity
+contract). `spatial_neighbour_positions` resolves the five §8.5.2.3.2
+neighbour locations (A1/B1/B0/A0/B2) across all three §6.4.2 `availLR`
+branches; `spatial_merge_candidates` appends them with the eqs. 463/464
+small-block bi-pred→uni demotion, the `numCurrMergeCand < mLSize−1`
+A0/B2 gate and the §8.5.2.3.10 redundancy trim. `combined_bipred_candidates`
+runs the §8.5.2.3.7 B-slice Table-21 pairing; `zero_mv_candidates` fills
+the §8.5.2.3.8 tail; `HmvpCandList::hmvp_merge_candidates` derives the
+§8.5.2.3.6 history-based merge candidates (the `maxNumCheckedHistory`
+stride-of-4 tail walk). `build_merge_cand_list` is the §8.5.2.3.1 general
+assembly (spatial → temporal → HMVP → combined → zero), and
+`select_merge_candidate` is the step-6 bridge that projects a decoded
+`merge_idx` into the concrete `mvLX`/`refIdxLX`/`predFlagLX` the §8.5.4
+MC path consumes. Still deferred: the §8.5.2.3.3/.4 **temporal
+collocated** candidate (needs the DPB-level collocated motion field) and
+the **affine** (§8.5.3) / ATS-inter / MMVD-syntax / AMVR / DMVR tools,
+plus the picture-level wiring of the EIPD + ATS-intra + merge layers into
+a full Main-profile `coding_unit()` reconstruction (needs the §6.4.1
+neighbour-mode grid + the per-position MV store).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
