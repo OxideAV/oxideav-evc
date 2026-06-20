@@ -382,6 +382,59 @@ pub enum MergeSliceType {
     B,
 }
 
+/// The concrete per-CU motion result of the §8.5.2.3.1 step-6 selection:
+/// the `mvLX[0][0]` / `refIdxLX` / `predFlagLX[0][0]` that the inter
+/// sample-prediction process (§8.5.4) consumes.
+///
+/// This is the bridge from the merge-candidate-list derivation to motion
+/// compensation — given a decoded `merge_idx` (or `mmvd_merge_idx`), it
+/// projects the selected list entry into the motion the MC path reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergedMotion {
+    pub pred_flag_l0: bool,
+    pub pred_flag_l1: bool,
+    pub ref_idx_l0: i32,
+    pub ref_idx_l1: i32,
+    pub mv_l0: MotionVector,
+    pub mv_l1: MotionVector,
+}
+
+/// §8.5.2.3.1 step 6 — select candidate `N = mergeCandList[ merge_idx ]`
+/// and project it into the per-CU motion (eqs. 450-453).
+///
+/// `merge_cand_list` is the populated buffer; `num_curr_merge_cand` is
+/// its filled length (the output of [`build_merge_cand_list`]); and
+/// `merge_idx` is the decoded `merge_idx[ xCb ][ yCb ]` (or
+/// `mmvd_merge_idx` for the step-7 MMVD path, which selects identically
+/// before the §8.5.2.3.9 offset is applied).
+///
+/// Per eq. 453, `predFlagLX` is set only when `refIdxLX` is a valid
+/// reference picture (≠ −1) — a candidate's stale inactive-list `refIdx`
+/// never lights up `predFlagLX`. Returns `None` when `merge_idx` is out
+/// of the filled range (a bitstream that signalled a `merge_idx` beyond
+/// the derived list length, which the caller surfaces as a decode
+/// error).
+pub fn select_merge_candidate(
+    merge_cand_list: &[MergeCand],
+    num_curr_merge_cand: usize,
+    merge_idx: usize,
+) -> Option<MergedMotion> {
+    if merge_idx >= num_curr_merge_cand || merge_idx >= merge_cand_list.len() {
+        return None;
+    }
+    let n = merge_cand_list[merge_idx];
+    let l0 = n.pred_flag_l0 && n.ref_idx_l0 != -1;
+    let l1 = n.pred_flag_l1 && n.ref_idx_l1 != -1;
+    Some(MergedMotion {
+        pred_flag_l0: l0,
+        pred_flag_l1: l1,
+        ref_idx_l0: if l0 { n.ref_idx_l0 } else { -1 },
+        ref_idx_l1: if l1 { n.ref_idx_l1 } else { -1 },
+        mv_l0: if l0 { n.mv_l0 } else { MotionVector::default() },
+        mv_l1: if l1 { n.mv_l1 } else { MotionVector::default() },
+    })
+}
+
 /// §8.5.2.3.1 — the general merge-candidate-list assembly.
 ///
 /// Runs the five ordered sub-derivations and returns the populated
@@ -744,5 +797,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn select_projects_chosen_candidate() {
+        let mut out = [MergeCand::default(); 6];
+        let n = build_merge_cand_list(
+            0,
+            0,
+            16,
+            16,
+            AvailLr::Lr00,
+            MergeSliceType::P,
+            |x, y| {
+                if (x, y) == (-1, 15) {
+                    avail(true, 0, (12, 4), false, -1, (0, 0))
+                } else {
+                    unavail()
+                }
+            },
+            None,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        // merge_idx 0 → the spatial candidate.
+        let m = select_merge_candidate(&out, n, 0).unwrap();
+        assert!(m.pred_flag_l0 && !m.pred_flag_l1);
+        assert_eq!(m.mv_l0, MotionVector::quarter_pel(12, 4));
+        assert_eq!(m.ref_idx_l0, 0);
+        // merge_idx 1 → a zero candidate (P-slice uni-L0).
+        let z = select_merge_candidate(&out, n, 1).unwrap();
+        assert!(z.pred_flag_l0 && !z.pred_flag_l1);
+        assert_eq!(z.mv_l0, MotionVector::default());
+    }
+
+    #[test]
+    fn select_rejects_out_of_range_idx() {
+        let list = [MergeCand::default(); 4];
+        assert!(select_merge_candidate(&list, 4, 4).is_none());
+        assert!(select_merge_candidate(&list, 2, 3).is_none());
+    }
+
+    #[test]
+    fn select_does_not_light_predflag_for_invalid_refidx() {
+        // A candidate with predFlagL1 set but refIdxL1 == -1 must not
+        // project to an active L1 (eq. 453 valid-ref gate).
+        let mut list = [MergeCand::default(); 4];
+        list[0] = MergeCand {
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+            mv_l0: MotionVector::quarter_pel(2, 2),
+            mv_l1: MotionVector::quarter_pel(9, 9),
+        };
+        let m = select_merge_candidate(&list, 1, 0).unwrap();
+        assert!(m.pred_flag_l0 && !m.pred_flag_l1);
+        assert_eq!(m.ref_idx_l1, -1);
+        assert_eq!(m.mv_l1, MotionVector::default());
     }
 }
