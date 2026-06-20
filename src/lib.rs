@@ -93,6 +93,7 @@ pub mod hmvp;
 pub mod ibc;
 pub mod inter;
 pub mod intra;
+pub mod merge;
 pub mod nal;
 pub mod neighbour;
 pub mod picture;
