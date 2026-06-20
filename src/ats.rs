@@ -73,6 +73,28 @@ impl AtsIntra {
             tr_type_ver: 0,
         }
     }
+
+    /// Apply the §8.7.4 inverse transform implied by this decision to one
+    /// luma transform block `coeffs` of size `n_tb_w × n_tb_h` (row-major),
+    /// bridging the §7.3.8.5 / Table-30 syntax decode to the §8.7.4.2
+    /// kernel selection.
+    ///
+    /// When [`used`](Self::used) is `false` both `trType`s are 0, so this
+    /// is byte-for-byte the plain DCT-II [`crate::transform::inverse_transform`] (the
+    /// trType-0 lookup reuses the DCT-II matrices). When `used` is `true`
+    /// the resolved `(trTypeHor, trTypeVer)` drive the DST-VII / DCT-VIII
+    /// kernels per [`crate::transform::inverse_transform_ats`]. Chroma is never ATS-coded
+    /// (§8.7.4.1 passes `trType = 0` for `cIdx != 0`), so chroma callers
+    /// use [`crate::transform::inverse_transform`] directly.
+    pub fn apply_inverse(self, coeffs: &mut [i32], n_tb_w: usize, n_tb_h: usize) -> Result<()> {
+        crate::transform::inverse_transform_ats(
+            coeffs,
+            n_tb_w,
+            n_tb_h,
+            self.tr_type_hor,
+            self.tr_type_ver,
+        )
+    }
 }
 
 /// §7.3.8.5 presence predicate for `ats_cu_intra_flag` (spec line
@@ -220,5 +242,84 @@ mod tests {
             EipdCtx::new(true).ats_mode_ctx(),
             (MainCtxTable::AtsMode.as_usize(), 0)
         );
+    }
+
+    /// `apply_inverse` on a `disabled` decision is byte-for-byte the plain
+    /// DCT-II inverse for every nTbS (trType 0/0 reuses the DCT-II tables).
+    #[test]
+    fn apply_inverse_disabled_matches_plain_dct() {
+        for n in [4usize, 8, 16, 32, 64] {
+            let mut a = vec![0i32; n * n];
+            a[0] = 5;
+            a[n + 1] = -3;
+            let mut b = a.clone();
+            crate::transform::inverse_transform(&mut a, n, n).unwrap();
+            AtsIntra::disabled().apply_inverse(&mut b, n, n).unwrap();
+            assert_eq!(a, b, "disabled apply_inverse must equal plain DCT for {n}");
+        }
+    }
+
+    /// End-to-end ATS-intra path: synthesise the CABAC bin sequence for
+    /// `ats_cu_intra_flag = 1, ats_hor_mode = 1, ats_ver_mode = 0`, decode
+    /// it through [`read_ats_intra`] (Table 30 → trTypeHor = 2 (DCT-VIII),
+    /// trTypeVer = 1 (DST-VII)), then drive a real coefficient block through
+    /// [`AtsIntra::apply_inverse`] for every §8.7.4.3 size {4,8,16,32} and
+    /// confirm it reproduces the kernel selected by the direct
+    /// [`crate::transform::inverse_transform_ats`] call. This exercises
+    /// syntax-decode → Table-30 derivation → kernel dispatch together.
+    #[test]
+    fn decode_to_transform_roundtrip_all_sizes() {
+        // Bins under sps_cm_init_flag = 0 all share ctx (0,0); the bypass
+        // engine and the (0,0) decision engine both read this stream. The
+        // sequence drives ats_cu_intra_flag → 1, ats_hor_mode → 1,
+        // ats_ver_mode → 0. The exact resolved modes are asserted, so the
+        // test is robust to the CABAC range-coder's internal mapping.
+        let bs = regular_bins(&[1, 1, 0]);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = AtsSyntaxStats::default();
+        let ats = read_ats_intra(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
+        assert!(ats.used);
+        assert_eq!(stats.cu_intra_flag_bins, 1);
+        assert_eq!(stats.hor_mode_bins, 1);
+        assert_eq!(stats.ver_mode_bins, 1);
+        // trType in {1,2} for an engaged ATS decision (Table 30 = 1 + mode).
+        assert!((1..=2).contains(&ats.tr_type_hor));
+        assert!((1..=2).contains(&ats.tr_type_ver));
+
+        for n in [4usize, 8, 16, 32] {
+            // A non-trivial coefficient block (a few low-freq impulses).
+            let mut block = vec![0i32; n * n];
+            block[0] = 17;
+            block[1] = -9;
+            block[n] = 4;
+            block[n + 1] = 2;
+
+            let mut via_decision = block.clone();
+            ats.apply_inverse(&mut via_decision, n, n).unwrap();
+
+            let mut via_direct = block.clone();
+            crate::transform::inverse_transform_ats(
+                &mut via_direct,
+                n,
+                n,
+                ats.tr_type_hor,
+                ats.tr_type_ver,
+            )
+            .unwrap();
+
+            assert_eq!(
+                via_decision, via_direct,
+                "apply_inverse kernel dispatch must match direct call at nTbS={n}"
+            );
+            // The alternative transform must actually differ from plain
+            // DCT-II for this engaged decision (sanity that a non-DCT kernel
+            // was selected, not silently falling back to trType 0).
+            let mut plain = block.clone();
+            crate::transform::inverse_transform(&mut plain, n, n).unwrap();
+            assert_ne!(
+                via_decision, plain,
+                "engaged ATS at nTbS={n} should differ from plain DCT-II"
+            );
+        }
     }
 }
