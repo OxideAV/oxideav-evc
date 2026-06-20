@@ -196,6 +196,80 @@ impl HmvpCandList {
         }
         None
     }
+
+    /// §8.5.2.3.6 — derive the ordered history-based **merge** candidates
+    /// for the merge-candidate-list assembly.
+    ///
+    /// The spec walks `HmvpCandList[ NumHmvpCand − hMvpIdx ]` for
+    /// `hMvpIdx = 3, 7, 11, …` up to
+    /// `Min( maxNumCheckedHistory, (mLSize == 4) ? 15 : 23 )` where
+    /// `maxNumCheckedHistory = ( ( ( NumHmvpCand + 1 ) >> 2 ) << 2 ) − 1`
+    /// (the largest `3 + 4k` index not exceeding `NumHmvpCand`).
+    ///
+    /// Step 1's small-block ref demotion (when both lists of the
+    /// candidate are valid and `nCbW + nCbH ≤ 12`, drop list 1) is applied
+    /// here. The per-append redundancy trim (step 3) and the
+    /// `numCurrMergeCand == mLSize` stop (step 4) are enforced by the
+    /// caller's [`crate::merge::build_merge_cand_list`] HMVP loop, which
+    /// consumes the returned candidates in order — so this method returns
+    /// the *full* ordered tail-walk and lets the assembly trim/stop.
+    ///
+    /// Returns an empty vec when `NumHmvpCand < 4` (no `hMvpIdx = 3`
+    /// candidate is reachable — `NumHmvpCand − 3 < 1` would underflow the
+    /// "valid index" window; the §8.5.2.3.1 step-3 gate also requires
+    /// `NumHmvpCand > 2`, and the first checked index needs
+    /// `NumHmvpCand ≥ 4` for a non-trivial walk).
+    pub fn hmvp_merge_candidates(
+        &self,
+        m_l_size: usize,
+        n_cb_w: i32,
+        n_cb_h: i32,
+    ) -> Vec<crate::inter::MergeCand> {
+        let mut out = Vec::new();
+        if self.num < 4 {
+            return out;
+        }
+        let max_num_checked_history = ((((self.num + 1) >> 2) << 2) as i64) - 1;
+        let cap = if m_l_size == 4 { 15i64 } else { 23i64 };
+        let upper = max_num_checked_history.min(cap);
+        let small_block = (n_cb_w + n_cb_h) <= 12;
+        let mut h_mvp_idx: i64 = 3;
+        while h_mvp_idx <= upper {
+            // HmvpCandList[ NumHmvpCand − hMvpIdx ] — a live index in
+            // 0..num. (num − h_mvp_idx) is guaranteed ≥ 0 here because
+            // h_mvp_idx ≤ maxNumCheckedHistory ≤ num.
+            let live_idx = self.num as i64 - h_mvp_idx;
+            if live_idx < 0 {
+                break;
+            }
+            if let Some(c) = self.get(live_idx as usize) {
+                let l0_valid = c.ref_idx_l0 >= 0;
+                let mut l1_valid = c.ref_idx_l1 >= 0;
+                // Step 1 small-block demotion.
+                if l0_valid && l1_valid && small_block {
+                    l1_valid = false;
+                }
+                out.push(crate::inter::MergeCand {
+                    pred_flag_l0: l0_valid,
+                    pred_flag_l1: l1_valid,
+                    ref_idx_l0: if l0_valid { c.ref_idx_l0 as i32 } else { -1 },
+                    ref_idx_l1: if l1_valid { c.ref_idx_l1 as i32 } else { -1 },
+                    mv_l0: if l0_valid {
+                        c.mv_l0
+                    } else {
+                        MotionVector::default()
+                    },
+                    mv_l1: if l1_valid {
+                        c.mv_l1
+                    } else {
+                        MotionVector::default()
+                    },
+                });
+            }
+            h_mvp_idx += 4;
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +414,49 @@ mod tests {
         let (mv, ridx) = h.derive_default_mv(0, 1).unwrap();
         assert_eq!(mv, MotionVector::quarter_pel(40, 40));
         assert_eq!(ridx, 0);
+    }
+
+    #[test]
+    fn hmvp_merge_empty_when_too_few_entries() {
+        let mut h = HmvpCandList::new();
+        for i in 0..3 {
+            h.update(make_cand_l0(i * 4, 0, 0));
+        }
+        // NumHmvpCand = 3 < 4 → no reachable hMvpIdx=3 walk.
+        assert!(h.hmvp_merge_candidates(6, 16, 16).is_empty());
+    }
+
+    #[test]
+    fn hmvp_merge_walks_stride_of_four_from_index_three() {
+        // NumHmvpCand = 8. maxNumCheckedHistory = (((8+1)>>2)<<2)-1
+        //   = ((9>>2=2)<<2=8)-1 = 7. hMvpIdx = 3, 7. cap (mLSize=6) = 23.
+        // Candidates: HmvpCandList[8-3=5] then [8-7=1].
+        let mut h = HmvpCandList::new();
+        for i in 0..8 {
+            // ref_idx encodes which live slot this is.
+            h.update(make_cand_l0(i * 4, i, 0));
+        }
+        let out = h.hmvp_merge_candidates(6, 16, 16);
+        assert_eq!(out.len(), 2);
+        // Live slot 5 first.
+        assert_eq!(out[0].mv_l0, MotionVector::quarter_pel(5 * 4, 5));
+        // Live slot 1 second.
+        assert_eq!(out[1].mv_l0, MotionVector::quarter_pel(4, 1));
+    }
+
+    #[test]
+    fn hmvp_merge_small_block_demotes_bipred() {
+        let mut h = HmvpCandList::new();
+        for i in 0..4 {
+            let mut c = make_cand_l0(i * 4, 0, 0);
+            c.mv_l1 = MotionVector::quarter_pel(7, 7);
+            c.ref_idx_l1 = 1;
+            h.update(c);
+        }
+        // nCbW + nCbH = 8 ≤ 12 → list 1 dropped on the derived cand.
+        let out = h.hmvp_merge_candidates(4, 4, 4);
+        assert!(!out.is_empty());
+        assert!(out[0].pred_flag_l0 && !out[0].pred_flag_l1);
+        assert_eq!(out[0].ref_idx_l1, -1);
     }
 }
