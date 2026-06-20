@@ -143,22 +143,25 @@ pub fn inverse_transform_ats(
 
 /// Look up the transform matrix for `(n_tb_s, tr_type)`. trType 0 reuses
 /// the DCT-II matrices; trType 1 (DST-VII) / trType 2 (DCT-VIII) are
-/// available for `nTbS ∈ {4, 8, 16, 32}` (§8.7.4.3 eqs. 1077-1090).
+/// implemented for `nTbS ∈ {4, 8, 16}` here (the §8.7.4.3 eqs.
+/// 1077-1089 spec range is `{4, 8, 16, 32}`; 32 is added separately).
 fn trans_matrix_typed(n_tb_s: usize, tr_type: u32) -> Result<&'static [i16]> {
     match tr_type {
         0 => Ok(trans_matrix(n_tb_s)),
         1 => match n_tb_s {
             4 => Ok(&DST7_4),
             8 => Ok(&DST7_8),
+            16 => Ok(&DST7_16),
             _ => Err(Error::unsupported(format!(
-                "evc ATS DST-VII: nTbS ∈ {{4,8}} implemented; got {n_tb_s}"
+                "evc ATS DST-VII: nTbS ∈ {{4,8,16}} implemented; got {n_tb_s}"
             ))),
         },
         2 => match n_tb_s {
             4 => Ok(&DCT8_4),
             8 => Ok(&DCT8_8),
+            16 => Ok(&DCT8_16),
             _ => Err(Error::unsupported(format!(
-                "evc ATS DCT-VIII: nTbS ∈ {{4,8}} implemented; got {n_tb_s}"
+                "evc ATS DCT-VIII: nTbS ∈ {{4,8,16}} implemented; got {n_tb_s}"
             ))),
         },
         _ => Err(Error::invalid(format!(
@@ -295,6 +298,48 @@ static DCT8_8: [i16; 64] = [
     46, -87,  32,  59, -84,  16,  70, -79,
     32, -79,  84, -46, -16,  70, -87,  59,
     16, -46,  70, -84,  87, -79,  59, -32,
+];
+
+/// DST-VII 16×16 — §8.7.4.3 eq. 1079.
+#[rustfmt::skip]
+static DST7_16: [i16; 16*16] = [
+      8,  17,  25,  33,  41,  48,  55,  62,  67,  73,  77,  81,  84,  87,  88,  89,
+     25,  48,  67,  81,  88,  88,  81,  67,  48,  25,   0, -25, -48, -67, -81, -88,
+     41,  73,  88,  84,  62,  25, -17, -55, -81, -89, -77, -48,  -8,  33,  67,  87,
+     55,  87,  81,  41, -17, -67, -89, -73, -25,  33,  77,  88,  62,   8, -48, -84,
+     67,  88,  48, -25, -81, -81, -25,  48,  88,  67,   0, -67, -88, -48,  25,  81,
+     77,  77,   0, -77, -77,   0,  77,  77,   0, -77, -77,   0,  77,  77,   0, -77,
+     84,  55, -48, -87,  -8,  81,  62, -41, -88, -17,  77,  67, -33, -89, -25,  73,
+     88,  25, -81, -48,  67,  67, -48, -81,  25,  88,   0, -88, -25,  81,  48, -67,
+     89,  -8, -88,  17,  87, -25, -84,  33,  81, -41, -77,  48,  73, -55, -67,  62,
+     87, -41, -67,  73,  33, -88,   8,  84, -48, -62,  77,  25, -89,  17,  81, -55,
+     81, -67, -25,  88, -48, -48,  88, -25, -67,  81,   0, -81,  67,  25, -88,  48,
+     73, -84,  25,  55, -89,  48,  33, -87,  67,   8, -77,  81, -17, -62,  88, -41,
+     62, -89,  67,  -8, -55,  88, -73,  17,  48, -87,  77, -25, -41,  84, -81,  33,
+     48, -81,  88, -67,  25,  25, -67,  88, -81,  48,   0, -48,  81, -88,  67, -25,
+     33, -62,  81, -89,  84, -67,  41,  -8, -25,  55, -77,  88, -87,  73, -48,  17,
+     17, -33,  48, -62,  73, -81,  87, -89,  88, -84,  77, -67,  55, -41,  25,  -8,
+];
+
+/// DCT-VIII 16×16 — §8.7.4.3 eq. 1086.
+#[rustfmt::skip]
+static DCT8_16: [i16; 16*16] = [
+     89,  88,  87,  84,  81,  77,  73,  67,  62,  55,  48,  41,  33,  25,  17,   8,
+     88,  81,  67,  48,  25,   0, -25, -48, -67, -81, -88, -88, -81, -67, -48, -25,
+     87,  67,  33,  -8, -48, -77, -89, -81, -55, -17,  25,  62,  84,  88,  73,  41,
+     84,  48,  -8, -62, -88, -77, -33,  25,  73,  89,  67,  17, -41, -81, -87, -55,
+     81,  25, -48, -88, -67,   0,  67,  88,  48, -25, -81, -81, -25,  48,  88,  67,
+     77,   0, -77, -77,   0,  77,  77,   0, -77, -77,   0,  77,  77,   0, -77, -77,
+     73, -25, -89, -33,  67,  77, -17, -88, -41,  62,  81,  -8, -87, -48,  55,  84,
+     67, -48, -81,  25,  88,   0, -88, -25,  81,  48, -67, -67,  48,  81, -25, -88,
+     62, -67, -55,  73,  48, -77, -41,  81,  33, -84, -25,  87,  17, -88,  -8,  89,
+     55, -81, -17,  89, -25, -77,  62,  48, -84,  -8,  88, -33, -73,  67,  41, -87,
+     48, -88,  25,  67, -81,   0,  81, -67, -25,  88, -48, -48,  88, -25, -67,  81,
+     41, -88,  62,  17, -81,  77,  -8, -67,  87, -33, -48,  89, -55, -25,  84, -73,
+     33, -81,  84, -41, -25,  77, -87,  48,  17, -73,  88, -55,  -8,  67, -89,  62,
+     25, -67,  88, -81,  48,   0, -48,  81, -88,  67, -25, -25,  67, -88,  81, -48,
+     17, -48,  73, -87,  88, -77,  55, -25,  -8,  41, -67,  84, -89,  81, -62,  33,
+      8, -25,  41, -55,  67, -77,  84, -88,  89, -87,  81, -73,  62, -48,  33, -17,
 ];
 
 // 32x32 matrix from §8.7.4.3 eq. 1067 onward — rebuilt from the spec's
@@ -528,12 +573,77 @@ mod tests {
     }
 
     /// DST-VII / DCT-VIII at unimplemented sizes surface Unsupported (the
-    /// matrices for 16/32 are deferred); never a panic.
+    /// 32×32 matrices are added separately); never a panic.
     #[test]
     fn ats_unsupported_size_errors() {
+        let mut coeffs = vec![0i32; 32 * 32];
+        assert!(inverse_transform_ats(&mut coeffs, 32, 32, 1, 1).is_err());
+        assert!(inverse_transform_ats(&mut coeffs, 32, 32, 2, 0).is_err());
+    }
+
+    /// 16×16 DST-VII / DCT-VIII zero input → zero output (matrix integrity).
+    #[test]
+    fn ats_16x16_zero() {
+        for (h, v) in [(1u32, 1u32), (2, 2), (1, 2), (2, 1)] {
+            let mut coeffs = vec![0i32; 16 * 16];
+            inverse_transform_ats(&mut coeffs, 16, 16, h, v).unwrap();
+            assert!(coeffs.iter().all(|&c| c == 0));
+        }
+    }
+
+    /// DST-VII 16×16 single-DC. Vertical DST-VII column 0 = the first
+    /// column of [`DST7_16`] = [8,25,41,55,67,77,84,88,89,87,81,73,62,
+    /// 48,33,17]; e_row0 = 8. Each row stage `out[i] = DST7_16[i][0]*8`.
+    /// coeffs[0] = 8*8, coeffs[1] = 25*8, coeffs[16] (row 1 col 0) =
+    /// 8*25, coeffs[17] = 25*25.
+    #[test]
+    fn ats_dst7_16x16_dc() {
         let mut coeffs = vec![0i32; 16 * 16];
-        assert!(inverse_transform_ats(&mut coeffs, 16, 16, 1, 1).is_err());
-        assert!(inverse_transform_ats(&mut coeffs, 16, 16, 2, 0).is_err());
+        coeffs[0] = 1;
+        inverse_transform_ats(&mut coeffs, 16, 16, 1, 1).unwrap();
+        assert_eq!(coeffs[0], 8 * 8);
+        assert_eq!(coeffs[1], 25 * 8);
+        assert_eq!(coeffs[16], 8 * 25);
+        assert_eq!(coeffs[17], 25 * 25);
+    }
+
+    /// DCT-VIII 16×16 single-DC. Column 0 of [`DCT8_16`] =
+    /// [89,88,87,84,81,77,73,67,62,55,48,41,33,25,17,8]; e_row0 = 89.
+    /// coeffs[0] = 89*89, coeffs[1] = 88*89, coeffs[16] = 89*88.
+    #[test]
+    fn ats_dct8_16x16_dc() {
+        let mut coeffs = vec![0i32; 16 * 16];
+        coeffs[0] = 1;
+        inverse_transform_ats(&mut coeffs, 16, 16, 2, 2).unwrap();
+        assert_eq!(coeffs[0], 89 * 89);
+        assert_eq!(coeffs[1], 88 * 89);
+        assert_eq!(coeffs[16], 89 * 88);
+    }
+
+    /// The EVC DCT-VIII tables are the row-signed column-reversal of the
+    /// DST-VII tables of the same size:
+    /// `DCT8[m][n] == (m&1 ? -1 : 1) * DST7[m][N-1-n]`. This relation,
+    /// derived purely from the spec's literal §8.7.4.3 tables, holds for
+    /// 4/8/16 and cross-validates both transcriptions against each other.
+    #[test]
+    fn dct8_is_signed_reflection_of_dst7() {
+        let cases: [(&[i16], &[i16], usize); 3] = [
+            (&DST7_4, &DCT8_4, 4),
+            (&DST7_8, &DCT8_8, 8),
+            (&DST7_16, &DCT8_16, 16),
+        ];
+        for (dst7, dct8, n) in cases {
+            for m in 0..n {
+                for k in 0..n {
+                    let sign = if m & 1 == 1 { -1 } else { 1 };
+                    assert_eq!(
+                        dct8[m * n + k],
+                        sign * dst7[m * n + (n - 1 - k)],
+                        "size {n}, row {m}, col {k}"
+                    );
+                }
+            }
+        }
     }
 
     /// 8x8 zero coefficients yield zero residuals.
