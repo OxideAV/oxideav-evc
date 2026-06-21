@@ -117,12 +117,31 @@ stride-of-4 tail walk). `build_merge_cand_list` is the §8.5.2.3.1 general
 assembly (spatial → temporal → HMVP → combined → zero), and
 `select_merge_candidate` is the step-6 bridge that projects a decoded
 `merge_idx` into the concrete `mvLX`/`refIdxLX`/`predFlagLX` the §8.5.4
-MC path consumes. Still deferred: the §8.5.2.3.3/.4 **temporal
-collocated** candidate (needs the DPB-level collocated motion field) and
-the **affine** (§8.5.3) / ATS-inter / MMVD-syntax / AMVR / DMVR tools,
-plus the picture-level wiring of the EIPD + ATS-intra + merge layers into
-a full Main-profile `coding_unit()` reconstruction (needs the §6.4.1
-neighbour-mode grid + the per-position MV store).
+MC path consumes.
+
+The **§8.5.2.3.3–§8.5.2.3.5 temporal (collocated) merge candidate**
+(TMVP) is now derived in the `tmvp` module — the candidate
+`build_merge_cand_list` accepts in its `temporal` slot.
+`tmvp_collocated_mv` (§8.5.2.3.4) does the POC-ratio scaling
+(`distScaleFactor = (currPocDiff << 5) / colPocDiff`, eq. 503; the
+eq. 504 round-half-away-from-zero clip) with the invalid-refIdx /
+zero-colPocDiff escape and the joint `availableFlagCol` (0/1/2/3) fold;
+`constrain_scaled_mv` (§8.5.2.3.5) clips against the padded reference
+grid (eqs. 506-511, `picPaddingSize = 144`); `tmvp_merge_candidate`
+(§8.5.2.3.3) runs the central → bottom → side collocated-position
+fallback (eqs. 485-500, 8×8-grid-quantised, first-available wins) with
+the eqs. 487/488 small-block bi-pred→uni demotion. The derivation is
+pure over a caller-supplied `ColPic` motion-field closure;
+`collocated_mv_from_side_info` bridges the decoder's existing
+`SideInfoGrid` per-4×4-cell motion field into that closure, so no new
+DPB-level per-picture motion array is needed — only the per-CU wiring of
+the §8.5.2.3.3 POC distances from the decoded `RefPicList0/1` remains.
+
+Still deferred: the **affine** (§8.5.3) / ATS-inter / MMVD-syntax /
+AMVR / DMVR tools, plus the picture-level wiring of the EIPD +
+ATS-intra + merge layers into a full Main-profile `coding_unit()`
+reconstruction (needs the §6.4.1 neighbour-mode grid + the per-position
+MV store).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
