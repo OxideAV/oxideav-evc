@@ -1,0 +1,661 @@
+//! §8.5.2.3.3–§8.5.2.3.5 temporal (collocated) merge-candidate derivation.
+//!
+//! This module derives the **temporal motion-vector predictor (TMVP)**
+//! merge candidate from the motion field of the collocated picture
+//! (`ColPic`). It is the §8.5.2.3.3 step-2 sub-derivation of the
+//! [`crate::merge`] ADMVP merge-candidate-list assembly: the
+//! [`build_merge_cand_list`](crate::merge::build_merge_cand_list)
+//! `temporal: Option<MergeCand>` slot is exactly the output of this
+//! module.
+//!
+//! The derivation is three nested clauses:
+//!
+//! * §8.5.2.3.4 [`tmvp_collocated_mv`] — given a single collocated
+//!   sample's stored motion (`predFlagL{0,1}Col`, `mvL{0,1}Col`,
+//!   `refIdxL{0,1}Col`) plus the four POC distances, produce the scaled
+//!   `mvpLXCol` (eqs. 503/504) and the joint `availableFlagCol` code
+//!   (0 / 1 / 2 / 3 per the eq.-after-505 table).
+//! * §8.5.2.3.5 [`constrain_scaled_mv`] — clip the scaled vector against
+//!   the padded picture boundary (eqs. 506-511).
+//! * §8.5.2.3.3 [`tmvp_merge_candidate`] — try the **central**,
+//!   **bottom**, then **side** collocated positions in order (eqs.
+//!   485-500), 8×8-grid-quantised, stopping at the first that yields a
+//!   non-zero `availableFlagCol`, and emit the resulting [`MergeCand`].
+//!
+//! All clause / equation / table numbers cite ISO/IEC 23094-1:2020(E).
+//!
+//! ## Purity & the collocated-lookup contract
+//!
+//! Like [`crate::merge::spatial_merge_candidates`], this module is a
+//! pure function parameterised on a caller-supplied closure that
+//! resolves an 8×8-grid-aligned collocated luma location to the
+//! [`CollocatedMv`] stored there in `ColPic`. The decoder's
+//! reference-picture motion store wires the closure in; the derivation
+//! itself never touches the DPB.
+
+use crate::inter::{MergeCand, MotionVector};
+use crate::neighbour::AvailLr;
+
+/// The motion state stored at one collocated luma sample of `ColPic`:
+/// the §8.5.2.3.4 `predFlagLXCol` / `mvLXCol` / `refIdxLXCol` arrays
+/// indexed at `( xColCb, yColCb )`.
+///
+/// `refIdxLXCol == -1` (or `pred_flag_lX == false`) marks list X
+/// "invalid" — the §8.5.2.3.4 "If refIdxLXCol[…] is invalid" branch.
+/// When both lists are invalid the position contributes nothing and
+/// `availableFlagCol` is 0.
+///
+/// The stored MV is `MvDmvrL{0,1}` of `ColPic` in 1/4-pel accuracy (the
+/// §8.5.2.3.4 input arrays explicitly read `MvDmvr`, the
+/// decoder-side-motion-refined field; for the Baseline / no-DMVR path
+/// it equals the plain `MvLX`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollocatedMv {
+    /// `predFlagL0Col[ xColCb ][ yColCb ]`.
+    pub pred_flag_l0: bool,
+    /// `predFlagL1Col[ xColCb ][ yColCb ]`.
+    pub pred_flag_l1: bool,
+    /// `refIdxL0Col[ xColCb ][ yColCb ]` (–1 ⇒ invalid).
+    pub ref_idx_l0: i32,
+    /// `refIdxL1Col[ xColCb ][ yColCb ]` (–1 ⇒ invalid).
+    pub ref_idx_l1: i32,
+    /// `mvL0Col[ xColCb ][ yColCb ]` (1/4-pel).
+    pub mv_l0: MotionVector,
+    /// `mvL1Col[ xColCb ][ yColCb ]` (1/4-pel).
+    pub mv_l1: MotionVector,
+}
+
+/// The POC-distance context the §8.5.2.3.4 scaling (eqs. 501-504) needs.
+///
+/// All four are signed `DiffPicOrderCnt` outputs: positive when the
+/// second argument precedes the first in output order.
+///
+/// * `curr_poc_diff_l0 = DiffPicOrderCnt( currPic, RefPicList0[ 0 ] )`
+///   (eq. 501, `refIdxLX == 0`).
+/// * `curr_poc_diff_l1 = DiffPicOrderCnt( currPic, RefPicList1[ 0 ] )`.
+/// * `col_poc_diff_l0 = DiffPicOrderCnt( ColPic, refPicOfColPic[ 0 ] )`
+///   (eq. 502).
+/// * `col_poc_diff_l1 = DiffPicOrderCnt( ColPic, refPicOfColPic[ 1 ] )`.
+///
+/// `refIdxLXCol` (always 0, per the §8.5.2.3.3 `refIdxLXCol = 0`
+/// assignment) selects which `RefPicListX[ 0 ]` the current-picture
+/// distance refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PocContext {
+    pub curr_poc_diff_l0: i32,
+    pub curr_poc_diff_l1: i32,
+    pub col_poc_diff_l0: i32,
+    pub col_poc_diff_l1: i32,
+}
+
+/// The padded-picture boundary parameters for the §8.5.2.3.5 clip.
+///
+/// `picPaddingSize` is the fixed `144` (eq. 506/507); the caller supplies
+/// the picture's luma dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PicBounds {
+    pub pic_width_in_luma_samples: i32,
+    pub pic_height_in_luma_samples: i32,
+}
+
+/// §8.5.2.3.4 — scale one collocated component by `distScaleFactor`
+/// (eq. 504): `Clip3(−32768, 32767, Sign(p) * ((Abs(p) + 16) >> 5))`
+/// where `p = distScaleFactor * mvComponent`.
+///
+/// The `+16` / `>> 5` is the round-half-up reduction of the 5-bit
+/// fractional `distScaleFactor`. The `Sign(p) * ((Abs(p) + …) >> …)`
+/// form rounds the magnitude away from zero, matching the spec's
+/// explicit `Sign`/`Abs` decomposition (a plain arithmetic shift would
+/// round negative products toward −∞ instead).
+fn scale_component(dist_scale_factor: i32, mv_component: i32) -> i32 {
+    let p = (dist_scale_factor as i64) * (mv_component as i64);
+    let mag = (p.abs() + 16) >> 5;
+    let signed = if p < 0 { -mag } else { mag };
+    signed.clamp(-32768, 32767) as i32
+}
+
+/// §8.5.2.3.4 eq. 503 — `distScaleFactorLX = (currPocDiffLX << 5) /
+/// colPocDiffLX`. Integer division truncates toward zero (the spec's
+/// `/` on integers). `col_poc_diff` is guaranteed non-zero by the
+/// caller (the eq.-503 branch is gated on `colPocDiffLX != 0`).
+fn dist_scale_factor(curr_poc_diff: i32, col_poc_diff: i32) -> i32 {
+    ((curr_poc_diff as i64) << 5).wrapping_div(col_poc_diff as i64) as i32
+}
+
+/// §8.5.2.3.5 — constrained-scaled-motion clip (eqs. 506-511).
+///
+/// Clips a single scaled `mvLXCol` so that `( xCb, yCb ) + mvLXCol`
+/// stays inside the padded reference grid `[−picPaddingSize, padded{W,H}]`.
+/// `picPaddingSize` is the fixed `144`.
+pub fn constrain_scaled_mv(
+    mv: MotionVector,
+    x_cb: i32,
+    y_cb: i32,
+    bounds: PicBounds,
+) -> MotionVector {
+    const PIC_PADDING_SIZE: i32 = 144;
+    let padded_width = bounds.pic_width_in_luma_samples + PIC_PADDING_SIZE;
+    let padded_height = bounds.pic_height_in_luma_samples + PIC_PADDING_SIZE;
+
+    let mut x = mv.x;
+    let mut y = mv.y;
+
+    // eq. 508 / 509: clamp the lower (negative-overrun) boundary first.
+    if x_cb + x < -PIC_PADDING_SIZE {
+        x = -(x_cb + PIC_PADDING_SIZE);
+    }
+    if y_cb + y < -PIC_PADDING_SIZE {
+        y = -(y_cb + PIC_PADDING_SIZE);
+    }
+    // eq. 510 / 511: clamp the upper (positive-overrun) boundary.
+    if x_cb + x > padded_width {
+        x = padded_width - x_cb;
+    }
+    if y_cb + y > padded_height {
+        y = padded_height - y_cb;
+    }
+    MotionVector { x, y }
+}
+
+/// The joint §8.5.2.3.4 `availableFlagCol` code: 0 (neither list), 1 (L0
+/// only), 2 (L1 only), 3 (both). Names mirror the eq.-after-505 table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvailableFlagCol {
+    None,
+    L0Only,
+    L1Only,
+    Both,
+}
+
+impl AvailableFlagCol {
+    fn from_pair(l0: bool, l1: bool) -> Self {
+        match (l0, l1) {
+            (true, true) => AvailableFlagCol::Both,
+            (true, false) => AvailableFlagCol::L0Only,
+            (false, true) => AvailableFlagCol::L1Only,
+            (false, false) => AvailableFlagCol::None,
+        }
+    }
+
+    /// Numeric code (0/1/2/3) the spec uses for the §8.5.2.3.3 gates.
+    pub fn code(self) -> u8 {
+        match self {
+            AvailableFlagCol::None => 0,
+            AvailableFlagCol::L0Only => 1,
+            AvailableFlagCol::L1Only => 2,
+            AvailableFlagCol::Both => 3,
+        }
+    }
+}
+
+/// The §8.5.2.3.4 output: the scaled `mvpLXCol` for both lists plus the
+/// joint availability code. `mvp_lX` only carries meaning when the
+/// `available` code includes list X.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollocatedResult {
+    pub available: AvailableFlagCol,
+    pub mvp_l0: MotionVector,
+    pub mvp_l1: MotionVector,
+}
+
+/// §8.5.2.3.4 — derive `mvpLXCol` / `availableFlagCol` from a single
+/// collocated sample's stored motion.
+///
+/// This implements the `temporal_mvp_assigned_flag == 0` path (the
+/// Baseline / ordinary case): the collocated reference list `colX` is
+/// chosen by which of `predFlagL{0,1}Col` is set (L1-only → take L1,
+/// L0-only → take L0, both → take both). The
+/// `temporal_mvp_assigned_flag == 1` path (explicit `col_pic_list_idx` /
+/// `col_source_mvp_list_idx` selection) is a Main-profile slice-header
+/// option not yet threaded; callers on that path pass the already
+/// list-selected motion in `col.mv_l0` / `col.pred_flag_l0` and leave
+/// `temporal_mvp_assigned_flag == false` — equivalent for the single
+/// active list.
+///
+/// `bounds` + `( x_cb, y_cb )` drive the §8.5.2.3.5 boundary clip
+/// applied to each scaled vector before output.
+pub fn tmvp_collocated_mv(
+    col: CollocatedMv,
+    poc: PocContext,
+    x_cb: i32,
+    y_cb: i32,
+    bounds: PicBounds,
+) -> CollocatedResult {
+    // The §8.5.2.3.4 "If refIdxLXCol is invalid" gate: a list is invalid
+    // when its predFlag is 0 or its refIdx is −1.
+    let l0_valid = col.pred_flag_l0 && col.ref_idx_l0 != -1;
+    let l1_valid = col.pred_flag_l1 && col.ref_idx_l1 != -1;
+
+    // §8.5.2.3.4 "Otherwise" — choose mvCol[ colX ] per the predFlag
+    // pattern. The spec's three cases (L1-only, L0-only, both) collapse
+    // to "per active list, take that list's stored mv".
+    let derive = |valid: bool,
+                  mv: MotionVector,
+                  curr_poc_diff: i32,
+                  col_poc_diff: i32|
+     -> Option<MotionVector> {
+        // eq.-after-504: invalid refIdxCol[X] or colPocDiff == 0 ⇒
+        // availableFlagLXCol = 0, mvpLXCol = 0 (eq. 505).
+        if !valid || col_poc_diff == 0 {
+            return None;
+        }
+        // eq. 503/504: scale mvCol[X] by the POC ratio, then clip.
+        let sf = dist_scale_factor(curr_poc_diff, col_poc_diff);
+        let scaled = MotionVector {
+            x: scale_component(sf, mv.x),
+            y: scale_component(sf, mv.y),
+        };
+        Some(constrain_scaled_mv(scaled, x_cb, y_cb, bounds))
+    };
+
+    let mvp_l0 = derive(
+        l0_valid,
+        col.mv_l0,
+        poc.curr_poc_diff_l0,
+        poc.col_poc_diff_l0,
+    );
+    let mvp_l1 = derive(
+        l1_valid,
+        col.mv_l1,
+        poc.curr_poc_diff_l1,
+        poc.col_poc_diff_l1,
+    );
+
+    CollocatedResult {
+        available: AvailableFlagCol::from_pair(mvp_l0.is_some(), mvp_l1.is_some()),
+        mvp_l0: mvp_l0.unwrap_or_default(),
+        mvp_l1: mvp_l1.unwrap_or_default(),
+    }
+}
+
+/// Convert a §8.5.2.3.4 result into the §8.5.2.3.3 merge candidate,
+/// applying the eqs. 487/488 (493/494, 499/500) small-block demotion:
+/// when both lists are available **and** `nCbW + nCbH ≤ 12`, list 1 is
+/// dropped (`predFlagL1Col = 0`, `refIdxL1Col = −1`).
+///
+/// Returns `None` when the result's availability code is 0 (no
+/// candidate produced). `refIdxLXCol` is always 0 (the §8.5.2.3.3
+/// `refIdxLXCol = 0` assignment).
+fn result_to_merge_cand(res: CollocatedResult, n_cb_w: i32, n_cb_h: i32) -> Option<MergeCand> {
+    let mut l0 = matches!(
+        res.available,
+        AvailableFlagCol::L0Only | AvailableFlagCol::Both
+    );
+    let mut l1 = matches!(
+        res.available,
+        AvailableFlagCol::L1Only | AvailableFlagCol::Both
+    );
+    if !l0 && !l1 {
+        return None;
+    }
+    // eqs. 487/488 (and the bottom/side parallels 493/494, 499/500):
+    // small-block bi-pred demotion. "availableFlagCol == 3" ≡ both lists.
+    if l0 && l1 && (n_cb_w + n_cb_h) <= 12 {
+        l1 = false;
+    }
+    let _ = &mut l0;
+    Some(MergeCand {
+        pred_flag_l0: l0,
+        pred_flag_l1: l1,
+        ref_idx_l0: if l0 { 0 } else { -1 },
+        ref_idx_l1: if l1 { 0 } else { -1 },
+        mv_l0: if l0 {
+            res.mvp_l0
+        } else {
+            MotionVector::default()
+        },
+        mv_l1: if l1 {
+            res.mvp_l1
+        } else {
+            MotionVector::default()
+        },
+    })
+}
+
+/// Quantise a luma location to the 8×8 collocated-motion grid:
+/// `( ( v >> 3 ) << 3 )`. The §8.5.2.3.3 central / bottom / side
+/// positions are all snapped to this grid before the §8.5.2.3.4 lookup.
+fn grid8(v: i32) -> i32 {
+    (v >> 3) << 3
+}
+
+/// §8.5.2.3.3 — derive the temporal (collocated) merge candidate.
+///
+/// Tries the three collocated positions in order — **central** (eqs.
+/// 485/486), **bottom** (eqs. 489-492), then **side** (eqs. 495-498) —
+/// each snapped to the 8×8 grid and looked up via `col_at`, stopping at
+/// the first position whose §8.5.2.3.4 derivation yields a non-zero
+/// `availableFlagCol`. Returns the resulting [`MergeCand`], or `None`
+/// when every position is unavailable.
+///
+/// Position fallbacks are gated exactly as the spec:
+///
+/// * **bottom** is consulted only when the central position was
+///   unavailable, `yColBot < pic_height_in_luma_samples`, and the bottom
+///   sample lies in the same CTB row as the CU (`yCb >> CtbLog2SizeY ==
+///   yColBot >> CtbLog2SizeY`).
+/// * **side** is consulted only when both earlier positions failed,
+///   `xColSide > 0`, and `xColSide < pic_width_in_luma_samples`.
+///
+/// The §8.5.2.3.3 redundancy trim (the per-step §8.5.2.3.10 invocation)
+/// is **not** applied here — it is the responsibility of
+/// [`build_merge_cand_list`](crate::merge::build_merge_cand_list)'s
+/// step-2, which already runs `merge_cand_redundancy_check` after
+/// appending this candidate.
+///
+/// `col_at` resolves an 8×8-grid-aligned collocated luma location
+/// `( xColCb, yColCb )` to the [`CollocatedMv`] stored there in `ColPic`.
+#[allow(clippy::too_many_arguments)]
+pub fn tmvp_merge_candidate<F>(
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w: i32,
+    n_cb_h: i32,
+    avail_lr: AvailLr,
+    poc: PocContext,
+    bounds: PicBounds,
+    ctb_log2_size_y: u32,
+    mut col_at: F,
+) -> Option<MergeCand>
+where
+    F: FnMut(i32, i32) -> CollocatedMv,
+{
+    let try_position = |x_col_cb: i32, y_col_cb: i32, col_at: &mut F| -> Option<MergeCand> {
+        let col = col_at(x_col_cb, y_col_cb);
+        let res = tmvp_collocated_mv(col, poc, x_cb, y_cb, bounds);
+        result_to_merge_cand(res, n_cb_w, n_cb_h)
+    };
+
+    // Step 1: central collocated position (eqs. 485/486).
+    let x_col_ctr = x_cb + (n_cb_w >> 1);
+    let y_col_ctr = y_cb + (n_cb_h >> 1);
+    if let Some(cand) = try_position(grid8(x_col_ctr), grid8(y_col_ctr), &mut col_at) {
+        return Some(cand);
+    }
+
+    // Step 2: bottom collocated position (eqs. 489-492), gated on
+    // same-CTB-row + in-picture-height.
+    let (x_col_bot, y_col_bot) = if avail_lr == AvailLr::Lr01 {
+        (x_cb, y_cb + n_cb_h) // eqs. 489/490
+    } else {
+        (x_cb + n_cb_w - 1, y_cb + n_cb_h) // eqs. 491/492
+    };
+    if y_col_bot < bounds.pic_height_in_luma_samples
+        && (y_cb >> ctb_log2_size_y) == (y_col_bot >> ctb_log2_size_y)
+    {
+        if let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot), &mut col_at) {
+            return Some(cand);
+        }
+    }
+
+    // Step 3: side collocated position (eqs. 495-498), gated on
+    // in-picture-width (strictly inside the left + right edges).
+    let (x_col_side, y_col_side) = if avail_lr == AvailLr::Lr01 {
+        (x_cb - 1, y_cb + n_cb_h - 1) // eqs. 495/496
+    } else {
+        (x_cb + n_cb_w, y_cb + n_cb_h - 1) // eqs. 497/498
+    };
+    if x_col_side > 0 && x_col_side < bounds.pic_width_in_luma_samples {
+        if let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side), &mut col_at) {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds() -> PicBounds {
+        PicBounds {
+            pic_width_in_luma_samples: 1920,
+            pic_height_in_luma_samples: 1080,
+        }
+    }
+
+    /// Same-distance scaling (currPocDiff == colPocDiff) is the identity:
+    /// distScaleFactor = (d << 5) / d = 32, and (32 * mv + 16) >> 5 == mv.
+    #[test]
+    fn equal_poc_distance_is_identity() {
+        let col = CollocatedMv {
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+            mv_l0: MotionVector::quarter_pel(40, -24),
+            mv_l1: MotionVector::default(),
+        };
+        let poc = PocContext {
+            curr_poc_diff_l0: 4,
+            curr_poc_diff_l1: 4,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 4,
+        };
+        let res = tmvp_collocated_mv(col, poc, 100, 100, bounds());
+        assert_eq!(res.available, AvailableFlagCol::L0Only);
+        assert_eq!(res.mvp_l0, MotionVector::quarter_pel(40, -24));
+    }
+
+    /// Double-distance scaling: distScaleFactor = (8 << 5)/4 = 64, so
+    /// (64 * mv + 16) >> 5 doubles the magnitude (round-half-up).
+    #[test]
+    fn double_poc_distance_doubles_mv() {
+        let col = CollocatedMv {
+            pred_flag_l0: true,
+            ref_idx_l0: 0,
+            mv_l0: MotionVector::quarter_pel(10, 7),
+            ..Default::default()
+        };
+        let poc = PocContext {
+            curr_poc_diff_l0: 8,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 0,
+        };
+        let res = tmvp_collocated_mv(col, poc, 0, 0, bounds());
+        // sf = 64. x: (64*10+16)>>5 = 656>>5 = 20. y: (64*7+16)>>5 = 464>>5 = 14.
+        assert_eq!(res.mvp_l0, MotionVector::quarter_pel(20, 14));
+    }
+
+    /// Negative product rounds away from zero (Sign/Abs decomposition),
+    /// not toward −∞.
+    #[test]
+    fn negative_scaling_rounds_away_from_zero() {
+        // p = sf*mv = -17. Sign/Abs: (|−17|+16)>>5 = 33>>5 = 1, signed → -1.
+        // A plain arithmetic shift `-17 >> 5` would give -1 here too, but
+        // diverges at p = -33: Sign/Abs → (49)>>5 = 1 → -1; `-33>>5` = -2.
+        assert_eq!(scale_component(1, -17), -1);
+        assert_eq!(scale_component(1, -33), -1);
+        assert_eq!(scale_component(1, 33), 1);
+    }
+
+    /// Zero colPocDiff ⇒ unavailable (eq.-after-504 / eq. 505).
+    #[test]
+    fn zero_col_poc_diff_unavailable() {
+        let col = CollocatedMv {
+            pred_flag_l0: true,
+            ref_idx_l0: 0,
+            mv_l0: MotionVector::quarter_pel(8, 8),
+            ..Default::default()
+        };
+        let poc = PocContext {
+            curr_poc_diff_l0: 4,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 0,
+            col_poc_diff_l1: 0,
+        };
+        let res = tmvp_collocated_mv(col, poc, 0, 0, bounds());
+        assert_eq!(res.available, AvailableFlagCol::None);
+    }
+
+    /// Invalid refIdx on a list ⇒ that list contributes nothing.
+    #[test]
+    fn invalid_ref_idx_drops_list() {
+        let col = CollocatedMv {
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            ref_idx_l0: -1, // invalid
+            ref_idx_l1: 0,
+            mv_l0: MotionVector::quarter_pel(99, 99),
+            mv_l1: MotionVector::quarter_pel(4, 4),
+        };
+        let poc = PocContext {
+            curr_poc_diff_l0: 2,
+            curr_poc_diff_l1: 2,
+            col_poc_diff_l0: 2,
+            col_poc_diff_l1: 2,
+        };
+        let res = tmvp_collocated_mv(col, poc, 0, 0, bounds());
+        assert_eq!(res.available, AvailableFlagCol::L1Only);
+        assert_eq!(res.mvp_l1, MotionVector::quarter_pel(4, 4));
+    }
+
+    /// Small-block bi-pred demotion (eqs. 487/488): nCbW+nCbH ≤ 12 drops L1.
+    #[test]
+    fn small_block_demotes_bipred() {
+        let res = CollocatedResult {
+            available: AvailableFlagCol::Both,
+            mvp_l0: MotionVector::quarter_pel(4, 0),
+            mvp_l1: MotionVector::quarter_pel(0, 8),
+        };
+        let cand = result_to_merge_cand(res, 4, 8).unwrap(); // 4+8=12 ≤ 12
+        assert!(cand.pred_flag_l0 && !cand.pred_flag_l1);
+        assert_eq!(cand.ref_idx_l1, -1);
+        // Larger block keeps both.
+        let cand2 = result_to_merge_cand(res, 8, 8).unwrap();
+        assert!(cand2.pred_flag_l0 && cand2.pred_flag_l1);
+    }
+
+    /// §8.5.2.3.5 boundary clip: a far-positive MV is clamped to the
+    /// padded right/bottom edge.
+    #[test]
+    fn boundary_clip_clamps_positive_overrun() {
+        let b = bounds(); // 1920x1080, padding 144 → padded 2064 x 1224.
+                          // CU at (2000, 1200), MV +200 in x would land at 2200 > 2064.
+        let mv = MotionVector::quarter_pel(200, 200);
+        let clipped = constrain_scaled_mv(mv, 2000, 1200, b);
+        assert_eq!(clipped.x, 2064 - 2000); // = 64
+        assert_eq!(clipped.y, 1224 - 1200); // = 24
+    }
+
+    /// §8.5.2.3.5 boundary clip: a far-negative MV is clamped to the
+    /// padded left/top edge.
+    #[test]
+    fn boundary_clip_clamps_negative_overrun() {
+        let b = bounds();
+        // CU at (10, 10), MV -200 → 10-200 = -190 < -144.
+        let mv = MotionVector::quarter_pel(-200, -200);
+        let clipped = constrain_scaled_mv(mv, 10, 10, b);
+        assert_eq!(clipped.x, -(10 + 144)); // = -154
+        assert_eq!(clipped.y, -(10 + 144));
+    }
+
+    /// §8.5.2.3.3 central position succeeds first — bottom/side never
+    /// consulted.
+    #[test]
+    fn central_position_short_circuits() {
+        let poc = PocContext {
+            curr_poc_diff_l0: 2,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 2,
+            col_poc_diff_l1: 0,
+        };
+        // 16x16 CU at (32, 32). Center = (40,40) → grid8 = (40,40).
+        let mut consulted = Vec::new();
+        let cand = tmvp_merge_candidate(32, 32, 16, 16, AvailLr::Lr00, poc, bounds(), 6, |x, y| {
+            consulted.push((x, y));
+            if (x, y) == (40, 40) {
+                CollocatedMv {
+                    pred_flag_l0: true,
+                    ref_idx_l0: 0,
+                    mv_l0: MotionVector::quarter_pel(12, -4),
+                    ..Default::default()
+                }
+            } else {
+                CollocatedMv::default()
+            }
+        })
+        .unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(12, -4));
+        assert_eq!(consulted, vec![(40, 40)]); // only the center.
+    }
+
+    /// §8.5.2.3.3 fallback: central unavailable → bottom consulted.
+    #[test]
+    fn falls_back_to_bottom_then_side() {
+        let poc = PocContext {
+            curr_poc_diff_l0: 2,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 2,
+            col_poc_diff_l1: 0,
+        };
+        // 16x16 CU at (0,0), LR_00. Center=(8,8). Bottom=(15,16)→grid(8,16).
+        let mut consulted = Vec::new();
+        let cand = tmvp_merge_candidate(0, 0, 16, 16, AvailLr::Lr00, poc, bounds(), 6, |x, y| {
+            consulted.push((x, y));
+            if (x, y) == (8, 16) {
+                CollocatedMv {
+                    pred_flag_l0: true,
+                    ref_idx_l0: 0,
+                    mv_l0: MotionVector::quarter_pel(5, 5),
+                    ..Default::default()
+                }
+            } else {
+                CollocatedMv::default() // center unavailable.
+            }
+        })
+        .unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(5, 5));
+        assert_eq!(consulted, vec![(8, 8), (8, 16)]);
+    }
+
+    /// All three positions unavailable ⇒ no candidate.
+    #[test]
+    fn all_positions_unavailable_yields_none() {
+        let poc = PocContext {
+            curr_poc_diff_l0: 2,
+            curr_poc_diff_l1: 2,
+            col_poc_diff_l0: 2,
+            col_poc_diff_l1: 2,
+        };
+        let cand = tmvp_merge_candidate(0, 0, 16, 16, AvailLr::Lr00, poc, bounds(), 6, |_, _| {
+            CollocatedMv::default()
+        });
+        assert!(cand.is_none());
+    }
+
+    /// Bottom position skipped when it crosses into the next CTB row.
+    #[test]
+    fn bottom_skipped_across_ctb_row() {
+        let poc = PocContext {
+            curr_poc_diff_l0: 2,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 2,
+            col_poc_diff_l1: 0,
+        };
+        // CtbLog2SizeY = 5 (32-sample CTB). CU 16x16 at (0,16): yColBot =
+        // 16+16 = 32. yCb>>5 = 0, yColBot>>5 = 1 → different CTB row → skip.
+        // Side: xColSide = 16, in-width → consulted.
+        let mut consulted = Vec::new();
+        let cand = tmvp_merge_candidate(0, 16, 16, 16, AvailLr::Lr00, poc, bounds(), 5, |x, y| {
+            consulted.push((x, y));
+            if (x, y) == (16, 24) {
+                // side = (16, 16+16-1=31) → grid (16, 24)
+                CollocatedMv {
+                    pred_flag_l0: true,
+                    ref_idx_l0: 0,
+                    mv_l0: MotionVector::quarter_pel(7, 7),
+                    ..Default::default()
+                }
+            } else {
+                CollocatedMv::default()
+            }
+        })
+        .unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(7, 7));
+        // center (8, 24) then side (16, 24) — bottom (8, 32) skipped.
+        assert_eq!(consulted, vec![(8, 24), (16, 24)]);
+    }
+}

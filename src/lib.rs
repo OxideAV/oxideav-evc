@@ -104,6 +104,7 @@ pub mod slice_data;
 pub mod slice_header;
 pub mod split;
 pub mod sps;
+pub mod tmvp;
 pub mod transform;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
