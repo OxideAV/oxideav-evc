@@ -404,6 +404,55 @@ where
     None
 }
 
+/// Adapt a decoded picture's [`SideInfoGrid`](crate::deblock::SideInfoGrid)
+/// — the per-4×4-cell motion field stamped during reconstruction — into
+/// the [`CollocatedMv`] a [`tmvp_merge_candidate`] `col_at` closure
+/// returns, for use as the `ColPic` motion store.
+///
+/// The §8.5.2.3.4 input arrays (`predFlagLXCol`, `mvLXCol`,
+/// `refIdxLXCol`) map onto a [`CuSideInfo`](crate::deblock::CuSideInfo)
+/// cell as:
+///
+/// * `predFlagLXCol` ⇐ the cell was coded `Inter` **and** `refIdxLX != −1`
+///   (the grid stores `−1` as the "list unavailable" sentinel; an intra /
+///   IBC cell carries no inter motion so both lists read invalid).
+/// * `refIdxLXCol` ⇐ `ref_idx_lX` (already `−1` when unavailable).
+/// * `mvLXCol` ⇐ `(mv_lX_x, mv_lX_y)` in 1/4-pel.
+///
+/// The lookup snaps the requested luma `( x_col_cb, y_col_cb )` to the
+/// grid's 4×4 cell (`>> 2`); the §8.5.2.3.3 caller has already snapped
+/// the position to the coarser 8×8 collocated grid, so the extra `>> 2`
+/// only selects the covering cell. Out-of-grid locations return the
+/// default (invalid) cell, which the §8.5.2.3.4 invalid-refIdx escape
+/// turns into `availableFlagCol = 0`.
+pub fn collocated_mv_from_side_info(
+    col_grid: &crate::deblock::SideInfoGrid,
+    x_col_cb: i32,
+    y_col_cb: i32,
+) -> CollocatedMv {
+    use crate::deblock::CuPredMode;
+
+    if x_col_cb < 0 || y_col_cb < 0 {
+        return CollocatedMv::default();
+    }
+    let cell = col_grid.at((x_col_cb >> 2) as usize, (y_col_cb >> 2) as usize);
+    // Only an inter-coded cell carries usable collocated motion; intra /
+    // IBC cells leave both lists invalid (refIdx == −1 sentinel).
+    if cell.pred_mode != CuPredMode::Inter {
+        return CollocatedMv::default();
+    }
+    let l0_valid = cell.ref_idx_l0 != -1;
+    let l1_valid = cell.ref_idx_l1 != -1;
+    CollocatedMv {
+        pred_flag_l0: l0_valid,
+        pred_flag_l1: l1_valid,
+        ref_idx_l0: cell.ref_idx_l0 as i32,
+        ref_idx_l1: cell.ref_idx_l1 as i32,
+        mv_l0: MotionVector::quarter_pel(cell.mv_l0_x, cell.mv_l0_y),
+        mv_l1: MotionVector::quarter_pel(cell.mv_l1_x, cell.mv_l1_y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +706,103 @@ mod tests {
         assert_eq!(cand.mv_l0, MotionVector::quarter_pel(7, 7));
         // center (8, 24) then side (16, 24) — bottom (8, 32) skipped.
         assert_eq!(consulted, vec![(8, 24), (16, 24)]);
+    }
+
+    /// The SideInfoGrid bridge maps an inter-coded cell's motion onto a
+    /// valid `CollocatedMv`.
+    #[test]
+    fn side_info_bridge_inter_cell() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        let mut grid = SideInfoGrid::new(64, 64);
+        grid.stamp_block(
+            16,
+            16,
+            16,
+            16,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 12,
+                mv_l0_y: -4,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        // Anywhere inside the stamped 16x16 block resolves to it.
+        let col = collocated_mv_from_side_info(&grid, 24, 24);
+        assert!(col.pred_flag_l0 && !col.pred_flag_l1);
+        assert_eq!(col.ref_idx_l0, 0);
+        assert_eq!(col.ref_idx_l1, -1);
+        assert_eq!(col.mv_l0, MotionVector::quarter_pel(12, -4));
+    }
+
+    /// Intra / IBC and out-of-grid cells read invalid (both lists off).
+    #[test]
+    fn side_info_bridge_non_inter_and_oob() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        let mut grid = SideInfoGrid::new(64, 64);
+        grid.stamp_block(
+            0,
+            0,
+            16,
+            16,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                mv_l0_x: 99,
+                ref_idx_l0: 0,
+                ..Default::default()
+            },
+        );
+        // Intra cell → invalid.
+        let intra = collocated_mv_from_side_info(&grid, 4, 4);
+        assert!(!intra.pred_flag_l0 && !intra.pred_flag_l1);
+        // Out-of-grid (negative + past the right edge) → default invalid.
+        assert_eq!(
+            collocated_mv_from_side_info(&grid, -8, 0),
+            CollocatedMv::default()
+        );
+        assert_eq!(
+            collocated_mv_from_side_info(&grid, 4096, 0),
+            CollocatedMv::default()
+        );
+    }
+
+    /// End-to-end: bridge a SideInfoGrid ColPic into a full
+    /// §8.5.2.3.3 derivation and recover the scaled candidate.
+    #[test]
+    fn side_info_bridge_drives_full_tmvp() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        let mut col_grid = SideInfoGrid::new(128, 128);
+        // Stamp an inter cell covering the central collocated position of
+        // a 16x16 CU at (32,32): center = (40,40), grid8 = (40,40).
+        col_grid.stamp_block(
+            40,
+            40,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                mv_l0_x: 10,
+                mv_l0_y: 6,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+                ..Default::default()
+            },
+        );
+        let poc = PocContext {
+            curr_poc_diff_l0: 8, // sf = (8<<5)/4 = 64 → doubles
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 0,
+        };
+        let cand = tmvp_merge_candidate(32, 32, 16, 16, AvailLr::Lr00, poc, bounds(), 6, |x, y| {
+            collocated_mv_from_side_info(&col_grid, x, y)
+        })
+        .unwrap();
+        // sf = 64 → (64*10+16)>>5 = 20, (64*6+16)>>5 = 12.
+        assert!(cand.pred_flag_l0 && !cand.pred_flag_l1);
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(20, 12));
     }
 }
