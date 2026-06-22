@@ -75,6 +75,7 @@
 //! spec-only — clauses, equations, and table numbers cite the
 //! Recommendation directly.
 
+pub mod affine;
 pub mod alf;
 pub mod alf_tables;
 pub mod aps;
