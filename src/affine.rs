@@ -381,6 +381,140 @@ pub fn affine_center_mv(
     }
 }
 
+/// The §8.5.3.3 input: the affine-coded neighbour block's stored corner
+/// motion vectors (for one prediction list X) plus its geometry and
+/// motion model.
+///
+/// `MvLX` is sampled at three neighbour corners (eqs. 744-753):
+///
+/// * `mv_tl` ⇐ `MvLX[ xNb ][ yNb ]` (top-left).
+/// * `mv_tr` ⇐ `MvLX[ xNb + nNbW − 1 ][ yNb ]` (top-right).
+/// * `mv_bl` ⇐ `MvLX[ xNb ][ yNb + nNbH − 1 ]` (bottom-left).
+///
+/// When the §8.5.3.3 `isCTUboundary` path is taken (the neighbour lies in
+/// the CTU row immediately above), the spec instead samples the
+/// neighbour's **bottom** edge — `MvLX[ xNb ][ yNb + nNbH − 1 ]` and
+/// `MvLX[ xNb + nNbW − 1 ][ yNb + nNbH − 1 ]`. The caller supplies the
+/// extra bottom-right corner in `mv_br` so this module can pick the
+/// correct row without re-reading the motion grid.
+///
+/// `motion_model_idc` is the neighbour's `MotionModelIdc[ xNb ][ yNb ]`
+/// (1 = 4-parameter, 2 = 6-parameter), selecting whether the genuine
+/// `dHorY`/`dVerY` (eqs. 752/753) or the 4-parameter rotation identity
+/// (eqs. 754/755) is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighbourAffineSource {
+    /// `( xNb, yNb )` — neighbour top-left, picture-relative.
+    pub x_nb: i32,
+    pub y_nb: i32,
+    /// `nNbW` / `nNbH` — neighbour block dimensions (powers of two).
+    pub n_nb_w: u32,
+    pub n_nb_h: u32,
+    /// `MvLX[ xNb ][ yNb ]`.
+    pub mv_tl: MotionVector,
+    /// `MvLX[ xNb + nNbW − 1 ][ yNb ]`.
+    pub mv_tr: MotionVector,
+    /// `MvLX[ xNb ][ yNb + nNbH − 1 ]`.
+    pub mv_bl: MotionVector,
+    /// `MvLX[ xNb + nNbW − 1 ][ yNb + nNbH − 1 ]`.
+    pub mv_br: MotionVector,
+    /// `MotionModelIdc[ xNb ][ yNb ]` (1 or 2).
+    pub motion_model_idc: u32,
+}
+
+/// §8.5.3.3 — derive the current block's affine control point motion
+/// vectors **inherited** from an affine-coded neighbour.
+///
+/// Picks the §8.5.3.3 `isCTUboundary` row (eqs. 744-751), derives the
+/// model gradients (`mvScaleHor/Ver`, `dHorX`, `dVerX`, and the
+/// `dHorY`/`dVerY` model-idc split of eqs. 752-755), projects them onto
+/// the current block's `numCpMv` control points (eqs. 756-761), then
+/// applies the §8.5.3.10 rounding (`rightShift = 7`) and the eq.-762/763
+/// clip. Returns `cpMvLX[ 0..numCpMv ]`.
+///
+/// `ctb_size_y` is the luma CTB size in samples (for the `isCTUboundary`
+/// test). `( x_cb, y_cb )` / `cb_width` / `cb_height` are the current
+/// block.
+pub fn inherited_cp_mvs(
+    x_cb: i32,
+    y_cb: i32,
+    cb_width: u32,
+    cb_height: u32,
+    num_cp_mv: u32,
+    ctb_size_y: i32,
+    src: NeighbourAffineSource,
+) -> Vec<ControlPointMv> {
+    let n_nb_h = src.n_nb_h as i32;
+    // isCTUboundary: the neighbour's bottom edge is on a CTB boundary AND
+    // is exactly the current block's top edge.
+    let is_ctu_boundary = ((src.y_nb + n_nb_h) % ctb_size_y == 0) && (src.y_nb + n_nb_h == y_cb);
+
+    let log2_nb_w = src.n_nb_w.trailing_zeros();
+    let log2_nb_h = src.n_nb_h.trailing_zeros();
+    let sh_w = 7 - log2_nb_w;
+    let sh_h = 7 - log2_nb_h;
+
+    // eqs. 744-751 — mvScaleHor/Ver, dHorX, dVerX. The isCTUboundary
+    // branch samples the neighbour's bottom edge (mv_bl / mv_br); the
+    // ordinary branch samples its top edge (mv_tl / mv_tr).
+    let (base, right) = if is_ctu_boundary {
+        (src.mv_bl, src.mv_br)
+    } else {
+        (src.mv_tl, src.mv_tr)
+    };
+    let mv_scale_hor = base.x << 7;
+    let mv_scale_ver = base.y << 7;
+    let d_hor_x = (right.x - base.x) << sh_w;
+    let d_ver_x = (right.y - base.y) << sh_w;
+
+    // eqs. 752-755 — dHorY / dVerY.
+    let (d_hor_y, d_ver_y) = if !is_ctu_boundary && src.motion_model_idc == 2 {
+        // 6-parameter genuine vertical gradient (eqs. 752/753): bottom-left
+        // minus top-left, scaled by 7 − log2NbH.
+        (
+            (src.mv_bl.x - src.mv_tl.x) << sh_h,
+            (src.mv_bl.y - src.mv_tl.y) << sh_h,
+        )
+    } else {
+        // 4-parameter (or CTU-boundary) rotation identity (eqs. 754/755).
+        (-d_ver_x, d_hor_x)
+    };
+
+    let dx = x_cb - src.x_nb;
+    let dy = y_cb - src.y_nb;
+    let cb_w = cb_width as i32;
+    let cb_h = cb_height as i32;
+
+    // eqs. 756-761 — project onto the current control points.
+    let mut cps = Vec::with_capacity(num_cp_mv as usize);
+    // cpMvLX[0] (eqs. 756/757).
+    cps.push(MotionVector {
+        x: mv_scale_hor + d_hor_x * dx + d_hor_y * dy,
+        y: mv_scale_ver + d_ver_x * dx + d_ver_y * dy,
+    });
+    // cpMvLX[1] (eqs. 758/759): + cbWidth in the horizontal projection.
+    cps.push(MotionVector {
+        x: mv_scale_hor + d_hor_x * (dx + cb_w) + d_hor_y * dy,
+        y: mv_scale_ver + d_ver_x * (dx + cb_w) + d_ver_y * dy,
+    });
+    if num_cp_mv == 3 {
+        // cpMvLX[2] (eqs. 760/761): + cbHeight in the vertical projection.
+        cps.push(MotionVector {
+            x: mv_scale_hor + d_hor_x * dx + d_hor_y * (dy + cb_h),
+            y: mv_scale_ver + d_ver_x * dx + d_ver_y * (dy + cb_h),
+        });
+    }
+
+    // eqs. 762/763 — §8.5.3.10 rightShift=7 rounding, then Clip3.
+    const C: i32 = 1 << 15;
+    for cp in &mut cps {
+        let r = round_motion_vector(*cp, 7, 0);
+        cp.x = r.x.clamp(-C, C - 1);
+        cp.y = r.y.clamp(-C, C - 1);
+    }
+    cps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +668,85 @@ mod tests {
         let c = affine_center_mv(32, 32, 2, &cps);
         assert!(c.x >= -(1 << 15) && c.x < (1 << 15));
         assert!(c.y >= -(1 << 15) && c.y < (1 << 15));
+    }
+
+    /// §8.5.3.3 — a purely translational neighbour (all four corner MVs
+    /// equal) inherits as the same translational CPMV at every control
+    /// point: zero gradients ⇒ cpMv = mvScale >> 7 = the corner MV.
+    #[test]
+    fn inherited_translational_neighbour() {
+        let t = cp(24, -16);
+        let src = NeighbourAffineSource {
+            x_nb: 0,
+            y_nb: 0,
+            n_nb_w: 16,
+            n_nb_h: 16,
+            mv_tl: t,
+            mv_tr: t,
+            mv_bl: t,
+            mv_br: t,
+            motion_model_idc: 1,
+        };
+        // Current block to the right of the neighbour, same row (not a
+        // CTU boundary), 4-param.
+        let cps = inherited_cp_mvs(16, 0, 16, 16, 2, 64, src);
+        assert_eq!(cps.len(), 2);
+        for c in cps {
+            assert_eq!(c, cp(24, -16));
+        }
+    }
+
+    /// §8.5.3.3 — a 6-parameter neighbour with distinct corners produces
+    /// distinct projected control points (genuine dHorY/dVerY path), and
+    /// every output stays inside the eq.-762/763 clip.
+    #[test]
+    fn inherited_6param_distinct_cps() {
+        let src = NeighbourAffineSource {
+            x_nb: 0,
+            y_nb: 0,
+            n_nb_w: 16,
+            n_nb_h: 16,
+            mv_tl: cp(0, 0),
+            mv_tr: cp(16, 0),
+            mv_bl: cp(0, 16),
+            mv_br: cp(16, 16),
+            motion_model_idc: 2,
+        };
+        let cps = inherited_cp_mvs(16, 16, 16, 16, 3, 64, src);
+        assert_eq!(cps.len(), 3);
+        // Not all equal — the model has genuine gradients.
+        assert!(!(cps[0] == cps[1] && cps[1] == cps[2]));
+        for c in &cps {
+            assert!(c.x >= -(1 << 15) && c.x < (1 << 15));
+            assert!(c.y >= -(1 << 15) && c.y < (1 << 15));
+        }
+    }
+
+    /// §8.5.3.3 — the CTU-boundary path samples the neighbour's bottom
+    /// edge (mv_bl / mv_br) rather than its top edge. With a neighbour
+    /// whose top edge differs from its bottom edge, the inherited base
+    /// follows the bottom-left corner.
+    #[test]
+    fn inherited_ctu_boundary_uses_bottom_edge() {
+        // Neighbour occupies y in [0,16); current block at y = 16, so the
+        // neighbour's bottom edge (yNb + nNbH = 16) == yCb and lands on a
+        // 16-aligned CTB boundary (ctb_size_y = 16).
+        let src = NeighbourAffineSource {
+            x_nb: 0,
+            y_nb: 0,
+            n_nb_w: 16,
+            n_nb_h: 16,
+            mv_tl: cp(100, 100), // top edge — must NOT be the base
+            mv_tr: cp(100, 100),
+            mv_bl: cp(8, -8), // bottom edge — the CTU-boundary base
+            mv_br: cp(8, -8),
+            motion_model_idc: 2,
+        };
+        let cps = inherited_cp_mvs(0, 16, 16, 16, 2, 16, src);
+        // Bottom edge is translational (bl == br) → zero horizontal
+        // gradient → cpMv tracks the bottom-left corner, not the top.
+        for c in cps {
+            assert_eq!(c, cp(8, -8));
+        }
     }
 }
