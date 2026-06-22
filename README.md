@@ -19,7 +19,8 @@ reference-picture-list parsing for non-IDR slices.
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
-`slice_data`, `intra`, `inter`, `eipd` / `eipd_mode` / `eipd_syntax`,
+`slice_data`, `intra`, `inter`, `affine` / `affine_syntax`,
+`eipd` / `eipd_mode` / `eipd_syntax`,
 `ats`, `transform`, `dequant`, `deblock`, `hmvp`, `rpl`, `neighbour`,
 `picture`, and the registered `decoder`
 factory. All clause / equation / table numbers cite ISO/IEC
@@ -137,11 +138,35 @@ pure over a caller-supplied `ColPic` motion-field closure;
 DPB-level per-picture motion array is needed — only the per-CU wiring of
 the §8.5.2.3.3 POC distances from the decoded `RefPicList0/1` remains.
 
-Still deferred: the **affine** (§8.5.3) / ATS-inter / MMVD-syntax /
-AMVR / DMVR tools, plus the picture-level wiring of the EIPD +
-ATS-intra + merge layers into a full Main-profile `coding_unit()`
-reconstruction (needs the §6.4.1 neighbour-mode grid + the per-position
-MV store).
+The **§8.5.3 affine** motion toolset (`sps_affine_flag == 1`) is now
+implemented at the derivation + syntax layers (`affine` + `affine_syntax`
+modules). The §8.5.3.7–§8.5.3.10 **geometric core** turns a 2- or 3-CPMV
+(control-point motion-vector) set into a dense per-subblock motion field:
+`affine_model_params` (§8.5.3.9) derives `dX`/`dY`/`mvBaseScaled` (eqs.
+897-906 with the 4-param `dY` rotation identity and the 6-param vertical
+gradient); `affine_subblock_size` (§8.5.3.8) derives `(sizeSbX, sizeSbY)`
+from Tables 22/23 plus the EIF bounding-box applicability test
+(`(W+2)·(H+2) > 72` → `clipMV`, eqs. 879-896); `affine_subblock_mvs`
+(§8.5.3.7) evaluates the model at each subblock centre (eqs. 873-878,
+§8.5.3.10 `rightShift = 5` rounding, 18-bit clip) and derives the
+§8.5.2.6 chroma field (1/16-pel luma, 1/32-pel chroma out). The §8.5.3.1
+`reconstruct_cp_mv` (eqs. 688-691) and `affine_center_mv` (eqs. 696-701,
+the §8.5.2.7 HMVP-update centre) plus the §8.5.3.3 `inherited_cp_mvs`
+(eqs. 744-763, projecting an affine neighbour's corner MVs onto the
+current control points across the `isCTUboundary` + model-idc branches)
+complete the derivation surface that feeds the merge/AMVP paths. The
+§7.3.8.4 CABAC syntax (`affine_syntax`) reads `affine_flag` (§9.3.4.2.4
+neighbour-derived ctxInc, Table 96), `affine_merge_idx` (TR cMax 5, per-bin
+ctxInc, Table 56), `affine_mode_flag` (→ `numCpMv`), and the per-list
+`affine_mvp_flag`/`affine_mvd_flag` group into an `AffineDecision` the
+derivation consumes.
+
+Still deferred: the **§8.5.3.2/.4/.5/.6 affine merge/predictor
+candidate-list assembly** (the constructed-CPMV candidates + the affine
+AMVP predictor list), ATS-inter / MMVD-syntax / AMVR / DMVR, plus the
+picture-level wiring of the EIPD + ATS-intra + merge + affine layers into
+a full Main-profile `coding_unit()` reconstruction (needs the §6.4.1
+neighbour-mode grid + the per-position MV store).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
