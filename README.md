@@ -19,7 +19,7 @@ reference-picture-list parsing for non-IDR slices.
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
-`slice_data`, `intra`, `inter`, `affine` / `affine_syntax`,
+`slice_data`, `intra`, `inter`, `affine` / `affine_cand` / `affine_syntax`,
 `eipd` / `eipd_mode` / `eipd_syntax`,
 `ats`, `transform`, `dequant`, `deblock`, `hmvp`, `rpl`, `neighbour`,
 `picture`, and the registered `decoder`
@@ -161,12 +161,35 @@ ctxInc, Table 56), `affine_mode_flag` (→ `numCpMv`), and the per-list
 `affine_mvp_flag`/`affine_mvd_flag` group into an `AffineDecision` the
 derivation consumes.
 
-Still deferred: the **§8.5.3.2/.4/.5/.6 affine merge/predictor
-candidate-list assembly** (the constructed-CPMV candidates + the affine
-AMVP predictor list), ATS-inter / MMVD-syntax / AMVR / DMVR, plus the
-picture-level wiring of the EIPD + ATS-intra + merge + affine layers into
-a full Main-profile `coding_unit()` reconstruction (needs the §6.4.1
-neighbour-mode grid + the per-position MV store).
+The **§8.5.3.2/.4/.5/.6 affine merge/predictor candidate-list assembly**
+is now implemented at the derivation layer (`affine_cand` module), pure
+over caller-supplied neighbour/corner sources like the merge/tmvp
+contracts. §8.5.3.4 `constructed_merge_candidates` builds the six
+corner-combined candidates Const1..Const6 (eqs. 798-835) — the
+eqs. 807/813/819 corner-completion arithmetic and the eqs. 828/829
+4-param model derivation of Const6's top-right CPMV (shift
+`7 + 2·log2W − log2H`, §8.5.3.10 `rightShift = 7` rounding + 16-bit
+clip). §8.5.3.2 `build_affine_merge_cand_list` assembles
+`affineMergeCandList` (≤ 5): the inherited model-based neighbours
+(`availLR`-ordered via `affine_merge_inherited_order` over the eqs.
+708-717 positions, projected through §8.5.3.3 `inherited_cp_mvs`), then
+Const1..6, then the step-9 zero-CPMV tail with the P/B-slice L1
+utilization; `select_affine_merge_candidate` is the eqs. 735-741 index
+bridge. §8.5.3.6 `constructed_mvp_candidate` derives the single
+constructed predictor (eqs. 868-872, corner-2 completion); §8.5.3.5
+`build_affine_mvp_cand_list` assembles `cpMvpListLX` (exactly 2): the
+inherited A/B/C refIdx-matched predictors, the constructed predictor,
+the per-corner translational fill (cpIdx 2→0 with the cpIdx-2→3
+redirect), then the zero tail (eqs. 836-866). `reconstruct_affine_amvp
+_cp_mvs` composes the eq.-867 predictor select with the §8.5.3.1 per-CP
+MVD reconstruction.
+
+Still deferred: the §8.5.3.4 corner-2/3 collocated-MV resolution wiring
+(the `CornerMv` temporal slots are threaded but the caller-side
+§8.5.2.3.4 lookup isn't yet bridged), ATS-inter / MMVD-syntax / AMVR /
+DMVR, plus the picture-level wiring of the EIPD + ATS-intra + merge +
+affine layers into a full Main-profile `coding_unit()` reconstruction
+(needs the §6.4.1 neighbour-mode grid + the per-position MV store).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
