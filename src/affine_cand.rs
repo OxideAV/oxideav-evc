@@ -29,6 +29,13 @@
 //!   predictor candidate (eqs. 868-872) from the four refIdx-matched
 //!   corner MVs.
 //!
+//! The neighbour **geometry** is exposed separately so the decoder's
+//! MV-store wiring can resolve each named neighbour without re-deriving
+//! the eqs. 708-717 / 836-842 sample locations:
+//! [`affine_merge_nb_positions`] + [`affine_merge_inherited_order`] +
+//! [`AffineNbName`] for the merge scan, and [`affine_mvp_nb_positions`]
+//! for the predictor scan.
+//!
 //! All clause / equation / table numbers cite ISO/IEC 23094-1:2020(E).
 //!
 //! ## Purity & the neighbour-lookup contract
@@ -52,6 +59,7 @@
 
 use crate::affine::{inherited_cp_mvs, ControlPointMv, NeighbourAffineSource};
 use crate::inter::MotionVector;
+use crate::neighbour::AvailLr;
 
 /// `Clip3(−2¹⁵, 2¹⁵ − 1, ·)` — the eqs. 808/809/814/815/820/821/834/835/872
 /// 16-bit CPMV clip applied to constructed-candidate components.
@@ -244,6 +252,134 @@ impl AffineNeighbour {
 /// and fills the array **in visiting order**, leaving
 /// `available_flag == false` for absent neighbours.
 pub type InheritedNeighbours = [AffineNeighbour; 5];
+
+/// The ten §8.5.3.2 neighbour sample locations (eqs. 708-717), keyed by
+/// the spec's `A0..C2` names. The merge inherited-neighbour scan and the
+/// §8.5.3.4 corner scan both index into this set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineMergeNbPositions {
+    pub a0: (i32, i32),
+    pub a1: (i32, i32),
+    pub a2: (i32, i32),
+    pub b0: (i32, i32),
+    pub b1: (i32, i32),
+    pub b2: (i32, i32),
+    pub b3: (i32, i32),
+    pub c0: (i32, i32),
+    pub c1: (i32, i32),
+    pub c2: (i32, i32),
+}
+
+/// §8.5.3.2 step-1 (eqs. 708-717) — the ten affine-merge neighbour sample
+/// locations for a luma block at `(x_cb, y_cb)` of size `cb_width` ×
+/// `cb_height`.
+pub fn affine_merge_nb_positions(
+    x_cb: i32,
+    y_cb: i32,
+    cb_width: u32,
+    cb_height: u32,
+) -> AffineMergeNbPositions {
+    let w = cb_width as i32;
+    let h = cb_height as i32;
+    AffineMergeNbPositions {
+        a0: (x_cb - 1, y_cb + h),     // eq. 708
+        a1: (x_cb - 1, y_cb + h - 1), // eq. 709
+        a2: (x_cb - 1, y_cb),         // eq. 710
+        b0: (x_cb + w, y_cb - 1),     // eq. 711
+        b1: (x_cb + w - 1, y_cb - 1), // eq. 712
+        b2: (x_cb - 1, y_cb - 1),     // eq. 713
+        b3: (x_cb, y_cb - 1),         // eq. 714
+        c0: (x_cb + w, y_cb + h),     // eq. 715
+        c1: (x_cb + w, y_cb + h - 1), // eq. 716
+        c2: (x_cb + w, y_cb),         // eq. 717
+    }
+}
+
+/// §8.5.3.2 step-3/-7 — the inherited-neighbour visiting order, as named
+/// tokens, selected by `availLR` (eqs. 720/721).
+///
+/// `LR_01` visits `[C1, B3, B2, C0, B0]`; every other `availLR` visits
+/// `[A1, B1, B0, A0, B2]`. The decoder maps each token through
+/// [`affine_merge_nb_positions`] to the sample location, resolves the
+/// §6.4.3 availability + `MotionModelIdc > 0` gate, and fills the
+/// [`InheritedNeighbours`] array in this order.
+pub fn affine_merge_inherited_order(avail_lr: AvailLr) -> [AffineNbName; 5] {
+    use AffineNbName::*;
+    if avail_lr == AvailLr::Lr01 {
+        [C1, B3, B2, C0, B0]
+    } else {
+        [A1, B1, B0, A0, B2]
+    }
+}
+
+/// A §8.5.3.2 neighbour-position name (`A0..C2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineNbName {
+    A0,
+    A1,
+    A2,
+    B0,
+    B1,
+    B2,
+    B3,
+    C0,
+    C1,
+    C2,
+}
+
+impl AffineNbName {
+    /// Resolve this name to its sample location in `pos`.
+    pub fn location(self, pos: &AffineMergeNbPositions) -> (i32, i32) {
+        match self {
+            AffineNbName::A0 => pos.a0,
+            AffineNbName::A1 => pos.a1,
+            AffineNbName::A2 => pos.a2,
+            AffineNbName::B0 => pos.b0,
+            AffineNbName::B1 => pos.b1,
+            AffineNbName::B2 => pos.b2,
+            AffineNbName::B3 => pos.b3,
+            AffineNbName::C0 => pos.c0,
+            AffineNbName::C1 => pos.c1,
+            AffineNbName::C2 => pos.c2,
+        }
+    }
+}
+
+/// The seven §8.5.3.5 affine-MVP neighbour sample locations (eqs.
+/// 836-842): the A-group `(A0, A1)`, the B-group `(B0, B1, B2)`, and the
+/// C-group `(C0, C1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineMvpNbPositions {
+    pub a0: (i32, i32),
+    pub a1: (i32, i32),
+    pub b0: (i32, i32),
+    pub b1: (i32, i32),
+    pub b2: (i32, i32),
+    pub c0: (i32, i32),
+    pub c1: (i32, i32),
+}
+
+/// §8.5.3.5 step-3 (eqs. 836-842) — the seven affine-MVP neighbour sample
+/// locations for a luma block at `(x_cb, y_cb)` of size `cb_width` ×
+/// `cb_height`.
+pub fn affine_mvp_nb_positions(
+    x_cb: i32,
+    y_cb: i32,
+    cb_width: u32,
+    cb_height: u32,
+) -> AffineMvpNbPositions {
+    let w = cb_width as i32;
+    let h = cb_height as i32;
+    AffineMvpNbPositions {
+        a0: (x_cb - 1, y_cb + h),     // eq. 836
+        a1: (x_cb - 1, y_cb + h - 1), // eq. 837
+        b0: (x_cb + w, y_cb - 1),     // eq. 838
+        b1: (x_cb + w - 1, y_cb - 1), // eq. 839
+        b2: (x_cb - 1, y_cb - 1),     // eq. 840
+        c0: (x_cb + w, y_cb + h),     // eq. 841
+        c1: (x_cb + w, y_cb + h - 1), // eq. 842
+    }
+}
 
 /// §8.5.3.4 — derive the six constructed affine merge candidates
 /// `ConstK` with `K = 1..6` from the four resolved corner CPMVs.
@@ -1079,6 +1215,67 @@ mod tests {
         assert_eq!(cp[1], mv(26, 26));
         // 3rd CP untouched (predictor value).
         assert_eq!(cp[2], mv(7, 7));
+    }
+
+    /// §8.5.3.2 step-1 positions (eqs. 708-717) at a 16×16 block placed at
+    /// (32, 48).
+    #[test]
+    fn merge_nb_positions_eqs_708_717() {
+        let p = affine_merge_nb_positions(32, 48, 16, 16);
+        assert_eq!(p.a0, (31, 64)); // (xCb−1, yCb+H)
+        assert_eq!(p.a1, (31, 63)); // (xCb−1, yCb+H−1)
+        assert_eq!(p.a2, (31, 48)); // (xCb−1, yCb)
+        assert_eq!(p.b0, (48, 47)); // (xCb+W, yCb−1)
+        assert_eq!(p.b1, (47, 47)); // (xCb+W−1, yCb−1)
+        assert_eq!(p.b2, (31, 47)); // (xCb−1, yCb−1)
+        assert_eq!(p.b3, (32, 47)); // (xCb, yCb−1)
+        assert_eq!(p.c0, (48, 64)); // (xCb+W, yCb+H)
+        assert_eq!(p.c1, (48, 63)); // (xCb+W, yCb+H−1)
+        assert_eq!(p.c2, (48, 48)); // (xCb+W, yCb)
+    }
+
+    /// §8.5.3.2 step-7 visiting order: LR_01 vs everything else (eqs.
+    /// 720/721).
+    #[test]
+    fn merge_inherited_order_by_avail_lr() {
+        use AffineNbName::*;
+        assert_eq!(
+            affine_merge_inherited_order(AvailLr::Lr01),
+            [C1, B3, B2, C0, B0]
+        );
+        assert_eq!(
+            affine_merge_inherited_order(AvailLr::Lr10),
+            [A1, B1, B0, A0, B2]
+        );
+        assert_eq!(
+            affine_merge_inherited_order(AvailLr::Lr00),
+            [A1, B1, B0, A0, B2]
+        );
+        assert_eq!(
+            affine_merge_inherited_order(AvailLr::Lr11),
+            [A1, B1, B0, A0, B2]
+        );
+    }
+
+    /// `AffineNbName::location` resolves a token through the position set.
+    #[test]
+    fn nb_name_location_resolution() {
+        let p = affine_merge_nb_positions(0, 0, 16, 16);
+        assert_eq!(AffineNbName::C1.location(&p), p.c1);
+        assert_eq!(AffineNbName::A0.location(&p), p.a0);
+    }
+
+    /// §8.5.3.5 step-3 positions (eqs. 836-842) at a 16×16 block at (32,48).
+    #[test]
+    fn mvp_nb_positions_eqs_836_842() {
+        let p = affine_mvp_nb_positions(32, 48, 16, 16);
+        assert_eq!(p.a0, (31, 64));
+        assert_eq!(p.a1, (31, 63));
+        assert_eq!(p.b0, (48, 47));
+        assert_eq!(p.b1, (47, 47));
+        assert_eq!(p.b2, (31, 47));
+        assert_eq!(p.c0, (48, 64));
+        assert_eq!(p.c1, (48, 63));
     }
 
     fn dummy_src() -> NeighbourAffineSource {
