@@ -700,6 +700,35 @@ pub fn build_affine_mvp_cand_list(
     [list[0], list[1]]
 }
 
+/// §8.5.3.5 eq. 867 + §8.5.3.1 eqs. 688-691 — the AMVP affine
+/// CPMV-reconstruction bridge.
+///
+/// Selects the predictor `cpMvpListLX[ affine_mvp_flag_lX ]` (eq. 867)
+/// from the [`build_affine_mvp_cand_list`] output, then reconstructs each
+/// control point's final motion vector by adding the decoded MVD per
+/// §8.5.3.1 (the 16-bit modular wrap of `mvpCp + mvdCp`, eqs. 688-691,
+/// via [`crate::affine::reconstruct_cp_mv`]).
+///
+/// `mvp_list` is the two-entry list for list X; `mvp_flag` is the decoded
+/// `affine_mvp_flag_lX` ∈ {0, 1}; `mvd_cp[ cpIdx ]` are the per-vertex
+/// decoded MVDs (all-zero when `affine_mvd_flag_lX == 0`, the §7.4 absent
+/// inference). `num_cp_mv` (2 or 3) bounds which control points are
+/// reconstructed; the unused tail entry is left at the predictor's value
+/// (never read by the §8.5.3.7 derivation, which honours `numCpMv`).
+pub fn reconstruct_affine_amvp_cp_mvs(
+    mvp_list: &[[ControlPointMv; 3]; 2],
+    mvp_flag: u32,
+    mvd_cp: &[MotionVector; 3],
+    num_cp_mv: u32,
+) -> [ControlPointMv; 3] {
+    let mvp = mvp_list[(mvp_flag & 1) as usize];
+    let mut out = mvp;
+    for (cp_idx, slot) in out.iter_mut().enumerate().take(num_cp_mv as usize) {
+        *slot = crate::affine::reconstruct_cp_mv(mvp[cp_idx], mvd_cp[cp_idx]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1046,39 @@ mod tests {
         // First filled: corner 1 → [9,10]×3; second: corner 0 → [7,8]×3.
         assert_eq!(list[0], [mv(9, 10), mv(9, 10), mv(9, 10)]);
         assert_eq!(list[1], [mv(7, 8), mv(7, 8), mv(7, 8)]);
+    }
+
+    /// §8.5.3.5 eq. 867 — the AMVP bridge selects `cpMvpListLX[mvp_flag]`
+    /// and adds the per-CP MVD (§8.5.3.1). 6-param: all 3 CPs reconstructed.
+    #[test]
+    fn amvp_reconstruct_selects_and_adds_mvd() {
+        let mvp_list = [
+            [mv(100, 200), mv(110, 210), mv(120, 220)],
+            [mv(5, 5), mv(6, 6), mv(7, 7)],
+        ];
+        let mvd = [mv(1, -2), mv(3, -4), mv(5, -6)];
+        // mvp_flag = 0 → first entry; add MVDs.
+        let cp = reconstruct_affine_amvp_cp_mvs(&mvp_list, 0, &mvd, 3);
+        assert_eq!(cp[0], mv(101, 198));
+        assert_eq!(cp[1], mv(113, 206));
+        assert_eq!(cp[2], mv(125, 214));
+    }
+
+    /// AMVP bridge honours `mvp_flag == 1` (selects the second predictor)
+    /// and `num_cp_mv == 2` (only 2 CPs reconstructed; the 3rd stays at the
+    /// predictor value, unread downstream).
+    #[test]
+    fn amvp_reconstruct_flag1_4param() {
+        let mvp_list = [
+            [mv(100, 200), mv(110, 210), mv(120, 220)],
+            [mv(5, 5), mv(6, 6), mv(7, 7)],
+        ];
+        let mvd = [mv(10, 10), mv(20, 20), mv(0, 0)];
+        let cp = reconstruct_affine_amvp_cp_mvs(&mvp_list, 1, &mvd, 2);
+        assert_eq!(cp[0], mv(15, 15));
+        assert_eq!(cp[1], mv(26, 26));
+        // 3rd CP untouched (predictor value).
+        assert_eq!(cp[2], mv(7, 7));
     }
 
     fn dummy_src() -> NeighbourAffineSource {
