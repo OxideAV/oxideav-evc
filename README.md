@@ -248,9 +248,12 @@ sliding 2×2 forward Hadamard (eqs. 1093-1097), the bit-depth-branched
 soft-threshold of the three AC coefficients (eqs. 1098/1099, DC kept),
 the inverse Hadamard (eqs. 1100-1103), the overlap accumulation
 (eq. 1104) and the `Clip1Y((accFlt + 2) >> 2)` rounding (eq. 1105). The
-filter is pure over the reconstructed-sample accessor; invoking it from
-the §8.4.1 / §8.6 reconstruction (when `cbf_luma && sps_htdf_flag`) is
-the next wiring step.
+filter is pure over the reconstructed-sample accessor;
+`picture::apply_htdf_luma` is the data-plane bridge that drives it
+in-place on the `YuvPicture` luma plane (short-circuiting on the
+applicability gates). Invoking that bridge from the §8.4.1 / §8.6
+reconstruction (when `cbf_luma && sps_htdf_flag`) and threading the real
+§6.4.1 border predicate is the next wiring step.
 
 ### Not yet supported
 

@@ -203,6 +203,80 @@ impl YuvPicture {
         .refs
     }
 
+    /// Apply the §8.7.6 HTDF post-reconstruction filter to the luma block
+    /// at `(x, y)` in place, the data-plane bridge for the `htdf` module.
+    ///
+    /// No-op (returns `false`) when the §8.7.6.1 applicability gates
+    /// disqualify the block ([`crate::htdf::htdf_applies`]); otherwise runs
+    /// the §8.7.6.2 padding + §8.7.6.3 LUT derivation + §8.7.6.1 filter and
+    /// writes the modified samples back into the luma plane, returning
+    /// `true`.
+    ///
+    /// `is_intra` is `LumaPredMode[xCb][yCb] == MODE_INTRA`;
+    /// `is_inter_square_ge32` is the eq.-1106 `MODE_INTER && square &&
+    /// Min >= 32` predicate selecting the qpIdx branch. Border availability
+    /// uses the in-picture-extent rule (single-slice / single-tile,
+    /// `constrained_intra_pred_flag == 0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_htdf_luma(
+        &mut self,
+        x: u32,
+        y: u32,
+        n_cb_w: usize,
+        n_cb_h: usize,
+        qp_y: i32,
+        is_intra: bool,
+        is_inter_square_ge32: bool,
+    ) -> bool {
+        use crate::htdf::{
+            derive_htdf_lut, filter_block, htdf_applies, pad_rec_samples, InPictureBorder,
+        };
+
+        if !htdf_applies(n_cb_w, n_cb_h, qp_y, is_intra) {
+            return false;
+        }
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let stride = self.y_stride();
+        let lut = derive_htdf_lut(qp_y, is_inter_square_ge32);
+        let border = InPictureBorder {
+            x_cb: x as i32,
+            y_cb: y as i32,
+            width: w,
+            height: h,
+        };
+        let pad = pad_rec_samples(
+            x as i32,
+            y as i32,
+            n_cb_w,
+            n_cb_h,
+            |ax, ay| {
+                // The §8.7.6.2 clamp keeps (ax, ay) in-extent; defensively
+                // clamp to the plane bounds anyway.
+                let cx = ax.clamp(0, w - 1) as usize;
+                let cy = ay.clamp(0, h - 1) as usize;
+                self.y[cy * stride + cx] as i32
+            },
+            &border,
+        );
+        let out = filter_block(&pad, n_cb_w, n_cb_h, &lut, self.bit_depth);
+        // Write back, clamped to the picture extent.
+        for j in 0..n_cb_h {
+            let yy = y as usize + j;
+            if yy >= self.height as usize {
+                break;
+            }
+            for i in 0..n_cb_w {
+                let xx = x as usize + i;
+                if xx >= self.width as usize {
+                    break;
+                }
+                self.y[yy * stride + xx] = out[j * n_cb_w + i] as u8;
+            }
+        }
+        true
+    }
+
     /// Clip to `[0, (1<<bit_depth) - 1]` and store into the right plane.
     pub fn store_block(
         &mut self,
@@ -449,6 +523,59 @@ mod tests {
         // Top row unavailable (y == 0) → EIPD corner-chain → all 128.
         for i in 0..8i32 {
             assert_eq!(refs.top(i), 128, "top[{i}]");
+        }
+    }
+
+    /// HTDF is a no-op when the §8.7.6.1 applicability gates fail (e.g. a
+    /// 4×4 block, < 64 samples) — the plane is untouched and the call
+    /// returns false.
+    #[test]
+    fn htdf_skipped_when_inapplicable() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 123;
+        }
+        let applied = pic.apply_htdf_luma(0, 0, 4, 4, 30, true, false);
+        assert!(!applied);
+        assert!(pic.y.iter().all(|&v| v == 123));
+    }
+
+    /// HTDF on a flat luma field is the identity (all AC coefficients are
+    /// zero), but the call returns true (it ran).
+    #[test]
+    fn htdf_flat_field_identity() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        let applied = pic.apply_htdf_luma(0, 0, 8, 8, 30, true, false);
+        assert!(applied);
+        // 8×8 block at (0,0) unchanged on a flat field.
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(pic.y[j * 16 + i], 100, "({i},{j})");
+            }
+        }
+    }
+
+    /// HTDF smooths a single-sample luma impulse without amplifying it.
+    #[test]
+    fn htdf_smooths_impulse() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        for v in pic.y.iter_mut() {
+            *v = 100;
+        }
+        pic.y[4 * 16 + 4] = 220;
+        let applied = pic.apply_htdf_luma(0, 0, 8, 8, 40, true, false);
+        assert!(applied);
+        let peak = pic.y[4 * 16 + 4];
+        assert!(peak <= 220, "peak={peak}");
+        // Filtered samples stay within the input value range.
+        for j in 0..8 {
+            for i in 0..8 {
+                let v = pic.y[j * 16 + i];
+                assert!((90..=220).contains(&v), "({i},{j})={v}");
+            }
         }
     }
 
