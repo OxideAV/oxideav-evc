@@ -106,9 +106,14 @@ mid-level and every other hole copies its scan predecessor
 path `p[nCbW][y-1]` down the right, the y=0 right predecessor taken from
 the top row at x=nCbW). The result is a `ConstructedRefs` carrying the
 filled `EipdRefSamples` ready for the §8.4.4.3-§8.4.4.10 kernels. The
-process is pure over the closures; the remaining intra wiring is
-threading the decoder's `IsCoded` raster + recon plane into the
-construction at the §8.4.4 dispatch.
+process is pure over the closures; `picture::fetch_eipd_refs` is the
+data-plane bridge that drives it from the `YuvPicture` reconstructed
+buffer (the EIPD analogue of the Baseline `fetch_intra_refs`),
+populating the top / left / corner / SUCO-right neighbourhood from the
+post-reconstruction plane with a causal availability rule. The remaining
+intra wiring is threading the real §6.4.1 `IsCoded` raster + tile
+predicate + `constrained_intra_pred_flag` through the availability
+closure at the §8.4.4 dispatch.
 
 The **ATS-intra** (Adaptive Transform Selection, `sps_ats_flag == 1`,
 intra path) toolset is implemented end-to-end at the syntax + transform

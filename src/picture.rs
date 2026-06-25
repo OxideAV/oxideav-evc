@@ -120,6 +120,89 @@ impl YuvPicture {
         refs
     }
 
+    /// Build the **EIPD** (§8.4.4.1) reference-sample neighbourhood for an
+    /// intra block at the given component-domain top-left position, running
+    /// the §8.4.4.1 construction + §8.4.4.2 substitution via
+    /// [`crate::eipd_ref::construct_eipd_refs`].
+    ///
+    /// The EIPD neighbourhood spans `nCbW + nCbH` samples on each of the
+    /// top row `p[x][-1]` and left column `p[-1][y]`, plus the `p[-1][-1]`
+    /// corner and — when `sps_suco_flag == 1` — the right column
+    /// `p[nCbW][y]`.
+    ///
+    /// Availability mirrors [`fetch_intra_refs`](Self::fetch_intra_refs)'s
+    /// simplified causal rule (top available iff above the block, left iff
+    /// to the block's left, both in-picture), extended to the right column:
+    /// `p[nCbW][y]` is available iff `right_available` is set (the caller's
+    /// SUCO split-unit-coding-order resolution) **and** the position is
+    /// in-picture and causal. `constrained_intra_pred_flag` is taken as 0
+    /// here (the round-3 single-slice fixtures are all-intra); a future
+    /// wiring threads the real predicate through the `available` closure.
+    ///
+    /// Returns the constructed [`crate::eipd::EipdRefSamples`] ready for
+    /// [`crate::eipd::predict_eipd`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_eipd_refs(
+        &self,
+        x: u32,
+        y: u32,
+        n_cb_w: usize,
+        n_cb_h: usize,
+        c_idx: u32,
+        sps_suco_flag: bool,
+        right_available: bool,
+    ) -> crate::eipd::EipdRefSamples {
+        let (plane, stride, w, h) = self.plane_view(c_idx);
+        let xb = x as i64;
+        let yb = y as i64;
+        let wi = w as i64;
+        let hi = h as i64;
+
+        // Availability: a component-domain offset (ox, oy) relative to the
+        // block's top-left. `available` returns true only for causal,
+        // in-picture neighbour locations.
+        let available = |ox: i64, oy: i64| -> bool {
+            let ax = xb + ox;
+            let ay = yb + oy;
+            if ax < 0 || ay < 0 || ax >= wi || ay >= hi {
+                return false;
+            }
+            if oy < 0 {
+                // Top row / corner: must be above the block (y > 0), and the
+                // sample column already reconstructed (above-row is always
+                // causal for ax to the right; the simplified model treats the
+                // whole above row as available when the block is not in the
+                // first row).
+                yb > 0
+            } else if ox < 0 {
+                // Left column: must be to the block's left (x > 0).
+                xb > 0
+            } else {
+                // Right column p[nCbW][y]: gated on the caller's SUCO
+                // right-available resolution.
+                right_available
+            }
+        };
+
+        let sample = |ox: i64, oy: i64| -> i32 {
+            let ax = (xb + ox) as usize;
+            let ay = (yb + oy) as usize;
+            plane[ay * stride + ax] as i32
+        };
+
+        crate::eipd_ref::construct_eipd_refs(
+            n_cb_w,
+            n_cb_h,
+            self.bit_depth,
+            true, // sps_eipd_flag (this is the EIPD fetch path)
+            sps_suco_flag,
+            |ox, oy| available(ox as i64, oy as i64),
+            // Only invoked for available offsets, so bounds hold.
+            |ox, oy| sample(ox as i64, oy as i64),
+        )
+        .refs
+    }
+
     /// Clip to `[0, (1<<bit_depth) - 1]` and store into the right plane.
     pub fn store_block(
         &mut self,
@@ -332,6 +415,60 @@ mod tests {
         }
         // Top is still y=0 → no row above, stays at 128.
         assert!(refs.top.iter().all(|&v| v == 128));
+    }
+
+    /// First CU EIPD refs: everything not-available → §8.4.4.2 EIPD
+    /// substitution. The corner is mid-level (128) and the copy-predecessor
+    /// chain propagates that 128 across the whole top row and left column.
+    #[test]
+    fn eipd_first_cu_is_grey() {
+        let pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        let refs = pic.fetch_eipd_refs(0, 0, 4, 4, 0, false, false);
+        assert_eq!(refs.top_left(), 128);
+        for i in -1..(8i32) {
+            assert_eq!(refs.top(i), 128, "top[{i}]");
+            assert_eq!(refs.left(i), 128, "left[{i}]");
+        }
+    }
+
+    /// EIPD refs pick up the stored left-neighbour column; the still-grey
+    /// top stays 128, and the EIPD copy-predecessor fill leaves available
+    /// left samples untouched.
+    #[test]
+    fn eipd_left_neighbour_carried_through() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        let block: Vec<i32> = (0..64i32).map(|i| 100 + (i & 0x1F)).collect();
+        pic.store_block(0, 0, 8, 8, 0, &block);
+        // Block at (8, 0): left column = right column of the stored block.
+        let refs = pic.fetch_eipd_refs(8, 0, 4, 4, 0, false, false);
+        // left[j] = block[j*8 + 7] for j in 0..4 (in-picture, x>0 ⇒ avail).
+        for j in 0..4i32 {
+            let expect = block[(j as usize) * 8 + 7].clamp(0, 255);
+            assert_eq!(refs.left(j), expect, "left[{j}]");
+        }
+        // Top row unavailable (y == 0) → EIPD corner-chain → all 128.
+        for i in 0..8i32 {
+            assert_eq!(refs.top(i), 128, "top[{i}]");
+        }
+    }
+
+    /// SUCO path: when `right_available` is set and the right column is
+    /// in-picture and reconstructed, `fetch_eipd_refs` populates the right
+    /// column from the picture instead of substituting.
+    #[test]
+    fn eipd_suco_right_column_populated() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        // Seed a column at x = 4 (the right neighbour of a block at x=0).
+        for yy in 0..8usize {
+            pic.y[yy * 16 + 4] = 77;
+        }
+        // Also seed top row so the block isn't first-row (give it a row
+        // above at y = 4..).
+        let refs = pic.fetch_eipd_refs(0, 4, 4, 4, 0, true, true);
+        // p[nCbW=4][y] for y in 0..nCbH+nCbW-1, in-picture rows carry 77.
+        for y in 0..4i32 {
+            assert_eq!(refs.right(y), 77, "right[{y}]");
+        }
     }
 
     /// Storing a block then intra-reconstructing with INTRA_DC + zero
