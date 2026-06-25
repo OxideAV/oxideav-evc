@@ -57,9 +57,13 @@ whether `split_unit_coding_order_flag` is signalled.
 
 The **EIPD** (extended intra prediction, `sps_eipd_flag == 1`) toolset is
 now implemented end-to-end at the prediction-and-mode-derivation layer
-(`eipd` + `eipd_mode` modules). The §8.4.4.8/.9/.10 sample kernels cover
-the full mode set of Table 15 — `INTRA_DC` (eqs. 286-288 aspect-ratio
-average), `INTRA_BI` bilinear (eqs. 297-311 with the `divScaleMult` /
+(`eipd` + `eipd_mode` modules). The §8.4.4.4/.5/.8/.9/.10 sample kernels
+cover the full mode set of Table 15 — `INTRA_DC` (eqs. 286-288
+aspect-ratio average), the `availLR`-dependent `INTRA_HOR` (§8.4.4.4: the
+eq.-290 `LR_11` left/right-column horizontal blend via
+`divScaleMult[Log2(nCbW)]`, the eq.-291 `LR_01` right-column copy, the
+eqs.-292 `LR_00`/`LR_10` left-column copy), `INTRA_VER` (§8.4.4.5
+eq. 293), `INTRA_BI` bilinear (eqs. 297-311 with the `divScaleMult` /
 `weightFactor` Tables 17/18), `INTRA_PLN` planar (eqs. 314-325 with the
 `mult`/`shift` Table 19), and the 33-direction angular set (§8.4.4.10
 Table 20 `dirXYSign`/`divDxy`/`divDyx`, the two-step

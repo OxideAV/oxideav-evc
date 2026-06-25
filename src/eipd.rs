@@ -232,6 +232,8 @@ pub fn predict_eipd(
         INTRA_DC => predict_dc_eipd(refs, n_cb_w, n_cb_h, avail_lr, dst),
         INTRA_PLN => predict_pln(refs, n_cb_w, n_cb_h, bit_depth, avail_lr, dst),
         INTRA_BI => predict_bi(refs, n_cb_w, n_cb_h, bit_depth, avail_lr, dst),
+        INTRA_HOR => predict_hor_eipd(refs, n_cb_w, n_cb_h, avail_lr, dst),
+        INTRA_VER => predict_ver_eipd(refs, n_cb_w, n_cb_h, dst),
         _ => predict_directional(
             pred_mode_intra,
             refs,
@@ -481,8 +483,76 @@ fn predict_pln(
     }
 }
 
+/// §8.4.4.5 INTRA_VER, `sps_eipd_flag == 1` path (eq. 293):
+/// `predSamples[ x ][ y ] = p[ x ][ −1 ]`. Unconditional (no `availLR`
+/// dependence) — a pure copy of the top row.
+fn predict_ver_eipd(refs: &EipdRefSamples, n_cb_w: usize, n_cb_h: usize, dst: &mut [i32]) {
+    for y in 0..n_cb_h {
+        for x in 0..n_cb_w {
+            dst[y * n_cb_w + x] = refs.top(x as i32);
+        }
+    }
+}
+
+/// §8.4.4.4 INTRA_HOR, `sps_eipd_flag == 1` path (eqs. 290-292).
+///
+/// Unlike the Baseline INTRA_HOR (eq. 289, a pure left-column copy), the
+/// EIPD form blends the left and right columns when a right neighbour is
+/// available:
+///
+/// * `LR_11` — both columns present: a per-`x` horizontal linear blend
+///   of `p[ −1 ][ y ]` and `p[ nCbW ][ y ]` weighted by `(nCbW − x)` /
+///   `(x + 1)`, normalised via `divScaleMult[ Log2(nCbW) ]` (eq. 290).
+/// * `LR_01` — only the right column present: a pure copy of
+///   `p[ nCbW ][ y ]` (eq. 291).
+/// * `LR_00` / `LR_10` — no right column: the pure left-column copy
+///   `p[ −1 ][ y ]` (eq. 292).
+fn predict_hor_eipd(
+    refs: &EipdRefSamples,
+    n_cb_w: usize,
+    n_cb_h: usize,
+    avail_lr: AvailLr,
+    dst: &mut [i32],
+) {
+    match avail_lr {
+        AvailLr::Lr11 => {
+            // eq. 290: per-x blend of the left and right columns.
+            let w = n_cb_w as i64;
+            let log2_w = log2_usize(n_cb_w) as usize;
+            let scale = DIV_SCALE_MULT[log2_w];
+            for y in 0..n_cb_h {
+                let left = refs.left(y as i32) as i64;
+                let right = refs.right(y as i32) as i64;
+                for x in 0..n_cb_w {
+                    let xi = x as i64;
+                    let num = left * (w - xi) + right * (xi + 1) + (w >> 1);
+                    dst[y * n_cb_w + x] = ((num * scale) >> DIV_SCALE_SHIFT) as i32;
+                }
+            }
+        }
+        AvailLr::Lr01 => {
+            // eq. 291: pure right-column copy.
+            for y in 0..n_cb_h {
+                let v = refs.right(y as i32);
+                for x in 0..n_cb_w {
+                    dst[y * n_cb_w + x] = v;
+                }
+            }
+        }
+        AvailLr::Lr00 | AvailLr::Lr10 => {
+            // eq. 292: pure left-column copy.
+            for y in 0..n_cb_h {
+                let v = refs.left(y as i32);
+                for x in 0..n_cb_w {
+                    dst[y * n_cb_w + x] = v;
+                }
+            }
+        }
+    }
+}
+
 /// §8.4.4.10 directional modes (`predModeIntra = 3..32`, excluding the
-/// `INTRA_VER`/`INTRA_HOR` special anchors handled separately below).
+/// `INTRA_VER`/`INTRA_HOR` special anchors handled in [`predict_eipd`]).
 ///
 /// Implements the full two-step process: step 1 derives
 /// `iOffset / iX / iY / refPosition` per the `availLR` + mode quadrant
@@ -498,26 +568,6 @@ fn predict_directional(
     avail_lr: AvailLr,
     dst: &mut [i32],
 ) {
-    // INTRA_VER (12) and INTRA_HOR (24) are pure copies, dispatched here
-    // before consulting the Table 20 (their rows are dashes).
-    if pred_mode_intra == INTRA_VER {
-        for y in 0..n_cb_h {
-            for x in 0..n_cb_w {
-                dst[y * n_cb_w + x] = refs.top(x as i32);
-            }
-        }
-        return;
-    }
-    if pred_mode_intra == INTRA_HOR {
-        for y in 0..n_cb_h {
-            let v = refs.left(y as i32);
-            for x in 0..n_cb_w {
-                dst[y * n_cb_w + x] = v;
-            }
-        }
-        return;
-    }
-
     let (dir_xy_sign, div_dxy, div_dyx) = DIR_TABLE[(pred_mode_intra - 3) as usize];
     let max_val = (1i64 << bit_depth) - 1;
     let w = n_cb_w as i64;
@@ -800,6 +850,64 @@ mod tests {
                 assert_eq!(dst[y * 4 + x], 70 + y as i32);
             }
         }
+    }
+
+    /// INTRA_HOR under LR_01 copies the *right* column (§8.4.4.4 eq. 291).
+    #[test]
+    fn hor_lr01_copies_right_column() {
+        let mut refs = EipdRefSamples::unavailable(4, 4, 8);
+        for y in 0..4i32 {
+            refs.set_left(y, 70 + y);
+            refs.set_right(y, 90 + y);
+        }
+        let mut dst = vec![0i32; 16];
+        predict_eipd(INTRA_HOR, &refs, 4, 4, 8, AvailLr::Lr01, &mut dst);
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(dst[y * 4 + x], 90 + y as i32, "y={y} x={x}");
+            }
+        }
+    }
+
+    /// INTRA_HOR under LR_11 horizontally blends the left and right columns
+    /// (§8.4.4.4 eq. 290). With both columns equal the blend reproduces
+    /// that value exactly (the normalisation is reciprocal-exact for a
+    /// power-of-two width).
+    #[test]
+    fn hor_lr11_blend_constant_columns() {
+        let mut refs = EipdRefSamples::unavailable(4, 4, 8);
+        for y in 0..4i32 {
+            refs.set_left(y, 120);
+            refs.set_right(y, 120);
+        }
+        let mut dst = vec![0i32; 16];
+        predict_eipd(INTRA_HOR, &refs, 4, 4, 8, AvailLr::Lr11, &mut dst);
+        // num = 120*(4-x) + 120*(x+1) + 2 = 120*5 + 2 = 602.
+        // scale = divScaleMult[Log2(4)=2] = 819; (602*819) >> 12 = 120.
+        assert!(dst.iter().all(|&v| v == 120), "got {dst:?}");
+    }
+
+    /// INTRA_HOR under LR_11 at the block edges blends toward the
+    /// dominant column (left at x=0, right at x=nCbW-1).
+    #[test]
+    fn hor_lr11_blend_edges() {
+        let mut refs = EipdRefSamples::unavailable(4, 4, 8);
+        // Constant rows so the per-y blend is independent of y.
+        for y in 0..4i32 {
+            refs.set_left(y, 40);
+            refs.set_right(y, 200);
+        }
+        let mut dst = vec![0i32; 16];
+        predict_eipd(INTRA_HOR, &refs, 4, 4, 8, AvailLr::Lr11, &mut dst);
+        let scale = DIV_SCALE_MULT[2]; // Log2(4)
+        for x in 0..4i64 {
+            let num = 40 * (4 - x) + 200 * (x + 1) + 2;
+            let expect = ((num * scale) >> DIV_SCALE_SHIFT) as i32;
+            assert_eq!(dst[x as usize], expect, "x={x}");
+        }
+        // Monotone increasing left→right between the two column values.
+        assert!(dst[0] < dst[3]);
+        assert!(dst[0] >= 40 && dst[3] <= 200);
     }
 
     /// DC averages top + left with the eipd=1 rounding/shift.
