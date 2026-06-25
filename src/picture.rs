@@ -402,6 +402,75 @@ pub fn intra_reconstruct_cb(
     Ok(())
 }
 
+/// EIPD (`sps_eipd_flag == 1`) analogue of [`intra_reconstruct_cb`]: the
+/// end-to-end §8.4.4 EIPD predict + §8.7.5 picture-construction path on
+/// the picture buffer, the data-plane bridge that ties `fetch_eipd_refs`,
+/// `eipd::predict_eipd` and `store_block` together.
+///
+/// `pred_mode_intra` is the EIPD mode index (0..32, Table 15).
+/// `sps_suco_flag` / `right_available` thread the §6.4.2 right-neighbour
+/// availability into the §8.4.4.1 construction. The `availLR` consumed by
+/// the §8.4.4 kernels is derived from the simplified causal rule (left
+/// available iff `x > 0` in-extent; right per `right_available`),
+/// matching `fetch_eipd_refs`.
+#[allow(clippy::too_many_arguments)]
+pub fn intra_reconstruct_cb_eipd(
+    pic: &mut YuvPicture,
+    x_luma: u32,
+    y_luma: u32,
+    log2_cb_w_luma: u32,
+    log2_cb_h_luma: u32,
+    pred_mode_intra: i32,
+    c_idx: u32,
+    sps_suco_flag: bool,
+    right_available: bool,
+    residual: &[i32],
+) -> Result<()> {
+    use crate::eipd::{predict_eipd, AvailLr};
+
+    let (sub_w, sub_h) = sub_sampling(pic.chroma_format_idc, c_idx)?;
+    let x = x_luma / sub_w;
+    let y = y_luma / sub_h;
+    let n_cb_w = 1usize << (log2_cb_w_luma - sub_w_log2(sub_w));
+    let n_cb_h = 1usize << (log2_cb_h_luma - sub_h_log2(sub_h));
+    if residual.len() != n_cb_w * n_cb_h {
+        return Err(Error::invalid(format!(
+            "evc reconstruct (eipd): residual len {} != {}*{}={}",
+            residual.len(),
+            n_cb_w,
+            n_cb_h,
+            n_cb_w * n_cb_h
+        )));
+    }
+
+    // §6.4.2 availLR from the simplified causal rule.
+    let left_avail = x > 0;
+    let avail_lr = match (left_avail, sps_suco_flag && right_available) {
+        (false, false) => AvailLr::Lr00,
+        (true, false) => AvailLr::Lr10,
+        (false, true) => AvailLr::Lr01,
+        (true, true) => AvailLr::Lr11,
+    };
+
+    let refs = pic.fetch_eipd_refs(x, y, n_cb_w, n_cb_h, c_idx, sps_suco_flag, right_available);
+    let mut pred = vec![0i32; n_cb_w * n_cb_h];
+    predict_eipd(
+        pred_mode_intra,
+        &refs,
+        n_cb_w,
+        n_cb_h,
+        pic.bit_depth,
+        avail_lr,
+        &mut pred,
+    );
+    // §8.7.5 picture construction: rec = clip(pred + res) — eq. 1091.
+    for (p, r) in pred.iter_mut().zip(residual.iter()) {
+        *p += *r;
+    }
+    pic.store_block(x, y, n_cb_w, n_cb_h, c_idx, &pred);
+    Ok(())
+}
+
 fn sub_sampling(chroma_format_idc: u32, c_idx: u32) -> Result<(u32, u32)> {
     if c_idx == 0 {
         return Ok((1, 1));
@@ -523,6 +592,45 @@ mod tests {
         // Top row unavailable (y == 0) → EIPD corner-chain → all 128.
         for i in 0..8i32 {
             assert_eq!(refs.top(i), 128, "top[{i}]");
+        }
+    }
+
+    /// End-to-end EIPD reconstruct: a first CU (all-grey EIPD refs) with
+    /// INTRA_DC + zero residual reconstructs to the mid-level constant.
+    #[test]
+    fn eipd_reconstruct_first_cu_dc() {
+        use crate::eipd::INTRA_DC;
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        let zero = vec![0i32; 64];
+        intra_reconstruct_cb_eipd(
+            &mut pic, 0, 0, 3, 3, // 8×8
+            INTRA_DC, 0, false, false, &zero,
+        )
+        .unwrap();
+        // All refs are 128 → DC average is 128.
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(pic.y[j * 16 + i], 128, "({i},{j})");
+            }
+        }
+    }
+
+    /// End-to-end EIPD reconstruct: INTRA_VER copies the (grey) top row,
+    /// then a non-zero residual offsets it; the result clips into range.
+    #[test]
+    fn eipd_reconstruct_ver_with_residual() {
+        use crate::eipd::INTRA_VER;
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        // Seed the row above an 8×8 block at (0, 8) with a ramp.
+        for i in 0..8usize {
+            pic.y[7 * 16 + i] = (10 + i * 5) as u8;
+        }
+        let res = vec![3i32; 64];
+        intra_reconstruct_cb_eipd(&mut pic, 0, 8, 3, 3, INTRA_VER, 0, false, false, &res).unwrap();
+        // INTRA_VER copies p[x][-1] (the ramp) + residual 3.
+        for x in 0..8usize {
+            let expect = (10 + x * 5) as i32 + 3;
+            assert_eq!(pic.y[8 * 16 + x] as i32, expect, "x={x}");
         }
     }
 

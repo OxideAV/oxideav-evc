@@ -110,10 +110,16 @@ process is pure over the closures; `picture::fetch_eipd_refs` is the
 data-plane bridge that drives it from the `YuvPicture` reconstructed
 buffer (the EIPD analogue of the Baseline `fetch_intra_refs`),
 populating the top / left / corner / SUCO-right neighbourhood from the
-post-reconstruction plane with a causal availability rule. The remaining
-intra wiring is threading the real §6.4.1 `IsCoded` raster + tile
+post-reconstruction plane with a causal availability rule.
+`picture::intra_reconstruct_cb_eipd` then ties `fetch_eipd_refs` →
+`predict_eipd` → §8.7.5 picture-construction (`clip(pred + res)`,
+eq. 1091) → `store_block` into one end-to-end EIPD reconstruct call (the
+EIPD analogue of the Baseline `intra_reconstruct_cb`), deriving the
+§6.4.2 `availLR` the kernels consume from the causal rule. The remaining
+intra wiring is the slice-walker selecting the EIPD vs Baseline path on
+`sps_eipd_flag` and threading the real §6.4.1 `IsCoded` raster + tile
 predicate + `constrained_intra_pred_flag` through the availability
-closure at the §8.4.4 dispatch.
+closure.
 
 The **ATS-intra** (Adaptive Transform Selection, `sps_ats_flag == 1`,
 intra path) toolset is implemented end-to-end at the syntax + transform
