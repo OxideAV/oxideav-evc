@@ -425,7 +425,7 @@ mod tests {
         let pic = YuvPicture::new(16, 16, 1, 8).unwrap();
         let refs = pic.fetch_eipd_refs(0, 0, 4, 4, 0, false, false);
         assert_eq!(refs.top_left(), 128);
-        for i in -1..(8i32) {
+        for i in -1..8i32 {
             assert_eq!(refs.top(i), 128, "top[{i}]");
             assert_eq!(refs.left(i), 128, "left[{i}]");
         }

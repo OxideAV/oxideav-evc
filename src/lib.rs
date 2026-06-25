@@ -94,6 +94,7 @@ pub mod eipd_mode;
 pub mod eipd_ref;
 pub mod eipd_syntax;
 pub mod hmvp;
+pub mod htdf;
 pub mod ibc;
 pub mod inter;
 pub mod intra;

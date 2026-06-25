@@ -20,9 +20,9 @@ reference-picture-list parsing for non-IDR slices.
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
 `slice_data`, `intra`, `inter`, `affine` / `affine_cand` / `affine_syntax`,
-`eipd` / `eipd_mode` / `eipd_syntax`,
-`ats`, `transform`, `dequant`, `deblock`, `hmvp`, `rpl`, `neighbour`,
-`picture`, and the registered `decoder`
+`eipd` / `eipd_mode` / `eipd_ref` / `eipd_syntax`,
+`ats`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
+`neighbour`, `picture`, and the registered `decoder`
 factory. All clause / equation / table numbers cite ISO/IEC
 23094-1:2020(E) directly.
 
@@ -235,6 +235,22 @@ to eqs. 1403-1409 — not a constant-identity short-circuit). The chroma
 (`map_one_chroma_sample` / `apply_chroma_inverse_mapping_u8`) driven
 by the per-luma-sample `chromaScale`, superseding the round-11
 per-segment QP-offset approximation.
+
+The **§8.7.6 Hadamard Transform Domain Filter** (HTDF, `sps_htdf_flag
+== 1`) post-reconstruction luma filter is implemented (`htdf` module).
+`htdf_applies` encodes the four §8.7.6.1 applicability gates;
+`derive_htdf_lut` (§8.7.6.3) selects `(bLUT, aTHR, tblShift)` from the
+`setOfLUT[5][16]` / `tblThrLog2[5]` tables (eqs. 1106-1111);
+`pad_rec_samples` (§8.7.6.2) builds the `(nCbW+2)×(nCbH+2)`
+replicate-padded array with the `dx`/`dy` border clamp gated on a
+`BorderAvailability` predicate; `filter_block` (§8.7.6.1) runs the
+sliding 2×2 forward Hadamard (eqs. 1093-1097), the bit-depth-branched
+soft-threshold of the three AC coefficients (eqs. 1098/1099, DC kept),
+the inverse Hadamard (eqs. 1100-1103), the overlap accumulation
+(eq. 1104) and the `Clip1Y((accFlt + 2) >> 2)` rounding (eq. 1105). The
+filter is pure over the reconstructed-sample accessor; invoking it from
+the §8.4.1 / §8.6 reconstruction (when `cbf_luma && sps_htdf_flag`) is
+the next wiring step.
 
 ### Not yet supported
 
