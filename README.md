@@ -83,8 +83,28 @@ new §9.3.3.6 `decode_tb_bypass` primitive) per Table 95 — and
 derivation and selection, producing the concrete `IntraPredModeY` /
 `IntraPredModeC` the §8.4.4 kernels consume; the `EipdCtx` selector
 honours `sps_cm_init_flag` (collapse-to-`(0,0)` under Baseline vs the
-per-element Main-profile context tables). The §8.4.4.1/.2 reference
-construction/substitution remains the next intra follow-up.
+per-element Main-profile context tables).
+
+The §8.4.4.1/.2 **reference-sample construction + substitution**
+process is now implemented (`eipd_ref` module). `construct_eipd_refs`
+runs the §8.4.4.1 *General* neighbourhood gather — the top row
+`p[x][-1]` (x = 0..nCbW+nCbH-1), the left column `p[-1][y]`, the
+`p[-1][-1]` corner, and the SUCO `p[nCbW][y]` right column — over two
+caller-supplied closures (a §6.4.1 `availableN` predicate already folded
+with `constrained_intra_pred_flag`, and a reconstructed-sample lookup),
+copying recon samples through where available and marking the rest "not
+available for intra prediction". The §8.4.4.2 substitution then fills
+every hole: under `sps_eipd_flag == 0` every hole takes the mid-level
+constant `1 << (bitDepth-1)` (corner, then top row, then left column);
+under `sps_eipd_flag == 1` only an unavailable corner takes the
+mid-level and every other hole copies its scan predecessor
+(`p[x-1][-1]` along the top, `p[-1][y-1]` down the left, and on the SUCO
+path `p[nCbW][y-1]` down the right, the y=0 right predecessor taken from
+the top row at x=nCbW). The result is a `ConstructedRefs` carrying the
+filled `EipdRefSamples` ready for the §8.4.4.3-§8.4.4.10 kernels. The
+process is pure over the closures; the remaining intra wiring is
+threading the decoder's `IsCoded` raster + recon plane into the
+construction at the §8.4.4 dispatch.
 
 The **ATS-intra** (Adaptive Transform Selection, `sps_ats_flag == 1`,
 intra path) toolset is implemented end-to-end at the syntax + transform
