@@ -80,6 +80,7 @@ pub mod affine_cand;
 pub mod affine_syntax;
 pub mod alf;
 pub mod alf_tables;
+pub mod amvr_syntax;
 pub mod aps;
 pub mod ats;
 pub mod bitreader;
