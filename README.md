@@ -219,16 +219,52 @@ redirect), then the zero tail (eqs. 836-866). `reconstruct_affine_amvp
 _cp_mvs` composes the eq.-867 predictor select with the §8.5.3.1 per-CP
 MVD reconstruction.
 
-Still deferred: the §8.5.3.4 corner-2/3 collocated-MV resolution wiring
-(the `CornerMv` temporal slots are threaded but the caller-side
-§8.5.2.3.4 lookup isn't yet bridged), ATS-inter / MMVD-syntax / AMVR /
-DMVR, plus the picture-level wiring of the EIPD + ATS-intra + merge +
-affine layers into a full Main-profile `coding_unit()` reconstruction
-(needs the §6.4.1 neighbour-mode grid + the per-position MV store).
+The **§8.5.3.4 affine corner CPMV resolution** is now bridged
+(`affine_cand::resolve_affine_corners`): the spatial scans (corner 0
+B2→B3→A2, corner 1 B0→B1→C2, corner 2 A0/A1, corner 3 C0/C1) plus the
+corner-2/3 **collocated-MV temporal fallback** (the
+`availLR != LR_10/LR_11` / `!= LR_01/LR_11` branches at `(xCb−1,
+yCb+cbHeight)` / `(xCb+cbWidth, yCb+cbHeight)`, eqs. 776-797, with the
+same-CTB-row + in-picture gate, 8×8-grid snap, `refIdxLXCorner = 0` and
+B-slice-only list 1) fill the four `cpMvLXCorner[ 0..3 ]` slots
+`constructed_merge_candidates` consumes, pure over a `merge::NeighbourMv`
+spatial lookup + a `tmvp::CollocatedMv` collocated lookup.
+
+The **§8.5.2.3.3 per-cell TMVP POC distances** are wired
+(`tmvp::PocInputs` / `diff_pic_order_cnt` / `tmvp_merge_candidate_with_poc`
+/ `collocated_cell_from_side_info`): `PocInputs::derive` builds each
+collocated cell's `PocContext` from eq. 501 `currPocDiffLX` (per-CU) +
+eq. 502 `colPocDiffLX = DiffPicOrderCnt(ColPic, refPicOfColPic[X])`
+(per-cell, since `refPicOfColPic` depends on the cell's stored
+reference), and `CollocatedCell` carries the two resolved
+`refPicOfColPic` POCs so the eq.-503 `distScaleFactor` is recomputed per
+consulted position.
+
+The **inter refinement toolset** now has its syntax + derivation layers:
+**ATS-inter** (sub-block transform, `ats::read_ats_inter` +
+`AllowAtsInter` + the §7.3.8.5 four-flag group + `AtsInter::derive_geometry`
+TrafoLog2/X0/Y0), **MMVD** (`mmvd_syntax::read_mmvd_group` — the §7.3.8.4
+`mmvd_flag`/group/merge/distance/direction group feeding the existing §8.5
+`inter::mmvd_*` derivation), **AMVR** (`amvr_syntax::read_amvr_idx` +
+`merge_mode_flag`/`direct_mode_flag` — the §7.3.8.4 mode-gating group
+feeding the eq.-145 MVD shift + eqs.-645/646 MVP round), and **DMVR**
+(`dmvr` — the §8.5.5 bilateral-SAD search core: §8.5.5.3 `sad_values`,
+§8.5.5.4 `select_best_idx`, §8.5.5.5 `parametric_refine`, §8.5.5.1
+`refine_subblock_mv` driver, pure over a `PredPlane` bilinear-prediction
+window).
+
+Still deferred: the picture-level wiring of these inter-refinement
+syntax/derivation layers + the EIPD + ATS-intra + merge + affine layers
+into a full Main-profile `coding_unit()` reconstruction (needs the
+§6.4.1 neighbour-mode grid, the per-position MV store, the §8.5.5.2 DMVR
+bilinear interpolation data plane, and `RefPictureView`/DPB POC threading
+so the slice-walker can supply `PocInputs` + the ColPic reference-list POC
+map).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
-walk / SUCO / ADMVP / IBC / ATS-inter / ADCC / ALF / DRA / AMVR / MMVD /
-affine / DMVR) still surface `Error::Unsupported`.
+walk / SUCO / ADMVP / IBC / ADCC / ALF / DRA / affine slice-walk) still
+surface `Error::Unsupported` at the `coding_unit()` integration layer
+even where their per-tool syntax/derivation modules now exist.
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
 §7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
