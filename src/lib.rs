@@ -89,6 +89,7 @@ pub mod cabac_init;
 pub mod deblock;
 pub mod decoder;
 pub mod dequant;
+pub mod dmvr;
 pub mod dra;
 pub mod eipd;
 pub mod eipd_mode;
