@@ -88,6 +88,73 @@ pub struct PocContext {
     pub col_poc_diff_l1: i32,
 }
 
+/// §8.6.2 eq. 165 — `DiffPicOrderCnt( picA, picB ) = PicOrderCnt( picA )
+/// − PicOrderCnt( picB )`. The fundamental signed picture-order-count
+/// distance every §8.5.2.3.4 / §8.5.2.3.9 scaling derivation is built on.
+#[inline]
+pub fn diff_pic_order_cnt(poc_a: i32, poc_b: i32) -> i32 {
+    poc_a - poc_b
+}
+
+/// The per-picture POC inputs the §8.5.2.3.3 caller resolves once per CU
+/// before any collocated lookup, plus the per-collocated-cell referenced
+/// POCs the §8.5.2.3.4 `colPocDiff` (eq. 502) needs.
+///
+/// This is the decoder-side wiring contract for the §8.5.2.3.3 POC
+/// distances: the current picture's POC, the POCs of `RefPicList0[ 0 ]`
+/// and `RefPicList1[ 0 ]` (the `refIdxLX == 0` references eq. 501 scales
+/// against), and `ColPic`'s own POC. The `refPicOfColPic[ X ]` POCs —
+/// which depend on the **per-cell** stored reference — are supplied at
+/// [`PocInputs::derive`] time, not here, because they vary per collocated
+/// sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PocInputs {
+    /// `PicOrderCnt( currPic )`.
+    pub curr_poc: i32,
+    /// `PicOrderCnt( RefPicList0[ 0 ] )` (the eq. 501 `refIdxL0 == 0`
+    /// reference).
+    pub ref_l0_poc: i32,
+    /// `PicOrderCnt( RefPicList1[ 0 ] )`. Ignored on a P-slice (no L1).
+    pub ref_l1_poc: i32,
+    /// `PicOrderCnt( ColPic )` — the collocated picture's own POC.
+    pub col_pic_poc: i32,
+}
+
+impl PocInputs {
+    /// §8.5.2.3.3 eq. 501 — the current-picture POC distances, resolved
+    /// once per CU (independent of the collocated cell):
+    /// `currPocDiffLX = DiffPicOrderCnt( currPic, RefPicListX[ 0 ] )`.
+    #[inline]
+    pub fn curr_poc_diff_l0(&self) -> i32 {
+        diff_pic_order_cnt(self.curr_poc, self.ref_l0_poc)
+    }
+
+    /// `currPocDiffL1 = DiffPicOrderCnt( currPic, RefPicList1[ 0 ] )`.
+    #[inline]
+    pub fn curr_poc_diff_l1(&self) -> i32 {
+        diff_pic_order_cnt(self.curr_poc, self.ref_l1_poc)
+    }
+
+    /// Build the full [`PocContext`] for one collocated cell, given the
+    /// POCs of `refPicOfColPic[ 0 ]` / `refPicOfColPic[ 1 ]` — the
+    /// pictures `ColPic`'s stored L0 / L1 motion at this cell referenced
+    /// (§8.5.2.3.4: `refPicOfColPic[ X ]` is the picture with reference
+    /// index `refIdxCol[ X ]` in `ColPic`'s list `listCol[ X ]`).
+    ///
+    /// `colPocDiffLX = DiffPicOrderCnt( ColPic, refPicOfColPic[ X ] )`
+    /// (eq. 502). The current-picture distances are the per-CU eq.-501
+    /// values; together they form the eq.-503 `distScaleFactorLX` ratio.
+    #[inline]
+    pub fn derive(&self, col_ref_l0_poc: i32, col_ref_l1_poc: i32) -> PocContext {
+        PocContext {
+            curr_poc_diff_l0: self.curr_poc_diff_l0(),
+            curr_poc_diff_l1: self.curr_poc_diff_l1(),
+            col_poc_diff_l0: diff_pic_order_cnt(self.col_pic_poc, col_ref_l0_poc),
+            col_poc_diff_l1: diff_pic_order_cnt(self.col_pic_poc, col_ref_l1_poc),
+        }
+    }
+}
+
 /// The padded-picture boundary parameters for the §8.5.2.3.5 clip.
 ///
 /// `picPaddingSize` is the fixed `144` (eq. 506/507); the caller supplies
@@ -404,6 +471,99 @@ where
     None
 }
 
+/// A collocated cell extended with the POCs of the pictures its stored L0
+/// / L1 motion referenced (`refPicOfColPic[ 0 ]` / `refPicOfColPic[ 1 ]`).
+///
+/// The plain [`CollocatedMv`] carries the cell's `refIdxLXCol`, but the
+/// §8.5.2.3.4 `colPocDiffLX` (eq. 502) needs the *POC* of the picture that
+/// reference index resolved to inside `ColPic`'s own reference list —
+/// information the decoder's DPB knows but a bare `refIdx` does not. This
+/// type pairs the motion with those resolved POCs so [`PocContext::derive`]
+/// can compute `colPocDiff` per cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CollocatedCell {
+    /// The cell's stored motion (`predFlagLXCol` / `mvLXCol` / `refIdxLXCol`).
+    pub mv: CollocatedMv,
+    /// `PicOrderCnt( refPicOfColPic[ 0 ] )` — the picture `ColPic`'s L0
+    /// motion at this cell referenced. Ignored when L0 is invalid.
+    pub col_ref_l0_poc: i32,
+    /// `PicOrderCnt( refPicOfColPic[ 1 ] )`.
+    pub col_ref_l1_poc: i32,
+}
+
+/// §8.5.2.3.3 — derive the temporal (collocated) merge candidate with the
+/// POC distances resolved **per collocated cell** from [`PocInputs`].
+///
+/// This is the per-CU TMVP entry point the decoder drives: rather than a
+/// single pre-computed [`PocContext`] (which bakes in one fixed
+/// `colPocDiff`), it takes the per-CU [`PocInputs`] and a `col_at` closure
+/// returning a [`CollocatedCell`] that carries each cell's
+/// `refPicOfColPic` POCs. For every consulted position the eq.-502
+/// `colPocDiff` is recomputed from that cell's stored references via
+/// [`PocInputs::derive`], so a `ColPic` whose collocated blocks reference
+/// different pictures is scaled correctly.
+///
+/// The position fallback order, gating, grid-quantisation and small-block
+/// demotion are identical to [`tmvp_merge_candidate`]; only the POC
+/// context is per-cell.
+#[allow(clippy::too_many_arguments)]
+pub fn tmvp_merge_candidate_with_poc<F>(
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w: i32,
+    n_cb_h: i32,
+    avail_lr: AvailLr,
+    poc_inputs: PocInputs,
+    bounds: PicBounds,
+    ctb_log2_size_y: u32,
+    mut col_at: F,
+) -> Option<MergeCand>
+where
+    F: FnMut(i32, i32) -> CollocatedCell,
+{
+    let mut try_position = |x_col_cb: i32, y_col_cb: i32| -> Option<MergeCand> {
+        let cell = col_at(x_col_cb, y_col_cb);
+        let poc = poc_inputs.derive(cell.col_ref_l0_poc, cell.col_ref_l1_poc);
+        let res = tmvp_collocated_mv(cell.mv, poc, x_cb, y_cb, bounds);
+        result_to_merge_cand(res, n_cb_w, n_cb_h)
+    };
+
+    // Step 1: central collocated position (eqs. 485/486).
+    let x_col_ctr = x_cb + (n_cb_w >> 1);
+    let y_col_ctr = y_cb + (n_cb_h >> 1);
+    if let Some(cand) = try_position(grid8(x_col_ctr), grid8(y_col_ctr)) {
+        return Some(cand);
+    }
+
+    // Step 2: bottom collocated position (eqs. 489-492).
+    let (x_col_bot, y_col_bot) = if avail_lr == AvailLr::Lr01 {
+        (x_cb, y_cb + n_cb_h)
+    } else {
+        (x_cb + n_cb_w - 1, y_cb + n_cb_h)
+    };
+    if y_col_bot < bounds.pic_height_in_luma_samples
+        && (y_cb >> ctb_log2_size_y) == (y_col_bot >> ctb_log2_size_y)
+    {
+        if let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot)) {
+            return Some(cand);
+        }
+    }
+
+    // Step 3: side collocated position (eqs. 495-498).
+    let (x_col_side, y_col_side) = if avail_lr == AvailLr::Lr01 {
+        (x_cb - 1, y_cb + n_cb_h - 1)
+    } else {
+        (x_cb + n_cb_w, y_cb + n_cb_h - 1)
+    };
+    if x_col_side > 0 && x_col_side < bounds.pic_width_in_luma_samples {
+        if let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side)) {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
 /// Adapt a decoded picture's [`SideInfoGrid`](crate::deblock::SideInfoGrid)
 /// — the per-4×4-cell motion field stamped during reconstruction — into
 /// the [`CollocatedMv`] a [`tmvp_merge_candidate`] `col_at` closure
@@ -450,6 +610,45 @@ pub fn collocated_mv_from_side_info(
         ref_idx_l1: cell.ref_idx_l1 as i32,
         mv_l0: MotionVector::quarter_pel(cell.mv_l0_x, cell.mv_l0_y),
         mv_l1: MotionVector::quarter_pel(cell.mv_l1_x, cell.mv_l1_y),
+    }
+}
+
+/// Adapt a decoded picture's [`SideInfoGrid`](crate::deblock::SideInfoGrid)
+/// into the [`CollocatedCell`] the per-cell [`tmvp_merge_candidate_with_poc`]
+/// consumes — the `ColPic` motion store **plus** the resolved
+/// `refPicOfColPic` POCs.
+///
+/// This extends [`collocated_mv_from_side_info`] with the §8.5.2.3.4
+/// eq.-502 POC resolution: `col_ref_poc(list_x, ref_idx)` maps the cell's
+/// stored `RefIdxLX` to the POC of the picture that index resolved to in
+/// `ColPic`'s own reference list `list_x` (the DPB knows this; the bare
+/// grid cell does not). For an invalid / unavailable list the lookup is
+/// skipped and the corresponding `col_ref_*_poc` stays `0` (it is unused
+/// because the §8.5.2.3.4 invalid-refIdx escape fires first).
+pub fn collocated_cell_from_side_info<P>(
+    col_grid: &crate::deblock::SideInfoGrid,
+    x_col_cb: i32,
+    y_col_cb: i32,
+    mut col_ref_poc: P,
+) -> CollocatedCell
+where
+    P: FnMut(u8, i32) -> i32,
+{
+    let mv = collocated_mv_from_side_info(col_grid, x_col_cb, y_col_cb);
+    let col_ref_l0_poc = if mv.pred_flag_l0 {
+        col_ref_poc(0, mv.ref_idx_l0)
+    } else {
+        0
+    };
+    let col_ref_l1_poc = if mv.pred_flag_l1 {
+        col_ref_poc(1, mv.ref_idx_l1)
+    } else {
+        0
+    };
+    CollocatedCell {
+        mv,
+        col_ref_l0_poc,
+        col_ref_l1_poc,
     }
 }
 
@@ -804,5 +1003,165 @@ mod tests {
         // sf = 64 → (64*10+16)>>5 = 20, (64*6+16)>>5 = 12.
         assert!(cand.pred_flag_l0 && !cand.pred_flag_l1);
         assert_eq!(cand.mv_l0, MotionVector::quarter_pel(20, 12));
+    }
+
+    // --- §8.5.2.3.3 per-cell POC-distance wiring ---
+
+    /// eq. 165 `DiffPicOrderCnt` is plain signed subtraction.
+    #[test]
+    fn diff_pic_order_cnt_is_subtraction() {
+        assert_eq!(diff_pic_order_cnt(8, 4), 4);
+        assert_eq!(diff_pic_order_cnt(4, 8), -4);
+        assert_eq!(diff_pic_order_cnt(5, 5), 0);
+    }
+
+    /// `PocInputs::derive` builds the four eq.-501/502 distances:
+    /// curr distances from RefPicListX[0], col distances from the per-cell
+    /// refPicOfColPic POCs.
+    #[test]
+    fn poc_inputs_derive_eqs_501_502() {
+        let inputs = PocInputs {
+            curr_poc: 16,
+            ref_l0_poc: 12, // currPocDiffL0 = 4
+            ref_l1_poc: 20, // currPocDiffL1 = -4
+            col_pic_poc: 8,
+        };
+        // refPicOfColPic[0] POC 4 → colPocDiffL0 = 8-4 = 4;
+        // refPicOfColPic[1] POC 10 → colPocDiffL1 = 8-10 = -2.
+        let poc = inputs.derive(4, 10);
+        assert_eq!(poc.curr_poc_diff_l0, 4);
+        assert_eq!(poc.curr_poc_diff_l1, -4);
+        assert_eq!(poc.col_poc_diff_l0, 4);
+        assert_eq!(poc.col_poc_diff_l1, -2);
+    }
+
+    /// The per-cell entry point scales each consulted cell by *its own*
+    /// colPocDiff: a central cell that referenced a 2×-distant picture is
+    /// scaled by the eq.-503 ratio derived from that cell's POCs.
+    #[test]
+    fn per_cell_poc_scales_central() {
+        // currPocDiffL0 = 16-12 = 4. Central cell referenced a picture at
+        // POC 6 → colPocDiffL0 = 8-6 = 2 → sf = (4<<5)/2 = 64 → doubles.
+        let inputs = PocInputs {
+            curr_poc: 16,
+            ref_l0_poc: 12,
+            ref_l1_poc: 0,
+            col_pic_poc: 8,
+        };
+        let cand = tmvp_merge_candidate_with_poc(
+            32,
+            32,
+            16,
+            16,
+            AvailLr::Lr00,
+            inputs,
+            bounds(),
+            6,
+            |x, y| {
+                if (x, y) == (40, 40) {
+                    CollocatedCell {
+                        mv: CollocatedMv {
+                            pred_flag_l0: true,
+                            ref_idx_l0: 0,
+                            mv_l0: MotionVector::quarter_pel(10, 6),
+                            ..Default::default()
+                        },
+                        col_ref_l0_poc: 6,
+                        col_ref_l1_poc: 0,
+                    }
+                } else {
+                    CollocatedCell::default()
+                }
+            },
+        )
+        .unwrap();
+        // sf = 64 → (64*10+16)>>5 = 20, (64*6+16)>>5 = 12.
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(20, 12));
+    }
+
+    /// A per-cell colPocDiff of 0 (cell referenced ColPic's own POC) makes
+    /// that position unavailable; the fallback chain advances.
+    #[test]
+    fn per_cell_zero_col_poc_diff_falls_through() {
+        let inputs = PocInputs {
+            curr_poc: 16,
+            ref_l0_poc: 12,
+            ref_l1_poc: 0,
+            col_pic_poc: 8,
+        };
+        // Central cell: col_ref_l0_poc == col_pic_poc → colPocDiff 0 →
+        // unavailable. Bottom cell (8,16) is valid.
+        let mut consulted = Vec::new();
+        let cand = tmvp_merge_candidate_with_poc(
+            0,
+            0,
+            16,
+            16,
+            AvailLr::Lr00,
+            inputs,
+            bounds(),
+            6,
+            |x, y| {
+                consulted.push((x, y));
+                if (x, y) == (8, 8) {
+                    CollocatedCell {
+                        mv: CollocatedMv {
+                            pred_flag_l0: true,
+                            ref_idx_l0: 0,
+                            mv_l0: MotionVector::quarter_pel(9, 9),
+                            ..Default::default()
+                        },
+                        col_ref_l0_poc: 8, // == col_pic_poc → colPocDiff 0
+                        col_ref_l1_poc: 0,
+                    }
+                } else if (x, y) == (8, 16) {
+                    CollocatedCell {
+                        mv: CollocatedMv {
+                            pred_flag_l0: true,
+                            ref_idx_l0: 0,
+                            mv_l0: MotionVector::quarter_pel(4, 4),
+                            ..Default::default()
+                        },
+                        col_ref_l0_poc: 4, // colPocDiff = 8-4 = 4 = currPocDiff → identity
+                        col_ref_l1_poc: 0,
+                    }
+                } else {
+                    CollocatedCell::default()
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(cand.mv_l0, MotionVector::quarter_pel(4, 4));
+        assert_eq!(consulted, vec![(8, 8), (8, 16)]);
+    }
+
+    /// The cell bridge resolves refPicOfColPic POCs through the supplied
+    /// ColPic reference-list lookup, only for valid lists.
+    #[test]
+    fn collocated_cell_bridge_resolves_ref_poc() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        let mut grid = SideInfoGrid::new(64, 64);
+        grid.stamp_block(
+            16,
+            16,
+            16,
+            16,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                mv_l0_x: 12,
+                mv_l0_y: -4,
+                ref_idx_l0: 1,
+                ref_idx_l1: -1,
+                ..Default::default()
+            },
+        );
+        // ColPic's L0 ref-list: refIdx 1 → POC 30.
+        let cell = collocated_cell_from_side_info(&grid, 24, 24, |list, ref_idx| {
+            assert_eq!((list, ref_idx), (0, 1)); // only L0 queried
+            30
+        });
+        assert!(cell.mv.pred_flag_l0 && !cell.mv.pred_flag_l1);
+        assert_eq!(cell.col_ref_l0_poc, 30);
+        assert_eq!(cell.col_ref_l1_poc, 0); // L1 invalid → not queried
     }
 }
