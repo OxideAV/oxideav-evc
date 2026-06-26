@@ -59,7 +59,9 @@
 
 use crate::affine::{inherited_cp_mvs, ControlPointMv, NeighbourAffineSource};
 use crate::inter::MotionVector;
+use crate::merge::NeighbourMv;
 use crate::neighbour::AvailLr;
+use crate::tmvp::{tmvp_collocated_mv, AvailableFlagCol, CollocatedMv, PicBounds, PocContext};
 
 /// `Clip3(−2¹⁵, 2¹⁵ − 1, ·)` — the eqs. 808/809/814/815/820/821/834/835/872
 /// 16-bit CPMV clip applied to constructed-candidate components.
@@ -378,6 +380,211 @@ pub fn affine_mvp_nb_positions(
         b2: (x_cb - 1, y_cb - 1),     // eq. 840
         c0: (x_cb + w, y_cb + h),     // eq. 841
         c1: (x_cb + w, y_cb + h - 1), // eq. 842
+    }
+}
+
+/// Map a spatial-neighbour [`NeighbourMv`] onto a [`CornerMv`] for the
+/// §8.5.3.4 corner scan (eqs. 764-774 / 785-787): a §6.4.3-available
+/// neighbour contributes its stored `PredFlagLX` / `RefIdxLX` / `MvLX`.
+#[inline]
+fn corner_from_neighbour(nb: NeighbourMv) -> CornerMv {
+    CornerMv {
+        available: nb.available,
+        pred_flag_l0: nb.pred_flag_l0,
+        ref_idx_l0: nb.ref_idx_l0,
+        mv_l0: nb.mv_l0,
+        pred_flag_l1: nb.pred_flag_l1,
+        ref_idx_l1: nb.ref_idx_l1,
+        mv_l1: nb.mv_l1,
+    }
+}
+
+/// §8.5.3.4 corner-2/3 **temporal** (collocated) fallback — derive the
+/// corner CPMV from the §8.5.2.3.4 collocated-MV process (eqs. 776-797).
+///
+/// The collocated position `(x_col, y_col)` is `(xCb−1, yCb+cbHeight)`
+/// for corner 2 (eqs. 776/777) or `(xCb+cbWidth, yCb+cbHeight)` for
+/// corner 3 (eqs. 789/790). The position is gated on:
+///
+/// * the collocated sample shares the current CU's CTB row
+///   (`yCb >> CtbLog2SizeY == y_col >> CtbLog2SizeY`),
+/// * `y_col < pic_height_in_luma_samples`, and
+/// * the per-corner horizontal in-picture test (`x_col > 0` for corner 2,
+///   eqs. after 777; `x_col < pic_width_in_luma_samples` for corner 3,
+///   eqs. after 790).
+///
+/// When in-bounds the position is snapped to the 8×8 collocated grid
+/// (`(v >> 3) << 3`) and resolved through [`tmvp_collocated_mv`] with
+/// `refIdxLXCorner = 0`. The result fills `cpMvL0Corner` / `cpMvL1Corner`
+/// per eqs. 778-784 (corner 2) / 791-797 (corner 3): list 1 is only
+/// retained on a B-slice (`slice_is_b`). When out of bounds (or the
+/// collocated derivation yields `availableFlagCol == 0`) the corner stays
+/// absent.
+#[allow(clippy::too_many_arguments)]
+fn corner_from_collocated<C>(
+    x_col: i32,
+    y_col: i32,
+    horizontal_ok: bool,
+    x_cb: i32,
+    y_cb: i32,
+    ctb_log2_size_y: u32,
+    poc: PocContext,
+    bounds: PicBounds,
+    slice_is_b: bool,
+    mut col_at: C,
+) -> CornerMv
+where
+    C: FnMut(i32, i32) -> CollocatedMv,
+{
+    // The §8.5.3.4 same-CTB-row + in-picture gate.
+    let in_bounds = (y_cb >> ctb_log2_size_y) == (y_col >> ctb_log2_size_y)
+        && y_col < bounds.pic_height_in_luma_samples
+        && horizontal_ok;
+    if !in_bounds {
+        return CornerMv::default();
+    }
+    // Snap to the 8×8 collocated grid and run §8.5.2.3.4.
+    let x_col_cb = (x_col >> 3) << 3;
+    let y_col_cb = (y_col >> 3) << 3;
+    let res = tmvp_collocated_mv(col_at(x_col_cb, y_col_cb), poc, x_cb, y_cb, bounds);
+
+    // eqs. 778-784 / 791-797: refIdxLXCorner = 0; list 1 is B-slice-only.
+    let l0 = matches!(
+        res.available,
+        AvailableFlagCol::L0Only | AvailableFlagCol::Both
+    );
+    let l1 = slice_is_b
+        && matches!(
+            res.available,
+            AvailableFlagCol::L1Only | AvailableFlagCol::Both
+        );
+    if !l0 && !l1 {
+        return CornerMv::default();
+    }
+    CornerMv {
+        available: true,
+        pred_flag_l0: l0,
+        ref_idx_l0: if l0 { 0 } else { -1 },
+        mv_l0: if l0 {
+            res.mvp_l0
+        } else {
+            MotionVector::default()
+        },
+        pred_flag_l1: l1,
+        ref_idx_l1: if l1 { 0 } else { -1 },
+        mv_l1: if l1 {
+            res.mvp_l1
+        } else {
+            MotionVector::default()
+        },
+    }
+}
+
+/// §8.5.3.4 — resolve the four corner CPMVs (`cpMvLXCorner[ 0..3 ]`) that
+/// feed [`constructed_merge_candidates`].
+///
+/// This is the §8.5.3.4 spatial-scan + corner-2/3 temporal-fallback
+/// bridge: it walks the spec's per-corner neighbour selection orders and,
+/// for corners 2 and 3 on the non-matching `availLR` branch, falls back
+/// to the §8.5.2.3.4 collocated MV.
+///
+/// * **Corner 0** (top-left, eqs. 764-767): scan `B2 → B3 → A2`, first
+///   §6.4.3-available wins.
+/// * **Corner 1** (top-right, eqs. 768-771): scan `B0 → B1 → C2`.
+/// * **Corner 2** (bottom-left, eqs. 772-784): if `availLR ∈ {LR_10,
+///   LR_11}` scan `A0 → A1`; otherwise the §8.5.2.3.4 collocated fallback
+///   at `(xCb−1, yCb+cbHeight)`.
+/// * **Corner 3** (bottom-right, eqs. 785-797): if `availLR ∈ {LR_01,
+///   LR_11}` scan `C0 → C1`; otherwise the collocated fallback at
+///   `(xCb+cbWidth, yCb+cbHeight)`.
+///
+/// `nb_at` resolves a spatial luma sample location to its [`NeighbourMv`]
+/// (the same §6.4.3 lookup [`crate::merge::spatial_merge_candidates`]
+/// uses). `col_at` resolves an 8×8-grid-aligned collocated luma location
+/// to the [`CollocatedMv`] stored in `ColPic` (the same closure
+/// [`crate::tmvp::tmvp_merge_candidate`] uses). Both are pure inputs the
+/// decoder's MV store wires in.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_affine_corners<N, C>(
+    x_cb: i32,
+    y_cb: i32,
+    cb_width: u32,
+    cb_height: u32,
+    avail_lr: AvailLr,
+    slice_is_b: bool,
+    ctb_log2_size_y: u32,
+    poc: PocContext,
+    bounds: PicBounds,
+    mut nb_at: N,
+    mut col_at: C,
+) -> AffineCorners
+where
+    N: FnMut(i32, i32) -> NeighbourMv,
+    C: FnMut(i32, i32) -> CollocatedMv,
+{
+    use AffineNbName::*;
+    let pos = affine_merge_nb_positions(x_cb, y_cb, cb_width, cb_height);
+
+    // First §6.4.3-available neighbour of `order` → CornerMv.
+    let mut scan = |order: &[AffineNbName]| -> CornerMv {
+        for name in order {
+            let (xn, yn) = name.location(&pos);
+            let nb = nb_at(xn, yn);
+            if nb.available {
+                return corner_from_neighbour(nb);
+            }
+        }
+        CornerMv::default()
+    };
+
+    // Corner 0: B2 → B3 → A2 (eqs. 764-767).
+    let corner0 = scan(&[B2, B3, A2]);
+    // Corner 1: B0 → B1 → C2 (eqs. 768-771).
+    let corner1 = scan(&[B0, B1, C2]);
+
+    let w = cb_width as i32;
+    let h = cb_height as i32;
+
+    // Corner 2: A0 → A1 (LR_10/LR_11) else collocated (eqs. 772-784).
+    let corner2 = if avail_lr == AvailLr::Lr10 || avail_lr == AvailLr::Lr11 {
+        scan(&[A0, A1])
+    } else {
+        let (x_col, y_col) = (x_cb - 1, y_cb + h); // eqs. 776/777
+        corner_from_collocated(
+            x_col,
+            y_col,
+            x_col > 0, // eqs. after 777
+            x_cb,
+            y_cb,
+            ctb_log2_size_y,
+            poc,
+            bounds,
+            slice_is_b,
+            &mut col_at,
+        )
+    };
+
+    // Corner 3: C0 → C1 (LR_01/LR_11) else collocated (eqs. 785-797).
+    let corner3 = if avail_lr == AvailLr::Lr01 || avail_lr == AvailLr::Lr11 {
+        scan(&[C0, C1])
+    } else {
+        let (x_col, y_col) = (x_cb + w, y_cb + h); // eqs. 789/790
+        corner_from_collocated(
+            x_col,
+            y_col,
+            x_col < bounds.pic_width_in_luma_samples, // eqs. after 790
+            x_cb,
+            y_cb,
+            ctb_log2_size_y,
+            poc,
+            bounds,
+            slice_is_b,
+            &mut col_at,
+        )
+    };
+
+    AffineCorners {
+        corner: [corner0, corner1, corner2, corner3],
     }
 }
 
@@ -1290,5 +1497,265 @@ mod tests {
             mv_br: MotionVector::default(),
             motion_model_idc: 1,
         }
+    }
+
+    // --- §8.5.3.4 corner resolution (resolve_affine_corners) ---
+
+    fn nb_avail(p0: bool, r0: i32, m0: MotionVector) -> NeighbourMv {
+        NeighbourMv {
+            available: true,
+            pred_flag_l0: p0,
+            pred_flag_l1: false,
+            ref_idx_l0: r0,
+            ref_idx_l1: -1,
+            mv_l0: m0,
+            mv_l1: MotionVector::default(),
+        }
+    }
+
+    fn bounds() -> PicBounds {
+        PicBounds {
+            pic_width_in_luma_samples: 1920,
+            pic_height_in_luma_samples: 1080,
+        }
+    }
+
+    fn no_col(_: i32, _: i32) -> CollocatedMv {
+        CollocatedMv::default()
+    }
+
+    /// Corner 0 scans B2→B3→A2 and corner 1 scans B0→B1→C2, each taking
+    /// the first §6.4.3-available neighbour (eqs. 764-771).
+    #[test]
+    fn corner01_first_available_in_scan_order() {
+        // 16×16 CU at (32,32). LR_10 so corner 2 is spatial (A0/A1).
+        let pos = affine_merge_nb_positions(32, 32, 16, 16);
+        let cand = resolve_affine_corners(
+            32,
+            32,
+            16,
+            16,
+            AvailLr::Lr10,
+            false,
+            6,
+            PocContext {
+                curr_poc_diff_l0: 0,
+                curr_poc_diff_l1: 0,
+                col_poc_diff_l0: 0,
+                col_poc_diff_l1: 0,
+            },
+            bounds(),
+            |x, y| {
+                // B3 (the 2nd of corner-0's scan) is available; B2 is not.
+                if (x, y) == pos.b3 {
+                    nb_avail(true, 0, mv(5, 6))
+                } else if (x, y) == pos.b1 {
+                    // B1 (2nd of corner-1's scan) — B0 unavailable.
+                    nb_avail(true, 0, mv(7, 8))
+                } else if (x, y) == pos.a0 {
+                    nb_avail(true, 0, mv(9, 10)) // corner 2 (A0 first)
+                } else {
+                    NeighbourMv::default()
+                }
+            },
+            no_col,
+        );
+        assert!(cand.corner[0].available);
+        assert_eq!(cand.corner[0].mv_l0, mv(5, 6)); // B3
+        assert!(cand.corner[1].available);
+        assert_eq!(cand.corner[1].mv_l0, mv(7, 8)); // B1
+        assert!(cand.corner[2].available);
+        assert_eq!(cand.corner[2].mv_l0, mv(9, 10)); // A0
+                                                     // Corner 3 is the collocated branch (LR_10 ≠ LR_01/LR_11) and
+                                                     // `no_col` yields nothing → absent.
+        assert!(!cand.corner[3].available);
+    }
+
+    /// On `availLR == LR_01` corner 2 takes the §8.5.2.3.4 collocated
+    /// fallback at (xCb−1, yCb+cbHeight) with refIdx 0; corner 3 stays
+    /// spatial (C0/C1).
+    #[test]
+    fn corner2_collocated_fallback_on_lr01() {
+        // 16×16 CU at (64,64). LR_01 → corner 2 = collocated.
+        // xColBl = 63, yColBl = 80. grid8 → (56, 80).
+        let poc = PocContext {
+            curr_poc_diff_l0: 4,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 0,
+        };
+        let pos = affine_merge_nb_positions(64, 64, 16, 16);
+        let cand = resolve_affine_corners(
+            64,
+            64,
+            16,
+            16,
+            AvailLr::Lr01,
+            false,
+            6,
+            poc,
+            bounds(),
+            |x, y| {
+                if (x, y) == pos.c0 {
+                    nb_avail(true, 0, mv(1, 2)) // corner 3 spatial (C0)
+                } else {
+                    NeighbourMv::default()
+                }
+            },
+            |x, y| {
+                if (x, y) == (56, 80) {
+                    CollocatedMv {
+                        pred_flag_l0: true,
+                        ref_idx_l0: 0,
+                        mv_l0: mv(20, -12),
+                        ..Default::default()
+                    }
+                } else {
+                    CollocatedMv::default()
+                }
+            },
+        );
+        // Corner 2: collocated, sf = (4<<5)/4 = 32 → identity.
+        assert!(cand.corner[2].available);
+        assert!(cand.corner[2].pred_flag_l0 && !cand.corner[2].pred_flag_l1);
+        assert_eq!(cand.corner[2].ref_idx_l0, 0);
+        assert_eq!(cand.corner[2].mv_l0, mv(20, -12));
+        // Corner 3: spatial C0.
+        assert!(cand.corner[3].available);
+        assert_eq!(cand.corner[3].mv_l0, mv(1, 2));
+    }
+
+    /// The corner-3 collocated position is gated on a same-CTB-row test:
+    /// if yColBr crosses into the next CTB row the corner is absent even
+    /// when ColPic carries motion there.
+    #[test]
+    fn corner3_collocated_skipped_across_ctb_row() {
+        // CtbLog2SizeY = 5 (32-sample CTB). 16×16 CU at (0,16).
+        // Corner 3 collocated: xColBr = 16, yColBr = 32. yCb>>5 = 0,
+        // yColBr>>5 = 1 → different CTB row → skip.
+        let poc = PocContext {
+            curr_poc_diff_l0: 4,
+            curr_poc_diff_l1: 0,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 0,
+        };
+        let cand = resolve_affine_corners(
+            0,
+            16,
+            16,
+            16,
+            AvailLr::Lr10, // corner 3 = collocated (≠ LR_01/LR_11)
+            false,
+            5,
+            poc,
+            bounds(),
+            |_, _| NeighbourMv::default(),
+            |_, _| CollocatedMv {
+                pred_flag_l0: true,
+                ref_idx_l0: 0,
+                mv_l0: mv(99, 99),
+                ..Default::default()
+            },
+        );
+        assert!(!cand.corner[3].available);
+    }
+
+    /// A B-slice retains list 1 of the collocated corner; a P-slice drops
+    /// it (eqs. 781/794 vs 782-784/795-797).
+    #[test]
+    fn corner_collocated_l1_b_slice_only() {
+        let poc = PocContext {
+            curr_poc_diff_l0: 4,
+            curr_poc_diff_l1: 4,
+            col_poc_diff_l0: 4,
+            col_poc_diff_l1: 4,
+        };
+        // 16×16 CU at (64,64), LR_01 → corner 2 collocated at grid (56,80).
+        let col = |x: i32, y: i32| {
+            if (x, y) == (56, 80) {
+                CollocatedMv {
+                    pred_flag_l0: true,
+                    pred_flag_l1: true,
+                    ref_idx_l0: 0,
+                    ref_idx_l1: 0,
+                    mv_l0: mv(4, 4),
+                    mv_l1: mv(-4, -4),
+                }
+            } else {
+                CollocatedMv::default()
+            }
+        };
+        // B-slice: both lists retained.
+        let b = resolve_affine_corners(
+            64,
+            64,
+            16,
+            16,
+            AvailLr::Lr01,
+            true,
+            6,
+            poc,
+            bounds(),
+            |_, _| NeighbourMv::default(),
+            col,
+        );
+        assert!(b.corner[2].pred_flag_l0 && b.corner[2].pred_flag_l1);
+        assert_eq!(b.corner[2].mv_l1, mv(-4, -4));
+        // P-slice: list 1 dropped.
+        let p = resolve_affine_corners(
+            64,
+            64,
+            16,
+            16,
+            AvailLr::Lr01,
+            false,
+            6,
+            poc,
+            bounds(),
+            |_, _| NeighbourMv::default(),
+            col,
+        );
+        assert!(p.corner[2].pred_flag_l0 && !p.corner[2].pred_flag_l1);
+        assert_eq!(p.corner[2].ref_idx_l1, -1);
+    }
+
+    /// End-to-end: resolved corners feed constructed_merge_candidates —
+    /// three spatial corners (LR_10) produce Const1 directly.
+    #[test]
+    fn resolved_corners_drive_const1() {
+        let pos = affine_merge_nb_positions(32, 32, 16, 16);
+        let corners = resolve_affine_corners(
+            32,
+            32,
+            16,
+            16,
+            AvailLr::Lr10,
+            false,
+            6,
+            PocContext {
+                curr_poc_diff_l0: 0,
+                curr_poc_diff_l1: 0,
+                col_poc_diff_l0: 0,
+                col_poc_diff_l1: 0,
+            },
+            bounds(),
+            |x, y| {
+                if (x, y) == pos.b2 {
+                    nb_avail(true, 0, mv(10, 20))
+                } else if (x, y) == pos.b0 {
+                    nb_avail(true, 0, mv(12, 22))
+                } else if (x, y) == pos.a0 {
+                    nb_avail(true, 0, mv(8, 24))
+                } else {
+                    NeighbourMv::default()
+                }
+            },
+            no_col,
+        );
+        let consts = constructed_merge_candidates(&corners, 16, 16);
+        let c1 = consts[0].expect("Const1 available from resolved corners");
+        assert_eq!(c1.l0.cp_mv[0], mv(10, 20));
+        assert_eq!(c1.l0.cp_mv[1], mv(12, 22));
+        assert_eq!(c1.l0.cp_mv[2], mv(8, 24));
     }
 }
