@@ -700,6 +700,66 @@ pub fn merge_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
 }
 
 // ===========================================================================
+// §9.3.3 / §9.3.4.2 — inter_pred_idc + bi_pred_idx (explicit-AMVP path)
+// ===========================================================================
+//
+// On the `sps_admvp_flag == 1` explicit-AMVP path (spec lines 2912-3025)
+// the B-slice prediction direction `inter_pred_idc[ x0 ][ y0 ]` is read,
+// and when it resolves to PRED_BI the `bi_pred_idx[ x0 ][ y0 ]` element
+// selects which of the two lists carry an MVD (Table 71 semantics:
+// 0 = both lists present, 1 = list-1 MVD absent, 2 = list-0 MVD absent).
+//
+// §9.3.3 binarizations:
+//   * `inter_pred_idc` — TR, `cMax = ( !sps_admvp_flag || nCbW + nCbH >
+//     12 ) ? 2 : 1`, cRiceParam 0. The §9.3.4.2 ctxInc is positional
+//     0,1 (Table 69).
+//   * `bi_pred_idx` — TR, `cMax = 2`, cRiceParam 0. The §9.3.4.2 ctxInc
+//     is positional 0,1 (Table 71).
+
+/// PRED_L0 (uni-directional, list 0). Table 8 mapping.
+pub const PRED_L0: u32 = 0;
+/// PRED_L1 (uni-directional, list 1). Table 8 mapping.
+pub const PRED_L1: u32 = 1;
+/// PRED_BI (bi-directional). Table 8 mapping.
+pub const PRED_BI: u32 = 2;
+
+/// §9.3.3 — `inter_pred_idc` TR `cMax` on the §7.3.8.4 inter path:
+/// `( !sps_admvp_flag || nCbW + nCbH > 12 ) ? 2 : 1`. The `cMax = 1`
+/// branch (small admvp block) caps the directionality to uni-pred.
+pub fn inter_pred_idc_c_max(sps_admvp_flag: bool, n_cb_w: u32, n_cb_h: u32) -> u32 {
+    if !sps_admvp_flag || n_cb_w + n_cb_h > 12 {
+        2
+    } else {
+        1
+    }
+}
+
+/// §9.3.4.2 — positional ctxInc for `inter_pred_idc` prefix bin
+/// (0,1 over Table 69). Valid for `bin_idx ∈ {0, 1}`.
+pub fn inter_pred_idc_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= 2 {
+        return Err(Error::unsupported(format!(
+            "evc inter: inter_pred_idc bin_idx = {bin_idx} exceeds TR cMax = 2 prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+/// Maximum legal value of `bi_pred_idx` (TR cMax). §9.3.3 binarization.
+pub const BI_PRED_IDX_MAX: u32 = 2;
+
+/// §9.3.4.2 — positional ctxInc for `bi_pred_idx` prefix bin (0,1 over
+/// Table 71). Valid for `bin_idx ∈ {0, 1}`.
+pub fn bi_pred_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= BI_PRED_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: bi_pred_idx bin_idx = {bin_idx} exceeds TR cMax = {BI_PRED_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+// ===========================================================================
 // §7.4.7 / §9.3.3 / §9.3.4 — MMVD (Merge with Motion Vector Difference)
 // distance / sign / offset derivation
 // ===========================================================================
@@ -1805,6 +1865,36 @@ mod tests {
         }
         assert!(merge_idx_ctx_inc(MERGE_IDX_MAX).is_err());
         assert!(merge_idx_ctx_inc(42).is_err());
+    }
+
+    /// §9.3.3 — `inter_pred_idc` cMax: admvp small block (nCbW+nCbH<=12)
+    /// caps at 1 (uni-pred only); larger admvp blocks or any non-admvp
+    /// block allow cMax 2.
+    #[test]
+    fn round377_inter_pred_idc_c_max() {
+        // admvp, 4+4=8 <= 12 → 1.
+        assert_eq!(inter_pred_idc_c_max(true, 4, 4), 1);
+        // admvp, 8+8=16 > 12 → 2.
+        assert_eq!(inter_pred_idc_c_max(true, 8, 8), 2);
+        // admvp boundary: 4+8=12, not > 12 → 1.
+        assert_eq!(inter_pred_idc_c_max(true, 4, 8), 1);
+        // admvp boundary: 8+8 already covered; 4+16=20 > 12 → 2.
+        assert_eq!(inter_pred_idc_c_max(true, 4, 16), 2);
+        // !admvp → always 2 regardless of size.
+        assert_eq!(inter_pred_idc_c_max(false, 4, 4), 2);
+    }
+
+    /// §9.3.4.2 — `inter_pred_idc` / `bi_pred_idx` ctxInc positional 0,1.
+    #[test]
+    fn round377_inter_pred_idc_and_bi_pred_idx_ctx_inc() {
+        assert_eq!(inter_pred_idc_ctx_inc(0).unwrap(), 0);
+        assert_eq!(inter_pred_idc_ctx_inc(1).unwrap(), 1);
+        assert!(inter_pred_idc_ctx_inc(2).is_err());
+        assert_eq!(bi_pred_idx_ctx_inc(0).unwrap(), 0);
+        assert_eq!(bi_pred_idx_ctx_inc(1).unwrap(), 1);
+        assert!(bi_pred_idx_ctx_inc(BI_PRED_IDX_MAX).is_err());
+        // Table 8 direction constants.
+        assert_eq!((PRED_L0, PRED_L1, PRED_BI), (0, 1, 2));
     }
 
     /// The AMVR-MVD shift (eq. 145) and the AMVR-MVP round (eq. 645/646)

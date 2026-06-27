@@ -36,7 +36,10 @@ use oxideav_core::Result;
 use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
 use crate::eipd_syntax::EipdCtx;
-use crate::inter::{amvr_idx_ctx_inc, merge_idx_c_max, merge_idx_ctx_inc, AMVR_IDX_MAX};
+use crate::inter::{
+    amvr_idx_ctx_inc, bi_pred_idx_ctx_inc, inter_pred_idc_c_max, inter_pred_idc_ctx_inc,
+    merge_idx_c_max, merge_idx_ctx_inc, AMVR_IDX_MAX, BI_PRED_IDX_MAX,
+};
 
 /// Per-element read counters for the §7.3.8.4 inter-mode-gating group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct InterModeGateStats {
     pub merge_mode_flag_bins: u32,
     pub direct_mode_flag_bins: u32,
     pub merge_idx_bins: u32,
+    pub inter_pred_idc_bins: u32,
+    pub bi_pred_idx_bins: u32,
 }
 
 /// `(ctxTable, ctxIdx)` for a single-context Main-profile table, with the
@@ -149,6 +154,70 @@ pub fn read_merge_idx(
         }
     })?;
     stats.merge_idx_bins += bins;
+    Ok(v)
+}
+
+/// §7.3.8.4 + §9.3.3 + Table 69 — read `inter_pred_idc` (TR `cMax =
+/// ( !sps_admvp_flag || nCbW + nCbH > 12 ) ? 2 : 1`; per-bin ctxInc 0,1).
+///
+/// Resolves the B-slice prediction direction: 0 = PRED_L0, 1 = PRED_L1,
+/// 2 = PRED_BI (Table 8). Present only when `slice_type == B` (spec line
+/// 2913); the caller applies that gate. The dimensions are in luma
+/// samples so the §9.3.3 area-dependent `cMax` matches.
+pub fn read_inter_pred_idc(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    sps_admvp_flag: bool,
+    n_cb_w: u32,
+    n_cb_h: u32,
+    stats: &mut InterModeGateStats,
+) -> Result<u32> {
+    let cm_init = ctx.is_cm_init();
+    let table = MainCtxTable::InterPredIdc.as_usize();
+    let c_max = inter_pred_idc_c_max(sps_admvp_flag, n_cb_w, n_cb_h);
+    let mut bins = 0u32;
+    let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
+        bins += 1;
+        if cm_init {
+            inter_pred_idc_ctx_inc(bin_idx).unwrap_or(0)
+        } else {
+            0
+        }
+    })?;
+    stats.inter_pred_idc_bins += bins;
+    Ok(v)
+}
+
+/// §7.3.8.4 + §9.3.3 + Table 71 — read `bi_pred_idx` (TR cMax = 2;
+/// per-bin ctxInc 0,1).
+///
+/// Present only on the `sps_admvp_flag == 1` explicit-AMVP path when
+/// `inter_pred_idc == PRED_BI` (spec line 2988); the caller applies that
+/// gate. Returns 0 (both lists' MVDs present), 1 (list-1 MVD absent) or
+/// 2 (list-0 MVD absent) per the Table 71 semantics. An absent
+/// `bi_pred_idx` is inferred 0 (spec line 5983).
+pub fn read_bi_pred_idx(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    stats: &mut InterModeGateStats,
+) -> Result<u32> {
+    let cm_init = ctx.is_cm_init();
+    let table = MainCtxTable::BiPredIdx.as_usize();
+    let mut bins = 0u32;
+    let v = eng.decode_tr_regular(
+        BI_PRED_IDX_MAX,
+        0,
+        if cm_init { table } else { 0 },
+        |bin_idx| {
+            bins += 1;
+            if cm_init {
+                bi_pred_idx_ctx_inc(bin_idx).unwrap_or(0)
+            } else {
+                0
+            }
+        },
+    )?;
+    stats.bi_pred_idx_bins += bins;
     Ok(v)
 }
 
@@ -299,6 +368,52 @@ mod tests {
         let v = read_merge_idx(&mut eng, EipdCtx::new(false), 4, 8, &mut stats).unwrap();
         assert_eq!(v, 3);
         assert_eq!(stats.merge_idx_bins, 3);
+    }
+
+    /// inter_pred_idc value 2 (PRED_BI) on a large admvp block (cMax 2):
+    /// "1 1" with no terminator → value 2 in two bins.
+    #[test]
+    fn inter_pred_idc_bi_large_block() {
+        let bs = tr_bins(2, 2);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_inter_pred_idc(&mut eng, EipdCtx::new(false), true, 8, 8, &mut stats).unwrap();
+        assert_eq!(v, crate::inter::PRED_BI);
+        assert_eq!(stats.inter_pred_idc_bins, 2);
+    }
+
+    /// inter_pred_idc on a small admvp block saturates at cMax 1: a single
+    /// "1" bin (no terminator) reads PRED_L1.
+    #[test]
+    fn inter_pred_idc_small_block_caps_unipred() {
+        let bs = tr_bins(1, 1);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_inter_pred_idc(&mut eng, EipdCtx::new(false), true, 4, 4, &mut stats).unwrap();
+        assert_eq!(v, crate::inter::PRED_L1);
+        assert_eq!(stats.inter_pred_idc_bins, 1);
+    }
+
+    /// bi_pred_idx value 0 (both MVDs present): single leading-0 bin.
+    #[test]
+    fn bi_pred_idx_zero() {
+        let bs = tr_bins(0, 2);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_bi_pred_idx(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
+        assert_eq!(v, 0);
+        assert_eq!(stats.bi_pred_idx_bins, 1);
+    }
+
+    /// bi_pred_idx value 2 (list-0 MVD absent): "1 1" → two bins, cMax 2.
+    #[test]
+    fn bi_pred_idx_two() {
+        let bs = tr_bins(2, 2);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_bi_pred_idx(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
+        assert_eq!(v, 2);
+        assert_eq!(stats.bi_pred_idx_bins, 2);
     }
 
     /// Main-profile context routing: under cm_init each flag lands on its
