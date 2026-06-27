@@ -99,6 +99,7 @@ pub mod hmvp;
 pub mod htdf;
 pub mod ibc;
 pub mod inter;
+pub mod inter_cu_syntax;
 pub mod intra;
 pub mod merge;
 pub mod mmvd_syntax;
