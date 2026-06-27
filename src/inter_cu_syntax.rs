@@ -52,7 +52,9 @@ use oxideav_core::Result;
 use crate::affine_syntax::AffineSyntaxStats;
 use crate::amvr_syntax::InterModeGateStats;
 use crate::cabac::CabacEngine;
+use crate::cabac_init::MainCtxTable;
 use crate::eipd_syntax::EipdCtx;
+use crate::inter::{MotionVector, PRED_BI, PRED_L0, PRED_L1};
 use crate::mmvd_syntax::{MmvdDecision, MmvdSyntaxStats};
 
 /// SPS / PPS gates that select which §7.3.8.4 inter tools are present.
@@ -224,6 +226,191 @@ pub fn read_inter_cu_mode(
     })
 }
 
+/// One reference list's decoded explicit-AMVP parameters: the reference
+/// index and the (already sign-applied) motion-vector difference in
+/// 1/4-luma-pel units (pre-AMVR-shift; the caller applies eq. 145 with
+/// `amvr_idx`). When the list is inactive for the CU's `inter_pred_idc`
+/// the whole entry is `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplicitListMv {
+    /// `ref_idx_lX[ x0 ][ y0 ]` — 0 when absent (inferred, spec §7.4.x).
+    pub ref_idx: u32,
+    /// `MvdLX[ x0 ][ y0 ]` (eq. from `abs_mvd` / sign), 0 when the
+    /// `bi_pred_idx` gate suppresses this list's MVD.
+    pub mvd: MotionVector,
+}
+
+/// The resolved §7.3.8.4 explicit-AMVP (`merge_mode_flag == 0`,
+/// non-affine) decision on the `sps_admvp_flag == 1` path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExplicitAmvpDecision {
+    /// `inter_pred_idc` — PRED_L0 / PRED_L1 / PRED_BI (Table 8). For a
+    /// P slice this is forced PRED_L0 (the element is absent).
+    pub inter_pred_idc: u32,
+    /// `bi_pred_idx` — the per-list MVD-present selector (0 when not
+    /// PRED_BI; Table 71 semantics otherwise).
+    pub bi_pred_idx: u32,
+    /// L0 parameters (`None` when `inter_pred_idc == PRED_L1`).
+    pub l0: Option<ExplicitListMv>,
+    /// L1 parameters (`None` when `inter_pred_idc == PRED_L0`).
+    pub l1: Option<ExplicitListMv>,
+}
+
+/// Per-element bin counters for the explicit-AMVP driver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplicitAmvpStats {
+    pub gate: InterModeGateStats,
+    pub ref_idx_bins: u32,
+    pub abs_mvd_bins: u32,
+    pub mvd_sign_bins: u32,
+}
+
+/// §7.3.8.4 — read one `abs_mvd` (EG0 bypass) + optional `mvd_sign_flag`
+/// (bypass) component, returning the signed value (spec lines 2918-2925).
+fn read_signed_mvd_component(eng: &mut CabacEngine, stats: &mut ExplicitAmvpStats) -> Result<i32> {
+    let abs = eng.decode_egk_bypass(0)?;
+    stats.abs_mvd_bins += 1;
+    if abs == 0 {
+        return Ok(0);
+    }
+    let sign = eng.decode_bypass()?;
+    stats.mvd_sign_bins += 1;
+    Ok(if sign != 0 { -(abs as i32) } else { abs as i32 })
+}
+
+/// Read one list's `{ ref_idx?, abs_mvd[0]/sign, abs_mvd[1]/sign }` group
+/// per the §7.3.8.4 admvp=1 explicit-AMVP body (spec lines 2989-3020).
+///
+/// * `ref_idx_lX` is present iff `num_ref_idx_active_minus1 > 0 &&
+///   bi_pred_idx == 0` (TR cMax = num_ref_idx_active_minus1; ctxInc 0,1
+///   then bypass — collapsed to `(0,0)` under Baseline).
+/// * the MVD pair is present iff `bi_pred_idx != mvd_absent_value` (1 for
+///   L0, 2 for L1).
+fn read_explicit_list(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    num_ref_idx_active_minus1: u32,
+    bi_pred_idx: u32,
+    mvd_absent_value: u32,
+    stats: &mut ExplicitAmvpStats,
+) -> Result<ExplicitListMv> {
+    let ref_idx = if num_ref_idx_active_minus1 > 0 && bi_pred_idx == 0 {
+        let cm_init = ctx.is_cm_init();
+        let table = MainCtxTable::RefIdx.as_usize();
+        let mut bins = 0u32;
+        let v = eng.decode_tr_regular(
+            num_ref_idx_active_minus1,
+            0,
+            if cm_init { table } else { 0 },
+            |bin_idx| {
+                bins += 1;
+                // ref_idx ctxInc is 0,1 for the first two bins, then bypass
+                // (Table 9.3.4.2). Under the Baseline collapse all bins are
+                // (0,0); the first two regular ctxIdx are 0 and 1.
+                if cm_init {
+                    bin_idx.min(1) as usize
+                } else {
+                    0
+                }
+            },
+        )?;
+        stats.ref_idx_bins += bins;
+        v
+    } else {
+        0
+    };
+
+    let mvd = if bi_pred_idx != mvd_absent_value {
+        let x = read_signed_mvd_component(eng, stats)?;
+        let y = read_signed_mvd_component(eng, stats)?;
+        MotionVector { x, y }
+    } else {
+        MotionVector::default()
+    };
+
+    Ok(ExplicitListMv { ref_idx, mvd })
+}
+
+/// Drive the §7.3.8.4 `sps_admvp_flag == 1` explicit-AMVP body (spec lines
+/// 2912-3025, non-affine `else` branch): `inter_pred_idc` (B only),
+/// `bi_pred_idx` (PRED_BI only), then the per-list ref_idx + MVD groups.
+///
+/// `slice_is_b` gates the `inter_pred_idc` read (absent ⇒ PRED_L0 for P
+/// slices). The caller has already resolved `affine_flag == 0` (the
+/// affine sub-tree is handled separately) and supplied
+/// `num_ref_idx_active_minus1[0/1]`.
+pub fn read_explicit_amvp(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    slice_is_b: bool,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    // `[ num_ref_idx_active_minus1[0], num_ref_idx_active_minus1[1] ]`.
+    num_ref_idx_active_minus1: [u32; 2],
+    stats: &mut ExplicitAmvpStats,
+) -> Result<ExplicitAmvpDecision> {
+    let num_ref_idx_active_minus1_l0 = num_ref_idx_active_minus1[0];
+    let num_ref_idx_active_minus1_l1 = num_ref_idx_active_minus1[1];
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
+    // inter_pred_idc — present only for B slices (spec line 2913);
+    // P slices force PRED_L0.
+    let inter_pred_idc = if slice_is_b {
+        crate::amvr_syntax::read_inter_pred_idc(
+            eng,
+            ctx,
+            true, // sps_admvp_flag == 1 on this driver's path.
+            n_cb_w,
+            n_cb_h,
+            &mut stats.gate,
+        )?
+    } else {
+        PRED_L0
+    };
+
+    // bi_pred_idx — present only when inter_pred_idc == PRED_BI.
+    let bi_pred_idx = if inter_pred_idc == PRED_BI {
+        crate::amvr_syntax::read_bi_pred_idx(eng, ctx, &mut stats.gate)?
+    } else {
+        0
+    };
+
+    // L0 group present when inter_pred_idc != PRED_L1.
+    let l0 = if inter_pred_idc != PRED_L1 {
+        Some(read_explicit_list(
+            eng,
+            ctx,
+            num_ref_idx_active_minus1_l0,
+            bi_pred_idx,
+            1, // L0 MVD absent when bi_pred_idx == 1.
+            stats,
+        )?)
+    } else {
+        None
+    };
+
+    // L1 group present when inter_pred_idc != PRED_L0.
+    let l1 = if inter_pred_idc != PRED_L0 {
+        Some(read_explicit_list(
+            eng,
+            ctx,
+            num_ref_idx_active_minus1_l1,
+            bi_pred_idx,
+            2, // L1 MVD absent when bi_pred_idx == 2.
+            stats,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(ExplicitAmvpDecision {
+        inter_pred_idc,
+        bi_pred_idx,
+        l0,
+        l1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +437,27 @@ mod tests {
             sps_affine_flag: true,
             mmvd_group_enable_flag: false,
         }
+    }
+
+    /// A bin token: regular `(0,0)`-ctx decision or a bypass bin.
+    enum Tok {
+        Reg(u8),
+        Byp(u8),
+    }
+
+    /// Encode a mixed regular/bypass token stream and flush.
+    fn mixed(toks: &[Tok]) -> Vec<u8> {
+        let mut enc = CabacEncoder::new();
+        for t in toks {
+            match t {
+                Tok::Reg(b) => enc.encode_decision(0, 0, *b),
+                Tok::Byp(b) => enc.encode_bypass(*b),
+            }
+        }
+        enc.encode_terminate(true);
+        let mut out = enc.finish();
+        out.extend_from_slice(&[0xFF; 4]);
+        out
     }
 
     /// affine_flag size gate: needs sps_affine_flag and both dims ≥ 3.
@@ -376,5 +584,139 @@ mod tests {
         assert_eq!(d.amvr_idx, 0);
         assert_eq!(stats.gate.amvr_idx_bins, 0);
         assert!(d.merge_mode_flag);
+    }
+
+    /// Explicit-AMVP P-slice uni-pred: PRED_L0 forced (no inter_pred_idc
+    /// bin), num_ref_idx=0 so no ref_idx → L0 present, L1 absent. The MVD
+    /// is read as two EG0 bypass components; the test-only encoder's
+    /// bypass-tail defer (documented in `cabac`) makes the trailing values
+    /// non-contractual, so we assert the structural decisions + the L1
+    /// absence + that exactly two abs_mvd components were consumed.
+    #[test]
+    fn explicit_amvp_p_unipred_structure() {
+        let bs = mixed(&[Tok::Byp(0), Tok::Byp(0)]);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            false, // P slice
+            3,
+            3,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.inter_pred_idc, PRED_L0);
+        assert_eq!(d.bi_pred_idx, 0);
+        assert!(d.l0.is_some());
+        assert_eq!(d.l0.unwrap().ref_idx, 0); // num_ref_idx=0 → no ref_idx bin
+        assert_eq!(d.l1, None);
+        // inter_pred_idc absent for P → no bin.
+        assert_eq!(stats.gate.inter_pred_idc_bins, 0);
+        // two abs_mvd EG0 components consumed (one x, one y).
+        assert_eq!(stats.abs_mvd_bins, 2);
+    }
+
+    /// Explicit-AMVP B-slice bi-pred: inter_pred_idc PRED_BI ("1 1",
+    /// cMax 2 large block) then bi_pred_idx "0" (both lists' MVD present).
+    /// These are regular-coded so decode exactly; the L0/L1 presence +
+    /// the inter_pred_idc / bi_pred_idx bin counts are contractual.
+    #[test]
+    fn explicit_amvp_b_bipred_both_lists() {
+        let toks = [
+            Tok::Reg(1), // inter_pred_idc bin 0
+            Tok::Reg(1), // inter_pred_idc bin 1 → value 2 = PRED_BI
+            Tok::Reg(0), // bi_pred_idx "0" → 0 (both lists' MVD present)
+            Tok::Byp(0), // L0 mvd_x abs
+            Tok::Byp(0), // L0 mvd_y abs
+            Tok::Byp(0), // L1 mvd_x abs
+            Tok::Byp(0), // L1 mvd_y abs
+        ];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            true, // B slice
+            3,
+            3,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.inter_pred_idc, PRED_BI);
+        assert_eq!(d.bi_pred_idx, 0);
+        assert!(d.l0.is_some());
+        assert!(d.l1.is_some());
+        assert_eq!(stats.gate.inter_pred_idc_bins, 2);
+        assert_eq!(stats.gate.bi_pred_idx_bins, 1);
+        // four abs_mvd EG0 components (two per list).
+        assert_eq!(stats.abs_mvd_bins, 4);
+    }
+
+    /// bi_pred_idx == 1 suppresses the L1 MVD (Table 71): only the L0 MVD
+    /// pair is read after the regular-coded "1 1 1 0" prefix
+    /// (inter_pred_idc PRED_BI, bi_pred_idx 1). The bin budget proves the
+    /// suppression — exactly two abs_mvd components, not four.
+    #[test]
+    fn explicit_amvp_bi_pred_idx_one_suppresses_l1_mvd() {
+        let toks = [
+            Tok::Reg(1), // inter_pred_idc bin 0
+            Tok::Reg(1), // bin 1 → PRED_BI
+            Tok::Reg(1), // bi_pred_idx bin 0
+            Tok::Reg(0), // bi_pred_idx bin 1 → value 1
+            Tok::Byp(0), // L0 mvd_x abs
+            Tok::Byp(0), // L0 mvd_y abs
+                         // L1 MVD suppressed (bi_pred_idx == 1).
+        ];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            true,
+            3,
+            3,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.inter_pred_idc, PRED_BI);
+        assert_eq!(d.bi_pred_idx, 1);
+        assert!(d.l1.is_some()); // L1 active (ref present) but MVD suppressed
+                                 // Only two abs_mvd components consumed (L0 only) — the L1 MVD pair
+                                 // was skipped by the bi_pred_idx == 1 gate.
+        assert_eq!(stats.abs_mvd_bins, 2);
+    }
+
+    /// ref_idx is present when num_ref_idx_active_minus1 > 0 && bi_pred_idx
+    /// == 0. The regular-coded ref_idx bin decodes exactly; here a P-slice
+    /// L0 with num_ref_idx_active_minus1=1 reads ref_idx "1" → ref_idx 1
+    /// (cMax 1 TR saturates in one bin), then the MVD pair.
+    #[test]
+    fn explicit_amvp_ref_idx_present() {
+        let toks = [
+            Tok::Reg(1), // ref_idx_l0 "1" → 1 (cMax 1 saturates)
+            Tok::Byp(0), // mvd_x abs
+            Tok::Byp(0), // mvd_y abs
+        ];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            false,
+            3,
+            3,
+            [1, 0], // num_ref_idx_active_minus1_l0 = 1 → ref_idx present
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.l0.unwrap().ref_idx, 1);
+        assert_eq!(stats.ref_idx_bins, 1);
     }
 }
