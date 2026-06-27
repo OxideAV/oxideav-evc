@@ -659,6 +659,47 @@ pub fn amvr_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
 }
 
 // ===========================================================================
+// §9.3.3 / §9.3.4.2 — merge_idx (regular merge candidate selector)
+// ===========================================================================
+//
+// `merge_idx[ x0 ][ y0 ]` selects the regular merging candidate on the
+// `sps_admvp_flag == 1` non-affine / non-MMVD merge path (spec lines
+// 2830 / 2908) and on the §7.3.8.4 cu_skip non-affine fall-through.
+//
+// §9.3.3 binarization: TR, `cMax = ( nCbW * nCbH <= 32 ) ? 3 : 5`,
+// `cRiceParam = 0`. The prefix-bin ctxInc (§9.3.4.2 table, `merge_idx`
+// row) is purely positional: bin `k` → ctxInc `k` for k ∈ {0,1,2,3,4}
+// (Table 49 carries 5 trained states per `initType`). There is no
+// neighbour-derived ctxInc term.
+
+/// Hard cap on `merge_idx` prefix bins — the larger of the two §9.3.3
+/// `cMax` branches (`cMax = 5` when `nCbW * nCbH > 32`).
+pub const MERGE_IDX_MAX: u32 = 5;
+
+/// §9.3.3 — `merge_idx` TR `cMax` as a function of the coding block area:
+/// `( nCbW * nCbH <= 32 ) ? 3 : 5`.
+pub fn merge_idx_c_max(n_cb_w: u32, n_cb_h: u32) -> u32 {
+    if n_cb_w.saturating_mul(n_cb_h) <= 32 {
+        3
+    } else {
+        5
+    }
+}
+
+/// §9.3.4.2 — positional ctxInc for `merge_idx` prefix bin `bin_idx`
+/// (0-based). Bin `k` maps 1-to-1 to ctxIdx `k` within the `initType`
+/// range; valid for `bin_idx ∈ 0..=4` (the `cMax = 5` branch needs at
+/// most 5 prefix bins). Returns [`Error::Unsupported`] for `bin_idx >= 5`.
+pub fn merge_idx_ctx_inc(bin_idx: u32) -> Result<usize> {
+    if bin_idx >= MERGE_IDX_MAX {
+        return Err(Error::unsupported(format!(
+            "evc inter: merge_idx bin_idx = {bin_idx} exceeds TR cMax = {MERGE_IDX_MAX} prefix bins (§9.3.4)"
+        )));
+    }
+    Ok(bin_idx as usize)
+}
+
+// ===========================================================================
 // §7.4.7 / §9.3.3 / §9.3.4 — MMVD (Merge with Motion Vector Difference)
 // distance / sign / offset derivation
 // ===========================================================================
@@ -1742,6 +1783,28 @@ mod tests {
     fn round213_amvr_idx_ctx_inc_rejects_oob_bin() {
         assert!(amvr_idx_ctx_inc(4).is_err());
         assert!(amvr_idx_ctx_inc(99).is_err());
+    }
+
+    /// §9.3.3 — `merge_idx` cMax is area-dependent: `nCbW*nCbH <= 32`
+    /// → 3, else 5. The boundary is exactly 32 samples.
+    #[test]
+    fn round377_merge_idx_c_max_area_boundary() {
+        assert_eq!(merge_idx_c_max(4, 8), 3); // 32 → small branch
+        assert_eq!(merge_idx_c_max(8, 4), 3); // 32 → small branch
+        assert_eq!(merge_idx_c_max(8, 8), 5); // 64 → large branch
+        assert_eq!(merge_idx_c_max(4, 16), 5); // 64 → large branch
+        assert_eq!(merge_idx_c_max(4, 4), 3); // 16 → small branch
+    }
+
+    /// §9.3.4.2 — `merge_idx` ctxInc is positional (Table 49 ranges
+    /// `0..4` / `5..9`), bin k → ctx k for k ∈ 0..=4.
+    #[test]
+    fn round377_merge_idx_ctx_inc_is_positional() {
+        for k in 0..MERGE_IDX_MAX {
+            assert_eq!(merge_idx_ctx_inc(k).unwrap(), k as usize);
+        }
+        assert!(merge_idx_ctx_inc(MERGE_IDX_MAX).is_err());
+        assert!(merge_idx_ctx_inc(42).is_err());
     }
 
     /// The AMVR-MVD shift (eq. 145) and the AMVR-MVP round (eq. 645/646)

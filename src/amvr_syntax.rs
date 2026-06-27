@@ -36,7 +36,7 @@ use oxideav_core::Result;
 use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
 use crate::eipd_syntax::EipdCtx;
-use crate::inter::{amvr_idx_ctx_inc, AMVR_IDX_MAX};
+use crate::inter::{amvr_idx_ctx_inc, merge_idx_c_max, merge_idx_ctx_inc, AMVR_IDX_MAX};
 
 /// Per-element read counters for the §7.3.8.4 inter-mode-gating group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub struct InterModeGateStats {
     pub amvr_idx_bins: u32,
     pub merge_mode_flag_bins: u32,
     pub direct_mode_flag_bins: u32,
+    pub merge_idx_bins: u32,
 }
 
 /// `(ctxTable, ctxIdx)` for a single-context Main-profile table, with the
@@ -115,6 +116,39 @@ pub fn read_direct_mode_flag(
     let (t, i) = ctx1(ctx, MainCtxTable::DirectModeFlag, 0);
     let v = eng.decode_decision(t, i)? != 0;
     stats.direct_mode_flag_bins += 1;
+    Ok(v)
+}
+
+/// §7.3.8.4 + §9.3.3 + Table 49 — read `merge_idx` (TR `cMax =
+/// ( nCbW * nCbH <= 32 ) ? 3 : 5`, per-bin ctxInc 0,1,2,3,4 via
+/// [`crate::inter::merge_idx_ctx_inc`]).
+///
+/// This is the regular merging-candidate selector read on the
+/// `sps_admvp_flag == 1` non-affine / non-MMVD merge path (spec lines
+/// 2830 / 2908) and on the §7.3.8.4 cu_skip non-affine fall-through. The
+/// caller supplies the coding-block dimensions in luma samples so the
+/// area-dependent `cMax` matches §9.3.3. An absent `merge_idx` is
+/// inferred 0 (spec line 5726); the caller applies that presence gate.
+pub fn read_merge_idx(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    n_cb_w: u32,
+    n_cb_h: u32,
+    stats: &mut InterModeGateStats,
+) -> Result<u32> {
+    let cm_init = ctx.is_cm_init();
+    let table = MainCtxTable::MergeIdx.as_usize();
+    let c_max = merge_idx_c_max(n_cb_w, n_cb_h);
+    let mut bins = 0u32;
+    let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
+        bins += 1;
+        if cm_init {
+            merge_idx_ctx_inc(bin_idx).unwrap_or(0)
+        } else {
+            0
+        }
+    })?;
+    stats.merge_idx_bins += bins;
     Ok(v)
 }
 
@@ -208,6 +242,63 @@ mod tests {
         let d = read_direct_mode_flag(&mut eng2, EipdCtx::new(false), &mut stats2).unwrap();
         assert!(!d);
         assert_eq!(stats2.direct_mode_flag_bins, 1);
+    }
+
+    /// Encode a TR value as the table-0 bin string the cm_init=false
+    /// decoder reads, padded with trailing 0s for renormalisation headroom.
+    fn tr_bins(value: u32, c_max: u32) -> Vec<u8> {
+        let mut bins = vec![1u8; value as usize];
+        if value < c_max {
+            bins.push(0u8);
+        }
+        bins.extend_from_slice(&[0, 0, 0, 0]);
+        regular_bins(&bins)
+    }
+
+    /// merge_idx cMax depends on the coding-block area (§9.3.3): 32-sample
+    /// area → cMax 3; larger → cMax 5.
+    #[test]
+    fn merge_idx_c_max_area_split() {
+        // 4×8 = 32 → cMax 3.
+        assert_eq!(crate::inter::merge_idx_c_max(4, 8), 3);
+        // 8×8 = 64 → cMax 5.
+        assert_eq!(crate::inter::merge_idx_c_max(8, 8), 5);
+        // 4×4 = 16 → cMax 3.
+        assert_eq!(crate::inter::merge_idx_c_max(4, 4), 3);
+    }
+
+    /// merge_idx value 0 on a large block: single leading-0 bin.
+    #[test]
+    fn merge_idx_zero_large_block() {
+        let bs = tr_bins(0, 5);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_merge_idx(&mut eng, EipdCtx::new(false), 16, 16, &mut stats).unwrap();
+        assert_eq!(v, 0);
+        assert_eq!(stats.merge_idx_bins, 1);
+    }
+
+    /// merge_idx value 4 (cMax 5 branch): "1 1 1 1 0" → five bins.
+    #[test]
+    fn merge_idx_four_large_block() {
+        let bs = tr_bins(4, 5);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_merge_idx(&mut eng, EipdCtx::new(false), 16, 16, &mut stats).unwrap();
+        assert_eq!(v, 4);
+        assert_eq!(stats.merge_idx_bins, 5);
+    }
+
+    /// On a 32-sample (4×8) block cMax saturates at 3: the all-ones
+    /// "1 1 1" string with no terminating 0 reads value 3 in three bins.
+    #[test]
+    fn merge_idx_small_block_saturates_at_three() {
+        let bs = tr_bins(3, 3);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterModeGateStats::default();
+        let v = read_merge_idx(&mut eng, EipdCtx::new(false), 4, 8, &mut stats).unwrap();
+        assert_eq!(v, 3);
+        assert_eq!(stats.merge_idx_bins, 3);
     }
 
     /// Main-profile context routing: under cm_init each flag lands on its
