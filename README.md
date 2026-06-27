@@ -19,7 +19,9 @@ reference-picture-list parsing for non-IDR slices.
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
-`slice_data`, `intra`, `inter`, `affine` / `affine_cand` / `affine_syntax`,
+`slice_data`, `intra`, `inter` / `inter_cu_syntax`,
+`affine` / `affine_cand` / `affine_syntax`,
+`amvr_syntax` / `mmvd_syntax`, `dmvr`,
 `eipd` / `eipd_mode` / `eipd_ref` / `eipd_syntax`,
 `ats`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
 `neighbour`, `picture`, and the registered `decoder`
@@ -253,8 +255,25 @@ feeding the eq.-145 MVD shift + eqs.-645/646 MVP round), and **DMVR**
 `refine_subblock_mv` driver, pure over a `PredPlane` bilinear-prediction
 window).
 
-Still deferred: the picture-level wiring of these inter-refinement
-syntax/derivation layers + the EIPD + ATS-intra + merge + affine layers
+The **§7.3.8.4 Main-profile inter coding-unit syntax tree** is now driven
+end-to-end by the `inter_cu_syntax` module, which threads the per-tool
+readers above into the layered mode-gating structure (spec lines
+2811-3025): `read_inter_cu_mode` (the `sps_admvp_flag == 1` non-skip path
+— `amvr_idx` → `merge_mode_flag` (with the line-5827 inferred-1 corner) →
+the `mmvd`/`affine-merge`/`merge_idx` merge branch, deferring to AMVP on
+`merge_mode_flag == 0`), `read_explicit_amvp` (the explicit-MVD body —
+`inter_pred_idc` → `bi_pred_idx` → the per-list `ref_idx`/`abs_mvd`/sign
+groups with the Table-71 MVD-suppression gates), and `read_cu_skip_main`
+(the cu_skip merge tree, with the `sps_admvp_flag` `merge_idx` vs
+Baseline `mvp_idx` fall-through). The `merge_idx` (Table 49),
+`inter_pred_idc` (Table 69), `bi_pred_idx` (Table 71) and `mvp_idx`
+(Table 48) syntax readers + their §9.3.3 area-dependent `cMax` /
+positional ctxInc geometry (`inter::merge_idx_c_max` etc.) landed with it.
+
+Still deferred: the slice-walker selecting these CU-syntax drivers on
+`sps_admvp_flag` and feeding the decoded `InterCuModeDecision` /
+`ExplicitAmvpDecision` / `CuSkipDecision` into the §8.5 MV-reconstruction,
+together with the EIPD + ATS-intra + merge + affine data-plane layers,
 into a full Main-profile `coding_unit()` reconstruction (needs the
 §6.4.1 neighbour-mode grid, the per-position MV store, the §8.5.5.2 DMVR
 bilinear interpolation data plane, and `RefPictureView`/DPB POC threading
