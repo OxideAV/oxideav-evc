@@ -66,6 +66,10 @@ pub struct InterToolGates {
     pub sps_mmvd_flag: bool,
     /// `sps_affine_flag` — affine model based motion compensation present.
     pub sps_affine_flag: bool,
+    /// `sps_admvp_flag` — advanced MV prediction (Main-profile merge
+    /// list). Selects the cu_skip non-affine fall-through (`merge_idx` vs
+    /// the Baseline `mvp_idx` pair).
+    pub sps_admvp_flag: bool,
     /// `mmvd_group_enable_flag` — slice-header gate for `mmvd_group_idx`.
     pub mmvd_group_enable_flag: bool,
 }
@@ -140,10 +144,6 @@ pub fn read_inter_cu_mode(
     log2_cb_height: u32,
     stats: &mut InterCuSyntaxStats,
 ) -> Result<InterCuModeDecision> {
-    // `merge_idx`'s §9.3.3 cMax depends on the coding-block area in luma
-    // samples, recovered from the log2 dimensions.
-    let n_cb_w = 1u32 << log2_cb_width;
-    let n_cb_h = 1u32 << log2_cb_height;
     // Step 1 — amvr_idx (else inferred 0).
     let amvr_idx = if gates.sps_amvr_flag {
         crate::amvr_syntax::read_amvr_idx(eng, ctx, &mut stats.gate)?
@@ -168,7 +168,47 @@ pub fn read_inter_cu_mode(
         });
     }
 
-    // Step 3 — the merge branch.
+    // Step 3 — the merge branch (shared with the cu_skip path), here on
+    // the sps_admvp_flag == 1 driver so the non-affine fall-through reads
+    // merge_idx.
+    let branch = read_merge_branch(eng, ctx, gates, true, log2_cb_width, log2_cb_height, stats)?;
+
+    Ok(InterCuModeDecision {
+        amvr_idx,
+        merge_mode_flag,
+        merge: Some(branch),
+    })
+}
+
+/// The shared §7.3.8.4 merge-branch reader (spec lines 2811-2832 for the
+/// cu_skip path; 2886-2910 for the non-skip `merge_mode_flag == 1` path):
+///
+/// ```text
+///   if( sps_mmvd_flag ) mmvd_flag
+///   if( mmvd_flag ) { …MMVD group… }
+///   else {
+///       if( sps_affine_flag && log2W>=3 && log2H>=3 ) affine_flag
+///       if( affine_flag ) affine_merge_idx
+///       else { sps_admvp_flag ? merge_idx : mvp_idx_l0 (+ mvp_idx_l1 for B) }
+///   }
+/// ```
+///
+/// On the `sps_admvp_flag == 1` paths the non-affine fall-through reads
+/// `merge_idx`; the `sps_admvp_flag == 0` cu_skip path reads `mvp_idx`
+/// instead, handled by [`read_cu_skip_main`] (which does not call this
+/// helper for that case). `admvp` is passed through for clarity but this
+/// helper only emits the `merge_idx` fall-through (admvp == true).
+fn read_merge_branch(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    gates: InterToolGates,
+    _admvp: bool,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    stats: &mut InterCuSyntaxStats,
+) -> Result<MergeBranch> {
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
     // mmvd_flag is present iff sps_mmvd_flag; read_mmvd_group reads it and
     // returns flag=false (inferred 0) when sps_mmvd_flag is set but the
     // decoded bit is 0. When sps_mmvd_flag == 0 the element is absent
@@ -186,9 +226,11 @@ pub fn read_inter_cu_mode(
         MmvdDecision::default()
     };
 
-    let branch = if mmvd.flag {
-        MergeBranch::Mmvd(mmvd)
-    } else if affine_flag_present_in_merge(gates.sps_affine_flag, log2_cb_width, log2_cb_height) {
+    if mmvd.flag {
+        return Ok(MergeBranch::Mmvd(mmvd));
+    }
+
+    if affine_flag_present_in_merge(gates.sps_affine_flag, log2_cb_width, log2_cb_height) {
         // affine_flag (FL cMax=1) — under the merge gate, ctxInc 0 (the
         // §9.3.4.2.4 neighbour term applies; here we leave it to the
         // single-context collapse like the sibling readers in the merge
@@ -205,25 +247,136 @@ pub fn read_inter_cu_mode(
                 crate::affine_syntax::read_affine_merge_idx(eng, ctx, &mut affine_stats)?;
             stats.affine.flag_bins += affine_stats.flag_bins;
             stats.affine.merge_idx_bins += affine_stats.merge_idx_bins;
-            MergeBranch::AffineMerge { affine_merge_idx }
-        } else {
-            stats.affine.flag_bins += affine_stats.flag_bins;
-            let merge_idx =
-                crate::amvr_syntax::read_merge_idx(eng, ctx, n_cb_w, n_cb_h, &mut stats.gate)?;
-            MergeBranch::Regular { merge_idx }
+            return Ok(MergeBranch::AffineMerge { affine_merge_idx });
         }
+        stats.affine.flag_bins += affine_stats.flag_bins;
+    }
+
+    // Regular merge_idx fall-through (sps_admvp_flag == 1).
+    let merge_idx = crate::amvr_syntax::read_merge_idx(eng, ctx, n_cb_w, n_cb_h, &mut stats.gate)?;
+    Ok(MergeBranch::Regular { merge_idx })
+}
+
+/// The resolved §7.3.8.4 cu_skip merge decision (spec lines 2811-2832).
+/// A skip CU is always a merge CU: it carries either an MMVD group, an
+/// affine merge, a regular `merge_idx` (admvp), or the Baseline
+/// `mvp_idx_l0` (+ `mvp_idx_l1` for B) pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CuSkipDecision {
+    /// `mmvd_flag == 1` — MMVD merge.
+    Mmvd(MmvdDecision),
+    /// Affine merge with `affine_merge_idx`.
+    AffineMerge { affine_merge_idx: u32 },
+    /// Regular merge `merge_idx` (the `sps_admvp_flag == 1` fall-through).
+    Merge { merge_idx: u32 },
+    /// Baseline `mvp_idx` pair (the `sps_admvp_flag == 0` fall-through):
+    /// `mvp_idx_l0` always, `mvp_idx_l1` for B slices (`None` for P).
+    MvpIdx { l0: u32, l1: Option<u32> },
+}
+
+/// Drive the §7.3.8.4 cu_skip merge tree (spec lines 2811-2832) for one
+/// skip CU on the Main profile. A skip CU reads no `amvr_idx` /
+/// `merge_mode_flag` — it is implicitly a merge CU:
+///
+/// ```text
+///   if( sps_mmvd_flag ) mmvd_flag
+///   if( mmvd_flag ) { …MMVD group… }
+///   else {
+///       if( sps_affine_flag && log2W>=3 && log2H>=3 ) affine_flag
+///       if( affine_flag ) affine_merge_idx
+///       else { !sps_admvp_flag ? (mvp_idx_l0 [+ mvp_idx_l1 if B]) : merge_idx }
+///   }
+/// ```
+///
+/// `gates.sps_admvp_flag` selects between the `merge_idx` (admvp) and
+/// `mvp_idx` (Baseline) fall-throughs; `slice_is_b` gates `mvp_idx_l1`.
+pub fn read_cu_skip_main(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    gates: InterToolGates,
+    slice_is_b: bool,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    stats: &mut InterCuSyntaxStats,
+) -> Result<CuSkipDecision> {
+    let sps_admvp_flag = gates.sps_admvp_flag;
+    // mmvd / affine share the merge-branch reading; only the non-affine
+    // fall-through differs by sps_admvp_flag.
+    let mmvd = if gates.sps_mmvd_flag {
+        crate::mmvd_syntax::read_mmvd_group(
+            eng,
+            ctx,
+            gates.mmvd_group_enable_flag,
+            log2_cb_width,
+            log2_cb_height,
+            &mut stats.mmvd,
+        )?
     } else {
-        // No affine eligibility — regular merge_idx fall-through.
+        MmvdDecision::default()
+    };
+    if mmvd.flag {
+        return Ok(CuSkipDecision::Mmvd(mmvd));
+    }
+
+    if affine_flag_present_in_merge(gates.sps_affine_flag, log2_cb_width, log2_cb_height) {
+        let mut affine_stats = AffineSyntaxStats::default();
+        let affine_flag = crate::affine_syntax::read_affine_flag(
+            eng,
+            ctx,
+            crate::affine_syntax::AffineFlagNeighbours::default(),
+            &mut affine_stats,
+        )?;
+        if affine_flag {
+            let affine_merge_idx =
+                crate::affine_syntax::read_affine_merge_idx(eng, ctx, &mut affine_stats)?;
+            stats.affine.flag_bins += affine_stats.flag_bins;
+            stats.affine.merge_idx_bins += affine_stats.merge_idx_bins;
+            return Ok(CuSkipDecision::AffineMerge { affine_merge_idx });
+        }
+        stats.affine.flag_bins += affine_stats.flag_bins;
+    }
+
+    if sps_admvp_flag {
+        let n_cb_w = 1u32 << log2_cb_width;
+        let n_cb_h = 1u32 << log2_cb_height;
         let merge_idx =
             crate::amvr_syntax::read_merge_idx(eng, ctx, n_cb_w, n_cb_h, &mut stats.gate)?;
-        MergeBranch::Regular { merge_idx }
-    };
+        Ok(CuSkipDecision::Merge { merge_idx })
+    } else {
+        // Baseline mvp_idx pair (spec lines 2825-2828). TR cMax = 3,
+        // ctxInc 0,1,2 (Table 48); collapses to (0,0) under Baseline
+        // sps_cm_init_flag == 0.
+        let l0 = read_mvp_idx(eng, ctx, stats)?;
+        let l1 = if slice_is_b {
+            Some(read_mvp_idx(eng, ctx, stats)?)
+        } else {
+            None
+        };
+        Ok(CuSkipDecision::MvpIdx { l0, l1 })
+    }
+}
 
-    Ok(InterCuModeDecision {
-        amvr_idx,
-        merge_mode_flag,
-        merge: Some(branch),
-    })
+/// §7.3.8.4 + §9.3.3 + Table 48 — read `mvp_idx_lX` (TR cMax = 3,
+/// ctxInc 0,1,2). The skip-path Baseline predictor selector; under the
+/// Baseline `sps_cm_init_flag == 0` collapse all bins are `(0,0)`.
+fn read_mvp_idx(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    stats: &mut InterCuSyntaxStats,
+) -> Result<u32> {
+    let cm_init = ctx.is_cm_init();
+    let table = MainCtxTable::MvpIdx.as_usize();
+    let mut bins = 0u32;
+    let v = eng.decode_tr_regular(3, 0, if cm_init { table } else { 0 }, |bin_idx| {
+        bins += 1;
+        if cm_init {
+            bin_idx.min(2) as usize
+        } else {
+            0
+        }
+    })?;
+    stats.gate.merge_idx_bins += bins;
+    Ok(v)
 }
 
 /// One reference list's decoded explicit-AMVP parameters: the reference
@@ -435,6 +588,7 @@ mod tests {
             sps_amvr_flag: true,
             sps_mmvd_flag: true,
             sps_affine_flag: true,
+            sps_admvp_flag: true,
             mmvd_group_enable_flag: false,
         }
     }
@@ -718,5 +872,124 @@ mod tests {
         .unwrap();
         assert_eq!(d.l0.unwrap().ref_idx, 1);
         assert_eq!(stats.ref_idx_bins, 1);
+    }
+
+    /// cu_skip admvp regular merge: mmvd 0, affine 0 (small block),
+    /// merge_idx 0.
+    #[test]
+    fn cu_skip_admvp_regular_merge() {
+        let bs = bins(&[0, 0]); // mmvd_flag 0, merge_idx 0 (affine off)
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterCuSyntaxStats::default();
+        let d = read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates_all(), // sps_admvp_flag == true
+            false,
+            2,
+            2,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d, CuSkipDecision::Merge { merge_idx: 0 });
+        assert_eq!(stats.mmvd.flag_bins, 1);
+        assert_eq!(stats.gate.merge_idx_bins, 1);
+    }
+
+    /// cu_skip Baseline (sps_admvp_flag == 0) P-slice: mmvd 0, no affine
+    /// (small block), mvp_idx_l0 0 only (P → no mvp_idx_l1).
+    #[test]
+    fn cu_skip_baseline_p_mvp_idx() {
+        let bs = bins(&[0, 0]); // mmvd 0, mvp_idx_l0 0
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterCuSyntaxStats::default();
+        let gates = InterToolGates {
+            sps_affine_flag: false,
+            sps_admvp_flag: false, // Baseline mvp_idx fall-through
+            ..gates_all()
+        };
+        let d = read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            false, // P slice
+            3,
+            3,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d, CuSkipDecision::MvpIdx { l0: 0, l1: None });
+    }
+
+    /// cu_skip Baseline B-slice reads both mvp_idx_l0 and mvp_idx_l1.
+    #[test]
+    fn cu_skip_baseline_b_mvp_idx_pair() {
+        let bs = bins(&[0, 0, 0]); // mmvd 0, mvp_idx_l0 0, mvp_idx_l1 0
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterCuSyntaxStats::default();
+        let gates = InterToolGates {
+            sps_affine_flag: false,
+            sps_admvp_flag: false,
+            ..gates_all()
+        };
+        let d = read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            true, // B slice → mvp_idx_l1 present
+            3,
+            3,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d, CuSkipDecision::MvpIdx { l0: 0, l1: Some(0) });
+    }
+
+    /// cu_skip affine merge: mmvd 0, affine_flag 1 (≥8×8), affine_merge_idx 0.
+    #[test]
+    fn cu_skip_affine_merge() {
+        let bs = bins(&[0, 1, 0]); // mmvd 0, affine 1, aff_merge_idx 0
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterCuSyntaxStats::default();
+        let d = read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates_all(),
+            false,
+            3,
+            3,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(
+            d,
+            CuSkipDecision::AffineMerge {
+                affine_merge_idx: 0
+            }
+        );
+        assert_eq!(stats.affine.flag_bins, 1);
+    }
+
+    /// cu_skip MMVD: mmvd_flag 1 → MMVD branch (group absent, indices 0).
+    #[test]
+    fn cu_skip_mmvd() {
+        let bs = bins(&[1, 0, 0, 1, 0]); // mmvd 1, merge 0, distance 0, direction "1 0"
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = InterCuSyntaxStats::default();
+        let d = read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates_all(),
+            false,
+            3,
+            3,
+            &mut stats,
+        )
+        .unwrap();
+        match d {
+            CuSkipDecision::Mmvd(m) => assert!(m.flag),
+            other => panic!("expected MMVD skip, got {other:?}"),
+        }
+        assert_eq!(stats.mmvd.flag_bins, 1);
     }
 }
