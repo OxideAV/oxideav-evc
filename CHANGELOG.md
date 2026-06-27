@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-evc/compare/v0.0.3...v0.0.4) - 2026-06-27
+
+### Other
+
+- README + CHANGELOG — §7.3.8.4 Main-profile inter-CU syntax driver milestone
+- §7.3.8.4 cu_skip Main-profile merge driver + shared merge-branch reader
+- §7.3.8.4 Main-profile explicit-AMVP syntax driver (read_explicit_amvp)
+- §7.3.8.4 inter_pred_idc + bi_pred_idx explicit-AMVP syntax readers
+- §7.3.8.4 Main-profile inter-CU merge-branch syntax driver (inter_cu_syntax module)
+- §7.3.8.4 + §9.3.3 merge_idx syntax reader (amvr_syntax::read_merge_idx)
+- README — round 373 inter toolset rollup (affine corner resolution + per-cell TMVP POC + ATS-inter/MMVD/AMVR/DMVR)
+- §8.5.5 DMVR (decoder-side motion-vector refinement) search core (dmvr module)
+- §7.3.8.4 AMVR + inter-mode-gating CABAC syntax (amvr_syntax module)
+- §7.3.8.4 MMVD CABAC syntax reader (mmvd_syntax::read_mmvd_group)
+- §7.3.8.5 ATS-inter (sub-block transform) syntax + geometry (ats::read_ats_inter / AllowAtsInter / AtsInter)
+- §8.5.2.3.3 per-cell TMVP POC-distance wiring (tmvp::PocInputs / tmvp_merge_candidate_with_poc)
+- §8.5.3.4 affine corner CPMV resolution + corner-2/3 collocated-MV fallback (affine_cand::resolve_affine_corners)
+- §8.4.4 EIPD end-to-end picture-buffer reconstruct (picture::intra_reconstruct_cb_eipd)
+- §8.7.6 HTDF picture-buffer bridge (picture::apply_htdf_luma)
+- §8.7.6 Hadamard Transform Domain Filter (HTDF) post-reconstruction filter (htdf module)
+- §8.4.4.1 EIPD picture-buffer reference fetch (picture::fetch_eipd_refs)
+- §8.4.4.4 EIPD INTRA_HOR availLR-dependent right-column blend + §8.4.4.5 INTRA_VER
+- §8.4.4.1/.2 intra reference-sample construction + substitution (eipd_ref module)
+- README + CHANGELOG — §8.5.3.2/.4/.5/.6 affine candidate-list assembly landed
+- §8.5.3.2/.5 affine neighbour-position geometry helpers
+- §8.5.3.5/.3.1 affine AMVP CPMV-reconstruction bridge
+- §8.5.3.2/.4/.5/.6 affine merge + MVP candidate-list assembly (affine_cand module)
+- README + CHANGELOG — §8.5.3 affine derivation + §7.3.8.4 syntax milestone
+- §7.3.8.4 affine inter-syntax CABAC reads (affine_syntax module)
+- §8.5.3.3 inherited affine CPMV derivation from a neighbour block
+- §8.5.3.7-.10 affine subblock-MV geometric core (affine module)
+- README — document §8.5.2.3.3–.5 TMVP derivation + SideInfoGrid ColPic bridge
+- bridge SideInfoGrid ColPic motion field into TMVP derivation
+- §8.5.2.3.3–.5 temporal (collocated) merge candidate (TMVP) derivation
+- README — ATS-intra DST-VII/DCT-VIII now full {4,8,16,32} + apply_inverse bridge
+- bridge ATS-intra decode to inverse transform + end-to-end test
+- ATS-intra DST-VII/DCT-VIII 32×32 kernels — full {4,8,16,32} range
+- ATS-intra DST-VII/DCT-VIII 16×16 transform kernels
+- README — §8.5.2.3 ADMVP merge-mode derivation layer landed
+- §8.5.2.3.1 step-6 merge selection bridge (select_merge_candidate -> MergedMotion)
+- §8.5.2.3.6 HMVP merge-candidate derivation (HmvpCandList::hmvp_merge_candidates)
+- §8.5.2.3 ADMVP merge-mode candidate-list derivation (merge module)
+- README + CHANGELOG — EIPD CABAC syntax wiring + ATS-intra milestone
+- §7.3.8.5 ATS-intra syntax + Table 30 trType derivation + §8.7.4.3 DST-VII/DCT-VIII kernels
+- §8.4.2/.3 EIPD mode resolution — syntax→derivation→kernel composition
+- §7.3.8.4 EIPD intra-mode CABAC syntax reader (eipd_syntax) + §9.3.3.6 TB primitive
+- README + CHANGELOG — EIPD intra prediction + mode derivation milestone
+- §8.4.3 EIPD chroma intra-mode derivation (Table 16 + modeIdx skip)
+- §8.4.2 EIPD luma intra-mode derivation (candModeList/extCandModeList/remModeList)
+- §8.4.4.8/9/10 EIPD prediction-sample derivation (INTRA_BI/PLN/directional)
+- §8.9.8 tableNum==0 branch — promote round-284 pin to errata #81/#130 lock
+- §7.4.9.3 SUCO availability layer (SucoSizeLimits eqs. 68/69 + allow_split_unit_coding_order)
+- §7.3.8.3 split-unit recursion-geometry layer (split_unit_children + quad_split_children)
+- §7.3.8.3 CABAC-driven BTT split-syntax reader (decode_btt_split)
+- §8.9.4 spec-faithful chroma inverse-mapping apply (eqs. 1377-1382)
+- §7.4.8.3 BTT split-geometry layer (allowSplit* + SplitMode)
+- description reflects working Baseline pixel decoder
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - §7.3.8.4 Main-profile inter coding-unit syntax driver (`inter_cu_syntax` module) — the picture-level glue that threads the standalone `amvr_syntax` / `mmvd_syntax` / `affine_syntax` readers into the layered §7.3.8.4 mode-gating tree (spec lines 2811-3025). `read_inter_cu_mode` drives the `sps_admvp_flag == 1` non-skip path: `amvr_idx` (else inferred 0) → `merge_mode_flag` (read iff `amvr_idx == 0`, else inferred 1 per line 5827) → merge branch (`mmvd_flag ? MMVD group : affine_flag (size-gated ≥8×8) ? affine_merge_idx : merge_idx`), returning `merge: None` when `merge_mode_flag == 0` so the caller dispatches to the explicit-AMVP driver. `read_explicit_amvp` drives the `merge_mode_flag == 0` body (lines 2912-3025): `inter_pred_idc` (B only) → `bi_pred_idx` (PRED_BI only) → per-list `{ ref_idx? (gated `num_ref_idx_active_minus1>0 && bi_pred_idx==0`), abs_mvd[0]/sign, abs_mvd[1]/sign (gated `bi_pred_idx != 1` for L0 / `!= 2` for L1) }`, capturing `ExplicitAmvpDecision { inter_pred_idc, bi_pred_idx, l0, l1 }`. `read_cu_skip_main` drives the cu_skip merge tree (lines 2811-2832): a skip CU is implicitly a merge CU — `mmvd_flag ? MMVD : affine ? affine_merge_idx : (sps_admvp_flag ? merge_idx : mvp_idx_l0 [+ mvp_idx_l1 for B])`. The shared mmvd/affine/merge_idx fall-through is `read_merge_branch`; the `merge_idx` (TR cMax=(nCbW·nCbH≤32)?3:5, Table 49), `inter_pred_idc` (TR cMax=(!admvp||nCbW+nCbH>12)?2:1, Table 69), `bi_pred_idx` (TR cMax=2, Table 71) and `mvp_idx` (TR cMax=3, Table 48) syntax readers landed alongside in `amvr_syntax`/`inter_cu_syntax`, with `inter::merge_idx_c_max`/`merge_idx_ctx_inc`/`inter_pred_idc_c_max`/`inter_pred_idc_ctx_inc`/`bi_pred_idx_ctx_inc` + `PRED_L0/L1/BI` (Table 8) supplying the §9.3.3 geometry. All collapse to ctx `(0,0)` under Baseline `sps_cm_init_flag == 0`. 28 new tests (each merge/skip/explicit branch, the amvr/merge-mode inference corners, area-gated cMax boundaries, positional ctxInc, bi_pred_idx MVD-suppression gates, ref_idx presence; MVD-value asserts respect the test-encoder's documented bypass-tail defer). The remaining wiring is the slice-walker selecting these drivers on `sps_admvp_flag` and feeding the decoded decisions into the §8.5 MV-reconstruction (`merge`/`affine_cand`/`inter`) already in place.
