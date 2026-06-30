@@ -2681,6 +2681,112 @@ fn decode_admvp_skip_cu(
     }
 }
 
+/// §7.3.8.4 Main-profile non-skip MODE_INTER CU. Drives
+/// [`read_inter_cu_mode`](crate::inter_cu_syntax::read_inter_cu_mode):
+///
+/// * `merge_mode_flag == 1` → the merge branch is reconstructed from the
+///   §8.5.2.3 mergeCandList (regular / MMVD / affine — see
+///   [`admvp_merge_branch_to_pair`]).
+/// * `merge_mode_flag == 0` → the explicit-AMVP body
+///   ([`read_explicit_amvp`](crate::inter_cu_syntax::read_explicit_amvp))
+///   reads `inter_pred_idc` / `ref_idx` / MVD per list; the §8.5.2.4
+///   grid AMVP predictor is added to the eq.-145 amvr-shifted MVD to
+///   form each list's MV.
+#[allow(clippy::too_many_arguments)]
+fn decode_admvp_nonskip_inter_cu(
+    eng: &mut CabacEngine,
+    stats: &mut InterDecodeStats,
+    side_info: &SideInfoGrid,
+    hmvp: &crate::hmvp::HmvpCandList,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> Result<InterMotionPair> {
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
+    let decision = crate::inter_cu_syntax::read_inter_cu_mode(
+        eng,
+        EipdCtx::new(false),
+        inputs.inter_tool_gates,
+        log2_cb_width,
+        log2_cb_height,
+        &mut stats.admvp_syntax,
+    )?;
+
+    if let Some(branch) = decision.merge {
+        stats.admvp_merge_cus += 1;
+        let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
+        return admvp_merge_branch_to_pair(
+            branch,
+            side_info,
+            &hmvp_merge,
+            inputs.slice_is_b,
+            x0,
+            y0,
+            n_cb_w,
+            n_cb_h,
+        );
+    }
+
+    // merge_mode_flag == 0 → explicit-AMVP body.
+    stats.admvp_explicit_cus += 1;
+    let mut explicit_stats = crate::inter_cu_syntax::ExplicitAmvpStats::default();
+    let amvp = crate::inter_cu_syntax::read_explicit_amvp(
+        eng,
+        EipdCtx::new(false),
+        inputs.slice_is_b,
+        log2_cb_width,
+        log2_cb_height,
+        [
+            inputs.num_ref_idx_active_minus1_l0,
+            inputs.num_ref_idx_active_minus1_l1,
+        ],
+        &mut explicit_stats,
+    )?;
+    // Fold the explicit-AMVP bin counters into the aggregate gate stats so
+    // a fixture can assert the end-to-end bin budget.
+    stats.admvp_syntax.gate.inter_pred_idc_bins += explicit_stats.gate.inter_pred_idc_bins;
+    stats.admvp_syntax.gate.bi_pred_idx_bins += explicit_stats.gate.bi_pred_idx_bins;
+    stats.ref_idx_bins += explicit_stats.ref_idx_bins;
+    stats.abs_mvd_egk_bins += explicit_stats.abs_mvd_bins;
+    stats.mvd_sign_flag_bins += explicit_stats.mvd_sign_bins;
+
+    let amvr_idx = decision.amvr_idx;
+    let reconstruct_list = |entry: crate::inter_cu_syntax::ExplicitListMv,
+                            list_x: u8|
+     -> Result<(MotionVector, u32)> {
+        // mvpLX from the §8.5.2.4 grid AMVP — the explicit body does not
+        // carry an mvp_idx separate from the merge path here, so slot 0
+        // (the first spatial predictor) is used; the eq.-145 amvr shift
+        // scales the parsed MVD before the add.
+        let mvp = baseline_amvp_select_with_grid_and_hmvp(
+            0,
+            side_info,
+            hmvp,
+            x0 as i32,
+            y0 as i32,
+            n_cb_w as i32,
+            n_cb_h as i32,
+            entry.ref_idx as i8,
+            list_x,
+        );
+        let mvd = crate::inter::amvr_apply_to_mvd_vector(entry.mvd, amvr_idx)?;
+        Ok((mvp.wrapping_add(&mvd), entry.ref_idx))
+    };
+
+    let pred_l0 = match amvp.l0 {
+        Some(entry) => Some(reconstruct_list(entry, 0)?),
+        None => None,
+    };
+    let pred_l1 = match amvp.l1 {
+        Some(entry) => Some(reconstruct_list(entry, 1)?),
+        None => None,
+    };
+    Ok((pred_l0, pred_l1))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_inter_coding_unit(
     eng: &mut CabacEngine,
@@ -2835,7 +2941,42 @@ fn decode_inter_coding_unit(
                 log2_cb_height,
             );
         }
-        // MODE_INTER explicit MV.
+        // MODE_INTER.
+        if gates.sps_admvp_flag {
+            // §7.3.8.4 Main-profile non-skip inter CU: read_inter_cu_mode
+            // walks amvr_idx → merge_mode_flag → (merge branch | defer to
+            // explicit-AMVP). The merge branch reconstructs from the
+            // §8.5.2.3 mergeCandList; merge_mode_flag==0 hands off to
+            // read_explicit_amvp + §8.5.2.4 grid AMVP.
+            let (p0, p1) = decode_admvp_nonskip_inter_cu(
+                eng,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+            )?;
+            pred_l0 = p0;
+            pred_l1 = p1;
+            return decode_inter_cu_residual_and_reconstruct(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                pred_l0,
+                pred_l1,
+            );
+        }
+        // MODE_INTER explicit MV (Baseline sps_admvp_flag == 0).
         let mut inter_pred_idc = 0u32; // PRED_L0 default
         if inputs.slice_is_b {
             // Baseline + sps_admvp_flag = 0 → cMax = 2 (TR).
@@ -2922,6 +3063,48 @@ fn decode_inter_coding_unit(
             None
         };
     }
+    decode_inter_cu_residual_and_reconstruct(
+        eng,
+        pic,
+        stats,
+        side_info,
+        hmvp,
+        inputs,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        pred_l0,
+        pred_l1,
+    )
+}
+
+/// §7.3.8.5 + §8.5 — the shared inter-CU tail: decode the single-tree
+/// `cbf_*` flags + `cu_qp_delta`, stamp the deblocking / HMVP motion
+/// state, decode the per-component residual, and run motion compensation.
+///
+/// Factored out of [`decode_inter_coding_unit`] so the Baseline
+/// (`sps_admvp_flag == 0`) and Main-profile (`sps_admvp_flag == 1`)
+/// motion-derivation front-ends both feed the identical reconstruction
+/// back-end once `pred_l0` / `pred_l1` are resolved.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_cu_residual_and_reconstruct(
+    eng: &mut CabacEngine,
+    pic: &mut YuvPicture,
+    stats: &mut InterDecodeStats,
+    side_info: &mut SideInfoGrid,
+    hmvp: &mut crate::hmvp::HmvpCandList,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    pred_l0: Option<(MotionVector, u32)>,
+    pred_l1: Option<(MotionVector, u32)>,
+) -> Result<()> {
+    let walk = inputs.walk;
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
     // CBFs (cbf_luma + cbf_cb/cbf_cr in single-tree). Per §7.3.8.5 the
     // path through cbf_all is gated by SINGLE_TREE && !MODE_INTRA. The
     // round-5 path decodes residual coefficients when CBF=1 and adds
@@ -5527,6 +5710,157 @@ mod tests {
         assert_eq!(stats.admvp_syntax.affine.flag_bins, 0);
         // Zero-MV merge candidate → MV (0,0), stamped Inter.
         assert_eq!(stats.coding_units, 1);
+    }
+
+    /// Round 381: a non-skip MODE_INTER CU on the admvp path with
+    /// `merge_mode_flag == 1` routes through `read_inter_cu_mode` and the
+    /// merge branch. sps_amvr/mmvd/affine off → the tree is
+    /// `merge_mode_flag "1"` then `merge_idx`.
+    #[test]
+    fn round381_admvp_nonskip_merge_mode() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (MODE_INTER)
+                                      // admvp non-skip: sps_amvr off → no amvr_idx; merge_mode_flag "1";
+                                      // sps_mmvd off → no mmvd_flag; sps_affine off → no affine_flag;
+                                      // merge_idx "0".
+        enc.encode_decision(0, 0, 1); // merge_mode_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_merge_cus, 1, "one admvp merge-mode CU");
+        assert_eq!(stats.admvp_skip_cus, 0);
+        assert_eq!(stats.admvp_explicit_cus, 0);
+        assert_eq!(stats.pred_mode_flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.gate.merge_mode_flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.gate.merge_idx_bins, 1);
+        // amvr off → no amvr_idx bin.
+        assert_eq!(stats.admvp_syntax.gate.amvr_idx_bins, 0);
+    }
+
+    /// Round 381: a non-skip MODE_INTER CU on the admvp path with
+    /// `merge_mode_flag == 0` defers to `read_explicit_amvp`. P-slice
+    /// uni-pred: PRED_L0 forced, num_ref_idx=0 → no ref_idx, then the
+    /// L0 MVD pair (EG0 bypass + sign). The CU is recorded as an
+    /// admvp-explicit CU; the abs_mvd counter proves the MVD was read.
+    #[test]
+    fn round381_admvp_nonskip_explicit_amvp() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (MODE_INTER)
+                                      // admvp non-skip: merge_mode_flag "0" → explicit-AMVP. P slice →
+                                      // no inter_pred_idc (PRED_L0). num_ref_idx=0 → no ref_idx. MVD:
+                                      // abs_mvd_x "0" (EG0 → no sign), abs_mvd_y "0".
+        enc.encode_decision(0, 0, 0); // merge_mode_flag = 0
+        enc.encode_bypass(0); // abs_mvd_l0[0] EG0 = 0
+        enc.encode_bypass(0); // abs_mvd_l0[1] EG0 = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_explicit_cus, 1, "one admvp explicit CU");
+        assert_eq!(stats.admvp_merge_cus, 0);
+        assert_eq!(stats.admvp_skip_cus, 0);
+        assert_eq!(stats.admvp_syntax.gate.merge_mode_flag_bins, 1);
+        // P-slice → no inter_pred_idc bin; uni-pred L0.
+        assert_eq!(stats.admvp_syntax.gate.inter_pred_idc_bins, 0);
+        // Two abs_mvd EG0 components (x, y) were read.
+        assert_eq!(stats.abs_mvd_egk_bins, 2);
+        assert_eq!(stats.uni_pred_cus, 1);
     }
 
     /// Round 100: a `cu_skip` inter CU has no residual (cbf inferred 0),
