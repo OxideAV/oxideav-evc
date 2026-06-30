@@ -5863,6 +5863,107 @@ mod tests {
         assert_eq!(stats.uni_pred_cus, 1);
     }
 
+    /// Round 381: `admvp_merge_motion_from_grid` selects a real spatial
+    /// (A1, left) neighbour from a populated grid. Stamp an inter CU at
+    /// the left of an 8×8 CU at (8, 0): A1 = (x-1, y+H-1) = (7, 7) lands
+    /// in that block, so `merge_idx = 0` returns its motion.
+    #[test]
+    fn round381_admvp_merge_selects_spatial_neighbour() {
+        let mut grid = SideInfoGrid::new(32, 32);
+        // Stamp an inter CU covering x∈[0,8), y∈[0,8) with a known MV.
+        grid.stamp_block(
+            0,
+            0,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 12,
+                mv_l0_y: -8,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        // Current CU at (8, 0), 8×8. A1 = (7, 7) is inside the stamped
+        // block. P slice, no HMVP, merge_idx 0.
+        let m = admvp_merge_motion_from_grid(0, &grid, &[], false, 8, 0, 8, 8)
+            .expect("merge candidate must resolve");
+        assert!(m.pred_flag_l0, "L0 active from neighbour");
+        assert!(!m.pred_flag_l1, "neighbour was L0-only");
+        assert_eq!(m.mv_l0, MotionVector { x: 12, y: -8 });
+        assert_eq!(m.ref_idx_l0, 0);
+    }
+
+    /// Round 381: an all-intra grid yields no spatial merge candidate, so
+    /// the §8.5.2.3.8 zero-MV fill provides `merge_idx = 0` → MV (0,0).
+    #[test]
+    fn round381_admvp_merge_zero_fill_when_no_neighbour() {
+        let grid = SideInfoGrid::new(32, 32);
+        let m = admvp_merge_motion_from_grid(0, &grid, &[], false, 0, 0, 16, 16)
+            .expect("zero-fill guarantees a candidate");
+        assert!(m.pred_flag_l0);
+        assert_eq!(m.mv_l0, MotionVector { x: 0, y: 0 });
+    }
+
+    /// Round 381: `merge_neighbour_mv_from_grid` reports an intra cell as
+    /// unavailable (§6.4.3) and an inter cell with a valid ref as
+    /// available with its stored motion.
+    #[test]
+    fn round381_merge_neighbour_grid_availability() {
+        let mut grid = SideInfoGrid::new(16, 16);
+        // Default (intra) cell → unavailable.
+        let nb = merge_neighbour_mv_from_grid(&grid, 0, 0);
+        assert!(!nb.available);
+        // Out-of-picture negative coords → unavailable.
+        assert!(!merge_neighbour_mv_from_grid(&grid, -1, 4).available);
+        // Stamp an inter cell.
+        grid.stamp_block(
+            4,
+            4,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 3,
+                mv_l0_y: 5,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let nb = merge_neighbour_mv_from_grid(&grid, 4, 4);
+        assert!(nb.available);
+        assert!(nb.pred_flag_l0);
+        assert!(!nb.pred_flag_l1);
+        assert_eq!(nb.mv_l0, MotionVector { x: 3, y: 5 });
+    }
+
+    /// Round 381: MMVD merge applies the §8.5.2.3.9 axis-aligned offset
+    /// (eqs. 133/134) on top of the selected base merge candidate.
+    /// distance_idx 0 → distance 1, direction_idx 0 → (+1, 0). The base
+    /// candidate is the zero-fill (0,0), so the result is (1, 0).
+    #[test]
+    fn round381_admvp_mmvd_offset_applied() {
+        use crate::mmvd_syntax::MmvdDecision;
+        let grid = SideInfoGrid::new(32, 32);
+        let branch = MergeBranch::Mmvd(MmvdDecision {
+            flag: true,
+            group_idx: 0,
+            merge_idx: 0,
+            distance_idx: 0,  // MmvdDistance = 1
+            direction_idx: 0, // (+1, 0)
+        });
+        let (p0, _p1) =
+            admvp_merge_branch_to_pair(branch, &grid, &[], false, 0, 0, 16, 16).unwrap();
+        let (mv, _) = p0.expect("L0 present on zero-fill base");
+        assert_eq!(mv, MotionVector { x: 1, y: 0 }, "base (0,0) + offset (1,0)");
+    }
+
     /// Round 100: a `cu_skip` inter CU has no residual (cbf inferred 0),
     /// so the §7.3.8.5 `cu_qp_delta_abs` presence condition `(cbf_luma ||
     /// cbf_cb || cbf_cr)` is false even when `cu_qp_delta_enabled_flag`
