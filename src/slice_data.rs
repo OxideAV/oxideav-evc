@@ -5964,6 +5964,73 @@ mod tests {
         assert_eq!(mv, MotionVector { x: 1, y: 0 }, "base (0,0) + offset (1,0)");
     }
 
+    /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The
+    /// 32×32 CU has `(nCbW + nCbH) > 12`, so the §8.5.2.3.8 zero-MV fill
+    /// for `merge_idx = 0` produces a bi-predictive candidate (both lists
+    /// active, MV (0,0)). The CU is counted as a bi-pred CU end-to-end.
+    #[test]
+    fn round381_admvp_cu_skip_b_slice_bipred() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let mk = || RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+                                      // admvp cu_skip: sps_mmvd/affine off → merge_idx only. 32×32 →
+                                      // mLSize 6, cMax 5; merge_idx "0".
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [mk()];
+        let ref_list_l1 = [mk()];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: true,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &ref_list_l1,
+            inter_tool_gates: gates,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_skip_cus, 1);
+        assert_eq!(stats.bi_pred_cus, 1, "B-slice zero-fill is bi-predictive");
+        assert_eq!(stats.uni_pred_cus, 0);
+    }
+
     /// Round 100: a `cu_skip` inter CU has no residual (cbf inferred 0),
     /// so the §7.3.8.5 `cu_qp_delta_abs` presence condition `(cbf_luma ||
     /// cbf_cb || cbf_cr)` is false even when `cu_qp_delta_enabled_flag`

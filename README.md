@@ -270,15 +270,30 @@ Baseline `mvp_idx` fall-through). The `merge_idx` (Table 49),
 (Table 48) syntax readers + their §9.3.3 area-dependent `cMax` /
 positional ctxInc geometry (`inter::merge_idx_c_max` etc.) landed with it.
 
-Still deferred: the slice-walker selecting these CU-syntax drivers on
-`sps_admvp_flag` and feeding the decoded `InterCuModeDecision` /
-`ExplicitAmvpDecision` / `CuSkipDecision` into the §8.5 MV-reconstruction,
-together with the EIPD + ATS-intra + merge + affine data-plane layers,
-into a full Main-profile `coding_unit()` reconstruction (needs the
-§6.4.1 neighbour-mode grid, the per-position MV store, the §8.5.5.2 DMVR
-bilinear interpolation data plane, and `RefPictureView`/DPB POC threading
-so the slice-walker can supply `PocInputs` + the ColPic reference-list POC
-map).
+The slice-walker now **selects these CU-syntax drivers on
+`sps_admvp_flag`** inside `decode_inter_coding_unit`: `InterToolGates`
+threads through `InterDecodeInputs` (the all-false default is exactly the
+historical Baseline `sps_admvp_flag == 0` inline path), and on
+`sps_admvp_flag == 1` each CU routes through `read_cu_skip_main`
+(cu_skip), `read_inter_cu_mode` (non-skip merge-mode) and
+`read_explicit_amvp` (non-skip `merge_mode_flag == 0`). The decoded
+`CuSkipDecision` / `InterCuModeDecision` / `ExplicitAmvpDecision` is then
+projected into per-CU motion: the merge branches build the §8.5.2.3 ADMVP
+`mergeCandList` from the per-4×4 `SideInfoGrid` spatial neighbours +
+HMVP merge candidates and run the step-6 selection
+(`admvp_merge_motion_from_grid`); the explicit body adds the §8.5.2.4
+grid AMVP predictor to the eq.-145 amvr-shifted MVD. MMVD applies the
+§8.5.2.3.9 axis-aligned offset (eqs. 133/134) to the base candidate. The
+shared CBF / residual / motion-compensation tail
+(`decode_inter_cu_residual_and_reconstruct`) is now common to the
+Baseline and Main-profile front-ends.
+
+Still deferred on this path: the §8.5.2.3.3 collocated temporal merge
+candidate (needs the ColPic motion field + DPB POC threading), the
+POC-scaled MMVD inter-list asymmetry (§8.5.2.3.9 eqs. 531-616), the
+affine CPMV sub-block motion field (§8.5.3/§8.5.5 — currently a
+translational fallback), and the explicit-affine sub-tree (the
+`sps_admvp_flag == 1` `affine_flag` body, spec lines 2940-2980).
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ADCC / ALF / DRA / affine slice-walk) still
