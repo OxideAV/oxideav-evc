@@ -2143,12 +2143,14 @@ fn add_chroma_residual_to_block(
 // Round-4 Baseline P / B slice decode pipeline.
 // =====================================================================
 
+use crate::eipd_syntax::EipdCtx;
 #[cfg(test)]
 use crate::inter::build_amvp_list_baseline;
 use crate::inter::{
     average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
     MotionVector, RefPictureView,
 };
+use crate::inter_cu_syntax::{CuSkipDecision, InterCuSyntaxStats, InterToolGates, MergeBranch};
 
 /// Inputs for the Baseline P/B decode entry point.
 ///
@@ -2180,6 +2182,14 @@ pub struct InterDecodeInputs<'a, 'b> {
     /// slices; for B slices must contain at least
     /// `num_ref_idx_active_minus1_l1 + 1` entries.
     pub ref_list_l1: &'b [RefPictureView<'a>],
+    /// §7.3.8.4 Main-profile inter-tool gates (`sps_admvp_flag`,
+    /// `sps_amvr_flag`, `sps_mmvd_flag`, `sps_affine_flag`,
+    /// `mmvd_group_enable_flag`). The all-false [`InterToolGates::default`]
+    /// is exactly the Baseline `sps_admvp_flag == 0` toolset the
+    /// historical inline path implements; setting `sps_admvp_flag` routes
+    /// each CU through the §7.3.8.4 Main-profile syntax drivers in
+    /// [`crate::inter_cu_syntax`].
+    pub inter_tool_gates: InterToolGates,
 }
 
 impl<'a, 'b> InterDecodeInputs<'a, 'b> {
@@ -2254,6 +2264,23 @@ pub struct InterDecodeStats {
     /// (§7.3.8.2 → §8.9), sized to the picture; one triplet per CTU so the
     /// post-filter pass can mask the ALF apply per coding tree block.
     pub alf_ctb_map: crate::alf::AlfCtbMap,
+    /// Round 381: aggregate §7.3.8.4 Main-profile (`sps_admvp_flag == 1`)
+    /// inter-CU syntax-driver bin counters. Non-zero only when the
+    /// `inter_tool_gates.sps_admvp_flag` path fires; every Baseline
+    /// fixture leaves this at default.
+    pub admvp_syntax: InterCuSyntaxStats,
+    /// Round 381: coding units that resolved through the §7.3.8.4
+    /// Main-profile cu_skip merge tree (`read_cu_skip_main`). Disjoint
+    /// from the Baseline `mvp_idx` skip path.
+    pub admvp_skip_cus: u32,
+    /// Round 381: coding units that resolved through the §7.3.8.4
+    /// Main-profile non-skip merge-mode tree (`read_inter_cu_mode` with
+    /// `merge_mode_flag == 1`).
+    pub admvp_merge_cus: u32,
+    /// Round 381: coding units that resolved through the §7.3.8.4
+    /// Main-profile explicit-AMVP body (`read_explicit_amvp`, i.e.
+    /// `merge_mode_flag == 0` on the `sps_admvp_flag == 1` path).
+    pub admvp_explicit_cus: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -2467,6 +2494,193 @@ fn decode_inter_split_unit(
     )
 }
 
+/// The per-CU motion pair the inter-CU reconstruction path consumes:
+/// `(mv, ref_idx)` for L0 and L1, each `None` when the list is inactive.
+type InterMotionPair = (Option<(MotionVector, u32)>, Option<(MotionVector, u32)>);
+
+/// Project a [`crate::merge::MergedMotion`] into the
+/// `(pred_l0, pred_l1)` pair the inter-CU reconstruction path expects.
+fn merged_motion_to_pair(m: crate::merge::MergedMotion) -> InterMotionPair {
+    let l0 = if m.pred_flag_l0 {
+        Some((m.mv_l0, m.ref_idx_l0.max(0) as u32))
+    } else {
+        None
+    };
+    let l1 = if m.pred_flag_l1 {
+        Some((m.mv_l1, m.ref_idx_l1.max(0) as u32))
+    } else {
+        None
+    };
+    (l0, l1)
+}
+
+/// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
+/// decoder's [`HmvpCandList`](crate::hmvp::HmvpCandList) (empty when the
+/// list holds fewer than four entries, per the §8.5.2.3.1 step-3 gate).
+fn admvp_hmvp_merge_cands(
+    hmvp: &crate::hmvp::HmvpCandList,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Vec<crate::inter::MergeCand> {
+    let m_l_size = if (n_cb_w * n_cb_h) <= 32 { 4 } else { 6 };
+    hmvp.hmvp_merge_candidates(m_l_size, n_cb_w as i32, n_cb_h as i32)
+}
+
+/// Resolve a §7.3.8.4 merge-branch decision (regular `merge_idx`, MMVD,
+/// or affine merge) into the per-CU `(pred_l0, pred_l1)` motion pair.
+///
+/// * **Regular** — §8.5.2.3.1 step 6: assemble `mergeCandList` from the
+///   grid + HMVP and select `mergeCandList[ merge_idx ]`.
+/// * **MMVD** — select the base candidate `mmvd_merge_idx` then add the
+///   §8.5.2.3.9 `MmvdOffset` (eqs. 133/134) to each active list's MV.
+///   The full POC-scaled inter-list offset asymmetry (eqs. 531-616) is a
+///   documented follow-up — it needs `DiffPicOrderCnt` between the L0/L1
+///   references, which the inter path does not yet thread; the
+///   axis-aligned offset is applied symmetrically here.
+/// * **AffineMerge** — the affine CPMV reconstruction (§8.5.3) needs the
+///   §8.5.5 sub-block motion field, a follow-up; the base
+///   `mergeCandList[ 0 ]` translational fallback is used so the bitstream
+///   still parses and a coarse motion is produced.
+#[allow(clippy::too_many_arguments)]
+fn admvp_merge_branch_to_pair(
+    branch: MergeBranch,
+    side_info: &SideInfoGrid,
+    hmvp_merge: &[crate::inter::MergeCand],
+    slice_is_b: bool,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Result<InterMotionPair> {
+    let select = |merge_idx: u32| {
+        admvp_merge_motion_from_grid(
+            merge_idx, side_info, hmvp_merge, slice_is_b, x0, y0, n_cb_w, n_cb_h,
+        )
+    };
+    match branch {
+        MergeBranch::Regular { merge_idx } => {
+            let m = select(merge_idx).ok_or_else(|| {
+                Error::invalid("evc admvp merge: merge_idx past derived mergeCandList length")
+            })?;
+            Ok(merged_motion_to_pair(m))
+        }
+        MergeBranch::Mmvd(d) => {
+            let base = select(d.merge_idx).ok_or_else(|| {
+                Error::invalid("evc admvp mmvd: mmvd_merge_idx past derived mergeCandList length")
+            })?;
+            let off = crate::inter::mmvd_offset(d.distance_idx, d.direction_idx)?;
+            let mut m = base;
+            if m.pred_flag_l0 {
+                m.mv_l0 = m.mv_l0.wrapping_add(&off);
+            }
+            if m.pred_flag_l1 {
+                m.mv_l1 = m.mv_l1.wrapping_add(&off);
+            }
+            Ok(merged_motion_to_pair(m))
+        }
+        MergeBranch::AffineMerge { .. } => {
+            // Translational fallback (CPMV sub-block field deferred).
+            let m = select(0)
+                .ok_or_else(|| Error::invalid("evc admvp affine-merge: empty mergeCandList"))?;
+            Ok(merged_motion_to_pair(m))
+        }
+    }
+}
+
+/// §7.3.8.4 Main-profile cu_skip merge CU. Drives [`read_cu_skip_main`]
+/// then reconstructs the per-CU motion from the resolved
+/// [`CuSkipDecision`].
+#[allow(clippy::too_many_arguments)]
+fn decode_admvp_skip_cu(
+    eng: &mut CabacEngine,
+    stats: &mut InterDecodeStats,
+    side_info: &SideInfoGrid,
+    hmvp: &crate::hmvp::HmvpCandList,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> Result<InterMotionPair> {
+    let n_cb_w = 1u32 << log2_cb_width;
+    let n_cb_h = 1u32 << log2_cb_height;
+    let decision = crate::inter_cu_syntax::read_cu_skip_main(
+        eng,
+        EipdCtx::new(false),
+        inputs.inter_tool_gates,
+        inputs.slice_is_b,
+        log2_cb_width,
+        log2_cb_height,
+        &mut stats.admvp_syntax,
+    )?;
+    stats.admvp_skip_cus += 1;
+    let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
+    match decision {
+        CuSkipDecision::Merge { merge_idx } => admvp_merge_branch_to_pair(
+            MergeBranch::Regular { merge_idx },
+            side_info,
+            &hmvp_merge,
+            inputs.slice_is_b,
+            x0,
+            y0,
+            n_cb_w,
+            n_cb_h,
+        ),
+        CuSkipDecision::Mmvd(d) => admvp_merge_branch_to_pair(
+            MergeBranch::Mmvd(d),
+            side_info,
+            &hmvp_merge,
+            inputs.slice_is_b,
+            x0,
+            y0,
+            n_cb_w,
+            n_cb_h,
+        ),
+        CuSkipDecision::AffineMerge { affine_merge_idx } => admvp_merge_branch_to_pair(
+            MergeBranch::AffineMerge { affine_merge_idx },
+            side_info,
+            &hmvp_merge,
+            inputs.slice_is_b,
+            x0,
+            y0,
+            n_cb_w,
+            n_cb_h,
+        ),
+        CuSkipDecision::MvpIdx { l0, l1 } => {
+            // The Baseline `mvp_idx` fall-through can still appear on the
+            // admvp driver when `sps_admvp_flag == 0` is passed through; on
+            // this path `sps_admvp_flag == 1`, so this arm is unreachable
+            // for well-formed Main-profile streams. Reconstruct via the
+            // grid AMVP for robustness.
+            let mv_l0 = baseline_amvp_select_with_grid_and_hmvp(
+                l0,
+                side_info,
+                hmvp,
+                x0 as i32,
+                y0 as i32,
+                n_cb_w as i32,
+                n_cb_h as i32,
+                0,
+                0,
+            );
+            let mv_l1 = l1.map(|idx| {
+                baseline_amvp_select_with_grid_and_hmvp(
+                    idx,
+                    side_info,
+                    hmvp,
+                    x0 as i32,
+                    y0 as i32,
+                    n_cb_w as i32,
+                    n_cb_h as i32,
+                    0,
+                    1,
+                )
+            });
+            Ok((Some((mv_l0, 0)), mv_l1.map(|mv| (mv, 0))))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_inter_coding_unit(
     eng: &mut CabacEngine,
@@ -2489,7 +2703,27 @@ fn decode_inter_coding_unit(
     stats.cu_skip_flag_bins += 1;
     let pred_l0;
     let pred_l1;
-    if cu_skip {
+    let gates = inputs.inter_tool_gates;
+    if cu_skip && gates.sps_admvp_flag {
+        // §7.3.8.4 Main-profile cu_skip merge tree (spec lines 2811-2832):
+        // a skip CU is implicitly a merge CU. The [`read_cu_skip_main`]
+        // syntax driver walks `mmvd_flag → affine_flag → merge_idx`, then
+        // the §8.5.2.3 ADMVP merge-candidate list (assembled here from the
+        // per-4×4 grid + HMVP) projects `merge_idx` into the per-CU motion.
+        let (p0, p1) = decode_admvp_skip_cu(
+            eng,
+            stats,
+            side_info,
+            hmvp,
+            inputs,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+        )?;
+        pred_l0 = p0;
+        pred_l1 = p1;
+    } else if cu_skip {
         // sps_admvp_flag = 0 path: mvp_idx_l0 (TR cMax=3, FL prefix bins
         // bypass-friendly under sps_cm_init_flag=0). Round-4 reads up to
         // 3 leading 1-bins as a U binarisation; mvp_idx ∈ 0..=3.
@@ -2969,6 +3203,93 @@ fn baseline_amvp_select_with_grid_and_hmvp(
         }
     }
     chosen
+}
+
+/// §8.5.2.3 — read the per-position [`crate::merge::NeighbourMv`] motion
+/// state at luma location `(x, y)` from the per-4×4 [`SideInfoGrid`].
+///
+/// A grid cell contributes an available motion neighbour only when it is
+/// an inter-coded CU with at least one valid (≠ −1) reference index
+/// (§6.4.3 `availableN`: an intra / IBC / out-of-picture cell yields the
+/// default `available == false`). The stored `MvLX` are already in
+/// 1/4-pel units, matching the [`MergeCand`](crate::inter::MergeCand)
+/// contract the §8.5.2.3.1 assembly consumes.
+fn merge_neighbour_mv_from_grid(grid: &SideInfoGrid, x: i32, y: i32) -> crate::merge::NeighbourMv {
+    if x < 0 || y < 0 {
+        return crate::merge::NeighbourMv::default();
+    }
+    let info = grid.at((x >> 2) as usize, (y >> 2) as usize);
+    if !matches!(info.pred_mode, CuPredMode::Inter) {
+        return crate::merge::NeighbourMv::default();
+    }
+    let l0 = info.ref_idx_l0 != -1;
+    let l1 = info.ref_idx_l1 != -1;
+    if !l0 && !l1 {
+        return crate::merge::NeighbourMv::default();
+    }
+    crate::merge::NeighbourMv {
+        available: true,
+        pred_flag_l0: l0,
+        pred_flag_l1: l1,
+        ref_idx_l0: info.ref_idx_l0 as i32,
+        ref_idx_l1: info.ref_idx_l1 as i32,
+        mv_l0: MotionVector {
+            x: info.mv_l0_x,
+            y: info.mv_l0_y,
+        },
+        mv_l1: MotionVector {
+            x: info.mv_l1_x,
+            y: info.mv_l1_y,
+        },
+    }
+}
+
+/// §8.5.2.3.1 + §8.5.2.3.2 — assemble the ADMVP `mergeCandList` from the
+/// per-4×4 [`SideInfoGrid`] spatial neighbours (plus the supplied HMVP
+/// merge candidates) and project `mergeCandList[ merge_idx ]` into the
+/// per-CU [`MergedMotion`](crate::merge::MergedMotion).
+///
+/// The collocated temporal candidate (§8.5.2.3.3) is not yet threaded —
+/// the inter path does not carry the collocated picture's motion field —
+/// so `temporal` is passed `None`; the zero-MV fill (§8.5.2.3.8)
+/// guarantees the list is non-empty so any in-range `merge_idx` resolves.
+/// Returns `None` only when `merge_idx` lands past the filled length,
+/// which the caller surfaces as a decode error.
+#[allow(clippy::too_many_arguments)]
+fn admvp_merge_motion_from_grid(
+    merge_idx: u32,
+    side_info: &SideInfoGrid,
+    hmvp_merge: &[crate::inter::MergeCand],
+    slice_is_b: bool,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Option<crate::merge::MergedMotion> {
+    use crate::merge::{build_merge_cand_list, select_merge_candidate, MergeSliceType};
+    let slice_type = if slice_is_b {
+        MergeSliceType::B
+    } else {
+        MergeSliceType::P
+    };
+    // Baseline split order (`sps_suco_flag == 0`) gives every CU a left
+    // neighbour only — availLR = LR_10 (§6.4.2 eq. 23).
+    let avail_lr = crate::neighbour::AvailLr::Lr10;
+    let mut out = [crate::inter::MergeCand::default(); 8];
+    let n = build_merge_cand_list(
+        x0 as i32,
+        y0 as i32,
+        n_cb_w as i32,
+        n_cb_h as i32,
+        avail_lr,
+        slice_type,
+        |xn, yn| merge_neighbour_mv_from_grid(side_info, xn, yn),
+        None,
+        hmvp_merge,
+        &mut out,
+    )
+    .ok()?;
+    select_merge_candidate(&out, n, merge_idx as usize)
 }
 
 fn decode_signed_mvd(
@@ -3934,6 +4255,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(pic.width, 32);
@@ -4046,6 +4368,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
+            inter_tool_gates: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -4255,6 +4578,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         // The decode may surface Err if the bypass-bit guess is wrong;
         // we accept either a clean decode or a bitreader exhaustion (the
@@ -4605,6 +4929,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -4646,6 +4971,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &[],
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("ref_list_l0"));
@@ -4697,6 +5023,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("num_ref_idx_active_minus1_l0"));
@@ -5108,6 +5435,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -5117,6 +5445,88 @@ mod tests {
         assert_eq!(stats.ibc_cus, 0);
         assert_eq!(stats.ibc_abs_mvd_bins, 0);
         assert_eq!(stats.ibc_mvd_sign_bins, 0);
+    }
+
+    /// Round 381: a `cu_skip` CU on the §7.3.8.4 Main-profile
+    /// (`sps_admvp_flag == 1`) path routes through `read_cu_skip_main`.
+    /// With `sps_mmvd_flag == 0` and `sps_affine_flag == 0` the merge
+    /// tree reads only the `merge_idx` (TR) element — here `merge_idx = 0`
+    /// selects the §8.5.2.3.8 zero-MV merge candidate (the grid has no
+    /// inter neighbour, so the list is the zero-fill). The CU is recorded
+    /// as an admvp-skip CU and the Baseline `mvp_idx` counter stays zero.
+    #[test]
+    fn round381_admvp_cu_skip_regular_merge() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+                                      // admvp merge tree: sps_mmvd off (no mmvd_flag), sps_affine off
+                                      // (no affine_flag) → merge_idx TR cMax = (nCbW*nCbH<=32?4:6)-1.
+                                      // 32×32 → cMax 5; merge_idx "0" = single 0 bin.
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_amvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_affine_flag: false,
+            mmvd_group_enable_flag: false,
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_skip_cus, 1, "one admvp cu_skip CU decoded");
+        assert_eq!(
+            stats.admvp_syntax.gate.merge_idx_bins, 1,
+            "exactly one merge_idx bin"
+        );
+        // Baseline mvp_idx path was NOT taken.
+        assert_eq!(stats.mvp_idx_bins, 0, "no Baseline mvp_idx bins");
+        // No MMVD / affine bins on this gate config.
+        assert_eq!(stats.admvp_syntax.mmvd.flag_bins, 0);
+        assert_eq!(stats.admvp_syntax.affine.flag_bins, 0);
+        // Zero-MV merge candidate → MV (0,0), stamped Inter.
+        assert_eq!(stats.coding_units, 1);
     }
 
     /// Round 100: a `cu_skip` inter CU has no residual (cbf inferred 0),
@@ -5179,6 +5589,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -5539,6 +5950,7 @@ mod tests {
             num_ref_idx_active_minus1_l1: 0,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(

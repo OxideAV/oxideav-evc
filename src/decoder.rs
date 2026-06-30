@@ -755,6 +755,7 @@ impl EvcDecoder {
             num_ref_idx_active_minus1_l1,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
+            inter_tool_gates: Default::default(),
         };
         let (pic, stats) =
             crate::slice_data::decode_baseline_inter_slice(slice_data_bytes, inputs)?;

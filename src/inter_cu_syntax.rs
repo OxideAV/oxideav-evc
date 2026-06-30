@@ -58,7 +58,7 @@ use crate::inter::{MotionVector, PRED_BI, PRED_L0, PRED_L1};
 use crate::mmvd_syntax::{MmvdDecision, MmvdSyntaxStats};
 
 /// SPS / PPS gates that select which §7.3.8.4 inter tools are present.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterToolGates {
     /// `sps_amvr_flag` — adaptive motion-vector resolution present.
     pub sps_amvr_flag: bool,
