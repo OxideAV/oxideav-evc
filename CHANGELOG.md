@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-evc/compare/v0.0.3...v0.0.4) - 2026-06-30
+
+### Other
+
+- CHANGELOG — §7.3.8.4 admvp coding_unit() integration round-381
+- B-slice bi-pred admvp coverage + README round-381 update
+- validate §8.5.2.3 admvp merge-list reconstruction from populated grid
+- wire §7.3.8.4 admvp non-skip merge-mode + explicit-AMVP into coding_unit()
+- wire §7.3.8.4 admvp cu_skip merge tree into coding_unit() decode
+- README + CHANGELOG — §7.3.8.4 Main-profile inter-CU syntax driver milestone
+- §7.3.8.4 cu_skip Main-profile merge driver + shared merge-branch reader
+- §7.3.8.4 Main-profile explicit-AMVP syntax driver (read_explicit_amvp)
+- §7.3.8.4 inter_pred_idc + bi_pred_idx explicit-AMVP syntax readers
+- §7.3.8.4 Main-profile inter-CU merge-branch syntax driver (inter_cu_syntax module)
+- §7.3.8.4 + §9.3.3 merge_idx syntax reader (amvr_syntax::read_merge_idx)
+- README — round 373 inter toolset rollup (affine corner resolution + per-cell TMVP POC + ATS-inter/MMVD/AMVR/DMVR)
+- §8.5.5 DMVR (decoder-side motion-vector refinement) search core (dmvr module)
+- §7.3.8.4 AMVR + inter-mode-gating CABAC syntax (amvr_syntax module)
+- §7.3.8.4 MMVD CABAC syntax reader (mmvd_syntax::read_mmvd_group)
+- §7.3.8.5 ATS-inter (sub-block transform) syntax + geometry (ats::read_ats_inter / AllowAtsInter / AtsInter)
+- §8.5.2.3.3 per-cell TMVP POC-distance wiring (tmvp::PocInputs / tmvp_merge_candidate_with_poc)
+- §8.5.3.4 affine corner CPMV resolution + corner-2/3 collocated-MV fallback (affine_cand::resolve_affine_corners)
+- §8.4.4 EIPD end-to-end picture-buffer reconstruct (picture::intra_reconstruct_cb_eipd)
+- §8.7.6 HTDF picture-buffer bridge (picture::apply_htdf_luma)
+- §8.7.6 Hadamard Transform Domain Filter (HTDF) post-reconstruction filter (htdf module)
+- §8.4.4.1 EIPD picture-buffer reference fetch (picture::fetch_eipd_refs)
+- §8.4.4.4 EIPD INTRA_HOR availLR-dependent right-column blend + §8.4.4.5 INTRA_VER
+- §8.4.4.1/.2 intra reference-sample construction + substitution (eipd_ref module)
+- README + CHANGELOG — §8.5.3.2/.4/.5/.6 affine candidate-list assembly landed
+- §8.5.3.2/.5 affine neighbour-position geometry helpers
+- §8.5.3.5/.3.1 affine AMVP CPMV-reconstruction bridge
+- §8.5.3.2/.4/.5/.6 affine merge + MVP candidate-list assembly (affine_cand module)
+- README + CHANGELOG — §8.5.3 affine derivation + §7.3.8.4 syntax milestone
+- §7.3.8.4 affine inter-syntax CABAC reads (affine_syntax module)
+- §8.5.3.3 inherited affine CPMV derivation from a neighbour block
+- §8.5.3.7-.10 affine subblock-MV geometric core (affine module)
+- README — document §8.5.2.3.3–.5 TMVP derivation + SideInfoGrid ColPic bridge
+- bridge SideInfoGrid ColPic motion field into TMVP derivation
+- §8.5.2.3.3–.5 temporal (collocated) merge candidate (TMVP) derivation
+- README — ATS-intra DST-VII/DCT-VIII now full {4,8,16,32} + apply_inverse bridge
+- bridge ATS-intra decode to inverse transform + end-to-end test
+- ATS-intra DST-VII/DCT-VIII 32×32 kernels — full {4,8,16,32} range
+- ATS-intra DST-VII/DCT-VIII 16×16 transform kernels
+- README — §8.5.2.3 ADMVP merge-mode derivation layer landed
+- §8.5.2.3.1 step-6 merge selection bridge (select_merge_candidate -> MergedMotion)
+- §8.5.2.3.6 HMVP merge-candidate derivation (HmvpCandList::hmvp_merge_candidates)
+- §8.5.2.3 ADMVP merge-mode candidate-list derivation (merge module)
+- README + CHANGELOG — EIPD CABAC syntax wiring + ATS-intra milestone
+- §7.3.8.5 ATS-intra syntax + Table 30 trType derivation + §8.7.4.3 DST-VII/DCT-VIII kernels
+- §8.4.2/.3 EIPD mode resolution — syntax→derivation→kernel composition
+- §7.3.8.4 EIPD intra-mode CABAC syntax reader (eipd_syntax) + §9.3.3.6 TB primitive
+- README + CHANGELOG — EIPD intra prediction + mode derivation milestone
+- §8.4.3 EIPD chroma intra-mode derivation (Table 16 + modeIdx skip)
+- §8.4.2 EIPD luma intra-mode derivation (candModeList/extCandModeList/remModeList)
+- §8.4.4.8/9/10 EIPD prediction-sample derivation (INTRA_BI/PLN/directional)
+- §8.9.8 tableNum==0 branch — promote round-284 pin to errata #81/#130 lock
+- §7.4.9.3 SUCO availability layer (SucoSizeLimits eqs. 68/69 + allow_split_unit_coding_order)
+- §7.3.8.3 split-unit recursion-geometry layer (split_unit_children + quad_split_children)
+- §7.3.8.3 CABAC-driven BTT split-syntax reader (decode_btt_split)
+- §8.9.4 spec-faithful chroma inverse-mapping apply (eqs. 1377-1382)
+- §7.4.8.3 BTT split-geometry layer (allowSplit* + SplitMode)
+- description reflects working Baseline pixel decoder
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - §7.3.8.4 Main-profile inter coding-unit **integration** — the slice-walker now selects the `inter_cu_syntax` CU-syntax drivers on `sps_admvp_flag` inside `decode_inter_coding_unit`. `InterToolGates` threads through `InterDecodeInputs` (the all-false default is the historical Baseline `sps_admvp_flag == 0` inline path, so every existing fixture is byte-unchanged). On `sps_admvp_flag == 1`: cu_skip CUs route through `read_cu_skip_main`; non-skip MODE_INTER CUs through `read_inter_cu_mode` (merge-mode) or `read_explicit_amvp` (`merge_mode_flag == 0`). The decoded `CuSkipDecision` / `InterCuModeDecision` / `ExplicitAmvpDecision` is projected into per-CU motion: merge branches assemble the §8.5.2.3 ADMVP `mergeCandList` from the per-4×4 `SideInfoGrid` spatial neighbours (`merge_neighbour_mv_from_grid`) + HMVP merge candidates and run the §8.5.2.3.1 step-6 selection (`admvp_merge_motion_from_grid`); the explicit body adds the §8.5.2.4 grid AMVP predictor to the eq.-145 amvr-shifted MVD; MMVD adds the §8.5.2.3.9 axis-aligned offset (eqs. 133/134) to the base candidate. The shared CBF / residual / motion-compensation tail is factored into `decode_inter_cu_residual_and_reconstruct`, common to the Baseline and Main-profile front-ends. New stats: `admvp_syntax`, `admvp_skip_cus` / `admvp_merge_cus` / `admvp_explicit_cus`. 8 new tests cover the cu_skip regular-merge, non-skip merge-mode, non-skip explicit-AMVP (P uni-pred), B-slice bi-pred zero-fill, real spatial-neighbour merge selection from a populated grid, zero-fill fallback, grid neighbour availability, and MMVD offset application. Deferred on this path: §8.5.2.3.3 collocated temporal merge (needs ColPic motion field + DPB POC), POC-scaled MMVD asymmetry (§8.5.2.3.9 eqs. 531-616), affine CPMV sub-block field (§8.5.3/§8.5.5 — translational fallback for now), and the explicit-affine sub-tree (spec lines 2940-2980).
