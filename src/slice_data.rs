@@ -10736,4 +10736,54 @@ mod tests {
         let stride = pic2.y_stride();
         assert_eq!(pic2.y[8 * stride + 8], ref2_y[8 * 32 + 9]);
     }
+
+    /// B-slice bi-pred inheritance: the store carries both lists' fields
+    /// independently — an affine-merge CU inherits a per-list §8.5.3.3
+    /// projection (distinct L0 / L1 models, distinct refIdx).
+    #[test]
+    fn round387_affine_merge_inherits_both_lists() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        let cp_l0 = [
+            MotionVector { x: 8, y: 4 },
+            MotionVector { x: 16, y: 4 },
+            MotionVector::default(),
+        ];
+        let cp_l1 = [
+            MotionVector { x: -8, y: 0 },
+            MotionVector { x: -8, y: 8 },
+            MotionVector::default(),
+        ];
+        let motion0 = AffineCuMotion {
+            l0: Some(AffineListMotion {
+                ref_idx: 0,
+                field: crate::affine::affine_subblock_mvs(16, 16, 2, &cp_l0, 2, 2),
+                center: crate::affine::affine_center_mv(16, 16, 2, &cp_l0),
+            }),
+            l1: Some(AffineListMotion {
+                ref_idx: 1,
+                field: crate::affine::affine_subblock_mvs(16, 16, 2, &cp_l1, 2, 2),
+                center: crate::affine::affine_center_mv(16, 16, 2, &cp_l1),
+            }),
+            motion_model_idc: 1,
+        };
+        stamp_affine_side_info(&mut grid, &motion0, 0, 0, 16, 16, 0);
+        let mut inputs = cpmv_store_inputs();
+        inputs.slice_is_b = true;
+        inputs.num_ref_idx_active_minus1_l1 = 1;
+        let motion = admvp_affine_merge_motion(&inputs, &grid, 0, 16, 0, 16, 16).unwrap();
+        let l0 = motion.l0.expect("L0 inherited");
+        let l1 = motion.l1.expect("L1 inherited");
+        assert_eq!(l0.ref_idx, 0);
+        assert_eq!(l1.ref_idx, 1, "neighbour's refIdxL1 carried over");
+        // Per-list §8.5.3.3 projections computed independently from the
+        // stored corner cells.
+        let nb = affine_neighbour_from_grid(&grid, 15, 15);
+        let project = |src| {
+            let cps = crate::affine::inherited_cp_mvs(16, 0, 16, 16, 2, 32, src);
+            crate::affine::affine_center_mv(16, 16, 2, &[cps[0], cps[1], MotionVector::default()])
+        };
+        assert_eq!(l0.center, project(nb.src_l0));
+        assert_eq!(l1.center, project(nb.src_l1));
+        assert_ne!(l0.center, l1.center, "distinct per-list models");
+    }
 }

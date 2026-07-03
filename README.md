@@ -252,8 +252,10 @@ TrafoLog2/X0/Y0), **MMVD** (`mmvd_syntax::read_mmvd_group` — the §7.3.8.4
 feeding the eq.-145 MVD shift + eqs.-645/646 MVP round), and **DMVR**
 (`dmvr` — the §8.5.5 bilateral-SAD search core: §8.5.5.3 `sad_values`,
 §8.5.5.4 `select_best_idx`, §8.5.5.5 `parametric_refine`, §8.5.5.1
-`refine_subblock_mv` driver, pure over a `PredPlane` bilinear-prediction
-window).
+`refine_subblock_mv` driver, plus the §8.5.5.2 Table-29 two-tap bilinear
+interpolation (`bilinear_pred_plane`, eqs. 989/990 + 999-1017) and the
+eqs.-387-390 subblock partition, so `refine_subblock_from_refs` runs the
+whole refinement over real reference pictures).
 
 The **§7.3.8.4 Main-profile inter coding-unit syntax tree** is now driven
 end-to-end by the `inter_cu_syntax` module, which threads the per-tool
@@ -311,20 +313,36 @@ from the DPB via the slice header's `col_pic_list_idx` /
 * **explicit affine** — the spec-line-2941 sub-tree (`affine_flag` →
   `affine_mode_flag` → per-list ref_idx / `affine_mvp_flag` /
   `affine_mvd_flag` / per-vertex MVDs), reconstructed through the
-  §8.5.3.5/.6 two-entry `cpMvpListLX` (constructed predictor +
-  translational fill + zero tail) and the same per-subblock MC.
+  §8.5.3.5/.6 two-entry `cpMvpListLX` (inherited A/B/C group predictors,
+  constructed predictor, translational fill, zero tail) and the same
+  per-subblock MC.
+* **inherited affine candidates** — the per-4×4 grid doubles as the
+  spec's per-CU CPMV store (`MotionModelIdc` + `CbPos`/`CbWidth`/
+  `CbHeight` per cell, written by the affine subblock stamp), so the
+  §8.5.3.2 step-3 neighbours (LR_10 order A1,B1,B0,A0,B2 with the
+  step-4 same-covering-CU pruning) and the §8.5.3.5 refIdx-matched
+  A/B/C groups project their stored corner-cell `MvLX` onto the current
+  block per §8.5.3.3 — inherited candidates now precede the
+  constructed/zero fills in both lists.
+* **DMVR** — the §8.5.1 `dmvrAppliedFlag` cascade (regular merge/skip
+  bi-pred, `mmvd_flag == 0`, opposite-side equidistant references,
+  ≥8×8, `sps_dmvr_flag`) routes qualifying CUs through
+  `apply_dmvr_inter_prediction`: the eqs.-387-390 subblock partition,
+  the §8.5.5 per-subblock search over §8.5.5.2 bilinear planes, the
+  eqs.-395-399 refined `refMvLX` (±2¹⁷ clip), and luma + §8.5.2.6
+  chroma MC through the eqs.-923/924 + 932/933 padded interpolators
+  anchored at the unrefined MV. Per the §8.5.1 NOTE the per-subblock
+  deltas are stored (`ref_mv_delta_*`) and the collocated readers
+  reconstruct `refMvLX = mv + delta` while spatial-MVP/deblock keep the
+  unrefined `mv` — proven across pictures by a DMVR→ColPic→TMVP chain
+  fixture.
 
 The shared CBF / residual / MC tail is motion-generic
-(`CuMotion::Translational` / `CuMotion::Affine`) and common to the
-Baseline and Main-profile front-ends. Each decoded P/B picture's motion
-field + reference POCs are retained in its DPB entry so it can serve as
-a later slice's `ColPic`.
-
-Still deferred on this path: **inherited** (model-based) affine
-merge/MVP candidates (they need a per-CU control-point MV store the
-per-4×4 grid does not carry), the §8.5.5 DMVR invocation on bi-predicted
-CUs (the search core exists in `dmvr`), and the eqs.-923/924 subblock
-reference-padding clamp inside the interpolators.
+(`CuMotion::Translational` / `CuMotion::MergeTranslational` /
+`CuMotion::Affine`) and common to the Baseline and Main-profile
+front-ends. Each decoded P/B picture's motion field + reference POCs
+are retained in its DPB entry so it can serve as a later slice's
+`ColPic`.
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ADCC / ALF / DRA / affine slice-walk) still
