@@ -317,6 +317,25 @@ fn sample_chroma_clipped(refp: RefPictureView<'_>, c_idx: u32, x: i32, y: i32) -
     plane[yc * refp.c_stride + xc] as i32
 }
 
+/// §8.5.4.3.1 — the top-left of the *bounding block for reference sample
+/// padding*: `( xSbIntL, ySbIntL ) = ( xSb + ( mvLX[0] >> 4 ), ySb +
+/// ( mvLX[1] >> 4 ) )` where `mvLX = refMvLX − mvOffset` is the
+/// **unrefined** motion vector. When threaded into the §8.5.4.3.2 /
+/// §8.5.4.3.3 sample interpolation, every reference fetch is clamped
+/// into the padded window around this anchor (eqs. 923/924 luma:
+/// `[xSbIntL − 3, xSbIntL + sbWidth + 3]`; eqs. 932/933 chroma:
+/// `[xSbIntC − 1, xSbIntC + sbWidth + 1]`) — so a DMVR-refined MV never
+/// requires reference samples beyond the window the original MV
+/// established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PadAnchor {
+    /// `xSbIntL` (luma) or `xSbIntC` (chroma), in the plane's own
+    /// full-sample units.
+    pub x_sb_int: i32,
+    /// `ySbIntL` / `ySbIntC`.
+    pub y_sb_int: i32,
+}
+
 /// Interpolate a luma block of size `sb_width × sb_height` at the given
 /// `mv` (1/16-pel) anchored at (`x_sb`, `y_sb`) in the current picture
 /// coordinate space. Outputs are i32 samples, clipped to `[0, 2^bd-1]`.
@@ -345,6 +364,7 @@ pub fn interpolate_luma_block(
         bit_depth,
         &LUMA_FILTER_TABLE25,
         true,
+        None,
         out,
     )
 }
@@ -373,6 +393,41 @@ pub fn interpolate_luma_block_main(
         bit_depth,
         &LUMA_FILTER_TABLE24,
         false,
+        None,
+        out,
+    )
+}
+
+/// §8.5.4.3.2 Main-profile luma interpolation with the eqs.-923/924
+/// subblock padding clamp: every fetched full-sample position is first
+/// clipped to the picture (eqs. 921/922) then into
+/// `[xSbIntL − 3, xSbIntL + sbWidth + 3] × [ySbIntL − 3, ySbIntL +
+/// sbHeight + 3]` around the caller-supplied [`PadAnchor`]. Used by the
+/// DMVR-refined motion compensation, whose refined MV must not fetch
+/// beyond the padding window of the original (unrefined) MV.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_luma_block_main_padded(
+    refp: RefPictureView<'_>,
+    x_sb: i32,
+    y_sb: i32,
+    mv: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    pad: PadAnchor,
+    out: &mut [i32],
+) -> Result<()> {
+    interpolate_luma_block_with(
+        refp,
+        x_sb,
+        y_sb,
+        mv,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &LUMA_FILTER_TABLE24,
+        false,
+        Some(pad),
         out,
     )
 }
@@ -388,6 +443,7 @@ fn interpolate_luma_block_with(
     bit_depth: u32,
     table: &[[i32; 8]; 16],
     baseline_phase_check: bool,
+    pad: Option<PadAnchor>,
     out: &mut [i32],
 ) -> Result<()> {
     if out.len() != sb_width * sb_height {
@@ -405,6 +461,27 @@ fn interpolate_luma_block_with(
             "evc inter: round-4 luma phase ({frac_x},{frac_y}) outside Baseline 1/4-pel grid"
         )));
     }
+    // eqs. 921/922 then 923/924 — the picture clip first, then (when a
+    // padding anchor is threaded) the subblock bounding-window clip. The
+    // final fetch re-clips to the picture for memory safety; on
+    // conforming streams the padded window never leaves the picture once
+    // the eq.-921/922 clip has run, so the re-clip is the identity.
+    let pic_w = refp.width as i32;
+    let pic_h = refp.height as i32;
+    let cl_x = |v: i32| -> i32 {
+        let c = v.clamp(0, pic_w - 1);
+        match pad {
+            Some(p) => c.clamp(p.x_sb_int - 3, p.x_sb_int + sb_width as i32 + 3),
+            None => c,
+        }
+    };
+    let cl_y = |v: i32| -> i32 {
+        let c = v.clamp(0, pic_h - 1);
+        match pad {
+            Some(p) => c.clamp(p.y_sb_int - 3, p.y_sb_int + sb_height as i32 + 3),
+            None => c,
+        }
+    };
     let max_val = (1i32 << bit_depth) - 1;
     let shift1 = (4u32).min(bit_depth.saturating_sub(8));
     let shift2 = (8u32).max(20u32.saturating_sub(bit_depth));
@@ -413,8 +490,11 @@ fn interpolate_luma_block_with(
         // Integer sample copy (eq. 925).
         for yl in 0..sb_height {
             for xl in 0..sb_width {
-                let s =
-                    sample_luma_clipped(refp, x_sb + int_x + xl as i32, y_sb + int_y + yl as i32);
+                let s = sample_luma_clipped(
+                    refp,
+                    cl_x(x_sb + int_x + xl as i32),
+                    cl_y(y_sb + int_y + yl as i32),
+                );
                 out[yl * sb_width + xl] = s;
             }
         }
@@ -430,7 +510,7 @@ fn interpolate_luma_block_with(
                 let by = y_sb + int_y + yl as i32;
                 let mut acc: i32 = 0;
                 for i in 0..8 {
-                    let s = sample_luma_clipped(refp, bx + i as i32 - 3, by);
+                    let s = sample_luma_clipped(refp, cl_x(bx + i as i32 - 3), cl_y(by));
                     acc += fx[i] * s;
                 }
                 out[yl * sb_width + xl] = (acc >> 6).clamp(0, max_val);
@@ -446,7 +526,7 @@ fn interpolate_luma_block_with(
                 let by = y_sb + int_y + yl as i32;
                 let mut acc: i32 = 0;
                 for i in 0..8 {
-                    let s = sample_luma_clipped(refp, bx, by + i as i32 - 3);
+                    let s = sample_luma_clipped(refp, cl_x(bx), cl_y(by + i as i32 - 3));
                     acc += fy[i] * s;
                 }
                 out[yl * sb_width + xl] = (acc >> 6).clamp(0, max_val);
@@ -465,7 +545,7 @@ fn interpolate_luma_block_with(
             let by = y_sb + int_y + yt as i32 - 3;
             let mut acc: i32 = 0;
             for i in 0..8 {
-                let s = sample_luma_clipped(refp, bx + i as i32 - 3, by);
+                let s = sample_luma_clipped(refp, cl_x(bx + i as i32 - 3), cl_y(by));
                 acc += fx[i] * s;
             }
             // shift1 == 0 for 8-bit per spec.
@@ -511,6 +591,7 @@ pub fn interpolate_chroma_block(
         bit_depth,
         &CHROMA_FILTER_TABLE27,
         true,
+        None,
         out,
     )
 }
@@ -540,6 +621,41 @@ pub fn interpolate_chroma_block_main(
         bit_depth,
         &CHROMA_FILTER_TABLE26,
         false,
+        None,
+        out,
+    )
+}
+
+/// §8.5.4.3.3 Main-profile chroma interpolation with the eqs.-932/933
+/// subblock padding clamp around the caller-supplied [`PadAnchor`]
+/// (`[xSbIntC − 1, xSbIntC + sbWidth + 1]` per axis). The anchor is in
+/// chroma full-sample units (`xSbIntC = xSb / SubWidthC + ( mvLX[0] >> 5 )`
+/// per §8.5.4.3.1, with `mvLX` the unrefined MV).
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_chroma_block_main_padded(
+    refp: RefPictureView<'_>,
+    c_idx: u32,
+    x_sb_c: i32,
+    y_sb_c: i32,
+    mv_c: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    pad: PadAnchor,
+    out: &mut [i32],
+) -> Result<()> {
+    interpolate_chroma_block_with(
+        refp,
+        c_idx,
+        x_sb_c,
+        y_sb_c,
+        mv_c,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &CHROMA_FILTER_TABLE26,
+        false,
+        Some(pad),
         out,
     )
 }
@@ -556,6 +672,7 @@ fn interpolate_chroma_block_with(
     bit_depth: u32,
     table: &[[i32; 4]; 32],
     baseline_phase_check: bool,
+    pad: Option<PadAnchor>,
     out: &mut [i32],
 ) -> Result<()> {
     if out.len() != sb_width * sb_height {
@@ -572,6 +689,25 @@ fn interpolate_chroma_block_with(
             "evc inter: round-4 chroma phase ({frac_x},{frac_y}) outside Baseline 1/8-pel grid"
         )));
     }
+    // eqs. 930/931 then 932/933 — picture clip, then the subblock
+    // padding-window clip when a [`PadAnchor`] is threaded (the chroma
+    // window is ±1 around the anchored subblock).
+    let pic_w_c = refp.pic_w_c() as i32;
+    let pic_h_c = refp.pic_h_c() as i32;
+    let cl_x = |v: i32| -> i32 {
+        let c = v.clamp(0, pic_w_c - 1);
+        match pad {
+            Some(p) => c.clamp(p.x_sb_int - 1, p.x_sb_int + sb_width as i32 + 1),
+            None => c,
+        }
+    };
+    let cl_y = |v: i32| -> i32 {
+        let c = v.clamp(0, pic_h_c - 1);
+        match pad {
+            Some(p) => c.clamp(p.y_sb_int - 1, p.y_sb_int + sb_height as i32 + 1),
+            None => c,
+        }
+    };
     let max_val = (1i32 << bit_depth) - 1;
     let shift1 = (4u32).min(bit_depth.saturating_sub(8));
     let shift2 = (8u32).max(20u32.saturating_sub(bit_depth));
@@ -582,8 +718,8 @@ fn interpolate_chroma_block_with(
                 let s = sample_chroma_clipped(
                     refp,
                     c_idx,
-                    x_sb_c + int_x + xl as i32,
-                    y_sb_c + int_y + yl as i32,
+                    cl_x(x_sb_c + int_x + xl as i32),
+                    cl_y(y_sb_c + int_y + yl as i32),
                 );
                 out[yl * sb_width + xl] = s;
             }
@@ -599,7 +735,7 @@ fn interpolate_chroma_block_with(
                 let by = y_sb_c + int_y + yl as i32;
                 let mut acc: i32 = 0;
                 for i in 0..4 {
-                    let s = sample_chroma_clipped(refp, c_idx, bx + i as i32 - 1, by);
+                    let s = sample_chroma_clipped(refp, c_idx, cl_x(bx + i as i32 - 1), cl_y(by));
                     acc += fx[i] * s;
                 }
                 out[yl * sb_width + xl] = (acc >> 6).clamp(0, max_val);
@@ -614,7 +750,7 @@ fn interpolate_chroma_block_with(
                 let by = y_sb_c + int_y + yl as i32;
                 let mut acc: i32 = 0;
                 for i in 0..4 {
-                    let s = sample_chroma_clipped(refp, c_idx, bx, by + i as i32 - 1);
+                    let s = sample_chroma_clipped(refp, c_idx, cl_x(bx), cl_y(by + i as i32 - 1));
                     acc += fy[i] * s;
                 }
                 out[yl * sb_width + xl] = (acc >> 6).clamp(0, max_val);
@@ -630,7 +766,7 @@ fn interpolate_chroma_block_with(
             let by = y_sb_c + int_y + yt as i32 - 1;
             let mut acc: i32 = 0;
             for i in 0..4 {
-                let s = sample_chroma_clipped(refp, c_idx, bx + i as i32 - 1, by);
+                let s = sample_chroma_clipped(refp, c_idx, cl_x(bx + i as i32 - 1), cl_y(by));
                 acc += fx[i] * s;
             }
             temp[yt * sb_width + xl] = acc >> shift1;
@@ -2910,5 +3046,105 @@ mod tests {
         };
         assert_eq!(merge_cand_matches(&a, &b), merge_cand_matches(&b, &a));
         assert!(merge_cand_matches(&a, &b));
+    }
+
+    // --- eqs. 923/924 + 932/933 subblock padding clamp -------------------
+
+    /// Build a 32×32 reference with a horizontal luma ramp (y = 4·x) and
+    /// distinct flat chroma.
+    fn ramp_ref<'a>(
+        y: &'a mut Vec<u8>,
+        cb: &'a mut Vec<u8>,
+        cr: &'a mut Vec<u8>,
+    ) -> RefPictureView<'a> {
+        *y = (0..32 * 32).map(|i| ((i % 32) * 4) as u8).collect();
+        *cb = (0..16 * 16).map(|i| ((i % 16) * 8) as u8).collect();
+        *cr = vec![77u8; 16 * 16];
+        RefPictureView {
+            y,
+            cb,
+            cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        }
+    }
+
+    /// With the anchor placed at the fetch MV itself (`mvOffset == 0`),
+    /// the eqs.-923/924 window covers every fetched position — the padded
+    /// interpolation is byte-identical to the unpadded one, including a
+    /// fractional phase (all 8 taps live inside `[xSbIntL−3, +sbW+3]`).
+    #[test]
+    fn padded_luma_identity_when_anchor_matches_mv() {
+        let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        let refp = ramp_ref(&mut y, &mut cb, &mut cr);
+        let mv = MotionVector {
+            x: (2 << 4) + 5,
+            y: 1 << 4,
+        }; // +2 int +5/16 frac, +1 int
+        let mut plain = vec![0i32; 8 * 8];
+        let mut padded = vec![0i32; 8 * 8];
+        interpolate_luma_block_main(refp, 8, 8, mv, 8, 8, 8, &mut plain).unwrap();
+        let pad = PadAnchor {
+            x_sb_int: 8 + (mv.x >> 4),
+            y_sb_int: 8 + (mv.y >> 4),
+        };
+        interpolate_luma_block_main_padded(refp, 8, 8, mv, 8, 8, 8, pad, &mut padded).unwrap();
+        assert_eq!(plain, padded);
+    }
+
+    /// A refined MV that walks +6 integer pels right of the anchor MV has
+    /// its right-edge fetches clamped to `xSbIntL + sbWidth + 3` — the
+    /// clamped columns replicate the window-edge sample instead of
+    /// reading fresh reference columns (eq. 923).
+    #[test]
+    fn padded_luma_clamps_beyond_anchor_window() {
+        let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        let refp = ramp_ref(&mut y, &mut cb, &mut cr);
+        // 4×4 block at (8, 8). Anchor MV = 0 → window x ∈ [5, 15].
+        let pad = PadAnchor {
+            x_sb_int: 8,
+            y_sb_int: 8,
+        };
+        // Refined MV = +6 integer pels → raw fetches x = 14..17; the last
+        // two columns clamp to 15.
+        let mv = MotionVector { x: 6 << 4, y: 0 };
+        let mut out = vec![0i32; 4 * 4];
+        interpolate_luma_block_main_padded(refp, 8, 8, mv, 4, 4, 8, pad, &mut out).unwrap();
+        // Columns 0/1 fetch x = 14/15 (in-window); columns 2/3 clamp to 15.
+        assert_eq!(out[0], 14 * 4);
+        assert_eq!(out[1], 15 * 4);
+        assert_eq!(out[2], 15 * 4, "eq. 923 clamps to xSbIntL+sbW+3");
+        assert_eq!(out[3], 15 * 4);
+        // Unpadded reads the genuine columns 16/17.
+        let mut plain = vec![0i32; 4 * 4];
+        interpolate_luma_block_main(refp, 8, 8, mv, 4, 4, 8, &mut plain).unwrap();
+        assert_eq!(plain[2], 16 * 4);
+        assert_eq!(plain[3], 17 * 4);
+    }
+
+    /// Chroma eq.-932 window is only ±1 around the anchored subblock: a
+    /// +3-chroma-sample refined fetch clamps every column past
+    /// `xSbIntC + sbWidth + 1` to the window edge.
+    #[test]
+    fn padded_chroma_clamps_beyond_anchor_window() {
+        let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        let refp = ramp_ref(&mut y, &mut cb, &mut cr);
+        // 4×4 chroma block at (4, 4). Anchor MV = 0 → window x ∈ [3, 9].
+        let pad = PadAnchor {
+            x_sb_int: 4,
+            y_sb_int: 4,
+        };
+        // Refined chroma MV = +3 integer chroma pels (1/32 units).
+        let mv_c = MotionVector { x: 3 << 5, y: 0 };
+        let mut out = vec![0i32; 4 * 4];
+        interpolate_chroma_block_main_padded(refp, 1, 4, 4, mv_c, 4, 4, 8, pad, &mut out).unwrap();
+        // Raw fetches x = 7..10; the last column clamps to 9 (= 9·8 = 72).
+        assert_eq!(out[0], 7 * 8);
+        assert_eq!(out[1], 8 * 8);
+        assert_eq!(out[2], 9 * 8);
+        assert_eq!(out[3], 9 * 8, "eq. 932 clamps to xSbIntC+sbW+1");
     }
 }
