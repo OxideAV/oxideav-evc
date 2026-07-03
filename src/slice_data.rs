@@ -2598,6 +2598,10 @@ struct AffineListMotion {
 struct AffineCuMotion {
     l0: Option<AffineListMotion>,
     l1: Option<AffineListMotion>,
+    /// `MotionModelIdc` of this CU (1 = 4-param, 2 = 6-param) — stamped
+    /// into the side-info grid so later CUs can inherit the affine model
+    /// (§8.5.3.2 step-3 / §8.5.3.5 step-4..6 availability).
+    motion_model_idc: u32,
 }
 
 /// The resolved per-CU motion: translational (single MV pair, the
@@ -2833,12 +2837,15 @@ fn admvp_temporal_merge_cand(
 /// `affineMergeCandList`, select `affine_merge_idx`, and derive the
 /// §8.5.3.7 per-subblock motion field for each active list.
 ///
-/// The inherited (model-based) candidates need the neighbours' stored
-/// control-point MVs, which the per-4×4 [`SideInfoGrid`] does not carry —
-/// they are treated as unavailable (documented deferral), so the list is
-/// populated by the §8.5.3.4 constructed candidates Const1..Const6 (from
-/// the grid-resolved corners, including the corner-3 collocated fallback
-/// when a `ColPic` is threaded) and the step-9 zero-CPMV tail.
+/// The inherited (model-based) candidates resolve through the per-CU
+/// CPMV store the affine stamp maintains on the [`SideInfoGrid`]
+/// (`MotionModelIdc` + covering-CU geometry per 4×4 cell): each §8.5.3.2
+/// step-3 neighbour with `MotionModelIdc > 0` projects its stored
+/// corner-cell MVs onto the current block per §8.5.3.3 (after the
+/// step-4 same-covering-CU pruning). The §8.5.3.4 constructed candidates
+/// Const1..Const6 (from the grid-resolved corners, including the
+/// corner-3 collocated fallback when a `ColPic` is threaded) and the
+/// step-9 zero-CPMV tail fill the rest of the list.
 #[allow(clippy::too_many_arguments)]
 fn admvp_affine_merge_motion(
     inputs: &InterDecodeInputs<'_, '_>,
@@ -2906,9 +2913,19 @@ fn admvp_affine_merge_motion(
             None => crate::tmvp::CollocatedMv::default(),
         },
     );
-    // Inherited model-based neighbours: unavailable (no per-CU CPMV
-    // store yet) — the constructed + zero candidates fill the list.
-    let inherited: crate::affine_cand::InheritedNeighbours = Default::default();
+    // §8.5.3.2 steps 2-4 — the five inherited (model-based) neighbours,
+    // resolved from the per-CU CPMV store in the §8.5.3.2 step-3 visiting
+    // order (Baseline split order ⇒ availLR = LR_10 ⇒ A1, B1, B0, A0,
+    // B2), then the step-4 same-covering-CU pruning.
+    let nb_pos =
+        crate::affine_cand::affine_merge_nb_positions(x0 as i32, y0 as i32, n_cb_w, n_cb_h);
+    let order = crate::affine_cand::affine_merge_inherited_order(crate::neighbour::AvailLr::Lr10);
+    let mut inherited: crate::affine_cand::InheritedNeighbours = Default::default();
+    for (slot, name) in order.iter().enumerate() {
+        let (xn, yn) = name.location(&nb_pos);
+        inherited[slot] = affine_neighbour_from_grid(side_info, xn, yn);
+    }
+    prune_inherited_neighbours_lr10(&mut inherited);
     let list = crate::affine_cand::build_affine_merge_cand_list(
         &inherited,
         &corners,
@@ -2952,16 +2969,21 @@ fn admvp_affine_merge_motion(
             "evc admvp affine-merge: selected candidate has no active list",
         ));
     }
-    Ok(AffineCuMotion { l0, l1 })
+    Ok(AffineCuMotion {
+        l0,
+        l1,
+        motion_model_idc: cand.motion_model_idc,
+    })
 }
 
 /// §8.5.3.5/.6 + §8.5.3.1 — resolve an explicit-affine CU's motion: per
 /// active list, assemble the two-entry `cpMvpListLX` (inherited
-/// model-based neighbours unavailable — no per-CU CPMV store; the
-/// §8.5.3.6 constructed predictor + per-corner translational fill + zero
-/// tail come from the refIdx-matched grid corners), select
-/// `affine_mvp_flag_lX`, add the decoded per-CP MVDs (eqs. 688-691), and
-/// derive the §8.5.3.7 subblock field.
+/// model-based predictors from the per-CU CPMV store — groups A/B/C
+/// gated on `MotionModelIdc > 0` + the refIdx match — then the §8.5.3.6
+/// constructed predictor + per-corner translational fill + zero tail
+/// from the refIdx-matched grid corners), select `affine_mvp_flag_lX`,
+/// add the decoded per-CP MVDs (eqs. 688-691), and derive the §8.5.3.7
+/// subblock field.
 #[allow(clippy::too_many_arguments)]
 fn admvp_affine_amvp_motion(
     inputs: &InterDecodeInputs<'_, '_>,
@@ -3019,12 +3041,29 @@ fn admvp_affine_amvp_motion(
             corner_mv,
             num_cp_mv - 1, // MotionModelIdc = numCpMv − 1
         );
-        // Inherited model-based predictors unavailable (documented
-        // deferral — the grid carries no neighbour CPMV sets).
+        // §8.5.3.5 steps 4-6 — the inherited (model-based) predictor
+        // groups, resolved from the per-CU CPMV store. A neighbour
+        // matches only when it is §6.4.3-available with
+        // `MotionModelIdc > 0`, uses list X, and references the same
+        // picture as the current CU (`RefIdxLX == refIdxLX`).
+        let mvp_pos =
+            crate::affine_cand::affine_mvp_nb_positions(x0 as i32, y0 as i32, n_cb_w, n_cb_h);
+        let mvp_nb = |xy: (i32, i32)| -> crate::affine_cand::AffineMvpNeighbour {
+            let nb = affine_neighbour_from_grid(side_info, xy.0, xy.1);
+            let (pf, ri, src) = if list_x == 0 {
+                (nb.pred_flag_l0, nb.ref_idx_l0, nb.src_l0)
+            } else {
+                (nb.pred_flag_l1, nb.ref_idx_l1, nb.src_l1)
+            };
+            crate::affine_cand::AffineMvpNeighbour {
+                matched: nb.available_flag && pf && ri == entry.ref_idx as i32,
+                src,
+            }
+        };
         let neigh = crate::affine_cand::AffineMvpNeighbours {
-            group_a: [crate::affine_cand::AffineMvpNeighbour::absent(); 2],
-            group_b: [crate::affine_cand::AffineMvpNeighbour::absent(); 3],
-            group_c: [crate::affine_cand::AffineMvpNeighbour::absent(); 2],
+            group_a: [mvp_nb(mvp_pos.a0), mvp_nb(mvp_pos.a1)],
+            group_b: [mvp_nb(mvp_pos.b0), mvp_nb(mvp_pos.b1), mvp_nb(mvp_pos.b2)],
+            group_c: [mvp_nb(mvp_pos.c0), mvp_nb(mvp_pos.c1)],
         };
         let mvp_list = crate::affine_cand::build_affine_mvp_cand_list(
             &neigh,
@@ -3066,7 +3105,11 @@ fn admvp_affine_amvp_motion(
             "evc explicit-affine: no active prediction list",
         ));
     }
-    Ok(AffineCuMotion { l0, l1 })
+    Ok(AffineCuMotion {
+        l0,
+        l1,
+        motion_model_idc: num_cp_mv - 1,
+    })
 }
 
 /// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
@@ -4329,10 +4372,108 @@ fn stamp_affine_side_info(
                     mv_l1_y: mv1.y,
                     ref_idx_l0: r0,
                     ref_idx_l1: r1,
+                    // The per-CU CPMV store: MotionModelIdc + covering-CU
+                    // geometry, constant across all subblock cells, so a
+                    // later CU can inherit this affine model via the
+                    // §8.5.3.3 corner-cell projection.
+                    motion_model_idc: a.motion_model_idc as u8,
+                    cu_x0: x0 as u16,
+                    cu_y0: y0 as u16,
+                    cu_log2_w: n_cb_w.trailing_zeros() as u8,
+                    cu_log2_h: n_cb_h.trailing_zeros() as u8,
                     ..Default::default()
                 },
             );
         }
+    }
+}
+
+/// §8.5.3.2 step-2/-3 (and the §8.5.3.5 step-4..6 analogue) — resolve
+/// one neighbour sample position into an inherited-affine source. The
+/// neighbour is available iff the covering 4×4 cell is inter-coded with
+/// `MotionModelIdc > 0`; the per-list [`NeighbourAffineSource`]
+/// (§8.5.3.3 input) reads the stored `MvLX` at the covering CU's four
+/// corner cells (eqs. 744-753 sample the CU's top and bottom rows) plus
+/// its `CbPos` / `CbWidth` / `CbHeight` geometry from the per-CU CPMV
+/// store the affine stamp maintains.
+///
+/// [`NeighbourAffineSource`]: crate::affine::NeighbourAffineSource
+fn affine_neighbour_from_grid(
+    grid: &SideInfoGrid,
+    x: i32,
+    y: i32,
+) -> crate::affine_cand::AffineNeighbour {
+    if x < 0 || y < 0 {
+        return Default::default();
+    }
+    let cell = grid.at((x >> 2) as usize, (y >> 2) as usize);
+    if cell.pred_mode != CuPredMode::Inter || cell.motion_model_idc == 0 {
+        return Default::default();
+    }
+    let (x_nb, y_nb) = (cell.cu_x0 as i32, cell.cu_y0 as i32);
+    let (n_nb_w, n_nb_h) = (1i32 << cell.cu_log2_w, 1i32 << cell.cu_log2_h);
+    let mv_at = |cx: i32, cy: i32, list_x: u8| -> MotionVector {
+        let c = grid.at((cx >> 2) as usize, (cy >> 2) as usize);
+        if list_x == 0 {
+            MotionVector {
+                x: c.mv_l0_x,
+                y: c.mv_l0_y,
+            }
+        } else {
+            MotionVector {
+                x: c.mv_l1_x,
+                y: c.mv_l1_y,
+            }
+        }
+    };
+    let src = |list_x: u8| crate::affine::NeighbourAffineSource {
+        x_nb,
+        y_nb,
+        n_nb_w: n_nb_w as u32,
+        n_nb_h: n_nb_h as u32,
+        mv_tl: mv_at(x_nb, y_nb, list_x),
+        mv_tr: mv_at(x_nb + n_nb_w - 1, y_nb, list_x),
+        mv_bl: mv_at(x_nb, y_nb + n_nb_h - 1, list_x),
+        mv_br: mv_at(x_nb + n_nb_w - 1, y_nb + n_nb_h - 1, list_x),
+        motion_model_idc: cell.motion_model_idc as u32,
+    };
+    crate::affine_cand::AffineNeighbour {
+        available_flag: true,
+        motion_model_idc: cell.motion_model_idc as u32,
+        pred_flag_l0: cell.ref_idx_l0 != -1,
+        ref_idx_l0: cell.ref_idx_l0 as i32,
+        pred_flag_l1: cell.ref_idx_l1 != -1,
+        ref_idx_l1: cell.ref_idx_l1 as i32,
+        src_l0: src(0),
+        src_l1: src(1),
+    }
+}
+
+/// §8.5.3.2 step-4, `availLR != LR_01` shape — drop a later inherited
+/// neighbour whose covering coding block (`CbPosX/CbPosY`) equals an
+/// earlier one's. Slots in the step-3 visiting order:
+/// `0 = A1, 1 = B1, 2 = B0, 3 = A0, 4 = B2`; the rules are
+/// `B1 == B0 → drop B0`, `A1 == A0 → drop A0`, `B1 == B2 → drop B2`,
+/// `A1 == B2 → drop B2`.
+fn prune_inherited_neighbours_lr10(inherited: &mut crate::affine_cand::InheritedNeighbours) {
+    let same_cb = |a: &crate::affine_cand::AffineNeighbour,
+                   b: &crate::affine_cand::AffineNeighbour| {
+        a.available_flag
+            && b.available_flag
+            && a.src_l0.x_nb == b.src_l0.x_nb
+            && a.src_l0.y_nb == b.src_l0.y_nb
+    };
+    if same_cb(&inherited[1], &inherited[2]) {
+        inherited[2].available_flag = false; // B1 == B0 → drop B0
+    }
+    if same_cb(&inherited[0], &inherited[3]) {
+        inherited[3].available_flag = false; // A1 == A0 → drop A0
+    }
+    if same_cb(&inherited[1], &inherited[4]) {
+        inherited[4].available_flag = false; // B1 == B2 → drop B2
+    }
+    if same_cb(&inherited[0], &inherited[4]) {
+        inherited[4].available_flag = false; // A1 == B2 → drop B2
     }
 }
 
@@ -10154,5 +10295,222 @@ mod tests {
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.dmvr_cus, 0, "sps_dmvr_flag off ⇒ no refinement");
+    }
+
+    // ================================================================
+    // Round 387 — per-CU CPMV store → §8.5.3.2/.5 inherited candidates.
+    // ================================================================
+
+    /// Stamp a 16×16 4-parameter affine CU at (0, 0) with CPMVs
+    /// `cp0 = (8, 4)`, `cp1 = (16, 4)` (1/4-pel) into a fresh grid.
+    fn grid_with_affine_cu() -> SideInfoGrid {
+        let mut grid = SideInfoGrid::new(64, 64);
+        let cp_mv = [
+            MotionVector { x: 8, y: 4 },
+            MotionVector { x: 16, y: 4 },
+            MotionVector::default(),
+        ];
+        let motion = AffineCuMotion {
+            l0: Some(AffineListMotion {
+                ref_idx: 0,
+                field: crate::affine::affine_subblock_mvs(16, 16, 2, &cp_mv, 2, 2),
+                center: crate::affine::affine_center_mv(16, 16, 2, &cp_mv),
+            }),
+            l1: None,
+            motion_model_idc: 1,
+        };
+        stamp_affine_side_info(&mut grid, &motion, 0, 0, 16, 16, 0);
+        grid
+    }
+
+    /// The §8.5.3.3 projection of the stored CU onto a 16×16 block at
+    /// (16, 0), computed from the grid's actual corner cells (the same
+    /// reads `affine_neighbour_from_grid` performs).
+    fn expected_inherited_center(grid: &SideInfoGrid) -> MotionVector {
+        let mv_at = |cx: usize, cy: usize| {
+            let c = grid.at(cx, cy);
+            MotionVector {
+                x: c.mv_l0_x,
+                y: c.mv_l0_y,
+            }
+        };
+        let src = crate::affine::NeighbourAffineSource {
+            x_nb: 0,
+            y_nb: 0,
+            n_nb_w: 16,
+            n_nb_h: 16,
+            mv_tl: mv_at(0, 0),
+            mv_tr: mv_at(3, 0),
+            mv_bl: mv_at(0, 3),
+            mv_br: mv_at(3, 3),
+            motion_model_idc: 1,
+        };
+        let cps = crate::affine::inherited_cp_mvs(16, 0, 16, 16, 2, 32, src);
+        let cp_mv = [cps[0], cps[1], MotionVector::default()];
+        crate::affine::affine_center_mv(16, 16, 2, &cp_mv)
+    }
+
+    fn cpmv_store_inputs<'a, 'b>() -> InterDecodeInputs<'a, 'b> {
+        InterDecodeInputs {
+            walk: SliceWalkInputs {
+                pic_width: 64,
+                pic_height: 64,
+                ctb_log2_size_y: 5,
+                min_cb_log2_size_y: 4,
+                max_tb_log2_size_y: 5,
+                chroma_format_idc: 1,
+                ..Default::default()
+            },
+            decode: SliceDecodeInputs::default(),
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates {
+                sps_admvp_flag: true,
+                sps_affine_flag: true,
+                ..Default::default()
+            },
+            pocs: Default::default(),
+            col_pic: None,
+        }
+    }
+
+    /// The affine stamp populates the per-CU CPMV store and
+    /// `affine_neighbour_from_grid` resolves it: geometry, model index,
+    /// per-list flags, and the four corner-cell MVs.
+    #[test]
+    fn round387_affine_neighbour_resolved_from_store() {
+        let grid = grid_with_affine_cu();
+        let nb = affine_neighbour_from_grid(&grid, 15, 15);
+        assert!(nb.available_flag);
+        assert_eq!(nb.motion_model_idc, 1);
+        assert!(nb.pred_flag_l0);
+        assert_eq!(nb.ref_idx_l0, 0);
+        assert!(!nb.pred_flag_l1);
+        assert_eq!((nb.src_l0.x_nb, nb.src_l0.y_nb), (0, 0));
+        assert_eq!((nb.src_l0.n_nb_w, nb.src_l0.n_nb_h), (16, 16));
+        // The stored corner MVs are the §8.5.3.7 subblock-field values
+        // (grid cells (0,0) / (3,0)); an x-growing 4-param model keeps
+        // mv_tr.x > mv_tl.x.
+        assert!(nb.src_l0.mv_tr.x > nb.src_l0.mv_tl.x);
+        // A translational (or unstamped) cell is not an affine neighbour.
+        assert!(!affine_neighbour_from_grid(&grid, 40, 40).available_flag);
+        assert!(!affine_neighbour_from_grid(&grid, -1, 0).available_flag);
+    }
+
+    /// §8.5.3.2 — an affine-merge CU at (16, 0) inherits the stored
+    /// neighbour model through A1 as `affineMergeCandList[ 0 ]` (the
+    /// inherited candidates precede the constructed ones in step 7),
+    /// projecting the neighbour's corner cells per §8.5.3.3.
+    #[test]
+    fn round387_affine_merge_inherits_stored_model() {
+        let grid = grid_with_affine_cu();
+        let inputs = cpmv_store_inputs();
+        let motion = admvp_affine_merge_motion(&inputs, &grid, 0, 16, 0, 16, 16).unwrap();
+        assert_eq!(motion.motion_model_idc, 1, "inherited 4-param model");
+        let l0 = motion.l0.expect("L0 active");
+        assert_eq!(l0.ref_idx, 0);
+        let expect = expected_inherited_center(&grid);
+        assert_eq!(l0.center, expect, "§8.5.3.3 projection selected");
+        assert_ne!(expect, MotionVector::default(), "non-trivial inheritance");
+    }
+
+    /// §8.5.3.5 — an explicit-affine CU at (16, 0) with `mvp_flag = 0`
+    /// selects the inherited group-A predictor (A1 matched on refIdx 0)
+    /// rather than the constructed/corner fallback.
+    #[test]
+    fn round387_affine_mvp_inherits_stored_model() {
+        use crate::inter_cu_syntax::{ExplicitAffineDecision, ExplicitAffineList};
+        let grid = grid_with_affine_cu();
+        let inputs = cpmv_store_inputs();
+        let aff = ExplicitAffineDecision {
+            affine_mode_flag: false,
+            l0: Some(ExplicitAffineList {
+                ref_idx: 0,
+                mvp_flag: 0,
+                mvd_flag: false,
+                mvd_cp: [MotionVector::default(); 3],
+            }),
+            l1: None,
+        };
+        let motion = admvp_affine_amvp_motion(&inputs, &grid, &aff, 16, 0, 16, 16).unwrap();
+        let l0 = motion.l0.expect("L0 active");
+        let expect = expected_inherited_center(&grid);
+        assert_eq!(l0.center, expect, "cpMvpListLX[0] is the inherited A1");
+        assert_ne!(expect, MotionVector::default());
+    }
+
+    /// §8.5.3.5 refIdx gate: the same neighbour does NOT match a CU that
+    /// references a different picture — the predictor falls back to the
+    /// zero fill (no constructed corners on this sparse grid).
+    #[test]
+    fn round387_affine_mvp_refidx_mismatch_falls_back() {
+        use crate::inter_cu_syntax::{ExplicitAffineDecision, ExplicitAffineList};
+        let grid = grid_with_affine_cu();
+        let mut inputs = cpmv_store_inputs();
+        inputs.num_ref_idx_active_minus1_l0 = 1;
+        let aff = ExplicitAffineDecision {
+            affine_mode_flag: false,
+            l0: Some(ExplicitAffineList {
+                ref_idx: 1, // stored neighbour has refIdx 0
+                mvp_flag: 0,
+                mvd_flag: false,
+                mvd_cp: [MotionVector::default(); 3],
+            }),
+            l1: None,
+        };
+        let motion = admvp_affine_amvp_motion(&inputs, &grid, &aff, 16, 0, 16, 16).unwrap();
+        let l0 = motion.l0.expect("L0 active");
+        assert_eq!(l0.center, MotionVector::default(), "refIdx mismatch");
+    }
+
+    /// §8.5.3.2 step-4 pruning: same-covering-CU later neighbours drop
+    /// (B0 vs B1, A0 vs A1, B2 vs B1/A1); distinct covering CUs survive.
+    #[test]
+    fn round387_inherited_pruning_lr10() {
+        use crate::affine_cand::AffineNeighbour;
+        let nb_at = |x_nb: i32, y_nb: i32| -> AffineNeighbour {
+            let mut nb = AffineNeighbour {
+                available_flag: true,
+                motion_model_idc: 1,
+                pred_flag_l0: true,
+                ref_idx_l0: 0,
+                ..Default::default()
+            };
+            nb.src_l0.x_nb = x_nb;
+            nb.src_l0.y_nb = y_nb;
+            nb
+        };
+        // All five from the same covering CU at (0, 0):
+        // [A1, B1, B0, A0, B2].
+        let mut all_same = [nb_at(0, 0); 5];
+        prune_inherited_neighbours_lr10(&mut all_same);
+        assert!(all_same[0].available_flag, "A1 kept");
+        assert!(all_same[1].available_flag, "B1 kept (no A1-vs-B1 rule)");
+        assert!(!all_same[2].available_flag, "B0 dropped (== B1)");
+        assert!(!all_same[3].available_flag, "A0 dropped (== A1)");
+        assert!(!all_same[4].available_flag, "B2 dropped (== B1)");
+        // Distinct covering CUs all survive.
+        let mut distinct = [
+            nb_at(0, 0),
+            nb_at(16, 0),
+            nb_at(32, 0),
+            nb_at(0, 16),
+            nb_at(48, 0),
+        ];
+        prune_inherited_neighbours_lr10(&mut distinct);
+        assert!(distinct.iter().all(|n| n.available_flag));
+        // B2 sharing only A1's CU is dropped by the fourth rule.
+        let mut a1_b2 = [
+            nb_at(0, 0),
+            nb_at(16, 0),
+            nb_at(32, 0),
+            nb_at(0, 16),
+            nb_at(0, 0),
+        ];
+        prune_inherited_neighbours_lr10(&mut a1_b2);
+        assert!(!a1_b2[4].available_flag, "B2 dropped (== A1)");
     }
 }

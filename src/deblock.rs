@@ -83,6 +83,20 @@ pub struct CuSideInfo {
     pub ref_mv_delta_l0_y: i32,
     pub ref_mv_delta_l1_x: i32,
     pub ref_mv_delta_l1_y: i32,
+    /// `MotionModelIdc[ x ][ y ]` (§7.4.9.4): 0 = translational (or not
+    /// inter), 1 = 4-parameter affine, 2 = 6-parameter affine. Non-zero
+    /// only on cells stamped by an affine CU; gates the §8.5.3.2/.5
+    /// inherited-candidate availability.
+    pub motion_model_idc: u8,
+    /// `CbPosX/CbPosY[ x ][ y ]` — the covering coding block's top-left
+    /// luma position, and `CbWidth/CbHeight` as log2. Written by the
+    /// affine stamp so the §8.5.3.3 neighbour projection can locate the
+    /// neighbour CU's corner cells (and the §8.5.3.2 step-4 pruning can
+    /// compare covering CUs). Zero (unused) on non-affine cells.
+    pub cu_x0: u16,
+    pub cu_y0: u16,
+    pub cu_log2_w: u8,
+    pub cu_log2_h: u8,
 }
 
 impl Default for CuSideInfo {
@@ -100,6 +114,11 @@ impl Default for CuSideInfo {
             ref_mv_delta_l0_y: 0,
             ref_mv_delta_l1_x: 0,
             ref_mv_delta_l1_y: 0,
+            motion_model_idc: 0,
+            cu_x0: 0,
+            cu_y0: 0,
+            cu_log2_w: 0,
+            cu_log2_h: 0,
         }
     }
 }
