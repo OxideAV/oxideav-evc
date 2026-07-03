@@ -207,6 +207,123 @@ pub fn refine_subblock_mv(
     (d_mv, frac_pel_applied)
 }
 
+/// Table 29 — the §8.5.5.2.2 luma bilinear interpolation filter
+/// coefficients `fbL[ p ] = [ 64 − 4·p, 4·p ]` for each 1/16 fractional
+/// position `p`.
+#[inline]
+fn fb_l(p: i32) -> [i32; 2] {
+    [64 - 4 * p, 4 * p]
+}
+
+/// §8.5.5.1 eqs. 989/990 + §8.5.5.2 — build one list's `(sbWidth +
+/// 2·srRange) × (sbHeight + 2·srRange)` bilinear prediction plane.
+///
+/// `mv_quarter` is the list's **1/4-pel** `mvLX`; the §8.5.2.9 conversion
+/// to 1/16-pel (`mvLtX = mvLX << 2`) and the eqs.-989/990 search-window
+/// pre-shift (`mvLsX = mvLtX − 16·srRange`) happen here, so the returned
+/// plane is exactly the §8.5.5.1 `predSamplesLXL` input of the SAD stage.
+///
+/// Per §8.5.5.2.2 the sample values are scaled to a common 10-bit-headroom
+/// domain: the integer-position copy applies `<< shift0 = 10 − BitDepthY`
+/// (eq. 1012, `BitDepthY <= 10`), the single-axis filters normalise by
+/// `>> shift2 = BitDepthY − 4` (eqs. 1013/1014) and the two-axis path by
+/// `>> shift3` then `( · + offset4 ) >> shift4` (eqs. 1015-1017). Every
+/// reference fetch is clipped to the picture (the eqs. 1013-1016 clips,
+/// extended to both axes for memory safety — border replicate).
+pub fn bilinear_pred_plane(
+    refp: crate::inter::RefPictureView<'_>,
+    x_sb: i32,
+    y_sb: i32,
+    mv_quarter: crate::inter::MotionVector,
+    sb_w: i32,
+    sb_h: i32,
+    bit_depth: u32,
+) -> PredPlane {
+    let mv_lt = mv_quarter.quarter_to_sixteenth();
+    // eqs. 989/990.
+    let mv_ls_x = mv_lt.x - 16 * SR_RANGE;
+    let mv_ls_y = mv_lt.y - 16 * SR_RANGE;
+    let int_x = mv_ls_x >> 4;
+    let int_y = mv_ls_y >> 4;
+    let frac_x = mv_ls_x & 15;
+    let frac_y = mv_ls_y & 15;
+    let w = (sb_w + 2 * SR_RANGE) as usize;
+    let h = (sb_h + 2 * SR_RANGE) as usize;
+    let bd = bit_depth as i32;
+    let fetch = |x: i32, y: i32| crate::inter::sample_luma_clipped(refp, x, y);
+    let mut samples = vec![0i32; w * h];
+    for (yl, row) in samples.chunks_exact_mut(w).enumerate() {
+        for (xl, out) in row.iter_mut().enumerate() {
+            // eqs. 999/1000.
+            let xi = x_sb + int_x + xl as i32;
+            let yi = y_sb + int_y + yl as i32;
+            *out = if frac_x == 0 && frac_y == 0 {
+                // eq. 1012.
+                let s = fetch(xi, yi);
+                if bd <= 10 {
+                    s << (10 - bd)
+                } else {
+                    (s + (1 << (bd - 11))) >> (bd - 10)
+                }
+            } else if frac_y == 0 {
+                // eq. 1013 — horizontal-only.
+                let f = fb_l(frac_x);
+                let shift2 = bd - 4;
+                let offset2 = 1 << (shift2 - 1);
+                (f[0] * fetch(xi, yi) + f[1] * fetch(xi + 1, yi) + offset2) >> shift2
+            } else if frac_x == 0 {
+                // eq. 1014 — vertical-only.
+                let f = fb_l(frac_y);
+                let shift2 = bd - 4;
+                let offset2 = 1 << (shift2 - 1);
+                (f[0] * fetch(xi, yi) + f[1] * fetch(xi, yi + 1) + offset2) >> shift2
+            } else {
+                // eqs. 1015-1017 — separable two-tap, offset3 = 0.
+                let fx = fb_l(frac_x);
+                let fy = fb_l(frac_y);
+                let shift3 = bd - 8;
+                let t0 = (fx[0] * fetch(xi, yi) + fx[1] * fetch(xi + 1, yi)) >> shift3;
+                let t1 = (fx[0] * fetch(xi, yi + 1) + fx[1] * fetch(xi + 1, yi + 1)) >> shift3;
+                // shift4 = 10, offset4 = 1 << 9 (eqs. 1010/1011).
+                (fy[0] * t0 + fy[1] * t1 + (1 << 9)) >> 10
+            };
+        }
+    }
+    PredPlane { stride: w, samples }
+}
+
+/// §8.5.1 eqs. 387-390 — the DMVR subblock partition of an
+/// `nCbW × nCbH` coding block: `(numSbX, numSbY, sbWidth, sbHeight)`.
+pub fn dmvr_subblock_geometry(n_cb_w: u32, n_cb_h: u32) -> (u32, u32, u32, u32) {
+    let num_sb_x = if n_cb_w > 16 { n_cb_w >> 4 } else { 1 };
+    let num_sb_y = if n_cb_h > 16 { n_cb_h >> 4 } else { 1 };
+    let sb_w = if n_cb_w > 16 { 16 } else { n_cb_w };
+    let sb_h = if n_cb_h > 16 { 16 } else { n_cb_h };
+    (num_sb_x, num_sb_y, sb_w, sb_h)
+}
+
+/// §8.5.5 end-to-end for one subblock over real reference pictures:
+/// build both lists' §8.5.5.2 bilinear prediction planes from the
+/// 1/4-pel `mvL0` / `mvL1` and run the §8.5.5.1 refinement. Returns the
+/// delta motion vector `dMvL0` in 1/16-pel units (the caller forms
+/// `refMvLX = ( mvLX << 2 ) ± dMvL0`, eqs. 395-397).
+#[allow(clippy::too_many_arguments)]
+pub fn refine_subblock_from_refs(
+    ref_l0: crate::inter::RefPictureView<'_>,
+    ref_l1: crate::inter::RefPictureView<'_>,
+    x_sb: i32,
+    y_sb: i32,
+    mv_l0_quarter: crate::inter::MotionVector,
+    mv_l1_quarter: crate::inter::MotionVector,
+    sb_w: i32,
+    sb_h: i32,
+    bit_depth: u32,
+) -> [i32; 2] {
+    let p0 = bilinear_pred_plane(ref_l0, x_sb, y_sb, mv_l0_quarter, sb_w, sb_h, bit_depth);
+    let p1 = bilinear_pred_plane(ref_l1, x_sb, y_sb, mv_l1_quarter, sb_w, sb_h, bit_depth);
+    refine_subblock_mv(&p0, &p1, sb_w, sb_h).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +460,124 @@ mod tests {
         let (d, frac) = refine_subblock_mv(&p0, &p1, 8, 8);
         assert!(frac);
         assert_eq!(d, [0, 0]); // flat → no integer step, degenerate parabola
+    }
+
+    // --- §8.5.5.2 bilinear interpolation + the refs-level driver ---------
+
+    /// Deterministic "generic" 8-bit texture.
+    fn texture(x: i32, y: i32) -> u8 {
+        (((x * 37 + y * 101) ^ (x * y * 13)) & 0xff) as u8
+    }
+
+    fn make_ref(shift_x: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y: Vec<u8> = (0i32..32 * 32)
+            .map(|i| texture(i % 32 - shift_x, i / 32))
+            .collect();
+        (y, vec![128u8; 16 * 16], vec![128u8; 16 * 16])
+    }
+
+    fn view<'a>(y: &'a [u8], cb: &'a [u8], cr: &'a [u8]) -> crate::inter::RefPictureView<'a> {
+        crate::inter::RefPictureView {
+            y,
+            cb,
+            cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        }
+    }
+
+    /// Integer-position bilinear plane (eq. 1012): a zero 1/4-pel MV
+    /// yields `mvLs = −2` integer pels each axis, and every plane sample
+    /// is the reference sample `<< shift0` (= 2 at 8-bit).
+    #[test]
+    fn bilinear_plane_integer_positions_scale_by_shift0() {
+        let (y, cb, cr) = make_ref(0);
+        let refp = view(&y, &cb, &cr);
+        let p = bilinear_pred_plane(refp, 8, 8, crate::inter::MotionVector::default(), 8, 8, 8);
+        assert_eq!(p.stride, 12);
+        for yl in 0..12 {
+            for xl in 0..12 {
+                let expect = (texture(8 - 2 + xl, 8 - 2 + yl) as i32) << 2;
+                assert_eq!(p.at(xl, yl), expect, "({xl},{yl})");
+            }
+        }
+    }
+
+    /// Half-pel horizontal phase (eq. 1013): `mvL0 = (2, 0)` in 1/4-pel →
+    /// `mvLs.x = −24` → fracX = 8 → the Table-29 `[32, 32]` average with
+    /// the `offset2 >> shift2` normalisation onto the same 10-bit domain.
+    #[test]
+    fn bilinear_plane_half_pel_is_two_tap_average() {
+        let (y, cb, cr) = make_ref(0);
+        let refp = view(&y, &cb, &cr);
+        let mv = crate::inter::MotionVector { x: 2, y: 0 };
+        let p = bilinear_pred_plane(refp, 8, 8, mv, 4, 4, 8);
+        // int_x = (8 − 32) >> 4 = −2, frac = 8.
+        for yl in 0..8 {
+            for xl in 0..8 {
+                let a = texture(8 - 2 + xl, 8 - 2 + yl) as i32;
+                let b = texture(8 - 2 + xl + 1, 8 - 2 + yl) as i32;
+                let expect = (32 * a + 32 * b + 8) >> 4;
+                assert_eq!(p.at(xl, yl), expect, "({xl},{yl})");
+            }
+        }
+    }
+
+    /// eqs. 387-390 — the DMVR partition: ≤16 stays whole, larger splits
+    /// into 16-sample subblocks.
+    #[test]
+    fn subblock_geometry_eqs_387_390() {
+        assert_eq!(dmvr_subblock_geometry(8, 8), (1, 1, 8, 8));
+        assert_eq!(dmvr_subblock_geometry(16, 16), (1, 1, 16, 16));
+        assert_eq!(dmvr_subblock_geometry(32, 16), (2, 1, 16, 16));
+        assert_eq!(dmvr_subblock_geometry(64, 32), (4, 2, 16, 16));
+    }
+
+    /// End-to-end over reference pictures: L0's content sits one pel
+    /// right of base, L1's one pel left. The bilateral match is exact at
+    /// `dMvL0 = (+1 int pel, 0)` (L0 shifts +d, L1 −d, eqs. 396/397), so
+    /// the refinement returns exactly `[16, 0]` with no sub-pel step
+    /// (second-pass centre SAD is 0).
+    #[test]
+    fn refine_from_refs_recovers_opposed_integer_shift() {
+        let (y0, cb0, cr0) = make_ref(1); // ref0[x] = base[x − 1]
+        let (y1, cb1, cr1) = make_ref(-1); // ref1[x] = base[x + 1]
+        let r0 = view(&y0, &cb0, &cr0);
+        let r1 = view(&y1, &cb1, &cr1);
+        let d = refine_subblock_from_refs(
+            r0,
+            r1,
+            8,
+            8,
+            crate::inter::MotionVector::default(),
+            crate::inter::MotionVector::default(),
+            8,
+            8,
+            8,
+        );
+        assert_eq!(d, [16, 0]);
+    }
+
+    /// Identical references ⇒ the §8.5.5.1 gate (centre SAD < sbW·sbH)
+    /// fails and the refinement is the identity.
+    #[test]
+    fn refine_from_refs_identical_refs_no_op() {
+        let (y0, cb0, cr0) = make_ref(0);
+        let r0 = view(&y0, &cb0, &cr0);
+        let d = refine_subblock_from_refs(
+            r0,
+            r0,
+            8,
+            8,
+            crate::inter::MotionVector::default(),
+            crate::inter::MotionVector::default(),
+            8,
+            8,
+            8,
+        );
+        assert_eq!(d, [0, 0]);
     }
 }

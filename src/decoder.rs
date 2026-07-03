@@ -815,6 +815,7 @@ impl EvcDecoder {
                 sps_mmvd_flag: sps.sps_mmvd_flag,
                 sps_affine_flag: sps.sps_affine_flag,
                 mmvd_group_enable_flag: header.mmvd_group_enable_flag,
+                sps_dmvr_flag: sps.sps_dmvr_flag,
             },
             // §8.5.2.3.3 / §8.5.2.3.9 POC context: the derived slice POC
             // plus the resolved reference-list POCs (parallel to the

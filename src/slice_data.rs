@@ -6634,6 +6634,7 @@ mod tests {
             sps_mmvd_flag: false,
             sps_affine_flag: false,
             mmvd_group_enable_flag: false,
+            sps_dmvr_flag: false,
         };
         let inputs = InterDecodeInputs {
             walk,

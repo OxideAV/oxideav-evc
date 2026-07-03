@@ -299,8 +299,8 @@ fn baseline_chroma_phase_supported(phase: u32) -> bool {
 
 /// Sample one luma reference position, clipping coordinates to the
 /// reference picture extent.  Implements the `Clip3(0, picW − 1, …)` step
-/// in eq. 921/922.
-fn sample_luma_clipped(refp: RefPictureView<'_>, x: i32, y: i32) -> i32 {
+/// in eq. 921/922. Shared with the §8.5.5.2 DMVR bilinear interpolation.
+pub(crate) fn sample_luma_clipped(refp: RefPictureView<'_>, x: i32, y: i32) -> i32 {
     let xc = x.clamp(0, refp.width as i32 - 1) as usize;
     let yc = y.clamp(0, refp.height as i32 - 1) as usize;
     refp.y[yc * refp.y_stride + xc] as i32

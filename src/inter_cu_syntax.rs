@@ -74,6 +74,10 @@ pub struct InterToolGates {
     pub sps_admvp_flag: bool,
     /// `mmvd_group_enable_flag` — slice-header gate for `mmvd_group_idx`.
     pub mmvd_group_enable_flag: bool,
+    /// `sps_dmvr_flag` — §8.5.5 decoder-side motion vector refinement
+    /// available. Reads no syntax of its own; it gates the §8.5.1
+    /// `dmvrAppliedFlag` derivation on merge/skip bi-pred CUs.
+    pub sps_dmvr_flag: bool,
 }
 
 /// The resolved §7.3.8.4 merge-branch sub-decision. Selected once
@@ -775,6 +779,7 @@ mod tests {
             sps_affine_flag: true,
             sps_admvp_flag: true,
             mmvd_group_enable_flag: false,
+            sps_dmvr_flag: false,
         }
     }
 
