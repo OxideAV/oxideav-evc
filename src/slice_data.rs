@@ -2338,6 +2338,14 @@ pub struct InterDecodeStats {
     /// list (diagnostic — counts CUs where the TMVP derivation produced
     /// a candidate, whether or not `merge_idx` selected it).
     pub tmvp_candidates: u32,
+    /// Round 387: coding units on which the §8.5.1 `dmvrAppliedFlag`
+    /// survived its modification cascade (regular merge/skip bi-pred,
+    /// opposite-side equidistant references, ≥8×8, `sps_dmvr_flag`) and
+    /// were reconstructed through the §8.5.5 refinement path.
+    pub dmvr_cus: u32,
+    /// Round 387: DMVR subblocks whose §8.5.5 refinement produced a
+    /// non-zero `dMvL0` (integer and/or parametric step).
+    pub dmvr_refined_subblocks: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -2596,6 +2604,13 @@ struct AffineCuMotion {
 /// Baseline shape) or affine (per-subblock fields).
 enum CuMotion {
     Translational(InterMotionPair),
+    /// A **regular-merge / skip** translational CU on the
+    /// `sps_admvp_flag == 1` path (`merge_mode_flag == 1` with
+    /// `mmvd_flag == 0` and `affine_flag == 0`) — the only CU shape on
+    /// which the §8.5.1 `dmvrAppliedFlag` survives its modification
+    /// cascade. Reconstruction-wise identical to [`Self::Translational`]
+    /// except that the DMVR gate is evaluated on it.
+    MergeTranslational(InterMotionPair),
     Affine(Box<AffineCuMotion>),
 }
 
@@ -3200,7 +3215,7 @@ fn decode_admvp_skip_cu(
             n_cb_w,
             n_cb_h,
         )
-        .map(CuMotion::Translational),
+        .map(CuMotion::MergeTranslational),
         CuSkipDecision::Mmvd(d) => admvp_merge_branch_to_pair(
             MergeBranch::Mmvd(d),
             side_info,
@@ -3311,6 +3326,10 @@ fn decode_admvp_nonskip_inter_cu(
         if temporal.is_some() {
             stats.tmvp_candidates += 1;
         }
+        // A regular merge CU keeps its §8.5.1 dmvrAppliedFlag alive
+        // (`mmvd_flag == 0` is one of the modification-cascade
+        // conditions); an MMVD CU does not.
+        let is_regular = matches!(branch, MergeBranch::Regular { .. });
         return admvp_merge_branch_to_pair(
             branch,
             side_info,
@@ -3324,7 +3343,11 @@ fn decode_admvp_nonskip_inter_cu(
             n_cb_w,
             n_cb_h,
         )
-        .map(CuMotion::Translational);
+        .map(if is_regular {
+            CuMotion::MergeTranslational
+        } else {
+            CuMotion::Translational
+        });
     }
 
     // merge_mode_flag == 0 → explicit-AMVP body.
@@ -3758,7 +3781,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     // HMVP / stats sections read. For an affine CU the §8.5.2.7 centre MV
     // stands in for the whole-CU vector.
     let (pred_l0, pred_l1) = match &motion {
-        CuMotion::Translational((l0, l1)) => (*l0, *l1),
+        CuMotion::Translational((l0, l1)) | CuMotion::MergeTranslational((l0, l1)) => (*l0, *l1),
         CuMotion::Affine(a) => (
             a.l0.as_ref().map(|l| (l.center, l.ref_idx)),
             a.l1.as_ref().map(|l| (l.center, l.ref_idx)),
@@ -3811,7 +3834,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     // 1/16 → 1/4 pel via the §8.5.3.10 rule) so the spatial-neighbour /
     // collocated readers observe the dense motion field.
     match &motion {
-        CuMotion::Translational(_) => {
+        CuMotion::Translational(_) | CuMotion::MergeTranslational(_) => {
             side_info.stamp_block(
                 x0,
                 y0,
@@ -3826,6 +3849,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                     mv_l1_y: pred_l1.map(|(m, _)| m.y).unwrap_or(0),
                     ref_idx_l0: pred_l0.map(|(_, r)| r as i8).unwrap_or(-1),
                     ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
+                    ..Default::default()
                 },
             );
         }
@@ -3912,8 +3936,58 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     } else {
         stats.uni_pred_cus += 1;
     }
+    // §8.5.1 dmvrAppliedFlag — initialised 1 by the §8.5.2.1 merge-mode
+    // derivation (encoded here as the MergeTranslational shape, which
+    // also carries the `mmvd_flag == 0` condition), then zeroed unless
+    // *all* of the modification-cascade conditions hold: bi-prediction,
+    // `DiffPicOrderCnt( currPic, RefPicList0[ refIdxL0 ] ) +
+    // DiffPicOrderCnt( currPic, RefPicList1[ refIdxL1 ] ) == 0`
+    // (opposite-side equidistant references), and nCbW/nCbH ≥ 8. The
+    // sps_dmvr_flag tool gate (§7.4.3.1) guards the whole clause; an
+    // unthreaded POC context (empty reference-POC tables) degrades to
+    // dmvrAppliedFlag = 0 exactly like a non-qualifying stream.
+    let dmvr_applied = matches!(&motion, CuMotion::MergeTranslational(_))
+        && inputs.inter_tool_gates.sps_dmvr_flag
+        && n_cb_w >= 8
+        && n_cb_h >= 8
+        && match (pred_l0, pred_l1) {
+            (Some((_, r0)), Some((_, r1))) => {
+                match (
+                    inputs.pocs.ref_pocs_l0.get(r0 as usize),
+                    inputs.pocs.ref_pocs_l1.get(r1 as usize),
+                ) {
+                    (Some(&p0), Some(&p1)) => {
+                        (inputs.pocs.curr_poc - p0) + (inputs.pocs.curr_poc - p1) == 0
+                            && p0 != inputs.pocs.curr_poc
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+    if dmvr_applied {
+        stats.dmvr_cus += 1;
+        let (Some((mv0, r0)), Some((mv1, r1))) = (pred_l0, pred_l1) else {
+            unreachable!("dmvr_applied requires bi-prediction");
+        };
+        return apply_dmvr_inter_prediction(
+            pic,
+            stats,
+            side_info,
+            inputs,
+            x0,
+            y0,
+            n_cb_w as usize,
+            n_cb_h as usize,
+            (mv0, r0),
+            (mv1, r1),
+            &residual_y_vec,
+            &residual_cb_vec,
+            &residual_cr_vec,
+        );
+    }
     match &motion {
-        CuMotion::Translational(_) => apply_inter_prediction(
+        CuMotion::Translational(_) | CuMotion::MergeTranslational(_) => apply_inter_prediction(
             pic,
             inputs,
             x0,
@@ -3939,6 +4013,264 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
             &residual_cr_vec,
         ),
     }
+}
+
+/// §8.5.1 steps 1)-4) for a `dmvrAppliedFlag == 1` CU: partition into
+/// the eqs.-387-390 subblock grid, refine each subblock's motion via the
+/// §8.5.5 process (over the §8.5.5.2 bilinear planes built from the real
+/// reference pictures), form the refined vectors (eqs. 395-399:
+/// `refMvL0 = ( mvL0 << 2 ) + dMvL0`, `refMvL1 = ( mvL1 << 2 ) − dMvL0`,
+/// clipped to ±2¹⁷), and motion-compensate each subblock through the
+/// §8.5.4.3 interpolation with the eqs.-923/924 (+932/933 chroma)
+/// reference-padding window anchored at the **unrefined** MV (the
+/// §8.5.4.3.1 `mvOffset = refMvLX − mvLX` inversion). The chroma motion
+/// follows §8.5.2.6 from the refined luma vector. Each subblock's
+/// refinement delta is stamped into the side-info grid
+/// (`ref_mv_delta_*`) so the retained motion field serves the
+/// §8.5.2.3.4 collocated readers with `refMvLX` per the §8.5.1 NOTE.
+#[allow(clippy::too_many_arguments)]
+fn apply_dmvr_inter_prediction(
+    pic: &mut YuvPicture,
+    stats: &mut InterDecodeStats,
+    side_info: &mut SideInfoGrid,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    n_cb_w: usize,
+    n_cb_h: usize,
+    l0: (MotionVector, u32),
+    l1: (MotionVector, u32),
+    residual_y: &[i32],
+    residual_cb: &[i32],
+    residual_cr: &[i32],
+) -> Result<()> {
+    let bit_depth = inputs.decode.bit_depth_luma;
+    let (mv0, r0) = l0;
+    let (mv1, r1) = l1;
+    let ref0 = inputs
+        .ref_l0(r0)
+        .ok_or_else(|| Error::invalid("evc dmvr: ref_idx_l0 out of reference-list range"))?;
+    let ref1 = inputs
+        .ref_l1(r1)
+        .ok_or_else(|| Error::invalid("evc dmvr: ref_idx_l1 out of reference-list range"))?;
+    // eqs. 387-390 — the DMVR subblock partition.
+    let (num_sb_x, num_sb_y, sb_w, sb_h) =
+        crate::dmvr::dmvr_subblock_geometry(n_cb_w as u32, n_cb_h as u32);
+    let n = n_cb_w * n_cb_h;
+    let mut buf_l0 = vec![0i32; n];
+    let mut buf_l1 = vec![0i32; n];
+    let chroma_present = inputs.walk.chroma_format_idc != 0;
+    let (sub_w, sub_h) = match inputs.walk.chroma_format_idc {
+        1 => (2u32, 2u32),
+        2 => (2u32, 1u32),
+        _ => (1u32, 1u32),
+    };
+    let cw = n_cb_w / sub_w as usize;
+    let ch = n_cb_h / sub_h as usize;
+    let nc = if chroma_present { cw * ch } else { 0 };
+    let mut cbuf = [
+        vec![0i32; nc], // L0 Cb
+        vec![0i32; nc], // L0 Cr
+        vec![0i32; nc], // L1 Cb
+        vec![0i32; nc], // L1 Cr
+    ];
+
+    // One list's luma + chroma MC for one subblock, padded per
+    // eqs. 923/924 + 932/933 at the unrefined anchor.
+    #[allow(clippy::too_many_arguments)]
+    fn mc_list_subblock(
+        refp: crate::inter::RefPictureView<'_>,
+        mv_q: MotionVector,
+        ref_mv: MotionVector,
+        x_sb: u32,
+        y_sb: u32,
+        x0: u32,
+        y0: u32,
+        sb_w: u32,
+        sb_h: u32,
+        n_cb_w: usize,
+        chroma: Option<(u32, u32, usize, u32)>, // (sub_w, sub_h, cw, cfi)
+        bit_depth: u32,
+        bit_depth_chroma: u32,
+        buf: &mut [i32],
+        cbuf_cb: &mut [i32],
+        cbuf_cr: &mut [i32],
+    ) -> Result<()> {
+        // §8.5.4.3.1 — xSbIntL anchored at mvLX = refMvLX − mvOffset,
+        // i.e. the unrefined 1/16-pel MV (mv_q << 2).
+        let pad = crate::inter::PadAnchor {
+            x_sb_int: x_sb as i32 + (mv_q.x >> 2),
+            y_sb_int: y_sb as i32 + (mv_q.y >> 2),
+        };
+        let mut sb = vec![0i32; (sb_w * sb_h) as usize];
+        crate::inter::interpolate_luma_block_main_padded(
+            refp,
+            x_sb as i32,
+            y_sb as i32,
+            ref_mv,
+            sb_w as usize,
+            sb_h as usize,
+            bit_depth,
+            pad,
+            &mut sb,
+        )?;
+        for row in 0..sb_h as usize {
+            let dst = ((y_sb - y0) as usize + row) * n_cb_w + (x_sb - x0) as usize;
+            buf[dst..dst + sb_w as usize]
+                .copy_from_slice(&sb[row * sb_w as usize..(row + 1) * sb_w as usize]);
+        }
+        if let Some((sub_w, sub_h, cw, cfi)) = chroma {
+            // §8.5.2.6 — refined + unrefined chroma vectors (1/32-pel).
+            let mv_c = crate::inter::derive_chroma_mv(ref_mv, cfi);
+            let mv_c_unref = crate::inter::derive_chroma_mv(mv_q.quarter_to_sixteenth(), cfi);
+            let (x_sb_c, y_sb_c) = ((x_sb / sub_w) as i32, (y_sb / sub_h) as i32);
+            let pad_c = crate::inter::PadAnchor {
+                x_sb_int: x_sb_c + (mv_c_unref.x >> 5),
+                y_sb_int: y_sb_c + (mv_c_unref.y >> 5),
+            };
+            let (csb_w, csb_h) = ((sb_w / sub_w) as usize, (sb_h / sub_h) as usize);
+            let mut csb = vec![0i32; csb_w * csb_h];
+            for (c_idx, cdst) in [(1u32, &mut *cbuf_cb), (2u32, &mut *cbuf_cr)] {
+                crate::inter::interpolate_chroma_block_main_padded(
+                    refp,
+                    c_idx,
+                    x_sb_c,
+                    y_sb_c,
+                    mv_c,
+                    csb_w,
+                    csb_h,
+                    bit_depth_chroma,
+                    pad_c,
+                    &mut csb,
+                )?;
+                for row in 0..csb_h {
+                    let dst = ((y_sb - y0) / sub_h) as usize * cw
+                        + row * cw
+                        + ((x_sb - x0) / sub_w) as usize;
+                    cdst[dst..dst + csb_w].copy_from_slice(&csb[row * csb_w..(row + 1) * csb_w]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const C17: i32 = 1 << 17;
+    for sy in 0..num_sb_y {
+        for sx in 0..num_sb_x {
+            let x_sb = x0 + sx * sb_w;
+            let y_sb = y0 + sy * sb_h;
+            // §8.5.5 — the per-subblock refinement delta (1/16-pel).
+            let d = crate::dmvr::refine_subblock_from_refs(
+                ref0,
+                ref1,
+                x_sb as i32,
+                y_sb as i32,
+                mv0,
+                mv1,
+                sb_w as i32,
+                sb_h as i32,
+                bit_depth,
+            );
+            if d != [0, 0] {
+                stats.dmvr_refined_subblocks += 1;
+            }
+            // eqs. 395-399.
+            let ref_mv0 = MotionVector {
+                x: ((mv0.x << 2) + d[0]).clamp(-C17, C17 - 1),
+                y: ((mv0.y << 2) + d[1]).clamp(-C17, C17 - 1),
+            };
+            let ref_mv1 = MotionVector {
+                x: ((mv1.x << 2) - d[0]).clamp(-C17, C17 - 1),
+                y: ((mv1.y << 2) - d[1]).clamp(-C17, C17 - 1),
+            };
+            let chroma =
+                chroma_present.then_some((sub_w, sub_h, cw, inputs.walk.chroma_format_idc));
+            let (cb0, rest) = cbuf.split_at_mut(1);
+            let (cr0, rest) = rest.split_at_mut(1);
+            let (cb1, cr1) = rest.split_at_mut(1);
+            mc_list_subblock(
+                ref0,
+                mv0,
+                ref_mv0,
+                x_sb,
+                y_sb,
+                x0,
+                y0,
+                sb_w,
+                sb_h,
+                n_cb_w,
+                chroma,
+                bit_depth,
+                inputs.decode.bit_depth_chroma,
+                &mut buf_l0,
+                &mut cb0[0],
+                &mut cr0[0],
+            )?;
+            mc_list_subblock(
+                ref1,
+                mv1,
+                ref_mv1,
+                x_sb,
+                y_sb,
+                x0,
+                y0,
+                sb_w,
+                sb_h,
+                n_cb_w,
+                chroma,
+                bit_depth,
+                inputs.decode.bit_depth_chroma,
+                &mut buf_l1,
+                &mut cb1[0],
+                &mut cr1[0],
+            )?;
+            // §8.5.1 NOTE — retain the per-subblock refined-MV delta for
+            // the collocated readers of later pictures.
+            side_info.stamp_ref_mv_delta(x_sb, y_sb, sb_w, sb_h, (d[0], d[1]), (-d[0], -d[1]));
+        }
+    }
+    // eq. 988 default weighting + residual + picture construction.
+    let mut combined = vec![0i32; n];
+    average_bipred(&buf_l0, &buf_l1, &mut combined);
+    if !residual_y.is_empty() {
+        if residual_y.len() != n {
+            return Err(Error::invalid(format!(
+                "evc dmvr: luma residual len {} != {}",
+                residual_y.len(),
+                n
+            )));
+        }
+        for (a, b) in combined.iter_mut().zip(residual_y.iter()) {
+            *a += *b;
+        }
+    }
+    pic.store_block(x0, y0, n_cb_w, n_cb_h, 0, &combined);
+    if chroma_present {
+        for c_idx in 1..=2u32 {
+            let (p0, p1) = if c_idx == 1 {
+                (&cbuf[0], &cbuf[2])
+            } else {
+                (&cbuf[1], &cbuf[3])
+            };
+            let mut ccomb = vec![0i32; nc];
+            average_bipred(p0, p1, &mut ccomb);
+            let res = if c_idx == 1 { residual_cb } else { residual_cr };
+            if !res.is_empty() {
+                if res.len() != nc {
+                    return Err(Error::invalid(format!(
+                        "evc dmvr: chroma residual len {} != {}",
+                        res.len(),
+                        nc
+                    )));
+                }
+                for (a, b) in ccomb.iter_mut().zip(res.iter()) {
+                    *a += *b;
+                }
+            }
+            pic.store_block(x0 / sub_w, y0 / sub_h, cw, ch, c_idx, &ccomb);
+        }
+    }
+    Ok(())
 }
 
 /// Stamp an affine CU's per-subblock motion into the side-info grid —
@@ -3997,6 +4329,7 @@ fn stamp_affine_side_info(
                     mv_l1_y: mv1.y,
                     ref_idx_l0: r0,
                     ref_idx_l1: r1,
+                    ..Default::default()
                 },
             );
         }
@@ -5891,6 +6224,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let hmvp = crate::hmvp::HmvpCandList::new();
@@ -5925,6 +6259,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 2, // mismatched against current cur_ref_idx=0
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let hmvp = crate::hmvp::HmvpCandList::new();
@@ -5967,6 +6302,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let hmvp = crate::hmvp::HmvpCandList::new();
@@ -6840,6 +7176,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         // Current CU at (8, 0), 8×8. A1 = (7, 7) is inside the stamped
@@ -6889,6 +7226,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let nb = merge_neighbour_mv_from_grid(&grid, 4, 4);
@@ -7044,6 +7382,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let mut enc = CabacEncoder::new();
@@ -7132,6 +7471,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let col_ref_pocs = [2i32];
@@ -7194,6 +7534,7 @@ mod tests {
                 mv_l1_y: -4,
                 ref_idx_l0: 0,
                 ref_idx_l1: 0,
+                ..Default::default()
             },
         );
         let col_ref_pocs = [0i32];
@@ -7403,6 +7744,7 @@ mod tests {
                     mv_l1_y: 0,
                     ref_idx_l0: 0,
                     ref_idx_l1: -1,
+                    ..Default::default()
                 },
             );
         };
@@ -7557,6 +7899,7 @@ mod tests {
                     mv_l1_y: 0,
                     ref_idx_l0: 0,
                     ref_idx_l1: -1,
+                    ..Default::default()
                 },
             );
         };
@@ -7638,6 +7981,7 @@ mod tests {
                     mv_l1_y: 0,
                     ref_idx_l0: 0,
                     ref_idx_l1: -1,
+                    ..Default::default()
                 },
             );
         };
@@ -7699,6 +8043,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 1, // ≠ the CU's target ref 0
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let hmvp = crate::hmvp::HmvpCandList::new();
@@ -7736,6 +8081,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         let hmvp = crate::hmvp::HmvpCandList::new();
@@ -9585,5 +9931,228 @@ mod tests {
         // Matches the single-tile raster walker on the same RBSP.
         let raster = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.hmvp_resets, raster.hmvp_resets);
+    }
+
+    // ================================================================
+    // Round 387 — §8.5.1/§8.5.5 DMVR on qualifying bi-pred merge CUs.
+    // ================================================================
+
+    /// Clamped-ramp luma: `base(x) = clamp(x, 1, 30) · 8`, constant along
+    /// y. Shifting this content by ±1 column commutes with the picture
+    /// border clamp, so the DMVR bilateral match at `dMvL0 = (16, 0)` is
+    /// *exactly* zero everywhere — including the plane-padding columns —
+    /// and the refined bi-prediction reproduces `base` bit-exactly.
+    fn dmvr_base(x: i32) -> u8 {
+        (x.clamp(1, 30) * 8) as u8
+    }
+
+    fn dmvr_ref_planes(shift_x: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y: Vec<u8> = (0i32..32 * 32)
+            .map(|i| dmvr_base(i % 32 - shift_x))
+            .collect();
+        (y, vec![128u8; 16 * 16], vec![128u8; 16 * 16])
+    }
+
+    fn dmvr_view<'a>(y: &'a [u8], cb: &'a [u8], cr: &'a [u8]) -> RefPictureView<'a> {
+        RefPictureView {
+            y,
+            cb,
+            cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        }
+    }
+
+    /// Encode one 32×32 skip CU on the admvp path: merge_idx = 0 (the
+    /// B-slice zero-fill candidate — bi-pred, refIdx 0/0, zero MV).
+    fn encode_dmvr_skip_cu_stream() -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        enc.finish()
+    }
+
+    fn dmvr_walk() -> SliceWalkInputs {
+        SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end §8.5.1 → §8.5.5 → §8.5.4.3: a B-slice zero-MV bi-pred
+    /// merge-skip CU between opposite-side equidistant references whose
+    /// contents are shifted ±1 column recovers `dMvL0 = (16, 0)` on every
+    /// 16×16 subblock, and the refined bi-prediction reconstructs the
+    /// un-shifted base content bit-exactly across the whole picture.
+    #[test]
+    fn round387_dmvr_bipred_merge_refines_to_exact_content() {
+        let (y0, cb0, cr0) = dmvr_ref_planes(1); // ref0 = base shifted right
+        let (y1, cb1, cr1) = dmvr_ref_planes(-1); // ref1 = base shifted left
+        let ref_l0 = [dmvr_view(&y0, &cb0, &cr0)];
+        let ref_l1 = [dmvr_view(&y1, &cb1, &cr1)];
+        let rbsp = encode_dmvr_skip_cu_stream();
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_dmvr_flag: true,
+            ..Default::default()
+        };
+        // POCs: curr = 2, L0 ref at 0, L1 ref at 4 →
+        // (2 − 0) + (2 − 4) = 0 (opposite side, equidistant).
+        let inputs = InterDecodeInputs {
+            walk: dmvr_walk(),
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: true,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_l0,
+            ref_list_l1: &ref_l1,
+            inter_tool_gates: gates,
+            pocs: InterPocs {
+                curr_poc: 2,
+                ref_pocs_l0: &[0],
+                ref_pocs_l1: &[4],
+            },
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.dmvr_cus, 1, "the CU qualified for DMVR");
+        assert_eq!(
+            stats.dmvr_refined_subblocks, 4,
+            "all four 16×16 subblocks refined (32×32 CU, eqs. 387-390)"
+        );
+        // The refined prediction reproduces base(x) everywhere: L0 fetches
+        // ref0[ x + 1 ] = base(x), L1 fetches ref1[ x − 1 ] = base(x).
+        let stride = pic.y_stride();
+        for yy in 0..32usize {
+            for xx in 0..32usize {
+                assert_eq!(pic.y[yy * stride + xx], dmvr_base(xx as i32), "({xx},{yy})");
+            }
+        }
+        // Flat chroma stays flat under the refined chroma MC.
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        // §8.5.1 NOTE — the per-subblock refined-MV deltas were stamped
+        // for the collocated readers: +dMvL0 on L0, −dMvL0 on L1.
+        let cell = stats.side_info.at(0, 0);
+        assert_eq!(
+            (cell.ref_mv_delta_l0_x, cell.ref_mv_delta_l0_y),
+            (16, 0),
+            "L0 delta = +dMvL0"
+        );
+        assert_eq!(
+            (cell.ref_mv_delta_l1_x, cell.ref_mv_delta_l1_y),
+            (-16, 0),
+            "L1 delta = −dMvL0"
+        );
+        // The unrefined MV stays in the mv fields (spatial/deblock view)…
+        assert_eq!((cell.mv_l0_x, cell.mv_l0_y), (0, 0));
+        // …while the collocated reader reconstructs refMvLX (1/4-pel).
+        let col = crate::tmvp::collocated_mv_from_side_info(&stats.side_info, 0, 0);
+        assert_eq!(col.mv_l0, MotionVector::quarter_pel(4, 0));
+        assert_eq!(col.mv_l1, MotionVector::quarter_pel(-4, 0));
+    }
+
+    /// The §8.5.1 modification cascade zeroes dmvrAppliedFlag when the
+    /// references are *same-side* (POC-diff sum ≠ 0): the identical CU
+    /// falls back to the plain whole-CU bi-prediction (the ±1-shifted
+    /// references average instead of re-aligning).
+    #[test]
+    fn round387_dmvr_gate_rejects_same_side_references() {
+        let (y0, cb0, cr0) = dmvr_ref_planes(1);
+        let (y1, cb1, cr1) = dmvr_ref_planes(-1);
+        let ref_l0 = [dmvr_view(&y0, &cb0, &cr0)];
+        let ref_l1 = [dmvr_view(&y1, &cb1, &cr1)];
+        let rbsp = encode_dmvr_skip_cu_stream();
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_dmvr_flag: true,
+            ..Default::default()
+        };
+        // (2 − 0) + (2 − 1) = 3 ≠ 0 → dmvrAppliedFlag = 0.
+        let inputs = InterDecodeInputs {
+            walk: dmvr_walk(),
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: true,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_l0,
+            ref_list_l1: &ref_l1,
+            inter_tool_gates: gates,
+            pocs: InterPocs {
+                curr_poc: 2,
+                ref_pocs_l0: &[0],
+                ref_pocs_l1: &[1],
+            },
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.dmvr_cus, 0, "same-side references disqualify");
+        assert_eq!(stats.dmvr_refined_subblocks, 0);
+        // Un-refined bi-pred: the average of the two shifted ramps at an
+        // interior column x is (base(x−1) + base(x+1) + 1) >> 1 ≠ base(x)
+        // only at the flat ends; at x = 15 it equals base(15) exactly, so
+        // probe a column where the shifted average differs: x = 1 →
+        // (base(0) + base(2) + 1) >> 1 = (8 + 16 + 1) >> 1 = 12 ≠ 8.
+        let stride = pic.y_stride();
+        assert_eq!(pic.y[16 * stride + 1], 12, "plain average, no re-align");
+        // The delta fields stay zero.
+        let cell = stats.side_info.at(0, 0);
+        assert_eq!(cell.ref_mv_delta_l0_x, 0);
+    }
+
+    /// With `sps_dmvr_flag == 0` the identical qualifying CU is not
+    /// refined — the tool gate guards the whole §8.5.1 clause.
+    #[test]
+    fn round387_dmvr_gate_requires_sps_flag() {
+        let (y0, cb0, cr0) = dmvr_ref_planes(1);
+        let (y1, cb1, cr1) = dmvr_ref_planes(-1);
+        let ref_l0 = [dmvr_view(&y0, &cb0, &cr0)];
+        let ref_l1 = [dmvr_view(&y1, &cb1, &cr1)];
+        let rbsp = encode_dmvr_skip_cu_stream();
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_dmvr_flag: false,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk: dmvr_walk(),
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: true,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_l0,
+            ref_list_l1: &ref_l1,
+            inter_tool_gates: gates,
+            pocs: InterPocs {
+                curr_poc: 2,
+                ref_pocs_l0: &[0],
+                ref_pocs_l1: &[4],
+            },
+            col_pic: None,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.dmvr_cus, 0, "sps_dmvr_flag off ⇒ no refinement");
     }
 }

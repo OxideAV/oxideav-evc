@@ -603,13 +603,40 @@ pub fn collocated_mv_from_side_info(
     }
     let l0_valid = cell.ref_idx_l0 != -1;
     let l1_valid = cell.ref_idx_l1 != -1;
+    // §8.5.1 NOTE — the collocated readers consume the *refined* motion
+    // `refMvLX = ( mvLX << 2 ) + delta` (eqs. 396/397/400; delta is 0 on
+    // every non-DMVR cell), rounded from the 1/16-pel refined vector back
+    // onto the grid's 1/4-pel unit via the §8.5.3.10 rule.
+    let refined = |mv_x: i32, mv_y: i32, dx: i32, dy: i32| -> MotionVector {
+        if dx == 0 && dy == 0 {
+            return MotionVector::quarter_pel(mv_x, mv_y);
+        }
+        crate::inter::round_motion_vector(
+            MotionVector {
+                x: (mv_x << 2) + dx,
+                y: (mv_y << 2) + dy,
+            },
+            2,
+            0,
+        )
+    };
     CollocatedMv {
         pred_flag_l0: l0_valid,
         pred_flag_l1: l1_valid,
         ref_idx_l0: cell.ref_idx_l0 as i32,
         ref_idx_l1: cell.ref_idx_l1 as i32,
-        mv_l0: MotionVector::quarter_pel(cell.mv_l0_x, cell.mv_l0_y),
-        mv_l1: MotionVector::quarter_pel(cell.mv_l1_x, cell.mv_l1_y),
+        mv_l0: refined(
+            cell.mv_l0_x,
+            cell.mv_l0_y,
+            cell.ref_mv_delta_l0_x,
+            cell.ref_mv_delta_l0_y,
+        ),
+        mv_l1: refined(
+            cell.mv_l1_x,
+            cell.mv_l1_y,
+            cell.ref_mv_delta_l1_x,
+            cell.ref_mv_delta_l1_y,
+        ),
     }
 }
 
@@ -927,6 +954,7 @@ mod tests {
                 mv_l1_y: 0,
                 ref_idx_l0: 0,
                 ref_idx_l1: -1,
+                ..Default::default()
             },
         );
         // Anywhere inside the stamped 16x16 block resolves to it.

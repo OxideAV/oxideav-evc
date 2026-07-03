@@ -72,6 +72,17 @@ pub struct CuSideInfo {
     /// Reference indices; -1 (i.e. 255 here as `u8`) means unavailable.
     pub ref_idx_l0: i8,
     pub ref_idx_l1: i8,
+    /// §8.5.1 eqs. 396/397 — the DMVR refinement delta
+    /// `refMvLX − ( mvLX << 2 )` in 1/16-pel units (`+dMvL0` on list 0,
+    /// `−dMvL0` on list 1); 0 for every non-DMVR cell, which makes the
+    /// stored refined MV collapse to eq. 400 (`refMvLX = mvLX << 2`).
+    /// Per the §8.5.1 NOTE the collocated (§8.5.2.3.4) readers
+    /// reconstruct `refMvLX` from `mv + delta`, while the spatial-MVP
+    /// and deblocking readers keep consuming the unrefined `mv_lX`.
+    pub ref_mv_delta_l0_x: i32,
+    pub ref_mv_delta_l0_y: i32,
+    pub ref_mv_delta_l1_x: i32,
+    pub ref_mv_delta_l1_y: i32,
 }
 
 impl Default for CuSideInfo {
@@ -85,6 +96,10 @@ impl Default for CuSideInfo {
             mv_l1_y: 0,
             ref_idx_l0: -1,
             ref_idx_l1: -1,
+            ref_mv_delta_l0_x: 0,
+            ref_mv_delta_l0_y: 0,
+            ref_mv_delta_l1_x: 0,
+            ref_mv_delta_l1_y: 0,
         }
     }
 }
@@ -142,6 +157,34 @@ impl SideInfoGrid {
         for j in y0..yn.min(self.h_cells) {
             for i in x0..xn.min(self.w_cells) {
                 self.cells[j * self.w_cells + i] = info;
+            }
+        }
+    }
+
+    /// Overwrite only the §8.5.1 DMVR refined-MV deltas (eqs. 396/397)
+    /// of every 4×4 cell the block covers — the whole-CU stamp has
+    /// already written the unrefined motion, and the deltas retrofit
+    /// the per-subblock `refMvLX` for the collocated readers.
+    pub fn stamp_ref_mv_delta(
+        &mut self,
+        x: u32,
+        y: u32,
+        cb_w: u32,
+        cb_h: u32,
+        d_l0: (i32, i32),
+        d_l1: (i32, i32),
+    ) {
+        let x0 = (x >> 2) as usize;
+        let y0 = (y >> 2) as usize;
+        let xn = ((x + cb_w + 3) >> 2) as usize;
+        let yn = ((y + cb_h + 3) >> 2) as usize;
+        for j in y0..yn.min(self.h_cells) {
+            for i in x0..xn.min(self.w_cells) {
+                let cell = &mut self.cells[j * self.w_cells + i];
+                cell.ref_mv_delta_l0_x = d_l0.0;
+                cell.ref_mv_delta_l0_y = d_l0.1;
+                cell.ref_mv_delta_l1_x = d_l1.0;
+                cell.ref_mv_delta_l1_y = d_l1.1;
             }
         }
     }
