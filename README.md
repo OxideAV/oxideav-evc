@@ -270,30 +270,61 @@ Baseline `mvp_idx` fall-through). The `merge_idx` (Table 49),
 (Table 48) syntax readers + their §9.3.3 area-dependent `cMax` /
 positional ctxInc geometry (`inter::merge_idx_c_max` etc.) landed with it.
 
-The slice-walker now **selects these CU-syntax drivers on
-`sps_admvp_flag`** inside `decode_inter_coding_unit`: `InterToolGates`
-threads through `InterDecodeInputs` (the all-false default is exactly the
-historical Baseline `sps_admvp_flag == 0` inline path), and on
-`sps_admvp_flag == 1` each CU routes through `read_cu_skip_main`
-(cu_skip), `read_inter_cu_mode` (non-skip merge-mode) and
-`read_explicit_amvp` (non-skip `merge_mode_flag == 0`). The decoded
-`CuSkipDecision` / `InterCuModeDecision` / `ExplicitAmvpDecision` is then
-projected into per-CU motion: the merge branches build the §8.5.2.3 ADMVP
-`mergeCandList` from the per-4×4 `SideInfoGrid` spatial neighbours +
-HMVP merge candidates and run the step-6 selection
-(`admvp_merge_motion_from_grid`); the explicit body adds the §8.5.2.4
-grid AMVP predictor to the eq.-145 amvr-shifted MVD. MMVD applies the
-§8.5.2.3.9 axis-aligned offset (eqs. 133/134) to the base candidate. The
-shared CBF / residual / motion-compensation tail
-(`decode_inter_cu_residual_and_reconstruct`) is now common to the
-Baseline and Main-profile front-ends.
+The slice-walker **selects these CU-syntax drivers on `sps_admvp_flag`**
+inside `decode_inter_coding_unit`, and as of round 384 the toolset is
+integrated to pixels end-to-end — `sps_admvp_flag` is **lifted from the
+decoder's unsupported gates**, so a Main-toolset (admvp + affine + amvr
++ mmvd + hmvp) IDR + P/B stream decodes through the public decoder.
+`InterToolGates` (from the SPS + the slice header's
+`mmvd_group_enable_flag`) threads through `InterDecodeInputs` alongside
+the §8.5 POC context (`InterPocs`: current POC + per-list reference
+POCs) and the §8.3.4 collocated picture (`ColPicInputs`: `ColPic`'s
+retained per-4×4 motion field + its own reference-list POCs, resolved
+from the DPB via the slice header's `col_pic_list_idx` /
+`col_pic_ref_idx`). Per CU:
 
-Still deferred on this path: the §8.5.2.3.3 collocated temporal merge
-candidate (needs the ColPic motion field + DPB POC threading), the
-POC-scaled MMVD inter-list asymmetry (§8.5.2.3.9 eqs. 531-616), the
-affine CPMV sub-block motion field (§8.5.3/§8.5.5 — currently a
-translational fallback), and the explicit-affine sub-tree (the
-`sps_admvp_flag == 1` `affine_flag` body, spec lines 2940-2980).
+* **merge / cu_skip** — the §8.5.2.3 `mergeCandList` assembles from the
+  grid spatial neighbours, the §8.5.2.3.3 **collocated temporal (TMVP)
+  candidate** (per-cell eq.-502 `refPicOfColPic` POC resolution, L1
+  stripped on P slices), the HMVP candidates, combined-bipred and the
+  zero fill.
+* **MMVD** — the full §8.5.2.3.9 derivation (eqs. 531-616): the
+  `mmvd_group_idx` retargeting (drop-list / POC-scaled list extension /
+  P-slice refIdx retarget with the ±3 nudge-or-rescale split) and the
+  POC-asymmetric per-list offset assignment with the eqs.-607-610
+  opposite-side negation.
+* **affine merge** — the §8.5.3.2 `affineMergeCandList` (grid-resolved
+  §8.5.3.4 corners incl. the corner-3 collocated fallback, Const1..6,
+  zero-CPMV tail) selects a CPMV set; §8.5.3.7 derives the dense
+  1/16-pel per-subblock field and MC runs **per subblock** through the
+  Main-profile full-phase interpolation filters (Tables 24/26,
+  `interpolate_luma_block_main` / `interpolate_chroma_block_main`;
+  translational MC also switches table sets on `sps_admvp_flag` per
+  §8.5.4.3). Affine CUs stamp per-subblock motion into the side-info
+  grid and update HMVP with the §8.5.2.7 centre MV.
+* **explicit AMVP** — the §8.5.2.4 `sps_admvp_flag == 1` MVP derivation
+  (eqs. 619-646): the `amvr_idx`-selected neighbour (A1/B1/B0/A0/B2)
+  with POC rescale on reference mismatch, the §8.5.2.4.2/.4.4/.4.5.2
+  default cascade, and the eqs.-645/646 AMVR predictor rounding, plus
+  the eq.-145 amvr-shifted MVD. `merge_mode_flag` absent (`amvr_idx !=
+  0`) is inferred 0 per its §7.4 semantics.
+* **explicit affine** — the spec-line-2941 sub-tree (`affine_flag` →
+  `affine_mode_flag` → per-list ref_idx / `affine_mvp_flag` /
+  `affine_mvd_flag` / per-vertex MVDs), reconstructed through the
+  §8.5.3.5/.6 two-entry `cpMvpListLX` (constructed predictor +
+  translational fill + zero tail) and the same per-subblock MC.
+
+The shared CBF / residual / MC tail is motion-generic
+(`CuMotion::Translational` / `CuMotion::Affine`) and common to the
+Baseline and Main-profile front-ends. Each decoded P/B picture's motion
+field + reference POCs are retained in its DPB entry so it can serve as
+a later slice's `ColPic`.
+
+Still deferred on this path: **inherited** (model-based) affine
+merge/MVP candidates (they need a per-CU control-point MV store the
+per-4×4 grid does not carry), the §8.5.5 DMVR invocation on bi-predicted
+CUs (the search core exists in `dmvr`), and the eqs.-923/924 subblock
+reference-padding clamp inside the interpolators.
 
 The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
 walk / SUCO / ADMVP / IBC / ADCC / ALF / DRA / affine slice-walk) still
