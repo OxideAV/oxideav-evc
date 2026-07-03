@@ -756,6 +756,14 @@ impl EvcDecoder {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
             inter_tool_gates: Default::default(),
+            // §8.5.2.3.3 / §8.5.2.3.9 POC context: the derived slice POC
+            // plus the resolved reference-list POCs (parallel to the
+            // RefPictureView lists above).
+            pocs: crate::slice_data::InterPocs {
+                curr_poc: poc,
+                ref_pocs_l0: &pocs_l0,
+                ref_pocs_l1: &pocs_l1,
+            },
         };
         let (pic, stats) =
             crate::slice_data::decode_baseline_inter_slice(slice_data_bytes, inputs)?;

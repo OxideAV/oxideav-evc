@@ -2190,6 +2190,27 @@ pub struct InterDecodeInputs<'a, 'b> {
     /// each CU through the §7.3.8.4 Main-profile syntax drivers in
     /// [`crate::inter_cu_syntax`].
     pub inter_tool_gates: InterToolGates,
+    /// The picture-order-count context for the `DiffPicOrderCnt`-driven
+    /// §8.5 derivations (§8.5.2.3.9 MMVD scaling, §8.5.2.3.3 temporal
+    /// merge). The [`InterPocs::default`] (empty reference POC lists)
+    /// marks "not threaded" — synthetic fixtures that exercise only the
+    /// POC-free paths leave it defaulted and the MMVD bridge synthesizes
+    /// an equal-distance context (under which §8.5.2.3.9 reduces to the
+    /// symmetric per-list offset).
+    pub pocs: InterPocs<'b>,
+}
+
+/// Picture-order-count inputs for the §8.5 inter derivations: the current
+/// picture's POC plus the POCs of every active `RefPicList0` /
+/// `RefPicList1` entry (parallel to `ref_list_l0` / `ref_list_l1`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InterPocs<'b> {
+    /// `PicOrderCnt( currPic )` (§8.3.1).
+    pub curr_poc: i32,
+    /// `PicOrderCnt( RefPicList0[ i ] )` per active index.
+    pub ref_pocs_l0: &'b [i32],
+    /// `PicOrderCnt( RefPicList1[ i ] )` per active index (empty for P).
+    pub ref_pocs_l1: &'b [i32],
 }
 
 impl<'a, 'b> InterDecodeInputs<'a, 'b> {
@@ -2514,6 +2535,19 @@ fn merged_motion_to_pair(m: crate::merge::MergedMotion) -> InterMotionPair {
     (l0, l1)
 }
 
+/// `NumRefIdxActive[ 0 / 1 ]` for the §8.5.2.3.9 derivation — the L1
+/// count is 0 on a P slice (the list is inactive).
+fn num_ref_idx_active(inputs: &InterDecodeInputs<'_, '_>) -> [u32; 2] {
+    [
+        inputs.num_ref_idx_active_minus1_l0 + 1,
+        if inputs.slice_is_b {
+            inputs.num_ref_idx_active_minus1_l1 + 1
+        } else {
+            0
+        },
+    ]
+}
+
 /// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
 /// decoder's [`HmvpCandList`](crate::hmvp::HmvpCandList) (empty when the
 /// list holds fewer than four entries, per the §8.5.2.3.1 step-3 gate).
@@ -2531,12 +2565,14 @@ fn admvp_hmvp_merge_cands(
 ///
 /// * **Regular** — §8.5.2.3.1 step 6: assemble `mergeCandList` from the
 ///   grid + HMVP and select `mergeCandList[ merge_idx ]`.
-/// * **MMVD** — select the base candidate `mmvd_merge_idx` then add the
-///   §8.5.2.3.9 `MmvdOffset` (eqs. 133/134) to each active list's MV.
-///   The full POC-scaled inter-list offset asymmetry (eqs. 531-616) is a
-///   documented follow-up — it needs `DiffPicOrderCnt` between the L0/L1
-///   references, which the inter path does not yet thread; the
-///   axis-aligned offset is applied symmetrically here.
+/// * **MMVD** — select the base candidate `mmvd_merge_idx` then run the
+///   full §8.5.2.3.9 derivation (eqs. 531-616): the `mmvd_group_idx`
+///   retargeting, the POC-distance-driven per-list offset assignment
+///   (with the eqs.-599-606 scaling and eqs.-607-610 negation), and the
+///   eqs.-613-616 update. When the caller has not threaded reference
+///   POCs (`InterPocs::default`), an equal-distance same-side context is
+///   synthesized, under which the clause reduces to the symmetric
+///   axis-aligned offset on each active list.
 /// * **AffineMerge** — the affine CPMV reconstruction (§8.5.3) needs the
 ///   §8.5.5 sub-block motion field, a follow-up; the base
 ///   `mergeCandList[ 0 ]` translational fallback is used so the bitstream
@@ -2547,6 +2583,8 @@ fn admvp_merge_branch_to_pair(
     side_info: &SideInfoGrid,
     hmvp_merge: &[crate::inter::MergeCand],
     slice_is_b: bool,
+    num_ref_idx_active: [u32; 2],
+    pocs: InterPocs<'_>,
     x0: u32,
     y0: u32,
     n_cb_w: u32,
@@ -2569,13 +2607,37 @@ fn admvp_merge_branch_to_pair(
                 Error::invalid("evc admvp mmvd: mmvd_merge_idx past derived mergeCandList length")
             })?;
             let off = crate::inter::mmvd_offset(d.distance_idx, d.direction_idx)?;
-            let mut m = base;
-            if m.pred_flag_l0 {
-                m.mv_l0 = m.mv_l0.wrapping_add(&off);
-            }
-            if m.pred_flag_l1 {
-                m.mv_l1 = m.mv_l1.wrapping_add(&off);
-            }
+            // Equal-distance same-side synthesis for POC-less callers:
+            // currPocDiffL0 == currPocDiffL1 == 1 makes every §8.5.2.3.9
+            // scale an identity and the eqs.-593-596 branch fire.
+            static SYNTH_REF_POCS: [i32; 17] = [0; 17];
+            let (mmvd_pocs, num_active) = if pocs.ref_pocs_l0.is_empty() {
+                (
+                    crate::mmvd::MmvdPocs {
+                        curr_poc: 1,
+                        ref_pocs_l0: &SYNTH_REF_POCS,
+                        ref_pocs_l1: &SYNTH_REF_POCS,
+                    },
+                    [1, u32::from(slice_is_b)],
+                )
+            } else {
+                (
+                    crate::mmvd::MmvdPocs {
+                        curr_poc: pocs.curr_poc,
+                        ref_pocs_l0: pocs.ref_pocs_l0,
+                        ref_pocs_l1: pocs.ref_pocs_l1,
+                    },
+                    num_ref_idx_active,
+                )
+            };
+            let m = crate::mmvd::mmvd_motion_vector(
+                base,
+                d.group_idx,
+                off,
+                slice_is_b,
+                num_active,
+                &mmvd_pocs,
+            )?;
             Ok(merged_motion_to_pair(m))
         }
         MergeBranch::AffineMerge { .. } => {
@@ -2615,12 +2677,15 @@ fn decode_admvp_skip_cu(
     )?;
     stats.admvp_skip_cus += 1;
     let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
+    let num_active = num_ref_idx_active(inputs);
     match decision {
         CuSkipDecision::Merge { merge_idx } => admvp_merge_branch_to_pair(
             MergeBranch::Regular { merge_idx },
             side_info,
             &hmvp_merge,
             inputs.slice_is_b,
+            num_active,
+            inputs.pocs,
             x0,
             y0,
             n_cb_w,
@@ -2631,6 +2696,8 @@ fn decode_admvp_skip_cu(
             side_info,
             &hmvp_merge,
             inputs.slice_is_b,
+            num_active,
+            inputs.pocs,
             x0,
             y0,
             n_cb_w,
@@ -2641,6 +2708,8 @@ fn decode_admvp_skip_cu(
             side_info,
             &hmvp_merge,
             inputs.slice_is_b,
+            num_active,
+            inputs.pocs,
             x0,
             y0,
             n_cb_w,
@@ -2723,6 +2792,8 @@ fn decode_admvp_nonskip_inter_cu(
             side_info,
             &hmvp_merge,
             inputs.slice_is_b,
+            num_ref_idx_active(inputs),
+            inputs.pocs,
             x0,
             y0,
             n_cb_w,
@@ -4439,6 +4510,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(pic.width, 32);
@@ -4552,6 +4624,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -4762,6 +4835,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         // The decode may surface Err if the bypass-bit guess is wrong;
         // we accept either a clean decode or a bitreader exhaustion (the
@@ -5113,6 +5187,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -5155,6 +5230,7 @@ mod tests {
             ref_list_l0: &[],
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("ref_list_l0"));
@@ -5207,6 +5283,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("num_ref_idx_active_minus1_l0"));
@@ -5619,6 +5696,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -5696,6 +5774,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: gates,
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_skip_cus, 1, "one admvp cu_skip CU decoded");
@@ -5774,6 +5853,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: gates,
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_merge_cus, 1, "one admvp merge-mode CU");
@@ -5850,6 +5930,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: gates,
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_explicit_cus, 1, "one admvp explicit CU");
@@ -5958,10 +6039,89 @@ mod tests {
             distance_idx: 0,  // MmvdDistance = 1
             direction_idx: 0, // (+1, 0)
         });
-        let (p0, _p1) =
-            admvp_merge_branch_to_pair(branch, &grid, &[], false, 0, 0, 16, 16).unwrap();
+        let (p0, _p1) = admvp_merge_branch_to_pair(
+            branch,
+            &grid,
+            &[],
+            false,
+            [1, 0],
+            InterPocs::default(),
+            0,
+            0,
+            16,
+            16,
+        )
+        .unwrap();
         let (mv, _) = p0.expect("L0 present on zero-fill base");
         assert_eq!(mv, MotionVector { x: 1, y: 0 }, "base (0,0) + offset (1,0)");
+    }
+
+    /// Round 384: with real reference POCs threaded, the §8.5.2.3.9
+    /// bi-pred offset assignment is POC-asymmetric — the nearer list
+    /// takes the full `MmvdOffset` and the farther one the eqs.-599-601
+    /// scaled copy. curr POC 4, L0[0] POC 0 (diff 4), L1[0] POC 2
+    /// (diff 2): |L0| > |L1| → offset (8, 0) rides L1, L0 gets
+    /// `((2·32/4)·8 + 16) >> 5 = 4`. Same-side references (product > 0)
+    /// so no negation.
+    #[test]
+    fn round384_admvp_mmvd_poc_scaled_offset() {
+        use crate::mmvd_syntax::MmvdDecision;
+        let grid = SideInfoGrid::new(32, 32);
+        let branch = MergeBranch::Mmvd(MmvdDecision {
+            flag: true,
+            group_idx: 0,
+            merge_idx: 0,
+            distance_idx: 3,  // MmvdDistance = 8
+            direction_idx: 0, // (+1, 0)
+        });
+        let pocs = InterPocs {
+            curr_poc: 4,
+            ref_pocs_l0: &[0],
+            ref_pocs_l1: &[2],
+        };
+        // 32×32 B CU → the §8.5.2.3.8 zero-fill produces a bi-pred base.
+        let (p0, p1) =
+            admvp_merge_branch_to_pair(branch, &grid, &[], true, [1, 1], pocs, 0, 0, 32, 32)
+                .unwrap();
+        let (mv0, _) = p0.expect("L0 present");
+        let (mv1, _) = p1.expect("L1 present");
+        assert_eq!(
+            mv1,
+            MotionVector { x: 8, y: 0 },
+            "nearer L1 takes the offset"
+        );
+        assert_eq!(
+            mv0,
+            MotionVector { x: 4, y: 0 },
+            "farther L0 gets the scaled copy"
+        );
+    }
+
+    /// Round 384: `mmvd_group_idx = 1` on a bi-pred base drops L1
+    /// (eqs. 533-536) — the CU becomes L0-only with the offset applied
+    /// to L0.
+    #[test]
+    fn round384_admvp_mmvd_group1_drops_l1() {
+        use crate::mmvd_syntax::MmvdDecision;
+        let grid = SideInfoGrid::new(32, 32);
+        let branch = MergeBranch::Mmvd(MmvdDecision {
+            flag: true,
+            group_idx: 1,
+            merge_idx: 0,
+            distance_idx: 0,  // MmvdDistance = 1
+            direction_idx: 0, // (+1, 0)
+        });
+        let pocs = InterPocs {
+            curr_poc: 2,
+            ref_pocs_l0: &[0],
+            ref_pocs_l1: &[4],
+        };
+        let (p0, p1) =
+            admvp_merge_branch_to_pair(branch, &grid, &[], true, [1, 1], pocs, 0, 0, 32, 32)
+                .unwrap();
+        assert!(p1.is_none(), "group 1 drops L1 on a bi-pred base");
+        let (mv0, _) = p0.expect("L0 kept");
+        assert_eq!(mv0, MotionVector { x: 1, y: 0 });
     }
 
     /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The
@@ -6024,6 +6184,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
             inter_tool_gates: gates,
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_skip_cus, 1);
@@ -6092,6 +6253,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -6453,6 +6615,7 @@ mod tests {
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
+            pocs: Default::default(),
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
