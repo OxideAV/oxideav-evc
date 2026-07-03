@@ -602,9 +602,12 @@ impl EvcDecoder {
         pps: &Pps,
         slice_nal_rbsp: &[u8],
     ) -> Result<NonIdrDecodeResult> {
+        // Round 384: sps_admvp_flag is lifted from the unsupported gate —
+        // P/B slices route each coding unit through the §7.3.8.4
+        // Main-profile syntax drivers (merge/MMVD/affine/explicit-AMVP)
+        // via the InterToolGates threaded below.
         if sps.sps_btt_flag
             || sps.sps_suco_flag
-            || sps.sps_admvp_flag
             || sps.sps_eipd_flag
             || sps.sps_addb_flag
             || sps.sps_dquant_flag
@@ -803,7 +806,16 @@ impl EvcDecoder {
             num_ref_idx_active_minus1_l1,
             ref_list_l0: &ref_list_l0,
             ref_list_l1: &ref_list_l1,
-            inter_tool_gates: Default::default(),
+            // §7.3.8.4 tool gates from the SPS + the slice header's
+            // mmvd_group_enable_flag. All-false when sps_admvp_flag == 0
+            // (the historical Baseline path, byte-identical).
+            inter_tool_gates: crate::inter_cu_syntax::InterToolGates {
+                sps_admvp_flag: sps.sps_admvp_flag,
+                sps_amvr_flag: sps.sps_amvr_flag,
+                sps_mmvd_flag: sps.sps_mmvd_flag,
+                sps_affine_flag: sps.sps_affine_flag,
+                mmvd_group_enable_flag: header.mmvd_group_enable_flag,
+            },
             // §8.5.2.3.3 / §8.5.2.3.9 POC context: the derived slice POC
             // plus the resolved reference-list POCs (parallel to the
             // RefPictureView lists above).

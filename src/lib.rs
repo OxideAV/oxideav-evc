@@ -307,9 +307,12 @@ pub fn decode_idr_slice(
     slice_nal_rbsp: &[u8],
 ) -> oxideav_core::Result<(picture::YuvPicture, slice_data::SliceDecodeStats)> {
     use oxideav_core::Error;
+    // Round 384: sps_admvp_flag no longer gates the IDR path — the ADMVP
+    // toolset only alters inter coding-unit syntax (§7.3.8.4) and the
+    // slice-header temporal-MVP group (P/B only); an intra slice decodes
+    // identically under either value.
     if sps.sps_btt_flag
         || sps.sps_suco_flag
-        || sps.sps_admvp_flag
         || sps.sps_eipd_flag
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
@@ -1502,5 +1505,162 @@ mod tests {
         dec.flush().unwrap();
         let next = dec.receive_frame();
         assert!(matches!(next, Err(oxideav_core::Error::NeedMore)));
+    }
+
+    /// Round 384: an SPS with `sps_admvp_flag = 1` (affine + hmvp on,
+    /// amvr/dmvr/mmvd off) built like [`build_rpl_sps_rbsp`] but with the
+    /// §7.3.2.1 admvp-nested flag group present.
+    fn build_admvp_sps_rbsp(width: u32, height: u32) -> Vec<u8> {
+        let mut sps_body = sps::tests::BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 1); // profile_idc (Main)
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(1); // chroma_format_idc 4:2:0
+        sps_body.ue(width);
+        sps_body.ue(height);
+        sps_body.ue(0); // bit_depth_luma_minus8
+        sps_body.ue(0); // bit_depth_chroma_minus8
+        sps_body.u(1, 0); // sps_btt
+        sps_body.u(1, 0); // sps_suco
+        sps_body.u(1, 1); // sps_admvp ← ON
+        sps_body.u(1, 1); //   sps_affine
+        sps_body.u(1, 0); //   sps_amvr
+        sps_body.u(1, 0); //   sps_dmvr
+        sps_body.u(1, 0); //   sps_mmvd
+        sps_body.u(1, 1); //   sps_hmvp
+        sps_body.u(1, 0); // sps_eipd
+        sps_body.u(1, 0); // sps_cm_init
+        sps_body.u(1, 0); // sps_iqt
+        sps_body.u(1, 0); // sps_addb
+        sps_body.u(1, 0); // sps_alf
+        sps_body.u(1, 0); // sps_htdf
+        sps_body.u(1, 1); // sps_rpl  ← enable
+        sps_body.u(1, 1); // sps_pocs ← enable
+        sps_body.u(1, 0); // sps_dquant
+        sps_body.u(1, 0); // sps_dra
+        sps_body.ue(4); // log2_max_pic_order_cnt_lsb_minus4 = 4 → 8 bits
+        sps_body.ue(1); // sps_max_dec_pic_buffering_minus1
+        sps_body.u(1, 0); // long_term_ref_pics_flag
+        sps_body.u(1, 0); // rpl1_same_as_rpl0_flag
+        sps_body.ue(0); // num_ref_pic_lists_in_sps[0]
+        sps_body.ue(0); // num_ref_pic_lists_in_sps[1]
+        sps_body.u(1, 0); // picture_cropping_flag
+        sps_body.u(1, 0); // chroma_qp_table_present_flag
+        sps_body.u(1, 0); // vui_parameters_present_flag
+        sps_body.finish_with_trailing_bits();
+        sps_body.into_bytes()
+    }
+
+    /// **Round 384 decoder-level ADMVP e2e.** The `sps_admvp_flag == 1`
+    /// gate is lifted: a Main-toolset (admvp + affine + hmvp) IDR + P
+    /// stream decodes through the public decoder. The P slice's single
+    /// CU is a cu_skip merge CU routed through `read_cu_skip_main`
+    /// (`affine_flag = 0` bin present because sps_affine is on;
+    /// `merge_idx = 0` selects the §8.5.2.3.8 zero-MV fill — no spatial
+    /// neighbours, no usable collocated motion from the intra IDR), so
+    /// the frame is a zero-MV copy of the grey IDR.
+    #[test]
+    fn round384_admvp_gate_lifted_idr_p_e2e() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_admvp_sps_rbsp(32, 32);
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        // IDR slice (POC 0) — grey.
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0);
+        idr_hdr.ue(2); // I slice
+        idr_hdr.u(1, 0); // no_output_of_prior_pics_flag
+        idr_hdr.u(1, 0); // slice_deblocking_filter_flag
+        idr_hdr.u(6, 22); // slice_qp
+        idr_hdr.ue(0);
+        idr_hdr.ue(0);
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        let mut idr_enc = CabacEncoder::new();
+        idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        idr_enc.encode_decision(0, 0, 0); // cbf_luma
+        idr_enc.encode_decision(0, 0, 0); // cbf_cb
+        idr_enc.encode_decision(0, 0, 0); // cbf_cr
+        idr_enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&idr_enc.finish());
+
+        // P slice (POC 1): inline RPL both lists, admvp slice header
+        // (temporal_mvp_assigned_flag = 0).
+        let mut p_hdr = BitEmitter::new();
+        p_hdr.ue(0); // slice_pps_id
+        p_hdr.ue(1); // slice_type = P
+        p_hdr.u(8, 1); // POC LSB
+        p_hdr.ue(1); // RPL L0: num_strp_entries
+        p_hdr.ue(1); //   delta_poc_st = 1
+        p_hdr.u(1, 0); //   sign → −1 → ref POC 0
+        p_hdr.ue(1); // RPL L1: same
+        p_hdr.ue(1);
+        p_hdr.u(1, 0);
+        p_hdr.u(1, 0); // num_ref_idx_active_override_flag
+        p_hdr.u(1, 0); // temporal_mvp_assigned_flag (sps_admvp = 1)
+        p_hdr.u(1, 0); // slice_deblocking_filter_flag
+        p_hdr.u(6, 22); // slice_qp
+        p_hdr.ue(0);
+        p_hdr.ue(0);
+        while p_hdr.bit_position() % 8 != 0 {
+            p_hdr.u(1, 0);
+        }
+        let mut p_rbsp = p_hdr.into_bytes();
+        let mut p_enc = CabacEncoder::new();
+        p_enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        p_enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+                                        // read_cu_skip_main: sps_mmvd off → no mmvd bin;
+                                        // affine gate on (32×32) → affine_flag bin.
+        p_enc.encode_decision(0, 0, 0); // affine_flag = 0
+        p_enc.encode_decision(0, 0, 0); // merge_idx = 0
+        p_enc.encode_decision(0, 0, 0); // cbf_luma
+        p_enc.encode_decision(0, 0, 0); // cbf_cb
+        p_enc.encode_decision(0, 0, 0); // cbf_cr
+        p_enc.encode_terminate(true);
+        p_rbsp.extend_from_slice(&p_enc.finish());
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp));
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp));
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp));
+        bs.extend_from_slice(&nal_envelope(0, &p_rbsp));
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let f0 = dec.receive_frame().unwrap();
+        let f1 = dec.receive_frame().unwrap();
+        let v0 = match f0 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v1 = match f1 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        assert!(v0.planes[0].data.iter().all(|&v| v == 128));
+        assert!(
+            v1.planes[0].data.iter().all(|&v| v == 128),
+            "admvp cu_skip zero-MV merge must copy the grey IDR"
+        );
     }
 }
