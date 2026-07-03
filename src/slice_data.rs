@@ -2809,6 +2809,120 @@ fn admvp_affine_merge_motion(
     Ok(AffineCuMotion { l0, l1 })
 }
 
+/// §8.5.3.5/.6 + §8.5.3.1 — resolve an explicit-affine CU's motion: per
+/// active list, assemble the two-entry `cpMvpListLX` (inherited
+/// model-based neighbours unavailable — no per-CU CPMV store; the
+/// §8.5.3.6 constructed predictor + per-corner translational fill + zero
+/// tail come from the refIdx-matched grid corners), select
+/// `affine_mvp_flag_lX`, add the decoded per-CP MVDs (eqs. 688-691), and
+/// derive the §8.5.3.7 subblock field.
+#[allow(clippy::too_many_arguments)]
+fn admvp_affine_amvp_motion(
+    inputs: &InterDecodeInputs<'_, '_>,
+    side_info: &SideInfoGrid,
+    aff: &crate::inter_cu_syntax::ExplicitAffineDecision,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Result<AffineCuMotion> {
+    let num_cp_mv = aff.num_cp_mv();
+    let (sub_w_c, sub_h_c) = match inputs.walk.chroma_format_idc {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let pos = crate::affine_cand::affine_merge_nb_positions(x0 as i32, y0 as i32, n_cb_w, n_cb_h);
+    let ctb_size = 1i32 << inputs.walk.ctb_log2_size_y;
+
+    let derive_list = |entry: &crate::inter_cu_syntax::ExplicitAffineList,
+                       list_x: u8|
+     -> Result<AffineListMotion> {
+        // §8.5.3.6 refIdx-matched corner resolution: corner 0 B2→B3→A2,
+        // corner 1 B0→B1→C2, corner 2 A1→A0, corner 3 C1→C0; a corner is
+        // available only when the neighbour uses list X with the same
+        // reference index as the current CU.
+        let matched = |xy: (i32, i32)| -> Option<MotionVector> {
+            let nb = merge_neighbour_mv_from_grid(side_info, xy.0, xy.1);
+            if !nb.available {
+                return None;
+            }
+            let (used, ref_idx, mv) = if list_x == 0 {
+                (nb.pred_flag_l0, nb.ref_idx_l0, nb.mv_l0)
+            } else {
+                (nb.pred_flag_l1, nb.ref_idx_l1, nb.mv_l1)
+            };
+            (used && ref_idx == entry.ref_idx as i32).then_some(mv)
+        };
+        let scan = |order: &[(i32, i32)]| -> (bool, MotionVector) {
+            for &xy in order {
+                if let Some(mv) = matched(xy) {
+                    return (true, mv);
+                }
+            }
+            (false, MotionVector::default())
+        };
+        let (a0c, m0) = scan(&[pos.b2, pos.b3, pos.a2]);
+        let (a1c, m1) = scan(&[pos.b0, pos.b1, pos.c2]);
+        let (a2c, m2) = scan(&[pos.a1, pos.a0]);
+        let (a3c, m3) = scan(&[pos.c1, pos.c0]);
+        let corner_avail = [a0c, a1c, a2c, a3c];
+        let corner_mv = [m0, m1, m2, m3];
+        let constructed = crate::affine_cand::constructed_mvp_candidate(
+            corner_avail,
+            corner_mv,
+            num_cp_mv - 1, // MotionModelIdc = numCpMv − 1
+        );
+        // Inherited model-based predictors unavailable (documented
+        // deferral — the grid carries no neighbour CPMV sets).
+        let neigh = crate::affine_cand::AffineMvpNeighbours {
+            group_a: [crate::affine_cand::AffineMvpNeighbour::absent(); 2],
+            group_b: [crate::affine_cand::AffineMvpNeighbour::absent(); 3],
+            group_c: [crate::affine_cand::AffineMvpNeighbour::absent(); 2],
+        };
+        let mvp_list = crate::affine_cand::build_affine_mvp_cand_list(
+            &neigh,
+            constructed,
+            corner_avail,
+            corner_mv,
+            num_cp_mv,
+            x0 as i32,
+            y0 as i32,
+            n_cb_w,
+            n_cb_h,
+            ctb_size,
+        );
+        let cp_mv = crate::affine_cand::reconstruct_affine_amvp_cp_mvs(
+            &mvp_list,
+            entry.mvp_flag,
+            &entry.mvd_cp,
+            num_cp_mv,
+        );
+        Ok(AffineListMotion {
+            ref_idx: entry.ref_idx,
+            field: crate::affine::affine_subblock_mvs(
+                n_cb_w, n_cb_h, num_cp_mv, &cp_mv, sub_w_c, sub_h_c,
+            ),
+            center: crate::affine::affine_center_mv(n_cb_w, n_cb_h, num_cp_mv, &cp_mv),
+        })
+    };
+
+    let l0 = match &aff.l0 {
+        Some(e) => Some(derive_list(e, 0)?),
+        None => None,
+    };
+    let l1 = match &aff.l1 {
+        Some(e) => Some(derive_list(e, 1)?),
+        None => None,
+    };
+    if l0.is_none() && l1.is_none() {
+        return Err(Error::invalid(
+            "evc explicit-affine: no active prediction list",
+        ));
+    }
+    Ok(AffineCuMotion { l0, l1 })
+}
+
 /// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
 /// decoder's [`HmvpCandList`](crate::hmvp::HmvpCandList) (empty when the
 /// list holds fewer than four entries, per the §8.5.2.3.1 step-3 gate).
@@ -3088,6 +3202,8 @@ fn decode_admvp_nonskip_inter_cu(
     let amvp = crate::inter_cu_syntax::read_explicit_amvp(
         eng,
         EipdCtx::new(false),
+        inputs.inter_tool_gates,
+        decision.amvr_idx,
         inputs.slice_is_b,
         log2_cb_width,
         log2_cb_height,
@@ -3104,6 +3220,17 @@ fn decode_admvp_nonskip_inter_cu(
     stats.ref_idx_bins += explicit_stats.ref_idx_bins;
     stats.abs_mvd_egk_bins += explicit_stats.abs_mvd_bins;
     stats.mvd_sign_flag_bins += explicit_stats.mvd_sign_bins;
+    stats.admvp_syntax.affine.flag_bins += explicit_stats.affine.flag_bins;
+    stats.admvp_syntax.affine.mode_flag_bins += explicit_stats.affine.mode_flag_bins;
+    stats.admvp_syntax.affine.mvp_flag_bins += explicit_stats.affine.mvp_flag_bins;
+    stats.admvp_syntax.affine.mvd_flag_bins += explicit_stats.affine.mvd_flag_bins;
+
+    // Explicit-affine sub-tree: reconstruct the per-CP MVs through the
+    // §8.5.3.5 predictor list and derive the §8.5.3.7 subblock field.
+    if let Some(aff) = amvp.affine {
+        return admvp_affine_amvp_motion(inputs, side_info, &aff, x0, y0, n_cb_w, n_cb_h)
+            .map(|m| CuMotion::Affine(Box::new(m)));
+    }
 
     let amvr_idx = decision.amvr_idx;
     let reconstruct_list = |entry: crate::inter_cu_syntax::ExplicitListMv,
@@ -7189,6 +7316,173 @@ mod tests {
         assert_eq!(dv, 4 * f.size_sb_y as i32);
         // Centre MV (§8.5.2.7): the model at the CU centre — non-zero.
         assert!(l0.center.x > 0 && l0.center.y > 0);
+    }
+
+    /// Round 384 explicit-affine e2e: a non-skip explicit CU takes the
+    /// spec-line-2941 affine branch (16×16 CU, amvr 0). With an empty
+    /// grid the §8.5.3.5 list zero-fills, `affine_mvd_flag = 0` keeps the
+    /// CPMVs zero, and the CU reconstructs as a whole-CU reference copy.
+    /// Bins: cu_skip 0, pred_mode 0, merge_mode 0, affine_flag 1,
+    /// affine_mode_flag 0, affine_mvp_flag 0, affine_mvd_flag 0,
+    /// cbf 0/0/0 (sps_amvr off → no amvr bins; P → no inter_pred_idc).
+    #[test]
+    fn round384_explicit_affine_zero_mvp_e2e() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let mut ref_y = vec![0u8; 16 * 16];
+        for (i, px) in ref_y.iter_mut().enumerate() {
+            *px = (i % 250) as u8;
+        }
+        let ref_cb = vec![100u8; 8 * 8];
+        let ref_cr = vec![150u8; 8 * 8];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        // 16×16 picture under a 32-CTU: the walker force-splits without
+        // a bin, leaving one 16×16 CU (min_cb 4 stops recursion).
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (inter)
+        enc.encode_decision(0, 0, 0); // merge_mode_flag = 0 → explicit
+        enc.encode_decision(0, 0, 1); // affine_flag = 1
+        enc.encode_decision(0, 0, 0); // affine_mode_flag = 0 (4-param)
+        enc.encode_decision(0, 0, 0); // affine_mvp_flag_l0 = 0
+        enc.encode_decision(0, 0, 0); // affine_mvd_flag_l0 = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let mut rbsp = enc.finish();
+        rbsp.extend_from_slice(&[0xFF; 4]);
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_affine_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[ref_view],
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_explicit_cus, 1);
+        assert_eq!(stats.admvp_syntax.affine.flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.affine.mode_flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.affine.mvp_flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.affine.mvd_flag_bins, 1);
+        assert_eq!(stats.uni_pred_cus, 1);
+        // Zero CPMVs → whole-CU copy.
+        assert_eq!(pic.y[0], ref_y[0]);
+        assert_eq!(pic.y[15 * 16 + 15], ref_y[15 * 16 + 15]);
+    }
+
+    /// Round 384: explicit-affine reconstruction through the §8.5.3.6
+    /// constructed predictor — refIdx-matched corners 0/1 feed the
+    /// 4-param model, the per-CP MVD adds on top of the eq.-867 selected
+    /// predictor, and the field carries the resulting gradient.
+    #[test]
+    fn round384_explicit_affine_constructed_predictor_with_mvd() {
+        use crate::inter_cu_syntax::{ExplicitAffineDecision, ExplicitAffineList};
+        let mut grid = SideInfoGrid::new(64, 64);
+        let stamp = |g: &mut SideInfoGrid, x: u32, y: u32, mv: (i32, i32)| {
+            g.stamp_block(
+                x,
+                y,
+                4,
+                4,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Inter,
+                    cbf_luma: 0,
+                    mv_l0_x: mv.0,
+                    mv_l0_y: mv.1,
+                    mv_l1_x: 0,
+                    mv_l1_y: 0,
+                    ref_idx_l0: 0,
+                    ref_idx_l1: -1,
+                },
+            );
+        };
+        // CU at (16, 16), 16×16: corner 0 via B2 (15, 15); corner 1 via
+        // B0 (32, 15). refIdx 0 matches the CU's ref_idx.
+        stamp(&mut grid, 12, 12, (8, 4)); // corner 0
+        stamp(&mut grid, 32, 12, (24, 4)); // corner 1
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs::default(),
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        // 4-param, mvp_flag 0 (the constructed predictor is entry 0 when
+        // no inherited neighbour matched), MVD (4, 0) on CP0 only.
+        let aff = ExplicitAffineDecision {
+            affine_mode_flag: false,
+            l0: Some(ExplicitAffineList {
+                ref_idx: 0,
+                mvp_flag: 0,
+                mvd_flag: true,
+                mvd_cp: [
+                    MotionVector { x: 4, y: 0 },
+                    MotionVector::default(),
+                    MotionVector::default(),
+                ],
+            }),
+            l1: None,
+        };
+        let motion = admvp_affine_amvp_motion(&inputs, &grid, &aff, 16, 16, 16, 16).unwrap();
+        let l0 = motion.l0.expect("L0 active");
+        let f = &l0.field;
+        // CP0 = (8, 4) + MVD (4, 0) = (12, 4); CP1 = (24, 4). dX[0] =
+        // (24 − 12) << 3 = 96 → adjacent-subblock x-delta = (96 ·
+        // sizeSbX) >> 5 = 3 · sizeSbX (1/16-pel).
+        if f.num_sb_x >= 2 {
+            let d = f.at(1, 0).luma.x - f.at(0, 0).luma.x;
+            assert_eq!(d, 3 * f.size_sb_x as i32);
+        }
+        // The field's first subblock reflects the MVD-shifted base:
+        // base = CP0 << 7 evaluated at the subblock centre — strictly
+        // greater than the unshifted (8, 4) model would give.
+        assert!(f.at(0, 0).luma.x >= 12 * 4, "MVD shifted the base CPMV");
     }
 
     /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The

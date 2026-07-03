@@ -213,6 +213,19 @@ fn read_affine_mvd_flag(
 }
 
 /// §7.3.8.4 — read the per-list AMVP affine flag pair
+/// (`affine_mvp_flag_lX` then `affine_mvd_flag_lX`) when list X is
+/// active. Public entry for the explicit-AMVP driver, which interleaves
+/// the `ref_idx_lX` read the spec places before this pair.
+pub fn read_affine_list_flags_pub(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    list: usize,
+    stats: &mut AffineSyntaxStats,
+) -> Result<AffineListFlags> {
+    read_affine_list_flags(eng, ctx, list, stats)
+}
+
+/// §7.3.8.4 — read the per-list AMVP affine flag pair
 /// (`affine_mvp_flag_lX` then `affine_mvd_flag_lX`) when list X is active.
 fn read_affine_list_flags(
     eng: &mut CabacEngine,

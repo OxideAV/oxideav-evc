@@ -393,19 +393,62 @@ pub struct ExplicitListMv {
     pub mvd: MotionVector,
 }
 
-/// The resolved §7.3.8.4 explicit-AMVP (`merge_mode_flag == 0`,
-/// non-affine) decision on the `sps_admvp_flag == 1` path.
+/// One reference list's explicit-**affine** parameters (spec lines
+/// 2946-2980): the reference index, the eq.-867 predictor selector, the
+/// MVD-present flag and the decoded per-control-point MVDs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplicitAffineList {
+    /// `ref_idx_lX` (0 when absent — the TR `cMax = 0` inference).
+    pub ref_idx: u32,
+    /// `affine_mvp_flag_lX` ∈ {0, 1} — selects `cpMvpListLX[ flag ]`.
+    pub mvp_flag: u32,
+    /// `affine_mvd_flag_lX` — 1 ⇒ the per-vertex MVD group was present.
+    pub mvd_flag: bool,
+    /// `MvdCpLX[ vertex ]` for `vertex < numCpMv`; zero when
+    /// `mvd_flag == 0` (the §7.4 absent inference).
+    pub mvd_cp: [MotionVector; 3],
+}
+
+/// The resolved explicit-**affine** decision (`affine_flag == 1` inside
+/// the `merge_mode_flag == 0` body, spec lines 2941-2980).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExplicitAffineDecision {
+    /// `affine_mode_flag` — 0 ⇒ 4-param (`numCpMv = 2`), 1 ⇒ 6-param
+    /// (`numCpMv = 3`); `vertexNum = 1 + affine_flag + affine_mode_flag`.
+    pub affine_mode_flag: bool,
+    /// L0 group (`None` when `inter_pred_idc == PRED_L1`).
+    pub l0: Option<ExplicitAffineList>,
+    /// L1 group (`None` when `inter_pred_idc == PRED_L0`).
+    pub l1: Option<ExplicitAffineList>,
+}
+
+impl ExplicitAffineDecision {
+    /// `numCpMv = 2 + affine_mode_flag` (eqs. 136/137).
+    pub fn num_cp_mv(&self) -> u32 {
+        2 + self.affine_mode_flag as u32
+    }
+}
+
+/// The resolved §7.3.8.4 explicit-AMVP (`merge_mode_flag == 0`) decision
+/// on the `sps_admvp_flag == 1` path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExplicitAmvpDecision {
     /// `inter_pred_idc` — PRED_L0 / PRED_L1 / PRED_BI (Table 8). For a
     /// P slice this is forced PRED_L0 (the element is absent).
     pub inter_pred_idc: u32,
     /// `bi_pred_idx` — the per-list MVD-present selector (0 when not
-    /// PRED_BI; Table 71 semantics otherwise).
+    /// PRED_BI; Table 71 semantics otherwise). Always 0 on the affine
+    /// branch (the element is not read there).
     pub bi_pred_idx: u32,
-    /// L0 parameters (`None` when `inter_pred_idc == PRED_L1`).
+    /// The explicit-affine sub-tree (spec lines 2941-2980): `Some` when
+    /// `affine_flag == 1` was decoded; the translational `l0` / `l1`
+    /// entries are then `None`.
+    pub affine: Option<ExplicitAffineDecision>,
+    /// L0 parameters (`None` when `inter_pred_idc == PRED_L1` or on the
+    /// affine branch).
     pub l0: Option<ExplicitListMv>,
-    /// L1 parameters (`None` when `inter_pred_idc == PRED_L0`).
+    /// L1 parameters (`None` when `inter_pred_idc == PRED_L0` or on the
+    /// affine branch).
     pub l1: Option<ExplicitListMv>,
 }
 
@@ -416,6 +459,9 @@ pub struct ExplicitAmvpStats {
     pub ref_idx_bins: u32,
     pub abs_mvd_bins: u32,
     pub mvd_sign_bins: u32,
+    /// Affine sub-tree bins (`affine_flag` / `affine_mode_flag` /
+    /// `affine_mvp_flag_lX` / `affine_mvd_flag_lX`).
+    pub affine: AffineSyntaxStats,
 }
 
 /// §7.3.8.4 — read one `abs_mvd` (EG0 bypass) + optional `mvd_sign_flag`
@@ -484,17 +530,96 @@ fn read_explicit_list(
     Ok(ExplicitListMv { ref_idx, mvd })
 }
 
+/// §7.3.8.4 — the explicit-affine size/AMVR gate (spec line 2941):
+/// `sps_affine_flag && log2CbWidth >= 4 && log2CbHeight >= 4 &&
+/// amvr_idx == 0`.
+pub fn affine_flag_present_in_explicit(
+    sps_affine_flag: bool,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    amvr_idx: u32,
+) -> bool {
+    sps_affine_flag && log2_cb_width >= 4 && log2_cb_height >= 4 && amvr_idx == 0
+}
+
+/// Read one explicit-affine list group (spec lines 2946-2980):
+/// `ref_idx_lX` (TR `cMax = num_ref_idx_active_minus1`, zero bins when 0)
+/// → `affine_mvp_flag_lX` → `affine_mvd_flag_lX` → per-vertex
+/// `abs_mvd`/sign pairs when the MVD flag is set.
+fn read_explicit_affine_list(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    list: usize,
+    num_ref_idx_active_minus1: u32,
+    vertex_num: u32,
+    stats: &mut ExplicitAmvpStats,
+) -> Result<ExplicitAffineList> {
+    let ref_idx = read_ref_idx(eng, ctx, num_ref_idx_active_minus1, stats)?;
+    let flags =
+        crate::affine_syntax::read_affine_list_flags_pub(eng, ctx, list, &mut stats.affine)?;
+    let mut mvd_cp = [MotionVector::default(); 3];
+    if flags.mvd_flag {
+        for slot in mvd_cp.iter_mut().take(vertex_num as usize) {
+            let x = read_signed_mvd_component(eng, stats)?;
+            let y = read_signed_mvd_component(eng, stats)?;
+            *slot = MotionVector { x, y };
+        }
+    }
+    Ok(ExplicitAffineList {
+        ref_idx,
+        mvp_flag: flags.mvp_flag,
+        mvd_flag: flags.mvd_flag,
+        mvd_cp,
+    })
+}
+
+/// Read `ref_idx_lX` (TR `cMax = num_ref_idx_active_minus1`, ctxInc 0,1
+/// then bypass; collapsed to `(0, 0)` under Baseline). Zero bins when the
+/// list holds a single active reference.
+fn read_ref_idx(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    num_ref_idx_active_minus1: u32,
+    stats: &mut ExplicitAmvpStats,
+) -> Result<u32> {
+    if num_ref_idx_active_minus1 == 0 {
+        return Ok(0);
+    }
+    let cm_init = ctx.is_cm_init();
+    let table = MainCtxTable::RefIdx.as_usize();
+    let mut bins = 0u32;
+    let v = eng.decode_tr_regular(
+        num_ref_idx_active_minus1,
+        0,
+        if cm_init { table } else { 0 },
+        |bin_idx| {
+            bins += 1;
+            if cm_init {
+                bin_idx.min(1) as usize
+            } else {
+                0
+            }
+        },
+    )?;
+    stats.ref_idx_bins += bins;
+    Ok(v)
+}
+
 /// Drive the §7.3.8.4 `sps_admvp_flag == 1` explicit-AMVP body (spec lines
-/// 2912-3025, non-affine `else` branch): `inter_pred_idc` (B only),
-/// `bi_pred_idx` (PRED_BI only), then the per-list ref_idx + MVD groups.
+/// 2912-3025): `inter_pred_idc` (B only), then the explicit-affine
+/// sub-tree when its gate passes (`affine_flag` → `affine_mode_flag` →
+/// per-list ref_idx + `affine_mvp_flag` + `affine_mvd_flag` + per-vertex
+/// MVDs), else `bi_pred_idx` (PRED_BI only) + the per-list ref_idx + MVD
+/// groups.
 ///
 /// `slice_is_b` gates the `inter_pred_idc` read (absent ⇒ PRED_L0 for P
-/// slices). The caller has already resolved `affine_flag == 0` (the
-/// affine sub-tree is handled separately) and supplied
-/// `num_ref_idx_active_minus1[0/1]`.
+/// slices). `gates` / `amvr_idx` drive the spec-line-2941 affine gate.
+#[allow(clippy::too_many_arguments)]
 pub fn read_explicit_amvp(
     eng: &mut CabacEngine,
     ctx: EipdCtx,
+    gates: InterToolGates,
+    amvr_idx: u32,
     slice_is_b: bool,
     log2_cb_width: u32,
     log2_cb_height: u32,
@@ -520,6 +645,62 @@ pub fn read_explicit_amvp(
     } else {
         PRED_L0
     };
+
+    // Explicit-affine sub-tree (spec lines 2941-2980).
+    if affine_flag_present_in_explicit(
+        gates.sps_affine_flag,
+        log2_cb_width,
+        log2_cb_height,
+        amvr_idx,
+    ) {
+        let affine_flag = crate::affine_syntax::read_affine_flag(
+            eng,
+            ctx,
+            crate::affine_syntax::AffineFlagNeighbours::default(),
+            &mut stats.affine,
+        )?;
+        if affine_flag {
+            let affine_mode_flag =
+                crate::affine_syntax::read_affine_mode_flag(eng, ctx, &mut stats.affine)?;
+            // vertexNum = 1 + affine_flag + affine_mode_flag.
+            let vertex_num = 2 + affine_mode_flag as u32;
+            let l0 = if inter_pred_idc != PRED_L1 {
+                Some(read_explicit_affine_list(
+                    eng,
+                    ctx,
+                    0,
+                    num_ref_idx_active_minus1_l0,
+                    vertex_num,
+                    stats,
+                )?)
+            } else {
+                None
+            };
+            let l1 = if inter_pred_idc != PRED_L0 {
+                Some(read_explicit_affine_list(
+                    eng,
+                    ctx,
+                    1,
+                    num_ref_idx_active_minus1_l1,
+                    vertex_num,
+                    stats,
+                )?)
+            } else {
+                None
+            };
+            return Ok(ExplicitAmvpDecision {
+                inter_pred_idc,
+                bi_pred_idx: 0,
+                affine: Some(ExplicitAffineDecision {
+                    affine_mode_flag,
+                    l0,
+                    l1,
+                }),
+                l0: None,
+                l1: None,
+            });
+        }
+    }
 
     // bi_pred_idx — present only when inter_pred_idc == PRED_BI.
     let bi_pred_idx = if inter_pred_idc == PRED_BI {
@@ -559,6 +740,7 @@ pub fn read_explicit_amvp(
     Ok(ExplicitAmvpDecision {
         inter_pred_idc,
         bi_pred_idx,
+        affine: None,
         l0,
         l1,
     })
@@ -754,6 +936,8 @@ mod tests {
         let d = read_explicit_amvp(
             &mut eng,
             EipdCtx::new(false),
+            InterToolGates::default(),
+            0,
             false, // P slice
             3,
             3,
@@ -793,6 +977,8 @@ mod tests {
         let d = read_explicit_amvp(
             &mut eng,
             EipdCtx::new(false),
+            InterToolGates::default(),
+            0,
             true, // B slice
             3,
             3,
@@ -831,6 +1017,8 @@ mod tests {
         let d = read_explicit_amvp(
             &mut eng,
             EipdCtx::new(false),
+            InterToolGates::default(),
+            0,
             true,
             3,
             3,
@@ -863,6 +1051,8 @@ mod tests {
         let d = read_explicit_amvp(
             &mut eng,
             EipdCtx::new(false),
+            InterToolGates::default(),
+            0,
             false,
             3,
             3,
@@ -991,5 +1181,139 @@ mod tests {
             other => panic!("expected MMVD skip, got {other:?}"),
         }
         assert_eq!(stats.mmvd.flag_bins, 1);
+    }
+
+    /// Round 384: the explicit-affine sub-tree on a P slice — gate passes
+    /// (16×16, amvr 0, sps_affine on), affine_flag 1, affine_mode_flag 0
+    /// (4-param, vertexNum 2), no ref_idx (single active), affine_mvp 0,
+    /// affine_mvd_flag 1 → two per-vertex MVD pairs (EG0 bypass).
+    #[test]
+    fn round384_explicit_affine_p_slice_group() {
+        let toks = [
+            Tok::Reg(1), // affine_flag
+            Tok::Reg(0), // affine_mode_flag → 4-param
+            Tok::Reg(0), // affine_mvp_flag_l0
+            Tok::Reg(1), // affine_mvd_flag_l0
+            Tok::Byp(0), // v0 mvd_x abs = 0
+            Tok::Byp(0), // v0 mvd_y abs = 0
+            Tok::Byp(0), // v1 mvd_x abs = 0
+            Tok::Byp(0), // v1 mvd_y abs = 0
+        ];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let gates = InterToolGates {
+            sps_affine_flag: true,
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            0, // amvr_idx
+            false,
+            4,
+            4,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        let aff = d.affine.expect("affine branch taken");
+        assert!(!aff.affine_mode_flag);
+        assert_eq!(aff.num_cp_mv(), 2);
+        let l0 = aff.l0.expect("L0 active on P");
+        assert_eq!(l0.ref_idx, 0);
+        assert_eq!(l0.mvp_flag, 0);
+        assert!(l0.mvd_flag);
+        assert_eq!(aff.l1, None);
+        assert_eq!(d.l0, None, "translational lists empty on affine branch");
+        assert_eq!(stats.affine.flag_bins, 1);
+        assert_eq!(stats.affine.mode_flag_bins, 1);
+        assert_eq!(stats.affine.mvp_flag_bins, 1);
+        assert_eq!(stats.affine.mvd_flag_bins, 1);
+        // vertexNum 2 → 4 abs_mvd components.
+        assert_eq!(stats.abs_mvd_bins, 4);
+        // bi_pred_idx never read on the affine branch.
+        assert_eq!(stats.gate.bi_pred_idx_bins, 0);
+    }
+
+    /// Round 384: `affine_mvd_flag == 0` suppresses every per-vertex MVD
+    /// (the §7.4 all-zero inference) — the bin budget proves it.
+    #[test]
+    fn round384_explicit_affine_mvd_flag_zero_suppresses_mvds() {
+        let toks = [
+            Tok::Reg(1), // affine_flag
+            Tok::Reg(1), // affine_mode_flag → 6-param
+            Tok::Reg(1), // affine_mvp_flag_l0 = 1
+            Tok::Reg(0), // affine_mvd_flag_l0 = 0 → no MVDs
+        ];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let gates = InterToolGates {
+            sps_affine_flag: true,
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            0,
+            false,
+            4,
+            5,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        let aff = d.affine.expect("affine");
+        assert!(aff.affine_mode_flag);
+        assert_eq!(aff.num_cp_mv(), 3);
+        let l0 = aff.l0.unwrap();
+        assert_eq!(l0.mvp_flag, 1);
+        assert!(!l0.mvd_flag);
+        assert_eq!(l0.mvd_cp, [MotionVector::default(); 3]);
+        assert_eq!(stats.abs_mvd_bins, 0);
+    }
+
+    /// Round 384: the spec-line-2941 gate — small blocks (log2 < 4),
+    /// non-zero amvr_idx, or sps_affine off skip the affine_flag bin and
+    /// fall through to the translational body.
+    #[test]
+    fn round384_explicit_affine_gate() {
+        assert!(affine_flag_present_in_explicit(true, 4, 4, 0));
+        assert!(!affine_flag_present_in_explicit(true, 3, 4, 0)); // width
+        assert!(!affine_flag_present_in_explicit(true, 4, 3, 0)); // height
+        assert!(!affine_flag_present_in_explicit(true, 4, 4, 1)); // amvr
+        assert!(!affine_flag_present_in_explicit(false, 4, 4, 0)); // tool
+
+        // Gate off (8×8) → the first bin is bi_pred-body territory; on a
+        // P slice with no ref_idx the two MVD pairs read immediately.
+        let toks = [Tok::Byp(0), Tok::Byp(0)];
+        let bs = mixed(&toks);
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        let mut stats = ExplicitAmvpStats::default();
+        let gates = InterToolGates {
+            sps_affine_flag: true,
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let d = read_explicit_amvp(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            0,
+            false,
+            3,
+            3,
+            [0, 0],
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.affine, None);
+        assert!(d.l0.is_some());
+        assert_eq!(stats.affine.flag_bins, 0);
     }
 }
