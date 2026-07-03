@@ -1,5 +1,7 @@
 # oxideav-evc
 
+[![CI](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-evc.svg)](https://crates.io/crates/oxideav-evc) [![docs.rs](https://docs.rs/oxideav-evc/badge.svg)](https://docs.rs/oxideav-evc) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1)
 video decoder. Zero C dependencies, zero FFI, zero `*-sys`.
 
