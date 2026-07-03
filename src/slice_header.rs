@@ -137,6 +137,16 @@ pub struct SliceHeader {
     pub num_ref_idx_active_override_flag: bool,
     pub num_ref_idx_active_minus1: [u32; 2],
     pub temporal_mvp_assigned_flag: bool,
+    /// `col_pic_list_idx` (§7.3.4) — the reference list `ColPic` is drawn
+    /// from. Inferred when absent: 0 for P slices, 1 for B slices.
+    pub col_pic_list_idx: u8,
+    /// `col_source_mvp_list_idx` (§7.3.4) — the collocated-location list
+    /// consulted first for the MV candidate. Inferred 0 when absent.
+    pub col_source_mvp_list_idx: u8,
+    /// `col_pic_ref_idx` (§7.3.4) — index into
+    /// `RefPicList[ col_pic_list_idx ]` selecting `ColPic` (§8.3.4).
+    /// Inferred 0 when absent.
+    pub col_pic_ref_idx: u32,
     pub slice_deblocking_filter_flag: bool,
     pub slice_alpha_offset: i32,
     pub slice_beta_offset: i32,
@@ -397,6 +407,11 @@ fn parse_from_bitreader(
     let mut num_ref_idx_active_override_flag = false;
     let mut num_ref_idx_active_minus1 = [0u32; 2];
     let mut temporal_mvp_assigned_flag = false;
+    // §7.4.x inference: col_pic_list_idx defaults to 0 for P and 1 for B
+    // when not present; col_source_mvp_list_idx / col_pic_ref_idx to 0.
+    let mut col_pic_list_idx: u8 = u8::from(slice_type == SliceType::B);
+    let mut col_source_mvp_list_idx: u8 = 0;
+    let mut col_pic_ref_idx: u32 = 0;
     if !matches!(nal_unit_type, NalUnitType::Idr)
         && (slice_type == SliceType::P || slice_type == SliceType::B)
     {
@@ -411,10 +426,10 @@ fn parse_from_bitreader(
             temporal_mvp_assigned_flag = br.u1()? != 0;
             if temporal_mvp_assigned_flag {
                 if slice_type == SliceType::B {
-                    let _col_pic_list_idx = br.u1()?;
-                    let _col_source_mvp_list_idx = br.u1()?;
+                    col_pic_list_idx = br.u1()? as u8;
+                    col_source_mvp_list_idx = br.u1()? as u8;
                 }
-                let _col_pic_ref_idx = br.ue()?;
+                col_pic_ref_idx = br.ue()?;
             }
         }
     }
@@ -471,6 +486,9 @@ fn parse_from_bitreader(
         num_ref_idx_active_override_flag,
         num_ref_idx_active_minus1,
         temporal_mvp_assigned_flag,
+        col_pic_list_idx,
+        col_source_mvp_list_idx,
+        col_pic_ref_idx,
         slice_deblocking_filter_flag,
         slice_alpha_offset,
         slice_beta_offset,

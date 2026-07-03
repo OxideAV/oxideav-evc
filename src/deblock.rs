@@ -59,7 +59,7 @@ pub enum CuPredMode {
 }
 
 /// Per-4×4-block side info that the deblocking process consults.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CuSideInfo {
     pub pred_mode: CuPredMode,
     /// Luma CBF (1 if any coded coefficient was decoded, else 0).
@@ -90,13 +90,31 @@ impl Default for CuSideInfo {
 }
 
 /// 4×4-grid side-info storage for a whole picture.
-#[derive(Clone, Debug)]
+///
+/// Besides driving the deblocking-filter BS derivation, the grid doubles
+/// as the picture's per-4×4 motion field: the §8.5.2.4 grid AMVP, the
+/// §8.5.2.3.2 spatial merge neighbours and — once the picture is retained
+/// in the DPB — the §8.5.2.3.3 collocated (`ColPic`) motion store all
+/// read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SideInfoGrid {
     /// Width of the grid in 4×4 cells (= ceil(pic_width / 4)).
     pub w_cells: usize,
     /// Height of the grid in 4×4 cells.
     pub h_cells: usize,
     pub cells: Vec<CuSideInfo>,
+}
+
+impl Default for SideInfoGrid {
+    /// A zero-cell grid — the "no motion field available" placeholder
+    /// (every lookup returns the default all-invalid cell).
+    fn default() -> Self {
+        Self {
+            w_cells: 0,
+            h_cells: 0,
+            cells: Vec::new(),
+        }
+    }
 }
 
 impl SideInfoGrid {

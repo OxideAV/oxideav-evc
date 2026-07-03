@@ -2198,6 +2198,32 @@ pub struct InterDecodeInputs<'a, 'b> {
     /// an equal-distance context (under which §8.5.2.3.9 reduces to the
     /// symmetric per-list offset).
     pub pocs: InterPocs<'b>,
+    /// §8.3.4 collocated picture (`ColPic = RefPicList[ col_pic_list_idx ]
+    /// [ col_pic_ref_idx ]`) — the motion field + POC context the
+    /// §8.5.2.3.3 temporal merge candidate reads. `None` when no decoded
+    /// reference with a retained motion field is available (IDR-only DPB,
+    /// or a caller that does not thread it), in which case the temporal
+    /// slot of the merge list stays empty exactly like a stream with no
+    /// usable collocated motion.
+    pub col_pic: Option<ColPicInputs<'b>>,
+}
+
+/// The §8.3.4 collocated-picture inputs for the §8.5.2.3.3/.4 temporal
+/// merge derivation: `ColPic`'s per-4×4 motion field, its own POC, and
+/// the POCs of *its* reference lists (so a collocated cell's stored
+/// `refIdxLXCol` resolves to the `refPicOfColPic[ X ]` POC of eq. 502).
+#[derive(Clone, Copy, Debug)]
+pub struct ColPicInputs<'b> {
+    /// `ColPic`'s per-4×4 motion field (`predFlagLXCol` / `mvLXCol` /
+    /// `refIdxLXCol` in the §8.5.2.3.4 input-array sense).
+    pub grid: &'b SideInfoGrid,
+    /// `PicOrderCnt( ColPic )`.
+    pub col_poc: i32,
+    /// `PicOrderCnt` of `ColPic`'s own `RefPicList0[ i ]` at its decode
+    /// time — the eq.-502 `refPicOfColPic[ 0 ]` resolution table.
+    pub ref_pocs_l0: &'b [i32],
+    /// `PicOrderCnt` of `ColPic`'s own `RefPicList1[ i ]`.
+    pub ref_pocs_l1: &'b [i32],
 }
 
 /// Picture-order-count inputs for the §8.5 inter derivations: the current
@@ -2302,6 +2328,16 @@ pub struct InterDecodeStats {
     /// Main-profile explicit-AMVP body (`read_explicit_amvp`, i.e.
     /// `merge_mode_flag == 0` on the `sps_admvp_flag == 1` path).
     pub admvp_explicit_cus: u32,
+    /// Round 384: the slice's per-4×4 motion field (the same grid the
+    /// deblocking pass consumed). The decoder retains it per DPB entry so
+    /// a later slice can use this picture as the §8.5.2.3.3 collocated
+    /// picture (`ColPic`) for temporal merge candidates.
+    pub side_info: SideInfoGrid,
+    /// Round 384: ADMVP merge CUs whose selected candidate came with a
+    /// §8.5.2.3.3 temporal (collocated) contribution available in the
+    /// list (diagnostic — counts CUs where the TMVP derivation produced
+    /// a candidate, whether or not `merge_idx` selected it).
+    pub tmvp_candidates: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -2446,6 +2482,10 @@ pub fn decode_baseline_inter_slice(
         }
         stats.deblock_edges = edges;
     }
+    // Surface the per-4×4 motion field: a decoded P/B picture retained in
+    // the DPB serves as the §8.5.2.3.3 collocated picture (`ColPic`) for
+    // later slices, whose TMVP derivation reads exactly this grid.
+    stats.side_info = side_info;
     Ok((pic, stats))
 }
 
@@ -2548,6 +2588,77 @@ fn num_ref_idx_active(inputs: &InterDecodeInputs<'_, '_>) -> [u32; 2] {
     ]
 }
 
+/// §8.5.2.3.3 — derive the temporal (collocated) merge candidate for one
+/// CU from the threaded [`ColPicInputs`], with the per-cell POC context
+/// (`refPicOfColPic` resolved through `ColPic`'s own reference-POC
+/// tables). Returns `None` when no collocated picture is threaded, the
+/// current slice's reference POCs are missing, or every collocated
+/// position is unavailable/invalid — the temporal slot of
+/// `mergeCandList` then simply stays empty.
+///
+/// On a P slice the L1 half of the collocated motion is stripped from
+/// the emitted candidate (the §8.5.2.3.3 process only outputs list-1
+/// motion for B slices).
+fn admvp_temporal_merge_cand(
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Option<crate::inter::MergeCand> {
+    let col = inputs.col_pic.as_ref()?;
+    let pocs = inputs.pocs;
+    // eq. 501 — currPocDiffLX is taken against RefPicListX[ 0 ]
+    // (refIdxLXCol is always 0 per §8.5.2.3.3).
+    let ref_l0_poc = *pocs.ref_pocs_l0.first()?;
+    let ref_l1_poc = pocs.ref_pocs_l1.first().copied().unwrap_or(ref_l0_poc);
+    let poc_inputs = crate::tmvp::PocInputs {
+        curr_poc: pocs.curr_poc,
+        ref_l0_poc,
+        ref_l1_poc,
+        col_pic_poc: col.col_poc,
+    };
+    let bounds = crate::tmvp::PicBounds {
+        pic_width_in_luma_samples: inputs.walk.pic_width as i32,
+        pic_height_in_luma_samples: inputs.walk.pic_height as i32,
+    };
+    let mut cand = crate::tmvp::tmvp_merge_candidate_with_poc(
+        x0 as i32,
+        y0 as i32,
+        n_cb_w as i32,
+        n_cb_h as i32,
+        // Baseline split order (`sps_suco_flag == 0`): left neighbours
+        // only — availLR = LR_10 (§6.4.2 eq. 23), matching the spatial
+        // assembly below.
+        crate::neighbour::AvailLr::Lr10,
+        poc_inputs,
+        bounds,
+        inputs.walk.ctb_log2_size_y,
+        |x_col, y_col| {
+            crate::tmvp::collocated_cell_from_side_info(col.grid, x_col, y_col, |list_x, idx| {
+                let table = if list_x == 0 {
+                    col.ref_pocs_l0
+                } else {
+                    col.ref_pocs_l1
+                };
+                // An out-of-table refIdx resolves to ColPic's own POC so
+                // the eq.-502 colPocDiff collapses to 0 and the
+                // §8.5.2.3.4 escape marks the list invalid.
+                table.get(idx as usize).copied().unwrap_or(col.col_poc)
+            })
+        },
+    )?;
+    if !inputs.slice_is_b && cand.pred_flag_l1 {
+        cand.pred_flag_l1 = false;
+        cand.ref_idx_l1 = -1;
+        cand.mv_l1 = MotionVector::default();
+        if !cand.pred_flag_l0 {
+            return None;
+        }
+    }
+    Some(cand)
+}
+
 /// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
 /// decoder's [`HmvpCandList`](crate::hmvp::HmvpCandList) (empty when the
 /// list holds fewer than four entries, per the §8.5.2.3.1 step-3 gate).
@@ -2581,6 +2692,7 @@ fn admvp_hmvp_merge_cands(
 fn admvp_merge_branch_to_pair(
     branch: MergeBranch,
     side_info: &SideInfoGrid,
+    temporal: Option<crate::inter::MergeCand>,
     hmvp_merge: &[crate::inter::MergeCand],
     slice_is_b: bool,
     num_ref_idx_active: [u32; 2],
@@ -2592,7 +2704,7 @@ fn admvp_merge_branch_to_pair(
 ) -> Result<InterMotionPair> {
     let select = |merge_idx: u32| {
         admvp_merge_motion_from_grid(
-            merge_idx, side_info, hmvp_merge, slice_is_b, x0, y0, n_cb_w, n_cb_h,
+            merge_idx, side_info, temporal, hmvp_merge, slice_is_b, x0, y0, n_cb_w, n_cb_h,
         )
     };
     match branch {
@@ -2678,10 +2790,15 @@ fn decode_admvp_skip_cu(
     stats.admvp_skip_cus += 1;
     let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
     let num_active = num_ref_idx_active(inputs);
+    let temporal = admvp_temporal_merge_cand(inputs, x0, y0, n_cb_w, n_cb_h);
+    if temporal.is_some() {
+        stats.tmvp_candidates += 1;
+    }
     match decision {
         CuSkipDecision::Merge { merge_idx } => admvp_merge_branch_to_pair(
             MergeBranch::Regular { merge_idx },
             side_info,
+            temporal,
             &hmvp_merge,
             inputs.slice_is_b,
             num_active,
@@ -2694,6 +2811,7 @@ fn decode_admvp_skip_cu(
         CuSkipDecision::Mmvd(d) => admvp_merge_branch_to_pair(
             MergeBranch::Mmvd(d),
             side_info,
+            temporal,
             &hmvp_merge,
             inputs.slice_is_b,
             num_active,
@@ -2706,6 +2824,7 @@ fn decode_admvp_skip_cu(
         CuSkipDecision::AffineMerge { affine_merge_idx } => admvp_merge_branch_to_pair(
             MergeBranch::AffineMerge { affine_merge_idx },
             side_info,
+            temporal,
             &hmvp_merge,
             inputs.slice_is_b,
             num_active,
@@ -2787,9 +2906,14 @@ fn decode_admvp_nonskip_inter_cu(
     if let Some(branch) = decision.merge {
         stats.admvp_merge_cus += 1;
         let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
+        let temporal = admvp_temporal_merge_cand(inputs, x0, y0, n_cb_w, n_cb_h);
+        if temporal.is_some() {
+            stats.tmvp_candidates += 1;
+        }
         return admvp_merge_branch_to_pair(
             branch,
             side_info,
+            temporal,
             &hmvp_merge,
             inputs.slice_is_b,
             num_ref_idx_active(inputs),
@@ -3503,9 +3627,9 @@ fn merge_neighbour_mv_from_grid(grid: &SideInfoGrid, x: i32, y: i32) -> crate::m
 /// merge candidates) and project `mergeCandList[ merge_idx ]` into the
 /// per-CU [`MergedMotion`](crate::merge::MergedMotion).
 ///
-/// The collocated temporal candidate (§8.5.2.3.3) is not yet threaded —
-/// the inter path does not carry the collocated picture's motion field —
-/// so `temporal` is passed `None`; the zero-MV fill (§8.5.2.3.8)
+/// The collocated temporal candidate (§8.5.2.3.3) — derived by
+/// [`admvp_temporal_merge_cand`] when a `ColPic` motion field is
+/// threaded — fills the step-2 slot; the zero-MV fill (§8.5.2.3.8)
 /// guarantees the list is non-empty so any in-range `merge_idx` resolves.
 /// Returns `None` only when `merge_idx` lands past the filled length,
 /// which the caller surfaces as a decode error.
@@ -3513,6 +3637,7 @@ fn merge_neighbour_mv_from_grid(grid: &SideInfoGrid, x: i32, y: i32) -> crate::m
 fn admvp_merge_motion_from_grid(
     merge_idx: u32,
     side_info: &SideInfoGrid,
+    temporal: Option<crate::inter::MergeCand>,
     hmvp_merge: &[crate::inter::MergeCand],
     slice_is_b: bool,
     x0: u32,
@@ -3538,7 +3663,7 @@ fn admvp_merge_motion_from_grid(
         avail_lr,
         slice_type,
         |xn, yn| merge_neighbour_mv_from_grid(side_info, xn, yn),
-        None,
+        temporal,
         hmvp_merge,
         &mut out,
     )
@@ -4511,6 +4636,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(pic.width, 32);
@@ -4625,6 +4751,7 @@ mod tests {
             ref_list_l1: &ref_list_l1,
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -4836,6 +4963,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         // The decode may surface Err if the bypass-bit guess is wrong;
         // we accept either a clean decode or a bitreader exhaustion (the
@@ -5188,6 +5316,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.coding_units, 1);
@@ -5231,6 +5360,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("ref_list_l0"));
@@ -5284,6 +5414,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let err = decode_baseline_inter_slice(&[], inputs).unwrap_err();
         assert!(format!("{err}").contains("num_ref_idx_active_minus1_l0"));
@@ -5697,6 +5828,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -5775,6 +5907,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: gates,
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_skip_cus, 1, "one admvp cu_skip CU decoded");
@@ -5854,6 +5987,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: gates,
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_merge_cus, 1, "one admvp merge-mode CU");
@@ -5931,6 +6065,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: gates,
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_explicit_cus, 1, "one admvp explicit CU");
@@ -5970,7 +6105,7 @@ mod tests {
         );
         // Current CU at (8, 0), 8×8. A1 = (7, 7) is inside the stamped
         // block. P slice, no HMVP, merge_idx 0.
-        let m = admvp_merge_motion_from_grid(0, &grid, &[], false, 8, 0, 8, 8)
+        let m = admvp_merge_motion_from_grid(0, &grid, None, &[], false, 8, 0, 8, 8)
             .expect("merge candidate must resolve");
         assert!(m.pred_flag_l0, "L0 active from neighbour");
         assert!(!m.pred_flag_l1, "neighbour was L0-only");
@@ -5983,7 +6118,7 @@ mod tests {
     #[test]
     fn round381_admvp_merge_zero_fill_when_no_neighbour() {
         let grid = SideInfoGrid::new(32, 32);
-        let m = admvp_merge_motion_from_grid(0, &grid, &[], false, 0, 0, 16, 16)
+        let m = admvp_merge_motion_from_grid(0, &grid, None, &[], false, 0, 0, 16, 16)
             .expect("zero-fill guarantees a candidate");
         assert!(m.pred_flag_l0);
         assert_eq!(m.mv_l0, MotionVector { x: 0, y: 0 });
@@ -6042,6 +6177,7 @@ mod tests {
         let (p0, _p1) = admvp_merge_branch_to_pair(
             branch,
             &grid,
+            None,
             &[],
             false,
             [1, 0],
@@ -6081,7 +6217,7 @@ mod tests {
         };
         // 32×32 B CU → the §8.5.2.3.8 zero-fill produces a bi-pred base.
         let (p0, p1) =
-            admvp_merge_branch_to_pair(branch, &grid, &[], true, [1, 1], pocs, 0, 0, 32, 32)
+            admvp_merge_branch_to_pair(branch, &grid, None, &[], true, [1, 1], pocs, 0, 0, 32, 32)
                 .unwrap();
         let (mv0, _) = p0.expect("L0 present");
         let (mv1, _) = p1.expect("L1 present");
@@ -6117,11 +6253,245 @@ mod tests {
             ref_pocs_l1: &[4],
         };
         let (p0, p1) =
-            admvp_merge_branch_to_pair(branch, &grid, &[], true, [1, 1], pocs, 0, 0, 32, 32)
+            admvp_merge_branch_to_pair(branch, &grid, None, &[], true, [1, 1], pocs, 0, 0, 32, 32)
                 .unwrap();
         assert!(p1.is_none(), "group 1 drops L1 on a bi-pred base");
         let (mv0, _) = p0.expect("L0 kept");
         assert_eq!(mv0, MotionVector { x: 1, y: 0 });
+    }
+
+    /// Round 384 TMVP e2e: a P-slice admvp cu_skip CU with no spatial
+    /// neighbours selects the §8.5.2.3.3 temporal (collocated) merge
+    /// candidate at `merge_idx = 0`. The collocated picture's grid holds
+    /// an inter cell with MV (16, 8) (1/4-pel = +4 px, +2 px); equal POC
+    /// distances (currPocDiff == colPocDiff == 2) make the eq.-503 scale
+    /// an identity, so the CU reconstructs by copying the reference at
+    /// the (+4, +2) offset.
+    #[test]
+    fn round384_admvp_tmvp_temporal_candidate_e2e() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        // Gradient reference so the MC offset is observable.
+        let mut ref_y = vec![0u8; 32 * 32];
+        for (i, px) in ref_y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        // ColPic motion field: the whole picture stamped inter with
+        // MV (16, 8), refIdxL0 0.
+        let mut col_grid = SideInfoGrid::new(32, 32);
+        col_grid.stamp_block(
+            0,
+            0,
+            32,
+            32,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 16,
+                mv_l0_y: 8,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let col_ref_pocs = [0i32];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: InterPocs {
+                curr_poc: 4,
+                ref_pocs_l0: &[2],
+                ref_pocs_l1: &[],
+            },
+            col_pic: Some(ColPicInputs {
+                grid: &col_grid,
+                col_poc: 2,
+                ref_pocs_l0: &col_ref_pocs,
+                ref_pocs_l1: &[],
+            }),
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_skip_cus, 1);
+        assert_eq!(
+            stats.tmvp_candidates, 1,
+            "TMVP derivation produced a candidate"
+        );
+        assert_eq!(stats.uni_pred_cus, 1);
+        // Pixel (0, 0) copied from the reference at (+4, +2).
+        let expect = ref_y[2 * 32 + 4];
+        assert_eq!(pic.y[0], expect, "MC read the temporal MV offset");
+        // The decoded CU's motion is stamped back into the slice grid.
+        let cell = stats.side_info.at(0, 0);
+        assert_eq!(cell.mv_l0_x, 16);
+        assert_eq!(cell.mv_l0_y, 8);
+    }
+
+    /// Round 384: the temporal candidate's POC scaling — curr distance 4
+    /// vs collocated distance 2 doubles the stored MV (eq. 503
+    /// distScaleFactor = (4 << 5) / 2 = 64).
+    #[test]
+    fn round384_admvp_tmvp_poc_scaling_doubles() {
+        let spatial = SideInfoGrid::new(32, 32);
+        let mut col_grid = SideInfoGrid::new(32, 32);
+        col_grid.stamp_block(
+            0,
+            0,
+            32,
+            32,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 6,
+                mv_l0_y: -10,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let col_ref_pocs = [2i32];
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs::default(),
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: InterPocs {
+                curr_poc: 8,
+                ref_pocs_l0: &[4], // currPocDiff = 4
+                ref_pocs_l1: &[],
+            },
+            col_pic: Some(ColPicInputs {
+                grid: &col_grid,
+                col_poc: 4,
+                ref_pocs_l0: &col_ref_pocs, // colPocDiff = 2
+                ref_pocs_l1: &[],
+            }),
+        };
+        let cand = admvp_temporal_merge_cand(&inputs, 0, 0, 16, 16).expect("temporal available");
+        assert!(cand.pred_flag_l0);
+        assert_eq!(cand.mv_l0, MotionVector { x: 12, y: -20 }, "doubled");
+        assert_eq!(cand.ref_idx_l0, 0);
+        // And it lands at merge_idx 0 when no spatial neighbour exists.
+        let m = admvp_merge_motion_from_grid(0, &spatial, Some(cand), &[], false, 0, 0, 16, 16)
+            .expect("temporal-first list");
+        assert_eq!(m.mv_l0, MotionVector { x: 12, y: -20 });
+    }
+
+    /// Round 384: a bi-predictive collocated cell contributes only its
+    /// L0 half on a P slice (the §8.5.2.3.3 list-1 output is B-only).
+    #[test]
+    fn round384_admvp_tmvp_p_slice_strips_l1() {
+        let mut col_grid = SideInfoGrid::new(32, 32);
+        col_grid.stamp_block(
+            0,
+            0,
+            32,
+            32,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 4,
+                mv_l0_y: 4,
+                mv_l1_x: -4,
+                mv_l1_y: -4,
+                ref_idx_l0: 0,
+                ref_idx_l1: 0,
+            },
+        );
+        let col_ref_pocs = [0i32];
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs::default(),
+            slice_is_b: false, // P slice
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: InterPocs {
+                curr_poc: 4,
+                ref_pocs_l0: &[2],
+                ref_pocs_l1: &[],
+            },
+            col_pic: Some(ColPicInputs {
+                grid: &col_grid,
+                col_poc: 2,
+                ref_pocs_l0: &col_ref_pocs,
+                ref_pocs_l1: &col_ref_pocs,
+            }),
+        };
+        let cand = admvp_temporal_merge_cand(&inputs, 0, 0, 16, 16).expect("temporal available");
+        assert!(cand.pred_flag_l0);
+        assert!(!cand.pred_flag_l1, "L1 stripped on a P slice");
+        assert_eq!(cand.ref_idx_l1, -1);
     }
 
     /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The
@@ -6185,6 +6555,7 @@ mod tests {
             ref_list_l1: &ref_list_l1,
             inter_tool_gates: gates,
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.admvp_skip_cus, 1);
@@ -6254,6 +6625,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(
@@ -6616,6 +6988,7 @@ mod tests {
             ref_list_l1: &[],
             inter_tool_gates: Default::default(),
             pocs: Default::default(),
+            col_pic: None,
         };
         let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
         assert_eq!(

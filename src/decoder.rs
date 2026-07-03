@@ -58,6 +58,15 @@ struct DpbEntry {
     /// `out` output queue. Stops `flush()` from re-emitting frames the
     /// caller has already received.
     output_emitted: bool,
+    /// Round 384: the picture's per-4×4 motion field, retained so a later
+    /// slice can select this picture as its §8.3.4 collocated picture
+    /// (`ColPic`) and read the §8.5.2.3.4 `mvLXCol` arrays from it.
+    /// `None` for IDR pictures (all-intra ⇒ no usable collocated motion).
+    side_info: Option<crate::deblock::SideInfoGrid>,
+    /// Round 384: the POCs of this picture's own reference lists at its
+    /// decode time — the eq.-502 `refPicOfColPic[ X ]` resolution tables.
+    ref_pocs_l0: Vec<i32>,
+    ref_pocs_l1: Vec<i32>,
 }
 
 /// Result of decoding one non-IDR (P/B) slice. Round 113 threads the
@@ -77,6 +86,12 @@ struct NonIdrDecodeResult {
     alf_luma_aps_id: Option<u8>,
     alf_chroma_aps_id: Option<u8>,
     alf_chroma2_aps_id: Option<u8>,
+    /// Round 384: the slice's per-4×4 motion field + its reference-list
+    /// POCs, retained in the DPB so this picture can serve as a later
+    /// slice's §8.3.4 collocated picture.
+    side_info: crate::deblock::SideInfoGrid,
+    ref_pocs_l0: Vec<i32>,
+    ref_pocs_l1: Vec<i32>,
 }
 
 /// Build the round-3 decoder for the registry.
@@ -389,6 +404,9 @@ impl Decoder for EvcDecoder {
                         pts: packet.pts,
                         used_for_reference: true,
                         output_emitted: false,
+                        side_info: None,
+                        ref_pocs_l0: Vec::new(),
+                        ref_pocs_l1: Vec::new(),
                     };
                     self.prev_poc_lsb = 0;
                     self.poc_msb = 0;
@@ -415,6 +433,9 @@ impl Decoder for EvcDecoder {
                         alf_luma_aps_id,
                         alf_chroma_aps_id,
                         alf_chroma2_aps_id,
+                        side_info,
+                        ref_pocs_l0,
+                        ref_pocs_l1,
                     } = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
                     // Round-11: ALF + DRA post-filter pass. Round 113: the
                     // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply.
@@ -445,6 +466,9 @@ impl Decoder for EvcDecoder {
                         pts: packet.pts,
                         used_for_reference: true,
                         output_emitted: false,
+                        side_info: Some(side_info),
+                        ref_pocs_l0,
+                        ref_pocs_l1,
                     };
                     self.dpb_insert(entry);
                     self.enqueue_for_output(poc);
@@ -747,6 +771,30 @@ impl EvcDecoder {
         } else {
             Vec::new()
         };
+        // §8.3.4 — ColPic = RefPicList[ col_pic_list_idx ][ col_pic_ref_idx ]
+        // (col_pic_list_idx inferred 0 for P / 1 for B when unsignalled).
+        // The motion field is only retained for previously decoded P/B
+        // pictures; an IDR ColPic (all-intra) yields no collocated motion
+        // and the temporal merge slot stays empty.
+        let col_pocs_list = if slice_is_b && header.col_pic_list_idx == 1 {
+            &pocs_l1
+        } else {
+            &pocs_l0
+        };
+        let col_pic = col_pocs_list
+            .get(header.col_pic_ref_idx as usize)
+            .and_then(|&col_poc| {
+                self.dpb_find(col_poc).and_then(|e| {
+                    e.side_info
+                        .as_ref()
+                        .map(|grid| crate::slice_data::ColPicInputs {
+                            grid,
+                            col_poc,
+                            ref_pocs_l0: &e.ref_pocs_l0,
+                            ref_pocs_l1: &e.ref_pocs_l1,
+                        })
+                })
+            });
         let inputs = InterDecodeInputs {
             walk,
             decode,
@@ -764,6 +812,7 @@ impl EvcDecoder {
                 ref_pocs_l0: &pocs_l0,
                 ref_pocs_l1: &pocs_l1,
             },
+            col_pic,
         };
         let (pic, stats) =
             crate::slice_data::decode_baseline_inter_slice(slice_data_bytes, inputs)?;
@@ -779,6 +828,9 @@ impl EvcDecoder {
         Ok(NonIdrDecodeResult {
             pic,
             poc,
+            side_info: stats.side_info,
+            ref_pocs_l0: pocs_l0,
+            ref_pocs_l1: pocs_l1,
             alf_ctb_map: stats.alf_ctb_map,
             // §8.9 chroma path (ChromaArrayType 1..2): the plane is filtered
             // when the slice-level chroma ALF enable is set (the per-CTB
@@ -1124,6 +1176,9 @@ mod tests {
                 pts: None,
                 used_for_reference: true,
                 output_emitted: false,
+                side_info: None,
+                ref_pocs_l0: Vec::new(),
+                ref_pocs_l1: Vec::new(),
             });
         }
         assert_eq!(dec.dpb.len(), MAX_DPB_ENTRIES);
@@ -1145,6 +1200,9 @@ mod tests {
             pts: None,
             used_for_reference: true,
             output_emitted: false,
+            side_info: None,
+            ref_pocs_l0: Vec::new(),
+            ref_pocs_l1: Vec::new(),
         });
         dec.poc_msb = 256;
         dec.prev_poc_lsb = 100;
@@ -1173,6 +1231,9 @@ mod tests {
             pts: None,
             used_for_reference: true,
             output_emitted: true,
+            side_info: None,
+            ref_pocs_l0: Vec::new(),
+            ref_pocs_l1: Vec::new(),
         });
         dec.dpb_insert(DpbEntry {
             pic: pic.clone(),
@@ -1180,6 +1241,9 @@ mod tests {
             pts: None,
             used_for_reference: true,
             output_emitted: false,
+            side_info: None,
+            ref_pocs_l0: Vec::new(),
+            ref_pocs_l1: Vec::new(),
         });
         dec.dpb_insert(DpbEntry {
             pic,
@@ -1187,6 +1251,9 @@ mod tests {
             pts: None,
             used_for_reference: true,
             output_emitted: false,
+            side_info: None,
+            ref_pocs_l0: Vec::new(),
+            ref_pocs_l1: Vec::new(),
         });
         assert!(dec.out.is_empty());
         dec.drain_dpb_to_output();
@@ -1218,6 +1285,9 @@ mod tests {
                 pts: None,
                 used_for_reference: true,
                 output_emitted: true,
+                side_info: None,
+                ref_pocs_l0: Vec::new(),
+                ref_pocs_l1: Vec::new(),
             });
         }
         let rpl = RefPicListStruct {
@@ -1259,6 +1329,9 @@ mod tests {
                 pts: None,
                 used_for_reference: true,
                 output_emitted: true,
+                side_info: None,
+                ref_pocs_l0: Vec::new(),
+                ref_pocs_l1: Vec::new(),
             });
         }
         let rpl = RefPicListStruct {
