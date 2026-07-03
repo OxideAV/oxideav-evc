@@ -10513,4 +10513,227 @@ mod tests {
         prune_inherited_neighbours_lr10(&mut a1_b2);
         assert!(!a1_b2[4].available_flag, "B2 dropped (== A1)");
     }
+
+    // ================================================================
+    // Round 387 — whole-picture P/B integration depth (CABAC streams).
+    // ================================================================
+
+    /// Full-stream two-CU P slice: CU0 at (0, 0) is an explicit-affine
+    /// CU (4-param, zero MVP + decoded per-vertex MVDs → CPMVs (4,0) /
+    /// (8,0)); CU1 at (16, 0) is a skip **affine-merge** CU whose
+    /// `affine_merge_idx = 0` selects the candidate *inherited from CU0
+    /// through A1* via the per-CU CPMV store. The whole chain — §7.3.8.4
+    /// syntax → §8.5.3.1 CPMV reconstruction → subblock stamp → store →
+    /// §8.5.3.2/.3 inheritance → CU1's stamped field — is cross-checked
+    /// against an independently-computed §8.5.3.3 projection.
+    #[test]
+    fn round387_e2e_affine_cu_chain_inherits_across_cus() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let mut ref_y = vec![0u8; 32 * 16];
+        for (i, px) in ref_y.iter_mut().enumerate() {
+            *px = (i % 249) as u8;
+        }
+        let ref_cb = vec![128u8; 16 * 8];
+        let ref_cr = vec![128u8; 16 * 8];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 16,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        // 32×16 picture under a 32-CTU: the walker force-splits (no bin);
+        // the two in-picture 16×16 children are leaves (min_cb 4).
+        // --- CU0 (0, 0): explicit affine, 4-param, MVDs (4,0) / (8,0).
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (inter)
+        enc.encode_decision(0, 0, 0); // merge_mode_flag = 0 → explicit
+        enc.encode_decision(0, 0, 1); // affine_flag = 1
+        enc.encode_decision(0, 0, 0); // affine_mode_flag = 0 (4-param)
+        enc.encode_decision(0, 0, 0); // affine_mvp_flag_l0 = 0
+        enc.encode_decision(0, 0, 1); // affine_mvd_flag_l0 = 1
+        encode_egk0_bypass(&mut enc, 4); // v0 mvd_x abs = 4
+        enc.encode_bypass(0); //            v0 mvd_x sign = +
+        encode_egk0_bypass(&mut enc, 0); // v0 mvd_y abs = 0
+        encode_egk0_bypass(&mut enc, 8); // v1 mvd_x abs = 8
+        enc.encode_bypass(0); //            v1 mvd_x sign = +
+        encode_egk0_bypass(&mut enc, 0); // v1 mvd_y abs = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // --- CU1 (16, 0): skip, affine merge, merge_idx 0 (inherited).
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 1); // affine_flag = 1
+        enc.encode_decision(0, 0, 0); // affine_merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let mut rbsp = enc.finish();
+        rbsp.extend_from_slice(&[0xFF; 4]);
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_affine_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[ref_view],
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_explicit_cus, 1, "CU0 explicit affine");
+        assert_eq!(stats.admvp_skip_cus, 1, "CU1 affine-merge skip");
+        assert_eq!(stats.admvp_syntax.affine.merge_idx_bins, 1);
+        // Both CUs stamped the affine store: model idc + covering CU.
+        let cu0 = stats.side_info.at(0, 0);
+        assert_eq!(cu0.motion_model_idc, 1);
+        assert_eq!((cu0.cu_x0, cu0.cu_y0), (0, 0));
+        let cu1 = stats.side_info.at(4, 0);
+        assert_eq!(cu1.motion_model_idc, 1, "CU1 inherited a 4-param model");
+        assert_eq!((cu1.cu_x0, cu1.cu_y0), (16, 0));
+        // CU0's model grows in x (CPMVs (4,0) → (8,0)); CU1 continues it.
+        assert!(cu1.mv_l0_x > cu0.mv_l0_x, "field continues across CUs");
+        // Cross-check CU1's stamped first subblock against an
+        // independently-computed §8.5.3.3 projection of CU0's stored
+        // corner cells.
+        let nb = affine_neighbour_from_grid(&stats.side_info, 15, 15);
+        assert!(nb.available_flag);
+        let cps = crate::affine::inherited_cp_mvs(16, 0, 16, 16, 2, 32, nb.src_l0);
+        let cp_mv = [cps[0], cps[1], MotionVector::default()];
+        let field = crate::affine::affine_subblock_mvs(16, 16, 2, &cp_mv, 2, 2);
+        let expect0 = crate::inter::round_motion_vector(field.at(0, 0).luma, 2, 0);
+        assert_eq!(
+            (cu1.mv_l0_x, cu1.mv_l0_y),
+            (expect0.x, expect0.y),
+            "CU1's stamped subblock 0 == §8.5.3.3 projection of CU0"
+        );
+    }
+
+    /// Cross-picture chain: picture 1's DMVR CU stores its per-subblock
+    /// refined-MV deltas; when picture 1 becomes the `ColPic` of picture
+    /// 2, the §8.5.2.3.3 temporal merge candidate reads the **refined**
+    /// `refMvLX` (the §8.5.1 NOTE) — the P-slice merge CU of picture 2
+    /// resolves to the refined (4, 0), not the unrefined (0, 0).
+    #[test]
+    fn round387_e2e_dmvr_refined_mv_feeds_tmvp_of_next_picture() {
+        use crate::inter::RefPictureView;
+        // --- Picture 1: the DMVR fixture (dMvL0 = (16, 0) everywhere).
+        let (y0, cb0, cr0) = dmvr_ref_planes(1);
+        let (y1, cb1, cr1) = dmvr_ref_planes(-1);
+        let ref_l0 = [dmvr_view(&y0, &cb0, &cr0)];
+        let ref_l1 = [dmvr_view(&y1, &cb1, &cr1)];
+        let rbsp1 = encode_dmvr_skip_cu_stream();
+        let inputs1 = InterDecodeInputs {
+            walk: dmvr_walk(),
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: true,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_l0,
+            ref_list_l1: &ref_l1,
+            inter_tool_gates: InterToolGates {
+                sps_admvp_flag: true,
+                sps_dmvr_flag: true,
+                ..Default::default()
+            },
+            pocs: InterPocs {
+                curr_poc: 2,
+                ref_pocs_l0: &[0],
+                ref_pocs_l1: &[4],
+            },
+            col_pic: None,
+        };
+        let (_pic1, stats1) = decode_baseline_inter_slice(&rbsp1, inputs1).unwrap();
+        assert_eq!(stats1.dmvr_cus, 1);
+
+        // --- Picture 2 (POC 4, P): ColPic = picture 1 (POC 2). The
+        // collocated cell's refined L0 motion is (0,0) + delta (16,0) →
+        // (4, 0) in 1/4-pel; identity POC scaling ((4−2)/(2−0) = 1).
+        let mut ref2_y = vec![0u8; 32 * 32];
+        for (i, px) in ref2_y.iter_mut().enumerate() {
+            *px = (i % 247) as u8;
+        }
+        let ref2_cb = vec![128u8; 16 * 16];
+        let ref2_cr = vec![128u8; 16 * 16];
+        let ref2 = RefPictureView {
+            y: &ref2_y,
+            cb: &ref2_cb,
+            cr: &ref2_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let rbsp2 = encode_dmvr_skip_cu_stream(); // same shape: skip, merge_idx 0
+        let col_ref_pocs_l0 = [0i32];
+        let col_ref_pocs_l1 = [4i32];
+        let inputs2 = InterDecodeInputs {
+            walk: dmvr_walk(),
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[ref2],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates {
+                sps_admvp_flag: true,
+                ..Default::default()
+            },
+            pocs: InterPocs {
+                curr_poc: 4,
+                ref_pocs_l0: &[2],
+                ref_pocs_l1: &[],
+            },
+            col_pic: Some(ColPicInputs {
+                grid: &stats1.side_info,
+                col_poc: 2,
+                ref_pocs_l0: &col_ref_pocs_l0,
+                ref_pocs_l1: &col_ref_pocs_l1,
+            }),
+        };
+        let (pic2, stats2) = decode_baseline_inter_slice(&rbsp2, inputs2).unwrap();
+        assert_eq!(stats2.tmvp_candidates, 1, "temporal candidate produced");
+        // The merge CU's motion is the *refined* collocated vector.
+        let cell = stats2.side_info.at(0, 0);
+        assert_eq!(
+            (cell.mv_l0_x, cell.mv_l0_y),
+            (4, 0),
+            "TMVP read refMvLX = mv + DMVR delta, not the unrefined (0,0)"
+        );
+        // And the MC honoured it: pixel (8, 8) copied from ref2 at +1 px.
+        let stride = pic2.y_stride();
+        assert_eq!(pic2.y[8 * stride + 8], ref2_y[8 * 32 + 9]);
+    }
 }
