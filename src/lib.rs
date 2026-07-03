@@ -102,6 +102,7 @@ pub mod inter;
 pub mod inter_cu_syntax;
 pub mod intra;
 pub mod merge;
+pub mod mmvd;
 pub mod mmvd_syntax;
 pub mod nal;
 pub mod neighbour;
