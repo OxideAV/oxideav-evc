@@ -2599,6 +2599,137 @@ enum CuMotion {
     Affine(Box<AffineCuMotion>),
 }
 
+/// eqs. 619-622 (and the parallel 623-642) — POC-rescale a neighbour's
+/// MV onto the current CU's target reference:
+/// `distScaleFactorLX = (targetPocDiff << 5) / currPocDiff` with the
+/// Sign/Abs round-half-away-from-zero and `Clip3(±2¹⁵)`. Skipped (the
+/// identity) when the POC tables are not threaded or the denominator
+/// vanishes (non-conforming input degrades gracefully to the unscaled
+/// neighbour vector rather than a decode abort, matching the merge-path
+/// convention for synthetic fixtures).
+fn admvp_rescale_mvp(
+    mv: MotionVector,
+    pocs: InterPocs<'_>,
+    list_x: u8,
+    nb_ref_idx: i32,
+    cur_ref_idx: u32,
+) -> MotionVector {
+    if nb_ref_idx == cur_ref_idx as i32 {
+        return mv;
+    }
+    let table = if list_x == 0 {
+        pocs.ref_pocs_l0
+    } else {
+        pocs.ref_pocs_l1
+    };
+    let (Some(&nb_poc), Some(&cur_poc)) = (
+        table.get(nb_ref_idx.max(0) as usize),
+        table.get(cur_ref_idx as usize),
+    ) else {
+        return mv;
+    };
+    let curr_poc_diff = pocs.curr_poc - nb_poc; // eq. 619
+    let target_poc_diff = pocs.curr_poc - cur_poc; // eq. 620
+    if curr_poc_diff == 0 {
+        return mv;
+    }
+    let dsf = (((target_poc_diff as i64) << 5).wrapping_div(curr_poc_diff as i64)) as i32; // eq. 621
+    let scale = |c: i32| -> i32 {
+        let p = (dsf as i64) * (c as i64);
+        let mag = (p.abs() + 16) >> 5;
+        let v = if p < 0 { -mag } else { mag };
+        v.clamp(-32768, 32767) as i32
+    }; // eq. 622
+    MotionVector {
+        x: scale(mv.x),
+        y: scale(mv.y),
+    }
+}
+
+/// §8.5.2.4 (`sps_admvp_flag == 1`) — derive `mvpLX` for one explicit
+/// list. `amvr_idx` selects **which single neighbour** is consulted
+/// (0→A1, 1→B1, 2→B0, 3→A0, 4→B2 at the §8.5.2.4.1 `availLR`-dependent
+/// positions; Baseline split order ⇒ LR_10/LR_00 shape):
+///
+/// * neighbour available with a valid list-X reference → `mvpLX` is its
+///   `MvLX`, POC-rescaled (eqs. 619-638) when its reference differs from
+///   the CU's `refIdxLX`;
+/// * otherwise the §8.5.2.4.5.2 `DefaultRefIdxLX` + §8.5.2.4.2
+///   `DefaultMvLX` cascade fires — A1 refIdx-matched, B1 refIdx-matched,
+///   A1 any-valid, B1 any-valid, then the §8.5.2.4.4 HMVP walk — with
+///   the eqs.-639-642 rescale when the default reference differs;
+/// * eqs. 645/646 round the predictor onto the AMVR grid when
+///   `amvr_idx != 0`.
+#[allow(clippy::too_many_arguments)]
+fn admvp_explicit_mvp(
+    side_info: &SideInfoGrid,
+    hmvp: &crate::hmvp::HmvpCandList,
+    pocs: InterPocs<'_>,
+    amvr_idx: u32,
+    cur_ref_idx: u32,
+    list_x: u8,
+    x0: i32,
+    y0: i32,
+    n_cb_w: i32,
+    n_cb_h: i32,
+) -> Result<MotionVector> {
+    // §8.5.2.4.1 LR_10/LR_00 neighbour positions.
+    let a1 = (x0 - 1, y0 + n_cb_h - 1);
+    let b1 = (x0 + n_cb_w - 1, y0 - 1);
+    let b0 = (x0 + n_cb_w, y0 - 1);
+    let a0 = (x0 - 1, y0 + n_cb_h);
+    let b2 = (x0 - 1, y0 - 1);
+    let sel = match amvr_idx {
+        0 => a1,
+        1 => b1,
+        2 => b0,
+        3 => a0,
+        _ => b2,
+    };
+    // §6.4.3 probe: an inter cell with a valid list-X reference.
+    let probe = |xy: (i32, i32)| -> Option<(MotionVector, i32)> {
+        let nb = merge_neighbour_mv_from_grid(side_info, xy.0, xy.1);
+        if !nb.available {
+            return None;
+        }
+        let (used, ref_idx, mv) = if list_x == 0 {
+            (nb.pred_flag_l0, nb.ref_idx_l0, nb.mv_l0)
+        } else {
+            (nb.pred_flag_l1, nb.ref_idx_l1, nb.mv_l1)
+        };
+        (used && ref_idx != -1).then_some((mv, ref_idx))
+    };
+
+    let mvp = if let Some((mv, nb_ref)) = probe(sel) {
+        // eqs. 619-638 — rescale when the neighbour references a
+        // different picture.
+        admvp_rescale_mvp(mv, pocs, list_x, nb_ref, cur_ref_idx)
+    } else {
+        // mvpAvailFlag == 0 → the §8.5.2.4.2/.4.4/.4.5.2 default cascade.
+        let a1_probe = probe(a1);
+        let b1_probe = probe(b1);
+        let (default_mv, default_ref) =
+            if let Some((mv, r)) = a1_probe.filter(|&(_, r)| r == cur_ref_idx as i32) {
+                (mv, r)
+            } else if let Some((mv, r)) = b1_probe.filter(|&(_, r)| r == cur_ref_idx as i32) {
+                (mv, r)
+            } else if let Some((mv, r)) = a1_probe {
+                (mv, r)
+            } else if let Some((mv, r)) = b1_probe {
+                (mv, r)
+            } else if let Some((mv, r)) = hmvp.derive_default_mv(cur_ref_idx as i8, list_x) {
+                (mv, r as i32)
+            } else {
+                (MotionVector::default(), cur_ref_idx as i32)
+            };
+        // eqs. 639-642 — rescale onto the target reference.
+        admvp_rescale_mvp(default_mv, pocs, list_x, default_ref, cur_ref_idx)
+    };
+
+    // eqs. 645/646 — AMVR-grid rounding of the predictor.
+    crate::inter::amvr_round_mvp_vector(mvp, amvr_idx)
+}
+
 /// `NumRefIdxActive[ 0 / 1 ]` for the §8.5.2.3.9 derivation — the L1
 /// count is 0 on a P slice (the list is inactive).
 fn num_ref_idx_active(inputs: &InterDecodeInputs<'_, '_>) -> [u32; 2] {
@@ -3236,21 +3367,21 @@ fn decode_admvp_nonskip_inter_cu(
     let reconstruct_list = |entry: crate::inter_cu_syntax::ExplicitListMv,
                             list_x: u8|
      -> Result<(MotionVector, u32)> {
-        // mvpLX from the §8.5.2.4 grid AMVP — the explicit body does not
-        // carry an mvp_idx separate from the merge path here, so slot 0
-        // (the first spatial predictor) is used; the eq.-145 amvr shift
-        // scales the parsed MVD before the add.
-        let mvp = baseline_amvp_select_with_grid_and_hmvp(
-            0,
+        // §8.5.2.4 (sps_admvp_flag == 1): the amvr_idx-selected single
+        // neighbour (with POC rescale + default cascade + eq.-645/646
+        // AMVR rounding), then the eq.-145 amvr-shifted MVD adds on top.
+        let mvp = admvp_explicit_mvp(
             side_info,
             hmvp,
+            inputs.pocs,
+            amvr_idx,
+            entry.ref_idx,
+            list_x,
             x0 as i32,
             y0 as i32,
             n_cb_w as i32,
             n_cb_h as i32,
-            entry.ref_idx as i8,
-            list_x,
-        );
+        )?;
         let mvd = crate::inter::amvr_apply_to_mvd_vector(entry.mvd, amvr_idx)?;
         Ok((mvp.wrapping_add(&mvd), entry.ref_idx))
     };
@@ -7483,6 +7614,145 @@ mod tests {
         // base = CP0 << 7 evaluated at the subblock centre — strictly
         // greater than the unshifted (8, 4) model would give.
         assert!(f.at(0, 0).luma.x >= 12 * 4, "MVD shifted the base CPMV");
+    }
+
+    /// Round 384: §8.5.2.4 (`sps_admvp_flag == 1`) — `amvr_idx` selects
+    /// which single neighbour supplies `mvpLX` (0→A1, 1→B1, 2→B0, 3→A0,
+    /// 4→B2).
+    #[test]
+    fn round384_admvp_explicit_mvp_amvr_selects_neighbour() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        let stamp = |g: &mut SideInfoGrid, x: u32, y: u32, mv: (i32, i32)| {
+            g.stamp_block(
+                x,
+                y,
+                4,
+                4,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Inter,
+                    cbf_luma: 0,
+                    mv_l0_x: mv.0,
+                    mv_l0_y: mv.1,
+                    mv_l1_x: 0,
+                    mv_l1_y: 0,
+                    ref_idx_l0: 0,
+                    ref_idx_l1: -1,
+                },
+            );
+        };
+        // CU at (16, 16), 16×16: A1 = (15, 31) → cell (12, 28);
+        // B1 = (31, 15) → cell (28, 12).
+        stamp(&mut grid, 12, 28, (40, 4));
+        stamp(&mut grid, 28, 12, (-8, 12));
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let mvp_a1 = admvp_explicit_mvp(
+            &grid,
+            &hmvp,
+            InterPocs::default(),
+            0, // amvr 0 → A1
+            0,
+            0,
+            16,
+            16,
+            16,
+            16,
+        )
+        .unwrap();
+        assert_eq!(mvp_a1, MotionVector { x: 40, y: 4 });
+        let mvp_b1 = admvp_explicit_mvp(
+            &grid,
+            &hmvp,
+            InterPocs::default(),
+            1, // amvr 1 → B1
+            0,
+            0,
+            16,
+            16,
+            16,
+            16,
+        )
+        .unwrap();
+        // eqs. 645/646 — amvr 1 rounds onto the 1/2-pel grid:
+        // −8 → −8 (already even), 12 → 12.
+        assert_eq!(mvp_b1, MotionVector { x: -8, y: 12 });
+    }
+
+    /// Round 384: the eqs.-619-622 POC rescale fires when the selected
+    /// neighbour references a different picture — curr 4, refs POC
+    /// [2, 0]: neighbour on ref 1 (diff 4), CU targets ref 0 (diff 2) →
+    /// dsf = (2 << 5) / 4 = 16 → MV halved (round-half-away).
+    #[test]
+    fn round384_admvp_explicit_mvp_poc_rescale() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        grid.stamp_block(
+            12,
+            28,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 40,
+                mv_l0_y: -12,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 1, // ≠ the CU's target ref 0
+                ref_idx_l1: -1,
+            },
+        );
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let pocs = InterPocs {
+            curr_poc: 4,
+            ref_pocs_l0: &[2, 0],
+            ref_pocs_l1: &[],
+        };
+        let mvp = admvp_explicit_mvp(&grid, &hmvp, pocs, 0, 0, 0, 16, 16, 16, 16).unwrap();
+        assert_eq!(
+            mvp,
+            MotionVector { x: 20, y: -6 },
+            "halved by the POC ratio"
+        );
+    }
+
+    /// Round 384: when the amvr-selected neighbour is unavailable the
+    /// §8.5.2.4.2 default cascade falls back to A1 (refIdx-matched
+    /// first).
+    #[test]
+    fn round384_admvp_explicit_mvp_default_cascade() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        // Only A1 populated; the amvr-2 selection (B0) is intra/absent.
+        grid.stamp_block(
+            12,
+            28,
+            4,
+            4,
+            CuSideInfo {
+                pred_mode: CuPredMode::Inter,
+                cbf_luma: 0,
+                mv_l0_x: 24,
+                mv_l0_y: 8,
+                mv_l1_x: 0,
+                mv_l1_y: 0,
+                ref_idx_l0: 0,
+                ref_idx_l1: -1,
+            },
+        );
+        let hmvp = crate::hmvp::HmvpCandList::new();
+        let mvp = admvp_explicit_mvp(
+            &grid,
+            &hmvp,
+            InterPocs::default(),
+            2, // → B0, unavailable → default cascade
+            0,
+            0,
+            16,
+            16,
+            16,
+            16,
+        )
+        .unwrap();
+        // A1's (24, 8) then eqs. 645/646 amvr-2 rounding: 24 → 24, 8 → 8.
+        assert_eq!(mvp, MotionVector { x: 24, y: 8 });
     }
 
     /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The

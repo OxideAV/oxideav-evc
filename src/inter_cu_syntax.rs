@@ -40,10 +40,12 @@
 //!   }
 //! ```
 //!
-//! `merge_mode_flag` is inferred 1 when `amvr_idx != 0` (spec line 5827):
-//! a non-1/4-pel AMVR resolution forces explicit-MVD off, so AMVR-shifted
-//! CUs can only be merge CUs. (The explicit-AMVP `merge_mode_flag == 0`
-//! sub-tree is a separate driver, landed alongside this one.)
+//! `merge_mode_flag` is present only when `amvr_idx == 0`; when absent
+//! it is **inferred 0** (§7.4.9.4 semantics: "when not present, inferred
+//! equal to 0") — an AMVR-shifted CU is therefore always an explicit-MVD
+//! CU, which is exactly why the §8.5.2.4 `sps_admvp_flag == 1` MVP
+//! derivation indexes its candidate neighbour by `amvr_idx`. (Round 384
+//! corrected the r381 inferred-1 reading.)
 //!
 //! All clause / equation / table numbers cite ISO/IEC 23094-1:2020(E).
 
@@ -152,12 +154,13 @@ pub fn read_inter_cu_mode(
     };
 
     // Step 2 — merge_mode_flag is read only when amvr_idx == 0; otherwise
-    // it is inferred 1 (spec line 5827 — a non-1/4-pel AMVR resolution
-    // forces a merge CU).
+    // it is absent and inferred 0 (§7.4.9.4) — an AMVR-shifted CU always
+    // carries explicit MVDs (the §8.5.2.4 admvp MVP derivation indexes
+    // its neighbour by amvr_idx).
     let merge_mode_flag = if amvr_idx == 0 {
         crate::amvr_syntax::read_merge_mode_flag(eng, ctx, &mut stats.gate)?
     } else {
-        true
+        false
     };
 
     if !merge_mode_flag {
@@ -855,21 +858,24 @@ mod tests {
         assert_eq!(stats.mmvd.direction_idx_bins, 2);
     }
 
-    /// amvr_idx != 0 forces merge_mode_flag inferred 1 (no bin read).
-    /// Bin string: amvr "1 0" (value 1), then mmvd_flag "0", affine off
-    /// (small block), merge_idx "0".
+    /// amvr_idx != 0 → merge_mode_flag absent and inferred 0 (§7.4.9.4
+    /// "when not present, inferred equal to 0"): the CU defers to the
+    /// explicit-AMVP driver and no merge-branch bin is consumed.
+    /// Bin string: amvr "1 0" (value 1) only.
     #[test]
-    fn amvr_nonzero_infers_merge_mode() {
-        let bs = bins(&[1, 0, 0, 0]);
+    fn amvr_nonzero_infers_merge_mode_zero() {
+        let bs = bins(&[1, 0]);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterCuSyntaxStats::default();
         let d = read_inter_cu_mode(&mut eng, EipdCtx::new(false), gates_all(), 2, 2, &mut stats)
             .unwrap();
         assert_eq!(d.amvr_idx, 1);
-        assert!(d.merge_mode_flag);
-        // merge_mode_flag was inferred — no bin consumed for it.
+        assert!(!d.merge_mode_flag);
+        // merge_mode_flag was inferred — no bin consumed for it, and no
+        // merge branch was read.
         assert_eq!(stats.gate.merge_mode_flag_bins, 0);
-        assert_eq!(d.merge, Some(MergeBranch::Regular { merge_idx: 0 }));
+        assert_eq!(d.merge, None);
+        assert_eq!(stats.mmvd.flag_bins, 0);
     }
 
     /// merge_mode_flag == 0 → explicit-AMVP path; driver returns
