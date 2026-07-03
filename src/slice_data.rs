@@ -2147,8 +2147,8 @@ use crate::eipd_syntax::EipdCtx;
 #[cfg(test)]
 use crate::inter::build_amvp_list_baseline;
 use crate::inter::{
-    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
-    MotionVector, RefPictureView,
+    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_chroma_block_main,
+    interpolate_luma_block, interpolate_luma_block_main, MotionVector, RefPictureView,
 };
 use crate::inter_cu_syntax::{CuSkipDecision, InterCuSyntaxStats, InterToolGates, MergeBranch};
 
@@ -2575,6 +2575,30 @@ fn merged_motion_to_pair(m: crate::merge::MergedMotion) -> InterMotionPair {
     (l0, l1)
 }
 
+/// One reference list's affine motion for a CU: the resolved reference
+/// index plus the §8.5.3.7 dense per-subblock motion field, and the
+/// §8.5.2.7 centre MV (1/4-pel) used for the HMVP update and the
+/// side-info grid stamp.
+struct AffineListMotion {
+    ref_idx: u32,
+    field: crate::affine::AffineMvField,
+    center: MotionVector,
+}
+
+/// The per-CU affine motion the §8.5.3 reconstruction path consumes —
+/// the affine analogue of [`InterMotionPair`].
+struct AffineCuMotion {
+    l0: Option<AffineListMotion>,
+    l1: Option<AffineListMotion>,
+}
+
+/// The resolved per-CU motion: translational (single MV pair, the
+/// Baseline shape) or affine (per-subblock fields).
+enum CuMotion {
+    Translational(InterMotionPair),
+    Affine(Box<AffineCuMotion>),
+}
+
 /// `NumRefIdxActive[ 0 / 1 ]` for the §8.5.2.3.9 derivation — the L1
 /// count is 0 on a P slice (the list is inactive).
 fn num_ref_idx_active(inputs: &InterDecodeInputs<'_, '_>) -> [u32; 2] {
@@ -2659,6 +2683,132 @@ fn admvp_temporal_merge_cand(
     Some(cand)
 }
 
+/// §8.5.3.2 — resolve an ADMVP affine-merge CU's motion: assemble the
+/// `affineMergeCandList`, select `affine_merge_idx`, and derive the
+/// §8.5.3.7 per-subblock motion field for each active list.
+///
+/// The inherited (model-based) candidates need the neighbours' stored
+/// control-point MVs, which the per-4×4 [`SideInfoGrid`] does not carry —
+/// they are treated as unavailable (documented deferral), so the list is
+/// populated by the §8.5.3.4 constructed candidates Const1..Const6 (from
+/// the grid-resolved corners, including the corner-3 collocated fallback
+/// when a `ColPic` is threaded) and the step-9 zero-CPMV tail.
+#[allow(clippy::too_many_arguments)]
+fn admvp_affine_merge_motion(
+    inputs: &InterDecodeInputs<'_, '_>,
+    side_info: &SideInfoGrid,
+    affine_merge_idx: u32,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) -> Result<AffineCuMotion> {
+    let bounds = crate::tmvp::PicBounds {
+        pic_width_in_luma_samples: inputs.walk.pic_width as i32,
+        pic_height_in_luma_samples: inputs.walk.pic_height as i32,
+    };
+    // The corner-3 collocated fallback's POC context (§8.5.3.4 shares the
+    // §8.5.2.3.4 scaling). Exact per-cell resolution: peek the collocated
+    // cell the fallback will consult and derive the eq.-502 colPocDiff
+    // from its stored references. Without a ColPic (or without threaded
+    // POCs) the zero colPocDiff makes the §8.5.2.3.4 escape mark the
+    // corner unavailable.
+    let poc_ctx = match (inputs.col_pic.as_ref(), inputs.pocs.ref_pocs_l0.first()) {
+        (Some(col), Some(&r0)) => {
+            let (x_col, y_col) = (
+                ((x0 + n_cb_w) as i32 >> 3) << 3,
+                ((y0 + n_cb_h) as i32 >> 3) << 3,
+            );
+            let cell =
+                crate::tmvp::collocated_cell_from_side_info(col.grid, x_col, y_col, |lx, idx| {
+                    let table = if lx == 0 {
+                        col.ref_pocs_l0
+                    } else {
+                        col.ref_pocs_l1
+                    };
+                    table.get(idx as usize).copied().unwrap_or(col.col_poc)
+                });
+            let ref_l1_poc = inputs.pocs.ref_pocs_l1.first().copied().unwrap_or(r0);
+            crate::tmvp::PocInputs {
+                curr_poc: inputs.pocs.curr_poc,
+                ref_l0_poc: r0,
+                ref_l1_poc,
+                col_pic_poc: col.col_poc,
+            }
+            .derive(cell.col_ref_l0_poc, cell.col_ref_l1_poc)
+        }
+        _ => crate::tmvp::PocContext {
+            curr_poc_diff_l0: 1,
+            curr_poc_diff_l1: 1,
+            col_poc_diff_l0: 0,
+            col_poc_diff_l1: 0,
+        },
+    };
+    let corners = crate::affine_cand::resolve_affine_corners(
+        x0 as i32,
+        y0 as i32,
+        n_cb_w,
+        n_cb_h,
+        crate::neighbour::AvailLr::Lr10,
+        inputs.slice_is_b,
+        inputs.walk.ctb_log2_size_y,
+        poc_ctx,
+        bounds,
+        |xn, yn| merge_neighbour_mv_from_grid(side_info, xn, yn),
+        |x_col, y_col| match inputs.col_pic.as_ref() {
+            Some(col) => crate::tmvp::collocated_mv_from_side_info(col.grid, x_col, y_col),
+            None => crate::tmvp::CollocatedMv::default(),
+        },
+    );
+    // Inherited model-based neighbours: unavailable (no per-CU CPMV
+    // store yet) — the constructed + zero candidates fill the list.
+    let inherited: crate::affine_cand::InheritedNeighbours = Default::default();
+    let list = crate::affine_cand::build_affine_merge_cand_list(
+        &inherited,
+        &corners,
+        inputs.slice_is_b,
+        x0 as i32,
+        y0 as i32,
+        n_cb_w,
+        n_cb_h,
+        1i32 << inputs.walk.ctb_log2_size_y,
+    );
+    let cand = crate::affine_cand::select_affine_merge_candidate(&list, affine_merge_idx as usize)
+        .ok_or_else(|| {
+            Error::invalid("evc admvp affine-merge: affine_merge_idx past candidate list")
+        })?;
+    let (sub_w_c, sub_h_c) = match inputs.walk.chroma_format_idc {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let num_cp = cand.num_cp_mv();
+    let derive_list = |lm: crate::affine_cand::AffineListMv| -> Option<AffineListMotion> {
+        if !lm.pred_flag || lm.ref_idx < 0 {
+            return None;
+        }
+        Some(AffineListMotion {
+            ref_idx: lm.ref_idx as u32,
+            field: crate::affine::affine_subblock_mvs(
+                n_cb_w, n_cb_h, num_cp, &lm.cp_mv, sub_w_c, sub_h_c,
+            ),
+            center: crate::affine::affine_center_mv(n_cb_w, n_cb_h, num_cp, &lm.cp_mv),
+        })
+    };
+    let l0 = derive_list(cand.l0);
+    let l1 = if inputs.slice_is_b {
+        derive_list(cand.l1)
+    } else {
+        None
+    };
+    if l0.is_none() && l1.is_none() {
+        return Err(Error::invalid(
+            "evc admvp affine-merge: selected candidate has no active list",
+        ));
+    }
+    Ok(AffineCuMotion { l0, l1 })
+}
+
 /// Build the §8.5.2.3.6 HMVP merge candidates for the current CU from the
 /// decoder's [`HmvpCandList`](crate::hmvp::HmvpCandList) (empty when the
 /// list holds fewer than four entries, per the §8.5.2.3.1 step-3 gate).
@@ -2684,10 +2834,10 @@ fn admvp_hmvp_merge_cands(
 ///   POCs (`InterPocs::default`), an equal-distance same-side context is
 ///   synthesized, under which the clause reduces to the symmetric
 ///   axis-aligned offset on each active list.
-/// * **AffineMerge** — the affine CPMV reconstruction (§8.5.3) needs the
-///   §8.5.5 sub-block motion field, a follow-up; the base
-///   `mergeCandList[ 0 ]` translational fallback is used so the bitstream
-///   still parses and a coarse motion is produced.
+/// * **AffineMerge** — routed by the callers into
+///   [`admvp_affine_merge_motion`] (the §8.5.3.2 CPMV list + §8.5.3.7
+///   subblock field); reaching this bridge with an affine branch is a
+///   caller bug surfaced as a decode error.
 #[allow(clippy::too_many_arguments)]
 fn admvp_merge_branch_to_pair(
     branch: MergeBranch,
@@ -2752,12 +2902,9 @@ fn admvp_merge_branch_to_pair(
             )?;
             Ok(merged_motion_to_pair(m))
         }
-        MergeBranch::AffineMerge { .. } => {
-            // Translational fallback (CPMV sub-block field deferred).
-            let m = select(0)
-                .ok_or_else(|| Error::invalid("evc admvp affine-merge: empty mergeCandList"))?;
-            Ok(merged_motion_to_pair(m))
-        }
+        MergeBranch::AffineMerge { .. } => Err(Error::invalid(
+            "evc admvp merge: affine branch must resolve through the §8.5.3 CPMV path",
+        )),
     }
 }
 
@@ -2775,7 +2922,7 @@ fn decode_admvp_skip_cu(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
-) -> Result<InterMotionPair> {
+) -> Result<CuMotion> {
     let n_cb_w = 1u32 << log2_cb_width;
     let n_cb_h = 1u32 << log2_cb_height;
     let decision = crate::inter_cu_syntax::read_cu_skip_main(
@@ -2807,7 +2954,8 @@ fn decode_admvp_skip_cu(
             y0,
             n_cb_w,
             n_cb_h,
-        ),
+        )
+        .map(CuMotion::Translational),
         CuSkipDecision::Mmvd(d) => admvp_merge_branch_to_pair(
             MergeBranch::Mmvd(d),
             side_info,
@@ -2820,20 +2968,11 @@ fn decode_admvp_skip_cu(
             y0,
             n_cb_w,
             n_cb_h,
-        ),
-        CuSkipDecision::AffineMerge { affine_merge_idx } => admvp_merge_branch_to_pair(
-            MergeBranch::AffineMerge { affine_merge_idx },
-            side_info,
-            temporal,
-            &hmvp_merge,
-            inputs.slice_is_b,
-            num_active,
-            inputs.pocs,
-            x0,
-            y0,
-            n_cb_w,
-            n_cb_h,
-        ),
+        )
+        .map(CuMotion::Translational),
+        CuSkipDecision::AffineMerge { affine_merge_idx } => Ok(CuMotion::Affine(Box::new(
+            admvp_affine_merge_motion(inputs, side_info, affine_merge_idx, x0, y0, n_cb_w, n_cb_h)?,
+        ))),
         CuSkipDecision::MvpIdx { l0, l1 } => {
             // The Baseline `mvp_idx` fall-through can still appear on the
             // admvp driver when `sps_admvp_flag == 0` is passed through; on
@@ -2864,7 +3003,10 @@ fn decode_admvp_skip_cu(
                     1,
                 )
             });
-            Ok((Some((mv_l0, 0)), mv_l1.map(|mv| (mv, 0))))
+            Ok(CuMotion::Translational((
+                Some((mv_l0, 0)),
+                mv_l1.map(|mv| (mv, 0)),
+            )))
         }
     }
 }
@@ -2891,7 +3033,7 @@ fn decode_admvp_nonskip_inter_cu(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
-) -> Result<InterMotionPair> {
+) -> Result<CuMotion> {
     let n_cb_w = 1u32 << log2_cb_width;
     let n_cb_h = 1u32 << log2_cb_height;
     let decision = crate::inter_cu_syntax::read_inter_cu_mode(
@@ -2905,6 +3047,20 @@ fn decode_admvp_nonskip_inter_cu(
 
     if let Some(branch) = decision.merge {
         stats.admvp_merge_cus += 1;
+        // The affine-merge branch resolves through the §8.5.3.2 CPMV
+        // candidate list into a per-subblock field, not the
+        // translational bridge.
+        if let MergeBranch::AffineMerge { affine_merge_idx } = branch {
+            return Ok(CuMotion::Affine(Box::new(admvp_affine_merge_motion(
+                inputs,
+                side_info,
+                affine_merge_idx,
+                x0,
+                y0,
+                n_cb_w,
+                n_cb_h,
+            )?)));
+        }
         let hmvp_merge = admvp_hmvp_merge_cands(hmvp, n_cb_w, n_cb_h);
         let temporal = admvp_temporal_merge_cand(inputs, x0, y0, n_cb_w, n_cb_h);
         if temporal.is_some() {
@@ -2922,7 +3078,8 @@ fn decode_admvp_nonskip_inter_cu(
             y0,
             n_cb_w,
             n_cb_h,
-        );
+        )
+        .map(CuMotion::Translational);
     }
 
     // merge_mode_flag == 0 → explicit-AMVP body.
@@ -2979,7 +3136,7 @@ fn decode_admvp_nonskip_inter_cu(
         Some(entry) => Some(reconstruct_list(entry, 1)?),
         None => None,
     };
-    Ok((pred_l0, pred_l1))
+    Ok(CuMotion::Translational((pred_l0, pred_l1)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3010,8 +3167,9 @@ fn decode_inter_coding_unit(
         // a skip CU is implicitly a merge CU. The [`read_cu_skip_main`]
         // syntax driver walks `mmvd_flag → affine_flag → merge_idx`, then
         // the §8.5.2.3 ADMVP merge-candidate list (assembled here from the
-        // per-4×4 grid + HMVP) projects `merge_idx` into the per-CU motion.
-        let (p0, p1) = decode_admvp_skip_cu(
+        // per-4×4 grid + HMVP) projects `merge_idx` into the per-CU motion
+        // (translational, or a §8.5.3.7 affine subblock field).
+        let motion = decode_admvp_skip_cu(
             eng,
             stats,
             side_info,
@@ -3022,8 +3180,19 @@ fn decode_inter_coding_unit(
             log2_cb_width,
             log2_cb_height,
         )?;
-        pred_l0 = p0;
-        pred_l1 = p1;
+        return decode_inter_cu_residual_and_reconstruct_motion(
+            eng,
+            pic,
+            stats,
+            side_info,
+            hmvp,
+            inputs,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            motion,
+        );
     } else if cu_skip {
         // sps_admvp_flag = 0 path: mvp_idx_l0 (TR cMax=3, FL prefix bins
         // bypass-friendly under sps_cm_init_flag=0). Round-4 reads up to
@@ -3143,7 +3312,7 @@ fn decode_inter_coding_unit(
             // explicit-AMVP). The merge branch reconstructs from the
             // §8.5.2.3 mergeCandList; merge_mode_flag==0 hands off to
             // read_explicit_amvp + §8.5.2.4 grid AMVP.
-            let (p0, p1) = decode_admvp_nonskip_inter_cu(
+            let motion = decode_admvp_nonskip_inter_cu(
                 eng,
                 stats,
                 side_info,
@@ -3154,9 +3323,7 @@ fn decode_inter_coding_unit(
                 log2_cb_width,
                 log2_cb_height,
             )?;
-            pred_l0 = p0;
-            pred_l1 = p1;
-            return decode_inter_cu_residual_and_reconstruct(
+            return decode_inter_cu_residual_and_reconstruct_motion(
                 eng,
                 pic,
                 stats,
@@ -3167,8 +3334,7 @@ fn decode_inter_coding_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
-                pred_l0,
-                pred_l1,
+                motion,
             );
         }
         // MODE_INTER explicit MV (Baseline sps_admvp_flag == 0).
@@ -3297,6 +3463,49 @@ fn decode_inter_cu_residual_and_reconstruct(
     pred_l0: Option<(MotionVector, u32)>,
     pred_l1: Option<(MotionVector, u32)>,
 ) -> Result<()> {
+    decode_inter_cu_residual_and_reconstruct_motion(
+        eng,
+        pic,
+        stats,
+        side_info,
+        hmvp,
+        inputs,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        CuMotion::Translational((pred_l0, pred_l1)),
+    )
+}
+
+/// The motion-generic reconstruction tail: identical CBF / `cu_qp_delta`
+/// / residual decode for both motion shapes, with the side-info stamp,
+/// HMVP update and motion compensation dispatched per [`CuMotion`]
+/// variant (§8.5.4 whole-CU vs §8.5.3.7 per-subblock).
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_cu_residual_and_reconstruct_motion(
+    eng: &mut CabacEngine,
+    pic: &mut YuvPicture,
+    stats: &mut InterDecodeStats,
+    side_info: &mut SideInfoGrid,
+    hmvp: &mut crate::hmvp::HmvpCandList,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    motion: CuMotion,
+) -> Result<()> {
+    // Project the motion into the (mv, ref) pairs the shared stamping /
+    // HMVP / stats sections read. For an affine CU the §8.5.2.7 centre MV
+    // stands in for the whole-CU vector.
+    let (pred_l0, pred_l1) = match &motion {
+        CuMotion::Translational((l0, l1)) => (*l0, *l1),
+        CuMotion::Affine(a) => (
+            a.l0.as_ref().map(|l| (l.center, l.ref_idx)),
+            a.l1.as_ref().map(|l| (l.center, l.ref_idx)),
+        ),
+    };
     let walk = inputs.walk;
     let n_cb_w = 1u32 << log2_cb_width;
     let n_cb_h = 1u32 << log2_cb_height;
@@ -3339,23 +3548,33 @@ fn decode_inter_cu_residual_and_reconstruct(
     }
     let cu_qp = (inputs.decode.slice_qp + qp_delta).clamp(0, 51);
     // Stamp the deblocking side-info for this inter CU. We record the
-    // L0 MV (already in 1/4-pel units) and ref_idx 0 / -1 per slot.
-    side_info.stamp_block(
-        x0,
-        y0,
-        n_cb_w,
-        n_cb_h,
-        CuSideInfo {
-            pred_mode: CuPredMode::Inter,
-            cbf_luma,
-            mv_l0_x: pred_l0.map(|(m, _)| m.x).unwrap_or(0),
-            mv_l0_y: pred_l0.map(|(m, _)| m.y).unwrap_or(0),
-            mv_l1_x: pred_l1.map(|(m, _)| m.x).unwrap_or(0),
-            mv_l1_y: pred_l1.map(|(m, _)| m.y).unwrap_or(0),
-            ref_idx_l0: pred_l0.map(|(_, r)| r as i8).unwrap_or(-1),
-            ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
-        },
-    );
+    // MVs (1/4-pel units) and ref_idx 0 / -1 per slot. An affine CU
+    // stamps each subblock with its own §8.5.3.7 field vector (rounded
+    // 1/16 → 1/4 pel via the §8.5.3.10 rule) so the spatial-neighbour /
+    // collocated readers observe the dense motion field.
+    match &motion {
+        CuMotion::Translational(_) => {
+            side_info.stamp_block(
+                x0,
+                y0,
+                n_cb_w,
+                n_cb_h,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Inter,
+                    cbf_luma,
+                    mv_l0_x: pred_l0.map(|(m, _)| m.x).unwrap_or(0),
+                    mv_l0_y: pred_l0.map(|(m, _)| m.y).unwrap_or(0),
+                    mv_l1_x: pred_l1.map(|(m, _)| m.x).unwrap_or(0),
+                    mv_l1_y: pred_l1.map(|(m, _)| m.y).unwrap_or(0),
+                    ref_idx_l0: pred_l0.map(|(_, r)| r as i8).unwrap_or(-1),
+                    ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
+                },
+            );
+        }
+        CuMotion::Affine(a) => {
+            stamp_affine_side_info(side_info, a, x0, y0, n_cb_w, n_cb_h, cbf_luma);
+        }
+    }
     // §8.5.2.7 HMVP update: append the just-decoded inter CU's motion
     // data to the history list. Empty (no valid refs) entries are dropped
     // by `update()`. The list itself is consulted by §8.5.2.4.4 when an
@@ -3435,19 +3654,266 @@ fn decode_inter_cu_residual_and_reconstruct(
     } else {
         stats.uni_pred_cus += 1;
     }
-    apply_inter_prediction(
-        pic,
-        inputs,
-        x0,
-        y0,
-        n_cb_w as usize,
-        n_cb_h as usize,
-        pred_l0,
-        pred_l1,
-        &residual_y_vec,
-        &residual_cb_vec,
-        &residual_cr_vec,
-    )
+    match &motion {
+        CuMotion::Translational(_) => apply_inter_prediction(
+            pic,
+            inputs,
+            x0,
+            y0,
+            n_cb_w as usize,
+            n_cb_h as usize,
+            pred_l0,
+            pred_l1,
+            &residual_y_vec,
+            &residual_cb_vec,
+            &residual_cr_vec,
+        ),
+        CuMotion::Affine(a) => apply_affine_inter_prediction(
+            pic,
+            inputs,
+            x0,
+            y0,
+            n_cb_w as usize,
+            n_cb_h as usize,
+            a,
+            &residual_y_vec,
+            &residual_cb_vec,
+            &residual_cr_vec,
+        ),
+    }
+}
+
+/// Stamp an affine CU's per-subblock motion into the side-info grid —
+/// each subblock cell carries its own §8.5.3.7 field vector rounded from
+/// 1/16-pel to the grid's 1/4-pel unit.
+fn stamp_affine_side_info(
+    side_info: &mut SideInfoGrid,
+    a: &AffineCuMotion,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+    cbf_luma: u8,
+) {
+    // Geometry comes from whichever list is active (both lists share the
+    // §8.5.3.8 subblock geometry when bi-predicted).
+    let geom =
+        a.l0.as_ref()
+            .map(|l| (&l.field, l.ref_idx as i8))
+            .map(|(f, _)| (f.num_sb_x, f.num_sb_y, f.size_sb_x, f.size_sb_y))
+            .or_else(|| {
+                a.l1.as_ref().map(|l| {
+                    (
+                        l.field.num_sb_x,
+                        l.field.num_sb_y,
+                        l.field.size_sb_x,
+                        l.field.size_sb_y,
+                    )
+                })
+            });
+    let Some((num_sb_x, num_sb_y, size_sb_x, size_sb_y)) = geom else {
+        return;
+    };
+    for sy in 0..num_sb_y {
+        for sx in 0..num_sb_x {
+            let quarter = |mv: MotionVector| crate::inter::round_motion_vector(mv, 2, 0);
+            let (mv0, r0) =
+                a.l0.as_ref()
+                    .map(|l| (quarter(l.field.at(sx, sy).luma), l.ref_idx as i8))
+                    .unwrap_or((MotionVector::default(), -1));
+            let (mv1, r1) =
+                a.l1.as_ref()
+                    .map(|l| (quarter(l.field.at(sx, sy).luma), l.ref_idx as i8))
+                    .unwrap_or((MotionVector::default(), -1));
+            side_info.stamp_block(
+                x0 + sx * size_sb_x,
+                y0 + sy * size_sb_y,
+                size_sb_x.min(n_cb_w),
+                size_sb_y.min(n_cb_h),
+                CuSideInfo {
+                    pred_mode: CuPredMode::Inter,
+                    cbf_luma,
+                    mv_l0_x: mv0.x,
+                    mv_l0_y: mv0.y,
+                    mv_l1_x: mv1.x,
+                    mv_l1_y: mv1.y,
+                    ref_idx_l0: r0,
+                    ref_idx_l1: r1,
+                },
+            );
+        }
+    }
+}
+
+/// §8.5.3.7 + §8.5.4 — per-subblock affine motion compensation: each
+/// subblock of the §8.5.3.8 geometry interpolates from its own field
+/// vector (full 1/16-pel luma / 1/32-pel chroma grid, Main-profile
+/// Tables 24/26), the per-list predictions combine with the eq.-988
+/// default weighting, and the residual adds on top.
+#[allow(clippy::too_many_arguments)]
+fn apply_affine_inter_prediction(
+    pic: &mut YuvPicture,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    n_cb_w: usize,
+    n_cb_h: usize,
+    a: &AffineCuMotion,
+    residual_y: &[i32],
+    residual_cb: &[i32],
+    residual_cr: &[i32],
+) -> Result<()> {
+    let bit_depth = inputs.decode.bit_depth_luma;
+    let n = n_cb_w * n_cb_h;
+
+    // Fill one list's whole-CU luma prediction subblock by subblock.
+    let fill_luma = |lm: &AffineListMotion, is_l1: bool, buf: &mut [i32]| -> Result<()> {
+        let refp = if is_l1 {
+            inputs.ref_l1(lm.ref_idx).ok_or_else(|| {
+                Error::invalid("evc affine MC: ref_idx_l1 out of reference-list range")
+            })?
+        } else {
+            inputs.ref_l0(lm.ref_idx).ok_or_else(|| {
+                Error::invalid("evc affine MC: ref_idx_l0 out of reference-list range")
+            })?
+        };
+        let f = &lm.field;
+        let (szx, szy) = (f.size_sb_x as usize, f.size_sb_y as usize);
+        let mut sb = vec![0i32; szx * szy];
+        for sy in 0..f.num_sb_y {
+            for sx in 0..f.num_sb_x {
+                let mv = f.at(sx, sy).luma; // 1/16-pel — passed through.
+                interpolate_luma_block_main(
+                    refp,
+                    x0 as i32 + (sx as usize * szx) as i32,
+                    y0 as i32 + (sy as usize * szy) as i32,
+                    mv,
+                    szx,
+                    szy,
+                    bit_depth,
+                    &mut sb,
+                )?;
+                for row in 0..szy {
+                    let dst = (sy as usize * szy + row) * n_cb_w + sx as usize * szx;
+                    buf[dst..dst + szx].copy_from_slice(&sb[row * szx..(row + 1) * szx]);
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let mut buf_l0 = vec![0i32; n];
+    let mut buf_l1 = vec![0i32; n];
+    if let Some(lm) = &a.l0 {
+        fill_luma(lm, false, &mut buf_l0)?;
+    }
+    if let Some(lm) = &a.l1 {
+        fill_luma(lm, true, &mut buf_l1)?;
+    }
+    let mut combined = vec![0i32; n];
+    match (a.l0.is_some(), a.l1.is_some()) {
+        (true, false) => combined.copy_from_slice(&buf_l0),
+        (false, true) => combined.copy_from_slice(&buf_l1),
+        (true, true) => average_bipred(&buf_l0, &buf_l1, &mut combined),
+        (false, false) => return Err(Error::invalid("evc affine MC: CU has no active list")),
+    }
+    if !residual_y.is_empty() {
+        if residual_y.len() != n {
+            return Err(Error::invalid("evc affine MC: luma residual size mismatch"));
+        }
+        for (o, r) in combined.iter_mut().zip(residual_y.iter()) {
+            *o += *r;
+        }
+    }
+    pic.store_block(x0, y0, n_cb_w, n_cb_h, 0, &combined);
+
+    if inputs.walk.chroma_format_idc == 0 {
+        return Ok(());
+    }
+    let (sub_w, sub_h) = match inputs.walk.chroma_format_idc {
+        1 => (2usize, 2usize),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let cw = n_cb_w / sub_w;
+    let ch = n_cb_h / sub_h;
+    let nc = cw * ch;
+
+    let fill_chroma =
+        |lm: &AffineListMotion, is_l1: bool, c_idx: u32, buf: &mut [i32]| -> Result<()> {
+            let refp = if is_l1 {
+                inputs.ref_l1(lm.ref_idx).unwrap()
+            } else {
+                inputs.ref_l0(lm.ref_idx).unwrap()
+            };
+            let f = &lm.field;
+            let (szx, szy) = (f.size_sb_x as usize / sub_w, f.size_sb_y as usize / sub_h);
+            if szx == 0 || szy == 0 {
+                return Err(Error::invalid(
+                    "evc affine MC: subblock smaller than the chroma sampling grid",
+                ));
+            }
+            let mut sb = vec![0i32; szx * szy];
+            for sy in 0..f.num_sb_y {
+                for sx in 0..f.num_sb_x {
+                    let mvc = f.at(sx, sy).chroma; // 1/32-pel chroma.
+                    interpolate_chroma_block_main(
+                        refp,
+                        c_idx,
+                        (x0 as usize / sub_w + sx as usize * szx) as i32,
+                        (y0 as usize / sub_h + sy as usize * szy) as i32,
+                        mvc,
+                        szx,
+                        szy,
+                        inputs.decode.bit_depth_chroma,
+                        &mut sb,
+                    )?;
+                    for row in 0..szy {
+                        let dst = (sy as usize * szy + row) * cw + sx as usize * szx;
+                        buf[dst..dst + szx].copy_from_slice(&sb[row * szx..(row + 1) * szx]);
+                    }
+                }
+            }
+            Ok(())
+        };
+
+    for c_idx in 1..=2u32 {
+        let mut cbuf_l0 = vec![0i32; nc];
+        let mut cbuf_l1 = vec![0i32; nc];
+        if let Some(lm) = &a.l0 {
+            fill_chroma(lm, false, c_idx, &mut cbuf_l0)?;
+        }
+        if let Some(lm) = &a.l1 {
+            fill_chroma(lm, true, c_idx, &mut cbuf_l1)?;
+        }
+        let mut ccomb = vec![0i32; nc];
+        match (a.l0.is_some(), a.l1.is_some()) {
+            (true, false) => ccomb.copy_from_slice(&cbuf_l0),
+            (false, true) => ccomb.copy_from_slice(&cbuf_l1),
+            (true, true) => average_bipred(&cbuf_l0, &cbuf_l1, &mut ccomb),
+            (false, false) => unreachable!(),
+        }
+        let residual_c = if c_idx == 1 { residual_cb } else { residual_cr };
+        if !residual_c.is_empty() {
+            if residual_c.len() != nc {
+                return Err(Error::invalid(
+                    "evc affine MC: chroma residual size mismatch",
+                ));
+            }
+            for (o, r) in ccomb.iter_mut().zip(residual_c.iter()) {
+                *o += *r;
+            }
+        }
+        pic.store_block(
+            (x0 as usize / sub_w) as u32,
+            (y0 as usize / sub_h) as u32,
+            cw,
+            ch,
+            c_idx,
+            &ccomb,
+        );
+    }
+    Ok(())
 }
 
 /// Build the four-entry §8.5.2.4.3 AMVP list and pick the
@@ -4147,6 +4613,20 @@ fn apply_inter_prediction(
     residual_cr: &[i32],
 ) -> Result<()> {
     let bit_depth = inputs.decode.bit_depth_luma;
+    // §8.5.4.3: sps_admvp_flag selects the interpolation filter tables —
+    // Tables 25/27 (quarter-pel-only) for Baseline, Tables 24/26 (full
+    // 1/16- / 1/32-pel) for the Main-profile toolset.
+    let admvp = inputs.inter_tool_gates.sps_admvp_flag;
+    let interp_luma = if admvp {
+        interpolate_luma_block_main
+    } else {
+        interpolate_luma_block
+    };
+    let interp_chroma = if admvp {
+        interpolate_chroma_block_main
+    } else {
+        interpolate_chroma_block
+    };
     let mut buf_l0 = vec![0i32; n_cb_w * n_cb_h];
     let mut buf_l1 = vec![0i32; n_cb_w * n_cb_h];
     let ref_l0_resolved = match pred_l0 {
@@ -4169,7 +4649,7 @@ fn apply_inter_prediction(
     };
     if let Some((mv, _ref_idx)) = pred_l0 {
         let mv16 = mv.quarter_to_sixteenth();
-        interpolate_luma_block(
+        interp_luma(
             ref_l0_resolved,
             x0 as i32,
             y0 as i32,
@@ -4183,7 +4663,7 @@ fn apply_inter_prediction(
     if let Some((mv, _ref_idx)) = pred_l1 {
         let refp = ref_l1_resolved.expect("L1 ref is required for B inter CU");
         let mv16 = mv.quarter_to_sixteenth();
-        interpolate_luma_block(
+        interp_luma(
             refp,
             x0 as i32,
             y0 as i32,
@@ -4231,7 +4711,7 @@ fn apply_inter_prediction(
             if let Some((mv, _)) = pred_l0 {
                 let mv16 = mv.quarter_to_sixteenth();
                 let mvc = derive_chroma_mv(mv16, inputs.walk.chroma_format_idc);
-                interpolate_chroma_block(
+                interp_chroma(
                     ref_l0_resolved,
                     c_idx,
                     (x0 / sub_w) as i32,
@@ -4247,7 +4727,7 @@ fn apply_inter_prediction(
                 let refp = ref_l1_resolved.unwrap();
                 let mv16 = mv.quarter_to_sixteenth();
                 let mvc = derive_chroma_mv(mv16, inputs.walk.chroma_format_idc);
-                interpolate_chroma_block(
+                interp_chroma(
                     refp,
                     c_idx,
                     (x0 / sub_w) as i32,
@@ -6492,6 +6972,223 @@ mod tests {
         assert!(cand.pred_flag_l0);
         assert!(!cand.pred_flag_l1, "L1 stripped on a P slice");
         assert_eq!(cand.ref_idx_l1, -1);
+    }
+
+    /// Round 384: an affine-merge cu_skip CU with no available corners
+    /// resolves the §8.5.3.2 step-9 zero-CPMV candidate — a degenerate
+    /// affine field whose every subblock MV is zero — and reconstructs
+    /// as a whole-CU copy of the reference. Bin string: split 0, skip 1,
+    /// affine_flag 1, affine_merge_idx 0, cbf 0/0/0 (sps_mmvd off so no
+    /// mmvd_flag bin).
+    #[test]
+    fn round384_admvp_affine_merge_zero_cpmv_e2e() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let mut ref_y = vec![0u8; 32 * 32];
+        for (i, px) in ref_y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        let ref_cb = vec![90u8; 16 * 16];
+        let ref_cr = vec![160u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 1); // affine_flag = 1 (32×32 ≥ 8×8)
+        enc.encode_decision(0, 0, 0); // affine_merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        // The range decoder may renormalise past the committed bytes on
+        // the final bins; pad so the bitreader never hard-ends.
+        let mut rbsp = enc.finish();
+        rbsp.extend_from_slice(&[0xFF; 4]);
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_affine_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                ..Default::default()
+            },
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[ref_view],
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_skip_cus, 1);
+        assert_eq!(stats.admvp_syntax.affine.flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.affine.merge_idx_bins, 1);
+        assert_eq!(stats.uni_pred_cus, 1);
+        // Zero-CPMV field → straight copy of the reference.
+        assert_eq!(pic.y[0], ref_y[0]);
+        assert_eq!(pic.y[31 * 32 + 31], ref_y[31 * 32 + 31]);
+        // The affine CU stamped inter motion into the slice grid.
+        let cell = stats.side_info.at(0, 0);
+        assert_eq!(cell.pred_mode, CuPredMode::Inter);
+        assert_eq!(cell.ref_idx_l0, 0);
+    }
+
+    /// Round 384 regression: the regular-bin pattern `0 1 1 0 0 0 0`
+    /// mis-decoded its final bin under the pre-384 outstanding-bit test
+    /// encoder (the flushed codeword fell outside the final interval).
+    /// The exact carry-propagation encoder round-trips it.
+    #[test]
+    fn round384_cabac_encoder_exact_tail_roundtrip() {
+        use crate::cabac::{CabacEncoder, CabacEngine};
+        let pattern = [0u8, 1, 1, 0, 0, 0, 0];
+        let mut enc = CabacEncoder::new();
+        for &b in &pattern {
+            enc.encode_decision(0, 0, b);
+        }
+        enc.encode_terminate(true);
+        let mut rbsp = enc.finish();
+        rbsp.extend_from_slice(&[0xFF; 4]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        for (i, &b) in pattern.iter().enumerate() {
+            assert_eq!(eng.decode_decision(0, 0).unwrap(), b, "bin {i}");
+        }
+        assert!(eng.decode_terminate().unwrap(), "terminate");
+    }
+
+    /// Round 384: bin-exact budget of the cu_skip affine-merge tree —
+    /// `affine_flag` + `affine_merge_idx` and nothing else (sps_mmvd off
+    /// ⇒ no `mmvd_flag` bin), with the shared CBF tail decoding in
+    /// lockstep after it.
+    #[test]
+    fn round384_cu_skip_affine_bin_budget() {
+        use crate::cabac::{CabacEncoder, CabacEngine};
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split
+        enc.encode_decision(0, 0, 1); // skip
+        enc.encode_decision(0, 0, 1); // affine_flag
+        enc.encode_decision(0, 0, 0); // affine_merge_idx
+        enc.encode_decision(0, 0, 0); // cbf_luma
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
+        enc.encode_terminate(true);
+        let mut rbsp = enc.finish();
+        rbsp.extend_from_slice(&[0xFF; 4]);
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        assert_eq!(eng.decode_decision(0, 0).unwrap(), 0, "split");
+        assert_eq!(eng.decode_decision(0, 0).unwrap(), 1, "skip");
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_affine_flag: true,
+            ..Default::default()
+        };
+        let mut st = crate::inter_cu_syntax::InterCuSyntaxStats::default();
+        let d = crate::inter_cu_syntax::read_cu_skip_main(
+            &mut eng,
+            EipdCtx::new(false),
+            gates,
+            false,
+            5,
+            5,
+            &mut st,
+        )
+        .unwrap();
+        eprintln!("DBG decision {d:?} stats {st:?}");
+        assert_eq!(eng.decode_decision(0, 0).unwrap(), 0, "cbf_luma");
+        assert_eq!(eng.decode_decision(0, 0).unwrap(), 0, "cbf_cb");
+        assert_eq!(eng.decode_decision(0, 0).unwrap(), 0, "cbf_cr");
+        assert!(eng.decode_terminate().unwrap(), "terminate");
+    }
+
+    /// Round 384: with grid-resolved corners, the §8.5.3.4 Const1
+    /// constructed candidate produces a genuinely varying subblock field —
+    /// adjacent subblocks differ by exactly `(dX[0] · sizeSbX) >> 5`
+    /// (eqs. 875 + §8.5.3.10 rounding).
+    #[test]
+    fn round384_admvp_affine_merge_constructed_field_varies() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        let stamp = |g: &mut SideInfoGrid, x: u32, y: u32, mv: (i32, i32)| {
+            g.stamp_block(
+                x,
+                y,
+                4,
+                4,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Inter,
+                    cbf_luma: 0,
+                    mv_l0_x: mv.0,
+                    mv_l0_y: mv.1,
+                    mv_l1_x: 0,
+                    mv_l1_y: 0,
+                    ref_idx_l0: 0,
+                    ref_idx_l1: -1,
+                },
+            );
+        };
+        // Current CU at (16, 16), 16×16. Corner 0 scans B2(15,15) →
+        // stamp (12, 12) cell; corner 1 scans B0(16+16, 15)=(32,15) →
+        // stamp (32, 12); corner 2 scans A0(15, 16+16)=(15,32) → stamp
+        // (12, 32). Distinct MVs make a 6-param Const1.
+        stamp(&mut grid, 12, 12, (0, 0)); // corner 0
+        stamp(&mut grid, 32, 12, (16, 0)); // corner 1
+        stamp(&mut grid, 12, 32, (0, 16)); // corner 2
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs::default(),
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &[],
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let motion = admvp_affine_merge_motion(&inputs, &grid, 0, 16, 16, 16, 16).unwrap();
+        let l0 = motion.l0.expect("L0 active");
+        assert!(motion.l1.is_none(), "P slice");
+        let f = &l0.field;
+        assert!(f.num_sb_x >= 2, "6-param model splits into subblocks");
+        // dX[0] = (c1.x − c0.x) << (7 − 4) = 16 << 3 = 128; adjacent
+        // subblock delta = (128 · sizeSbX) >> 5 = 4 · sizeSbX (1/16-pel).
+        let d = f.at(1, 0).luma.x - f.at(0, 0).luma.x;
+        assert_eq!(d, 4 * f.size_sb_x as i32);
+        // Vertical gradient mirrors: dY[1] = (c2.y − c0.y) << 3 = 128.
+        let dv = f.at(0, 1).luma.y - f.at(0, 0).luma.y;
+        assert_eq!(dv, 4 * f.size_sb_y as i32);
+        // Centre MV (§8.5.2.7): the model at the CU centre — non-zero.
+        assert!(l0.center.x > 0 && l0.center.y > 0);
     }
 
     /// Round 381: a B-slice admvp cu_skip merge CU bi-predicts. The

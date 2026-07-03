@@ -402,7 +402,7 @@ pub fn affine_center_mv(
 /// (1 = 4-parameter, 2 = 6-parameter), selecting whether the genuine
 /// `dHorY`/`dVerY` (eqs. 752/753) or the 4-parameter rotation identity
 /// (eqs. 754/755) is used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct NeighbourAffineSource {
     /// `( xNb, yNb )` — neighbour top-left, picture-relative.
     pub x_nb: i32,

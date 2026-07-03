@@ -468,81 +468,81 @@ fn ceil_log2_plus_one(c_max: u32) -> u32 {
 /// exposed publicly because the round-2 deliverable is the decoder side
 /// only.
 ///
-/// The implementation follows the textbook M-coder construction used by
-/// HEVC / EVC: a range register `low_full` of 17 bits and a `range`
-/// register of 14 bits, with `outstanding` bits buffering the
-/// resolution-pending output until the carry propagates.
+/// Round 384: rewritten as an **exact carry-propagation arithmetic
+/// coder**. The previous outstanding-bit M-coder emitted an
+/// under-committed tail for some bin patterns (e.g. the regular-bin
+/// sequence `0 1 1 0 0 0 0` mis-decoded its final bin), because the
+/// first-bit-suppression + outstanding-bit dance did not always leave
+/// the flushed codeword inside the final interval. This construction is
+/// the mathematically transparent dual of [`CabacEngine`]:
+///
+/// * `low` is the 14-bit window of the codeword still being refined;
+///   emitted bits are the committed prefix.
+/// * A renormalisation step (encoder `range <<= 1`) emits the window's
+///   top bit exactly when the decoder's `renormd` consumes one.
+/// * An interval-base increment that overflows the window (`low >
+///   0x3FFF`) propagates a carry into the committed prefix (flipping
+///   trailing 1-bits — the classic carry walk; a carry can never run
+///   past the start of a valid codeword).
+/// * `encode_terminate(true)` selects the §9.3.4.3.5 terminate point and
+///   flushes the full 14-bit window, so the decoder's final reads see
+///   the exact codeword rather than a padding heuristic.
+///
+/// Every regular/bypass bin therefore round-trips exactly (the historic
+/// "bypass-tail defer" caveat is gone).
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct CabacEncoder {
-    out_bits: Vec<u8>,
-    bit_pos: u32,
+    /// Committed codeword bits (one per element, MSB-first).
+    bits: Vec<u8>,
+    /// The 14-bit sliding codeword window (`< 0x4000` between calls).
     low: u32,
+    /// `ivlCurrRange` mirror of the decoder.
     range: u32,
-    outstanding: u32,
-    first_bit_pending: bool,
     ctx: Vec<Vec<ContextVar>>,
 }
 
 #[cfg(test)]
 impl CabacEncoder {
+    const WINDOW_MASK: u32 = (1 << 14) - 1;
+
     pub(crate) fn new() -> Self {
         Self {
-            out_bits: Vec::new(),
-            bit_pos: 0,
+            bits: Vec::new(),
             low: 0,
             range: 16384,
-            outstanding: 0,
-            first_bit_pending: true,
             ctx: vec![vec![ContextVar::default(); MAX_CTX_PER_TABLE]; MAX_CTX_TABLES],
         }
     }
 
-    fn write_raw_bit(&mut self, bit: u32) {
-        if self.bit_pos % 8 == 0 {
-            self.out_bits.push(0);
+    /// Propagate a carry out of the 14-bit window into the committed
+    /// prefix: flip trailing 1-bits to 0 and the first 0 to 1.
+    fn propagate_carry(&mut self) {
+        let mut i = self.bits.len();
+        loop {
+            assert!(i > 0, "evc test cabac: carry past codeword start");
+            i -= 1;
+            if self.bits[i] == 1 {
+                self.bits[i] = 0;
+            } else {
+                self.bits[i] = 1;
+                break;
+            }
         }
-        let last = self.out_bits.len() - 1;
-        let shift = 7 - (self.bit_pos % 8);
-        self.out_bits[last] |= ((bit & 1) as u8) << shift;
-        self.bit_pos += 1;
     }
 
-    fn put_bit(&mut self, bit: u32) {
-        // The HEVC encoder convention is to suppress the *very first*
-        // emitted bit because the decoder pre-reads its 14-bit
-        // `ivl_offset` from byte zero and the first encoded bit is
-        // expected to be a leading 0 (initial low=0). Suppressing a
-        // leading 0 leaves the freshly-allocated byte buffer (all
-        // zeros) at the right value. Suppressing a leading 1 would lose
-        // information — that case happens when the very first emitted
-        // bit comes from `encode_bypass(1)`. We handle it explicitly
-        // by only suppressing 0-bits; a leading 1 is written through
-        // and the outstanding-bit dance still tracks correctly.
-        if self.first_bit_pending && bit == 0 {
-            self.first_bit_pending = false;
-        } else {
-            self.first_bit_pending = false;
-            self.write_raw_bit(bit);
+    fn carry_check(&mut self) {
+        if self.low > Self::WINDOW_MASK {
+            self.propagate_carry();
+            self.low &= Self::WINDOW_MASK;
         }
-        for _ in 0..self.outstanding {
-            self.write_raw_bit(1 - bit);
-        }
-        self.outstanding = 0;
     }
 
+    /// Emit the window's top bit for every decoder-side `renormd` shift.
     fn renorm(&mut self) {
         while self.range < 8192 {
-            if self.low < 8192 {
-                self.put_bit(0);
-            } else if self.low >= 16384 {
-                self.low -= 16384;
-                self.put_bit(1);
-            } else {
-                self.low -= 8192;
-                self.outstanding += 1;
-            }
-            self.low <<= 1;
+            self.bits.push(((self.low >> 13) & 1) as u8);
+            self.low = (self.low << 1) & Self::WINDOW_MASK;
             self.range <<= 1;
         }
     }
@@ -557,6 +557,7 @@ impl CabacEncoder {
         if bin != var.val_mps {
             self.low += self.range;
             self.range = ivl_lps_range;
+            self.carry_check();
         }
         self.ctx[ctx_table][ctx_idx] = next_state(var, bin);
         self.renorm();
@@ -564,63 +565,53 @@ impl CabacEncoder {
 
     #[allow(dead_code)]
     pub(crate) fn encode_bypass(&mut self, bin: u8) {
-        // Mirror the decoder's bypass formulation: ivl_offset is doubled
-        // and a fresh bit is shifted in; symbolically we double `low` and
-        // add `range` for a 1, then renormalise by writing one bit out.
+        // Decoder bypass: offset <<= 1 | bit, compare against range,
+        // subtract on 1. Dual: double the window, add `range` for a 1,
+        // then commit exactly one bit (the decoder consumed exactly one).
         self.low <<= 1;
         if bin != 0 {
             self.low += self.range;
         }
-        if self.low < 8192 {
-            self.put_bit(0);
-        } else if self.low >= 16384 {
-            self.low -= 16384;
-            self.put_bit(1);
-        } else {
-            self.low -= 8192;
-            self.outstanding += 1;
+        if self.low >= (1 << 15) {
+            self.propagate_carry();
+            self.low -= 1 << 15;
         }
+        self.bits.push(((self.low >> 14) & 1) as u8);
+        self.low &= Self::WINDOW_MASK;
     }
 
     pub(crate) fn encode_terminate(&mut self, terminate: bool) {
-        // EVC §9.3.4.3.5: the decoder side does ivlCurrRange -= 1, then
-        // the bin is 1 iff ivl_offset >= ivl_curr_range. Mirror that on
-        // the encoder by reserving the topmost code as the terminate
-        // sentinel.
+        // EVC §9.3.4.3.5: the decoder does ivlCurrRange -= 1, then the
+        // bin is 1 iff ivl_offset >= ivl_curr_range (no renormalisation
+        // on 1). Select the terminate point and flush the window.
         self.range -= 1;
         if terminate {
             self.low += self.range;
-            self.flush();
+            self.carry_check();
+            for i in (0..14).rev() {
+                self.bits.push(((self.low >> i) & 1) as u8);
+            }
         } else {
             self.renorm();
         }
     }
 
-    fn flush(&mut self) {
-        // Standard M-coder flush: pin range to 2, renormalise to push
-        // out the trailing bits, then emit the final two bits of `low`.
-        // Trailing padding is 1-bits so any over-read by the decoder
-        // during a final renormalisation always sees a 1, keeping
-        // ivl_offset in the upper region.
-        self.range = 2;
-        self.renorm();
-        self.put_bit((self.low >> 14) & 1);
-        if self.first_bit_pending {
-            self.first_bit_pending = false;
-        } else {
-            self.write_raw_bit((self.low >> 13) & 1);
-        }
-        while self.bit_pos % 8 != 0 {
-            self.write_raw_bit(1);
-        }
-    }
-
     pub(crate) fn finish(self) -> Vec<u8> {
-        // Note: caller is expected to invoke `encode_terminate(true)`
-        // before `finish()` to commit the final M-coder state. We do
-        // not flush again here to avoid double-emitting the trailing
-        // bits.
-        self.out_bits
+        // Pack MSB-first, padding the final byte with 1-bits (any
+        // decoder over-read during a trailing renormalisation stays in
+        // the upper region, mirroring the historical convention).
+        let mut out = Vec::with_capacity(self.bits.len().div_ceil(8));
+        for chunk in self.bits.chunks(8) {
+            let mut byte = 0u8;
+            for (i, &b) in chunk.iter().enumerate() {
+                byte |= b << (7 - i);
+            }
+            for i in chunk.len()..8 {
+                byte |= 1 << (7 - i);
+            }
+            out.push(byte);
+        }
+        out
     }
 }
 
@@ -974,6 +965,53 @@ mod tests {
                     assert!(b[..a.len()] != a[..], "codeword {a:?} prefixes {b:?}");
                 }
             }
+        }
+    }
+
+    /// Round 384: randomized encoder↔decoder round-trip. The exact
+    /// carry-propagation encoder must reproduce every regular + bypass
+    /// bin sequence bit-exactly through [`CabacEngine`], terminate
+    /// included. (The pre-384 outstanding-bit encoder failed e.g. the
+    /// regular pattern `0 1 1 0 0 0 0`.)
+    #[test]
+    fn encoder_randomized_roundtrip() {
+        // Small deterministic LCG so the test is reproducible.
+        let mut seed = 0x2545_F491u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 16
+        };
+        for _ in 0..500 {
+            let n = (next() % 48 + 1) as usize;
+            let ops: Vec<(bool, usize, u8)> = (0..n)
+                .map(|_| {
+                    let bypass = next() % 10 < 3;
+                    let ctx = (next() % 3) as usize;
+                    let bin = (next() & 1) as u8;
+                    (bypass, ctx, bin)
+                })
+                .collect();
+            let mut enc = CabacEncoder::new();
+            for &(bypass, ctx, bin) in &ops {
+                if bypass {
+                    enc.encode_bypass(bin);
+                } else {
+                    enc.encode_decision(0, ctx, bin);
+                }
+            }
+            enc.encode_terminate(true);
+            let mut bs = enc.finish();
+            bs.extend_from_slice(&[0xFF; 8]);
+            let mut eng = CabacEngine::new(&bs).unwrap();
+            for (i, &(bypass, ctx, bin)) in ops.iter().enumerate() {
+                let got = if bypass {
+                    eng.decode_bypass().unwrap()
+                } else {
+                    eng.decode_decision(0, ctx).unwrap()
+                };
+                assert_eq!(got, bin, "op {i} of {ops:?}");
+            }
+            assert!(eng.decode_terminate().unwrap(), "terminate of {ops:?}");
         }
     }
 }

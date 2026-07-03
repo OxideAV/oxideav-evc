@@ -186,7 +186,7 @@ pub struct AffineCorners {
 /// per-list sources carry the neighbour's stored corner MVs + geometry
 /// (the §8.5.3.3 [`NeighbourAffineSource`] input) plus its
 /// `PredFlagLX` / `RefIdxLX`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AffineNeighbour {
     /// §8.5.3.2-step-3 `availableFlagBLK`.
     pub available_flag: bool,

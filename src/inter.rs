@@ -226,6 +226,69 @@ const CHROMA_FILTER_TABLE27: [[i32; 4]; 32] = [
     [0, 0, 0, 0],     // 31
 ];
 
+/// Table 24 (ISO/IEC 23094-1:2020 §8.5.4.3.2). Main-profile
+/// (`sps_admvp_flag == 1`) luma 8-tap interpolation filter coefficients —
+/// every 1/16-pel phase is defined, as the §8.5.3.7 affine subblock
+/// motion field (and the §8.5.5 DMVR refinement) address the full
+/// 1/16-pel grid. Indexed `[phase][tap]`; phase 0 is the integer-sample
+/// stub (caller short-circuits).
+const LUMA_FILTER_TABLE24: [[i32; 8]; 16] = [
+    [0, 0, 0, 64, 0, 0, 0, 0],        // 0 — full sample
+    [0, 1, -3, 63, 4, -2, 1, 0],      // 1
+    [-1, 2, -5, 62, 8, -3, 1, 0],     // 2
+    [-1, 3, -8, 60, 13, -4, 1, 0],    // 3
+    [-1, 4, -10, 58, 17, -5, 1, 0],   // 4
+    [-1, 4, -11, 52, 26, -8, 3, -1],  // 5
+    [-1, 3, -9, 47, 31, -10, 4, -1],  // 6
+    [-1, 4, -11, 45, 34, -10, 4, -1], // 7
+    [-1, 4, -11, 40, 40, -11, 4, -1], // 8
+    [-1, 4, -10, 34, 45, -11, 4, -1], // 9
+    [-1, 4, -10, 31, 47, -9, 3, -1],  // 10
+    [-1, 3, -8, 26, 52, -11, 4, -1],  // 11
+    [0, 1, -5, 17, 58, -10, 4, -1],   // 12
+    [0, 1, -4, 13, 60, -8, 3, -1],    // 13
+    [0, 1, -3, 8, 62, -5, 2, -1],     // 14
+    [0, 1, -2, 4, 63, -3, 1, 0],      // 15
+];
+
+/// Table 26 (ISO/IEC 23094-1:2020 §8.5.4.3.3). Main-profile
+/// (`sps_admvp_flag == 1`) chroma 4-tap interpolation filter
+/// coefficients — every 1/32-pel phase is defined.
+const CHROMA_FILTER_TABLE26: [[i32; 4]; 32] = [
+    [0, 64, 0, 0],    // 0 — full sample
+    [-1, 63, 2, 0],   // 1
+    [-2, 62, 4, 0],   // 2
+    [-2, 60, 7, -1],  // 3
+    [-2, 58, 10, -2], // 4
+    [-3, 57, 12, -2], // 5
+    [-4, 56, 14, -2], // 6
+    [-4, 55, 15, -2], // 7
+    [-4, 54, 16, -2], // 8
+    [-5, 53, 18, -2], // 9
+    [-6, 52, 20, -2], // 10
+    [-6, 49, 24, -3], // 11
+    [-6, 46, 28, -4], // 12
+    [-5, 44, 29, -4], // 13
+    [-4, 42, 30, -4], // 14
+    [-4, 39, 33, -4], // 15
+    [-4, 36, 36, -4], // 16
+    [-4, 33, 39, -4], // 17
+    [-4, 30, 42, -4], // 18
+    [-4, 29, 44, -5], // 19
+    [-4, 28, 46, -6], // 20
+    [-3, 24, 49, -6], // 21
+    [-2, 20, 52, -6], // 22
+    [-2, 18, 53, -5], // 23
+    [-2, 16, 54, -4], // 24
+    [-2, 15, 55, -4], // 25
+    [-2, 14, 56, -4], // 26
+    [-2, 12, 57, -3], // 27
+    [-2, 10, 58, -2], // 28
+    [-1, 7, 60, -2],  // 29
+    [0, 4, 62, -2],   // 30
+    [0, 2, 63, -1],   // 31
+];
+
 fn baseline_luma_phase_supported(phase: u32) -> bool {
     matches!(phase, 0 | 4 | 8 | 12)
 }
@@ -258,10 +321,10 @@ fn sample_chroma_clipped(refp: RefPictureView<'_>, c_idx: u32, x: i32, y: i32) -
 /// `mv` (1/16-pel) anchored at (`x_sb`, `y_sb`) in the current picture
 /// coordinate space. Outputs are i32 samples, clipped to `[0, 2^bd-1]`.
 ///
-/// Implements the §8.5.4.3.2 luma interpolation. Round-4 only supports
-/// the Baseline-table (Table 25) phases — non-baseline phases return
-/// `Error::Unsupported`.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+/// Implements the §8.5.4.3.2 luma interpolation with the Baseline
+/// Table 25 filters (`sps_admvp_flag == 0`). Non-Baseline phases (the
+/// `na` rows of Table 25) return `Error::Unsupported`.
+#[allow(clippy::too_many_arguments)]
 pub fn interpolate_luma_block(
     refp: RefPictureView<'_>,
     x_sb: i32,
@@ -272,6 +335,61 @@ pub fn interpolate_luma_block(
     bit_depth: u32,
     out: &mut [i32],
 ) -> Result<()> {
+    interpolate_luma_block_with(
+        refp,
+        x_sb,
+        y_sb,
+        mv,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &LUMA_FILTER_TABLE25,
+        true,
+        out,
+    )
+}
+
+/// §8.5.4.3.2 luma interpolation with the Main-profile Table 24 filters
+/// (`sps_admvp_flag == 1`) — every 1/16-pel phase is legal, as the
+/// affine subblock field addresses the full grid.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_luma_block_main(
+    refp: RefPictureView<'_>,
+    x_sb: i32,
+    y_sb: i32,
+    mv: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    out: &mut [i32],
+) -> Result<()> {
+    interpolate_luma_block_with(
+        refp,
+        x_sb,
+        y_sb,
+        mv,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &LUMA_FILTER_TABLE24,
+        false,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn interpolate_luma_block_with(
+    refp: RefPictureView<'_>,
+    x_sb: i32,
+    y_sb: i32,
+    mv: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    table: &[[i32; 8]; 16],
+    baseline_phase_check: bool,
+    out: &mut [i32],
+) -> Result<()> {
     if out.len() != sb_width * sb_height {
         return Err(Error::invalid("evc inter: luma out buffer size mismatch"));
     }
@@ -280,7 +398,9 @@ pub fn interpolate_luma_block(
     let int_y = mv.y >> 4;
     let frac_x = (mv.x & 15) as u32;
     let frac_y = (mv.y & 15) as u32;
-    if !baseline_luma_phase_supported(frac_x) || !baseline_luma_phase_supported(frac_y) {
+    if baseline_phase_check
+        && (!baseline_luma_phase_supported(frac_x) || !baseline_luma_phase_supported(frac_y))
+    {
         return Err(Error::unsupported(format!(
             "evc inter: round-4 luma phase ({frac_x},{frac_y}) outside Baseline 1/4-pel grid"
         )));
@@ -300,8 +420,8 @@ pub fn interpolate_luma_block(
         }
         return Ok(());
     }
-    let fx = LUMA_FILTER_TABLE25[frac_x as usize];
-    let fy = LUMA_FILTER_TABLE25[frac_y as usize];
+    let fx = table[frac_x as usize];
+    let fy = table[frac_y as usize];
     if frac_y == 0 {
         // Horizontal-only filter (eq. 926).
         for yl in 0..sb_height {
@@ -366,8 +486,9 @@ pub fn interpolate_luma_block(
 
 /// Interpolate a chroma block (`c_idx ∈ {1, 2}`) at the given chroma
 /// `mvC` in 1/32-chroma-pel units, anchored at chroma coordinates
-/// (`x_sb_c`, `y_sb_c`). Implements §8.5.4.3.3.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+/// (`x_sb_c`, `y_sb_c`). Implements §8.5.4.3.3 with the Baseline
+/// Table 27 filters (`sps_admvp_flag == 0`).
+#[allow(clippy::too_many_arguments)]
 pub fn interpolate_chroma_block(
     refp: RefPictureView<'_>,
     c_idx: u32,
@@ -379,6 +500,64 @@ pub fn interpolate_chroma_block(
     bit_depth: u32,
     out: &mut [i32],
 ) -> Result<()> {
+    interpolate_chroma_block_with(
+        refp,
+        c_idx,
+        x_sb_c,
+        y_sb_c,
+        mv_c,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &CHROMA_FILTER_TABLE27,
+        true,
+        out,
+    )
+}
+
+/// §8.5.4.3.3 chroma interpolation with the Main-profile Table 26
+/// filters (`sps_admvp_flag == 1`) — every 1/32-pel phase is legal.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate_chroma_block_main(
+    refp: RefPictureView<'_>,
+    c_idx: u32,
+    x_sb_c: i32,
+    y_sb_c: i32,
+    mv_c: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    out: &mut [i32],
+) -> Result<()> {
+    interpolate_chroma_block_with(
+        refp,
+        c_idx,
+        x_sb_c,
+        y_sb_c,
+        mv_c,
+        sb_width,
+        sb_height,
+        bit_depth,
+        &CHROMA_FILTER_TABLE26,
+        false,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn interpolate_chroma_block_with(
+    refp: RefPictureView<'_>,
+    c_idx: u32,
+    x_sb_c: i32,
+    y_sb_c: i32,
+    mv_c: MotionVector,
+    sb_width: usize,
+    sb_height: usize,
+    bit_depth: u32,
+    table: &[[i32; 4]; 32],
+    baseline_phase_check: bool,
+    out: &mut [i32],
+) -> Result<()> {
     if out.len() != sb_width * sb_height {
         return Err(Error::invalid("evc inter: chroma out buffer size mismatch"));
     }
@@ -386,7 +565,9 @@ pub fn interpolate_chroma_block(
     let int_y = mv_c.y >> 5;
     let frac_x = (mv_c.x & 31) as u32;
     let frac_y = (mv_c.y & 31) as u32;
-    if !baseline_chroma_phase_supported(frac_x) || !baseline_chroma_phase_supported(frac_y) {
+    if baseline_phase_check
+        && (!baseline_chroma_phase_supported(frac_x) || !baseline_chroma_phase_supported(frac_y))
+    {
         return Err(Error::unsupported(format!(
             "evc inter: round-4 chroma phase ({frac_x},{frac_y}) outside Baseline 1/8-pel grid"
         )));
@@ -409,8 +590,8 @@ pub fn interpolate_chroma_block(
         }
         return Ok(());
     }
-    let fx = CHROMA_FILTER_TABLE27[frac_x as usize];
-    let fy = CHROMA_FILTER_TABLE27[frac_y as usize];
+    let fx = table[frac_x as usize];
+    let fy = table[frac_y as usize];
     if frac_y == 0 {
         for yl in 0..sb_height {
             for xl in 0..sb_width {
