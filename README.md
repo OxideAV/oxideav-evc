@@ -10,8 +10,9 @@ framework but usable standalone.
 
 ## Status
 
-A working **Baseline-profile** decoder: IDR + P + B slices, 8-bit 4:2:0,
-with residual coding (RLE + dequant + inverse DCT-II for transform sizes
+A working **Baseline-profile** decoder: IDR + P + B slices, 8- and
+10-bit (any §7.4.3.1 depth 8..=16 flows through the u16 reconstruction
+chain) 4:2:0, with residual coding (RLE + dequant + inverse DCT-II for transform sizes
 up to 64×64), intra prediction (the 5-mode Baseline set), inter
 prediction (8-tap luma / 4-tap chroma sub-pel interpolation, AMVP
 candidate construction, default-weighted bipred), deblocking
@@ -36,7 +37,25 @@ The Main-profile CABAC infrastructure is in place — the §9.3.5 init
 tables (Tables 40-90), the §9.3.2.2 init pipeline, and the §9.3.4.2
 per-syntax-element ctxInc helpers — together with a large body of pure
 §6.5.1 / §7.4.5 tile-geometry and §6.4 neighbour-availability helpers and
-the §7.3.8.1 multi-tile `slice_data()` CTU-walk driver. The §7.4.8.3
+the §7.3.8.1 multi-tile `slice_data()` CTU-walk driver.
+
+As of round 391 the **§7.3.8.3 BTT + SUCO coding-tree walk is decoded by
+both pixel walkers** (IDR and P/B): `resolve_split_unit` reads the
+`btt_split_flag`/`dir`/`type` group (with the picture-boundary implicit
+splits), the `split_unit_coding_order_flag` (Table 45, §7.4.9.3
+`allowSplitUnitCodingOrder` gating, mirrored child orders), and — on
+admvp P/B slices — the `pred_mode_constraint_type_flag` (Table 46,
+`needSignalPredModeConstraintTypeFlag`, eq. 126). The §7.4.9.3
+`predModeConstraint` threads through the recursion: an INTER-constrained
+subtree suppresses `pred_mode_flag` (CuPredMode inferred MODE_INTER) and
+feeds the §7.4.8.3 `allowSplit*` INTER carve-outs; an
+INTRA_IBC-constrained subtree decodes as a **local dual tree** —
+luma-only intra/IBC CUs with one `DUAL_TREE_CHROMA` `coding_unit()`
+covering the split unit at the `isTreeSplitPoint`. `sps_btt_flag` and
+`sps_suco_flag` are lifted from both decoder gates. (Under SUCO's
+mirrored orders the Baseline intra kernels still fetch causal top/left
+references only — right-column reference selection belongs to the EIPD
+`availLR` wiring below.) The §7.4.8.3
 binary/ternary-tree (BTT) split-geometry layer (`split` module) supplies
 the `allowSplit{Bt,Tt}{Ver,Hor}` derivations, the `btt_split_dir`/`type`
 signalling + inference predicates, and the `SplitMode` derivation
@@ -346,10 +365,11 @@ front-ends. Each decoded P/B picture's motion field + reference POCs
 are retained in its DPB entry so it can serve as a later slice's
 `ColPic`.
 
-The remaining Main-profile syntax-decode tools (CABAC-driven BTT tree
-walk / SUCO / ADMVP / IBC / ADCC / ALF / DRA / affine slice-walk) still
-surface `Error::Unsupported` at the `coding_unit()` integration layer
-even where their per-tool syntax/derivation modules now exist.
+The remaining Main-profile syntax-decode tools (EIPD leaf selection /
+ADCC residual coding / `sps_cm_init_flag` context models / ATS in the
+walkers / advanced deblocking / DQUANT) still surface
+`Error::Unsupported` at the decoder gates even where their per-tool
+syntax/derivation modules exist.
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
 §7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
@@ -384,8 +404,9 @@ reconstruction (when `cbf_luma && sps_htdf_flag`) and threading the real
 
 ### Not yet supported
 
-- 10-bit / high-bit-depth pixel decode.
 - Advanced deblocking (`sps_addb_flag == 1`).
+- DRA post-filter application on >8-bit pictures (the §8.9 apply is
+  8-bit-code-space; high-bit-depth pictures skip it).
 - Full Main-profile picture reconstruction (see above).
 
 ## Usage
