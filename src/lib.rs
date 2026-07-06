@@ -1672,4 +1672,182 @@ mod tests {
             "admvp cu_skip zero-MV merge must copy the grey IDR"
         );
     }
+
+    /// Round 391: `decode_idr_slice` end-to-end with a **Main-shaped
+    /// SPS** (`sps_btt_flag = 1`, 32×32 CTU, monochrome): the §7.3.8.3
+    /// BTT split syntax parses out of the real SPS fields, the slice
+    /// decodes a BT_HOR root → leaf + TT_VER subtree, and the all-VER
+    /// no-residual leaves reconstruct uniform mid-grey.
+    #[test]
+    fn round391_decode_idr_slice_btt_sps_end_to_end() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        // SPS: btt on (CtbLog2SizeY = 5, MinCbLog2SizeY = 2, all diff
+        // fields 0), suco off, monochrome 32x32.
+        let mut sps_body = BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 1); // profile_idc (Main)
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(0); // chroma_format_idc 0 (monochrome)
+        sps_body.ue(32); // width
+        sps_body.ue(32); // height
+        sps_body.ue(0); // bit_depth_luma_minus8
+        sps_body.ue(0); // bit_depth_chroma_minus8
+        sps_body.u(1, 1); // sps_btt_flag = 1
+        sps_body.ue(0); // log2_ctu_size_minus5 → CtbLog2SizeY = 5
+        sps_body.ue(0); // log2_min_cb_size_minus2 → MinCbLog2SizeY = 2
+        sps_body.ue(0); // log2_diff_ctu_max_14_cb_size
+        sps_body.ue(0); // log2_diff_ctu_max_tt_cb_size
+        sps_body.ue(0); // log2_diff_min_cb_min_tt_cb_size_minus2
+        for _ in 0..12 {
+            sps_body.u(1, 0); // suco..dra tool flags all 0
+        }
+        sps_body.ue(1); // log2_sub_gop_length
+        sps_body.ue(1); // max_num_tid0_ref_pics
+        sps_body.u(1, 0); // picture_cropping_flag
+        sps_body.u(1, 0); // chroma_qp_table_present_flag
+        sps_body.u(1, 0); // vui_parameters_present_flag
+        sps_body.finish_with_trailing_bits();
+        let sps = sps::parse(&sps_body.into_bytes()).unwrap();
+        assert!(sps.sps_btt_flag);
+        let pps = pps::parse(&build_baseline_pps_rbsp()).unwrap();
+
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2); // I slice
+        hdr.u(1, 0);
+        hdr.u(1, 0); // slice_deblocking_filter_flag = 0
+        hdr.u(6, 22);
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut slice_rbsp = hdr.into_bytes();
+
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let mut enc = CabacEncoder::new();
+        let leaf = |enc: &mut CabacEncoder| {
+            enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+            enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+            enc.encode_decision(0, 0, 0); //   U terminator
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        };
+        // CTU 32x32 → BT_HOR; top 32x16 leaf; bottom 32x16 → TT_VER
+        // with three leaves.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        enc.encode_decision(t_flag, 0, 0);
+        leaf(&mut enc);
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_type, 0, 1);
+        for _ in 0..3 {
+            enc.encode_decision(t_flag, 0, 0);
+            leaf(&mut enc);
+        }
+        enc.encode_terminate(true);
+        slice_rbsp.extend_from_slice(&enc.finish());
+
+        let (pic, stats) = decode_idr_slice(&sps, &pps, &slice_rbsp).unwrap();
+        assert_eq!(stats.split_cu_flag_bins, 0);
+        assert_eq!(stats.tree.btt.flag_bins, 6);
+        assert_eq!(stats.tree.btt.dir_bins, 2);
+        assert_eq!(stats.tree.btt.type_bins, 2);
+        assert_eq!(stats.coding_units, 8);
+        assert!(pic.y.iter().all(|&v| v == 128));
+    }
+
+    /// Round 391: `decode_idr_slice` end-to-end with a **10-bit SPS**
+    /// (`bit_depth_luma_minus8 = 2`): the reconstructed picture carries
+    /// `bit_depth = 10` and its DC + positive-residual samples exceed
+    /// the 8-bit range.
+    #[test]
+    fn round391_decode_idr_slice_10bit_sps_end_to_end() {
+        use crate::cabac::CabacEncoder;
+        let mut sps_body = BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 0); // profile_idc
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(1); // chroma_format_idc 4:2:0
+        sps_body.ue(32); // width
+        sps_body.ue(32); // height
+        sps_body.ue(2); // bit_depth_luma_minus8 = 2 → 10-bit
+        sps_body.ue(2); // bit_depth_chroma_minus8 = 2
+        for _ in 0..13 {
+            sps_body.u(1, 0); // all tool flags 0 (Baseline)
+        }
+        sps_body.ue(1); // log2_sub_gop_length
+        sps_body.ue(1); // max_num_tid0_ref_pics
+        sps_body.u(1, 0); // picture_cropping_flag
+        sps_body.u(1, 0); // chroma_qp_table_present_flag
+        sps_body.u(1, 0); // vui_parameters_present_flag
+        sps_body.finish_with_trailing_bits();
+        let sps = sps::parse(&sps_body.into_bytes()).unwrap();
+        assert_eq!(sps.bit_depth_y(), 10);
+        let pps = pps::parse(&build_baseline_pps_rbsp()).unwrap();
+
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2); // I slice
+        hdr.u(1, 0);
+        hdr.u(1, 0);
+        hdr.u(6, 30); // slice_qp = 30
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut slice_rbsp = hdr.into_bytes();
+
+        // One 32x32 CTU: split_cu_flag = 1 → four 16x16 dual-tree leaf
+        // pairs; the first luma CU carries a DC level of +30, the rest
+        // are residual-free.
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1
+        for leaf_idx in 0..4 {
+            enc.encode_decision(0, 0, 0); // child split_cu_flag = 0
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            if leaf_idx == 0 {
+                enc.encode_decision(0, 0, 1); // cbf_luma = 1
+                enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+                for _ in 0..29 {
+                    enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 29
+                }
+                enc.encode_decision(0, 0, 0); // U terminator → level 30
+                enc.encode_bypass(0); // sign = +
+                enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+            } else {
+                enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            }
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        slice_rbsp.extend_from_slice(&enc.finish());
+
+        let (pic, stats) = decode_idr_slice(&sps, &pps, &slice_rbsp).unwrap();
+        assert_eq!(pic.bit_depth, 10);
+        assert_eq!(stats.coeff_runs, 1);
+        // First 16x16 leaf: DC 512 + non-negative residual (position-
+        // dependent magnitudes under the literal eq. 1062 basis; the
+        // smallest round to zero) — at least one sample must exceed the
+        // 8-bit-impossible 512 and none may drop below it.
+        assert!(
+            (0..16).any(|j| (0..16).any(|i| pic.y[j * 32 + i] > 512)),
+            "10-bit residual leaf must lift samples above the mid-level"
+        );
+        assert!((0..16).all(|j| (0..16).all(|i| pic.y[j * 32 + i] >= 512)));
+        // Residual-free leaves stay at the 10-bit mid-level.
+        assert!((0..16).all(|j| (16..32).all(|i| pic.y[j * 32 + i] == 512)));
+        assert!(pic.cb.iter().all(|&v| v == 512));
+        assert!(pic.cr.iter().all(|&v| v == 512));
+    }
 }
