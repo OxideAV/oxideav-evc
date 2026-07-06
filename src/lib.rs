@@ -289,6 +289,10 @@ pub fn walk_idr_slice(
         slice_alf_chroma_map_flag: false,
         slice_chroma2_alf_enabled_flag: false,
         slice_alf_chroma2_map_flag: false,
+        // This stats-only walker keeps the Baseline gate above
+        // (sps_btt_flag == 0), so the default (BTT/SUCO-off) tree gates
+        // are exact.
+        tree_gates: slice_data::CodingTreeGates::default(),
     };
     slice_data::walk_baseline_idr_slice(slice_data_bytes, inputs)
 }
@@ -311,9 +315,11 @@ pub fn decode_idr_slice(
     // toolset only alters inter coding-unit syntax (§7.3.8.4) and the
     // slice-header temporal-MVP group (P/B only); an intra slice decodes
     // identically under either value.
-    if sps.sps_btt_flag
-        || sps.sps_suco_flag
-        || sps.sps_eipd_flag
+    // Round 391: sps_btt_flag and sps_suco_flag are lifted — the pixel
+    // walker decodes the full §7.3.8.3 split_unit() syntax (BTT split
+    // group + split_unit_coding_order_flag) via the threaded
+    // `CodingTreeGates`.
+    if sps.sps_eipd_flag
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
@@ -368,6 +374,9 @@ pub fn decode_idr_slice(
         slice_alf_chroma_map_flag: false,
         slice_chroma2_alf_enabled_flag: false,
         slice_alf_chroma2_map_flag: false,
+        // Round 391: thread the real §7.3.8.3 BTT/SUCO gates — the
+        // pixel walker decodes the Main-profile coding-tree syntax.
+        tree_gates: slice_data::CodingTreeGates::from_sps(sps),
     };
     let decode = slice_data::SliceDecodeInputs {
         slice_qp,

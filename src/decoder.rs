@@ -754,6 +754,8 @@ impl EvcDecoder {
             slice_alf_chroma_map_flag: header.slice_alf_chroma_map_flag,
             slice_chroma2_alf_enabled_flag: header.slice_chroma2_alf_enabled_flag,
             slice_alf_chroma2_map_flag: header.slice_alf_chroma2_map_flag,
+            // Round 391: thread the real §7.3.8.3 BTT/SUCO gates.
+            tree_gates: crate::slice_data::CodingTreeGates::from_sps(sps),
         };
         let decode = SliceDecodeInputs {
             slice_qp: slice_qp as i32,

@@ -979,6 +979,153 @@ pub fn quad_split_children(
     }
 }
 
+/// The three-valued §7.4.9.3 `predModeConstraint` state threaded through
+/// the `split_unit()` recursion (`predModeConstraintCurrent` on entry,
+/// the derived `predModeConstraint` passed to BTT children).
+///
+/// [`PredModeConstraint`] above is the two-valued projection the
+/// §7.4.8.3 `allowSplit*` derivation consumes (it only distinguishes
+/// INTER from everything else); [`ModeConstraint::to_split_constraint`]
+/// maps between the two.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModeConstraint {
+    /// `PRED_MODE_NO_CONSTRAINT`.
+    #[default]
+    NoConstraint,
+    /// `PRED_MODE_CONSTRAINT_INTER` — every CU in the subtree is inter
+    /// (`cu_skip_flag` read, `pred_mode_flag` absent, CuPredMode =
+    /// MODE_INTER).
+    Inter,
+    /// `PRED_MODE_CONSTRAINT_INTRA_IBC` — every CU in the subtree is
+    /// intra or IBC, coded as a local dual tree (luma-only CUs, one
+    /// chroma CU at the tree-split point).
+    IntraIbc,
+}
+
+impl ModeConstraint {
+    /// Project onto the two-valued [`PredModeConstraint`] the §7.4.8.3
+    /// `allowSplit*` derivation consumes.
+    pub fn to_split_constraint(self) -> PredModeConstraint {
+        match self {
+            ModeConstraint::Inter => PredModeConstraint::Inter,
+            _ => PredModeConstraint::NotInterConstrained,
+        }
+    }
+}
+
+/// §7.4.9.3 — derive `needSignalPredModeConstraintTypeFlag`, the
+/// predicate gating whether `pred_mode_constraint_type_flag` is signalled
+/// for the current `split_unit()` (spec lines 5523-5544).
+///
+/// Set to 0 when `sps_btt_flag == 0` or `sps_admvp_flag == 0`, on I
+/// slices, when `ChromaArrayType != 1`, or when the inherited
+/// `predModeConstraintCurrent` is already constrained. Otherwise it is 1
+/// exactly when the resolved split would produce sub-4:2:0-chroma-size
+/// children: a 64-luma-sample block binary-split, or a 128-luma-sample
+/// block ternary-split.
+#[allow(clippy::too_many_arguments)]
+pub fn need_signal_pred_mode_constraint_type_flag(
+    sps_btt_flag: bool,
+    sps_admvp_flag: bool,
+    slice_is_i: bool,
+    chroma_array_type: u32,
+    constraint_current: ModeConstraint,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    split_mode: SplitMode,
+) -> bool {
+    if !sps_btt_flag
+        || !sps_admvp_flag
+        || slice_is_i
+        || chroma_array_type != 1
+        || constraint_current != ModeConstraint::NoConstraint
+    {
+        return false;
+    }
+    let log2_area = log2_cb_width + log2_cb_height;
+    // cbWidth * cbHeight == 64 → log2 area 6; == 128 → log2 area 7.
+    (log2_area == 6 && matches!(split_mode, SplitMode::SplitBtHor | SplitMode::SplitBtVer))
+        || (log2_area == 7 && matches!(split_mode, SplitMode::SplitTtHor | SplitMode::SplitTtVer))
+}
+
+/// §7.4.9.3 — derive the `predModeConstraint` passed to the BTT children
+/// of the current `split_unit()` (spec lines 5555-5590, incl. eq. 126).
+///
+/// `signalled_type_flag` is `Some(pred_mode_constraint_type_flag)` when
+/// [`need_signal_pred_mode_constraint_type_flag`] held and the flag was
+/// read from the bitstream, `None` otherwise (the not-present inference
+/// to 0 is irrelevant because the flag is only *consulted* on the
+/// signalled branch).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_pred_mode_constraint(
+    sps_btt_flag: bool,
+    sps_admvp_flag: bool,
+    chroma_array_type: u32,
+    constraint_current: ModeConstraint,
+    signalled_type_flag: Option<bool>,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    split_mode: SplitMode,
+) -> ModeConstraint {
+    if !sps_btt_flag || !sps_admvp_flag {
+        return ModeConstraint::NoConstraint;
+    }
+    if let Some(flag) = signalled_type_flag {
+        // eq. 126.
+        return if flag {
+            ModeConstraint::IntraIbc
+        } else {
+            ModeConstraint::Inter
+        };
+    }
+    if constraint_current != ModeConstraint::NoConstraint {
+        return constraint_current;
+    }
+    let log2_area = log2_cb_width + log2_cb_height;
+    let bt = matches!(split_mode, SplitMode::SplitBtHor | SplitMode::SplitBtVer);
+    let tt = matches!(split_mode, SplitMode::SplitTtHor | SplitMode::SplitTtVer);
+    let auto_intra_ibc =
+        (chroma_array_type == 1 && log2_area == 6 && split_mode != SplitMode::NoSplit)
+            || (chroma_array_type == 1 && log2_area == 7 && tt)
+            || (chroma_array_type == 2 && log2_area == 5 && bt)
+            || (chroma_array_type == 2 && log2_area == 6 && tt);
+    if auto_intra_ibc {
+        ModeConstraint::IntraIbc
+    } else {
+        ModeConstraint::NoConstraint
+    }
+}
+
+/// §7.3.8.3 leaf-level `predModeConstraint` reassignment (spec lines
+/// 2790-2793): a `coding_unit()` leaf reached with
+/// `PRED_MODE_NO_CONSTRAINT` becomes `PRED_MODE_CONSTRAINT_INTRA_IBC`
+/// on an I slice, or on any slice for a 4×4 block under
+/// `sps_admvp_flag == 1` (Main profile has no 4×4 inter CUs).
+pub fn leaf_pred_mode_constraint(
+    constraint: ModeConstraint,
+    slice_is_i: bool,
+    sps_admvp_flag: bool,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> ModeConstraint {
+    if constraint == ModeConstraint::NoConstraint
+        && (slice_is_i || (sps_admvp_flag && log2_cb_width == 2 && log2_cb_height == 2))
+    {
+        ModeConstraint::IntraIbc
+    } else {
+        constraint
+    }
+}
+
+/// §7.4.9.3 — `isTreeSplitPoint` (spec lines 5595-5601): the point in
+/// the coding tree where the mode constraint transitions from
+/// `PRED_MODE_NO_CONSTRAINT` to `PRED_MODE_CONSTRAINT_INTRA_IBC`; there
+/// (and only there) a `DUAL_TREE_CHROMA` `coding_unit()` covering the
+/// whole split unit follows the luma subtree.
+pub fn is_tree_split_point(constraint_current: ModeConstraint, derived: ModeConstraint) -> bool {
+    constraint_current == ModeConstraint::NoConstraint && derived == ModeConstraint::IntraIbc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1810,5 +1957,226 @@ mod tests {
             256,
             256,
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4.9.3 mode-constraint layer.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn need_signal_gates_on_tools_slice_and_chroma() {
+        use ModeConstraint::*;
+        // 8×8 (64 samples) BT split, P slice, 4:2:0, both tools on →
+        // signalled.
+        assert!(need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            1,
+            NoConstraint,
+            3,
+            3,
+            SplitMode::SplitBtVer,
+        ));
+        // 16×8 (128 samples) TT split → signalled.
+        assert!(need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            1,
+            NoConstraint,
+            4,
+            3,
+            SplitMode::SplitTtVer,
+        ));
+        // I slice → never.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            true,
+            1,
+            NoConstraint,
+            3,
+            3,
+            SplitMode::SplitBtVer,
+        ));
+        // sps_admvp_flag == 0 → never.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            false,
+            false,
+            1,
+            NoConstraint,
+            3,
+            3,
+            SplitMode::SplitBtVer,
+        ));
+        // ChromaArrayType != 1 → never.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            0,
+            NoConstraint,
+            3,
+            3,
+            SplitMode::SplitBtVer,
+        ));
+        // Already constrained → never.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            1,
+            IntraIbc,
+            3,
+            3,
+            SplitMode::SplitBtVer,
+        ));
+        // 64 samples but TT (would be 16-sample outer children — the
+        // spec's 64-sample trigger is BT-only) → not signalled.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            1,
+            NoConstraint,
+            3,
+            3,
+            SplitMode::SplitTtVer,
+        ));
+        // 256-sample BT split → not signalled.
+        assert!(!need_signal_pred_mode_constraint_type_flag(
+            true,
+            true,
+            false,
+            1,
+            NoConstraint,
+            4,
+            4,
+            SplitMode::SplitBtVer,
+        ));
+    }
+
+    #[test]
+    fn derive_pred_mode_constraint_signalled_and_auto_paths() {
+        use ModeConstraint::*;
+        // eq. 126: signalled flag = 1 → INTRA_IBC, = 0 → INTER.
+        assert_eq!(
+            derive_pred_mode_constraint(
+                true,
+                true,
+                1,
+                NoConstraint,
+                Some(true),
+                3,
+                3,
+                SplitMode::SplitBtVer,
+            ),
+            IntraIbc
+        );
+        assert_eq!(
+            derive_pred_mode_constraint(
+                true,
+                true,
+                1,
+                NoConstraint,
+                Some(false),
+                3,
+                3,
+                SplitMode::SplitBtVer,
+            ),
+            Inter
+        );
+        // Inherited constraint propagates.
+        assert_eq!(
+            derive_pred_mode_constraint(true, true, 1, Inter, None, 4, 4, SplitMode::SplitBtVer,),
+            Inter
+        );
+        // Auto INTRA_IBC on a 64-sample 4:2:0 split (I-slice shape:
+        // needSignal is 0 there, so signalled_type_flag is None).
+        assert_eq!(
+            derive_pred_mode_constraint(
+                true,
+                true,
+                1,
+                NoConstraint,
+                None,
+                3,
+                3,
+                SplitMode::SplitBtHor,
+            ),
+            IntraIbc
+        );
+        // 128-sample TT ditto.
+        assert_eq!(
+            derive_pred_mode_constraint(
+                true,
+                true,
+                1,
+                NoConstraint,
+                None,
+                4,
+                3,
+                SplitMode::SplitTtVer,
+            ),
+            IntraIbc
+        );
+        // 128-sample BT stays unconstrained (children are 64 samples).
+        assert_eq!(
+            derive_pred_mode_constraint(
+                true,
+                true,
+                1,
+                NoConstraint,
+                None,
+                4,
+                3,
+                SplitMode::SplitBtVer,
+            ),
+            NoConstraint
+        );
+        // Baseline tools (sps_btt_flag == 0) → always NO_CONSTRAINT.
+        assert_eq!(
+            derive_pred_mode_constraint(
+                false,
+                false,
+                1,
+                IntraIbc,
+                None,
+                3,
+                3,
+                SplitMode::SplitBtHor,
+            ),
+            NoConstraint
+        );
+    }
+
+    #[test]
+    fn leaf_constraint_override_and_tree_split_point() {
+        use ModeConstraint::*;
+        // I-slice leaf: NO_CONSTRAINT → INTRA_IBC.
+        assert_eq!(
+            leaf_pred_mode_constraint(NoConstraint, true, false, 4, 4),
+            IntraIbc
+        );
+        // P-slice 4×4 leaf under sps_admvp_flag → INTRA_IBC.
+        assert_eq!(
+            leaf_pred_mode_constraint(NoConstraint, false, true, 2, 2),
+            IntraIbc
+        );
+        // P-slice 8×8 leaf → unchanged.
+        assert_eq!(
+            leaf_pred_mode_constraint(NoConstraint, false, true, 3, 3),
+            NoConstraint
+        );
+        // Inherited INTER is never overridden.
+        assert_eq!(leaf_pred_mode_constraint(Inter, false, true, 2, 2), Inter);
+        // Tree split point fires exactly on the NO_CONSTRAINT →
+        // INTRA_IBC transition.
+        assert!(is_tree_split_point(NoConstraint, IntraIbc));
+        assert!(!is_tree_split_point(IntraIbc, IntraIbc));
+        assert!(!is_tree_split_point(NoConstraint, Inter));
+        assert!(!is_tree_split_point(NoConstraint, NoConstraint));
     }
 }

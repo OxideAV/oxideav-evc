@@ -106,6 +106,10 @@ pub struct SliceWalkInputs {
     /// `slice_alf_chroma2_map_flag` (§7.4.5). Inferred 0 unless
     /// `ChromaArrayType == 3`.
     pub slice_alf_chroma2_map_flag: bool,
+    /// §7.3.8.3 Main-profile coding-tree gates (BTT + SUCO enables plus
+    /// their SPS size-limit derivations). Default is the Baseline shape
+    /// (both off).
+    pub tree_gates: CodingTreeGates,
 }
 
 impl Default for SliceWalkInputs {
@@ -126,6 +130,7 @@ impl Default for SliceWalkInputs {
             slice_alf_chroma_map_flag: false,
             slice_chroma2_alf_enabled_flag: false,
             slice_alf_chroma2_map_flag: false,
+            tree_gates: CodingTreeGates::default(),
         }
     }
 }
@@ -140,6 +145,276 @@ impl SliceWalkInputs {
     fn pic_height_in_ctus(&self) -> u32 {
         (self.pic_height + self.ctb_size() - 1) >> self.ctb_log2_size_y
     }
+}
+
+/// The §7.3.8.3 Main-profile coding-tree gates threaded from the SPS:
+/// the BTT (binary/ternary-tree) and SUCO (split-unit coding order)
+/// enables plus their §7.3.2.2 / §7.4.9.3 size-limit derivations, and the
+/// two SPS flags the split recursion itself consults
+/// (`sps_cm_init_flag` for the §9.3.4.2 ctxInc selections,
+/// `sps_admvp_flag` for the leaf 4×4 mode-constraint override and the
+/// §7.4.9.3 `predModeConstraint` derivation).
+///
+/// The [`Default`] value is the Baseline shape: BTT and SUCO off, limits
+/// derived from a 64×64 CTU with all diff fields zero (never consulted
+/// when the enables are off).
+#[derive(Clone, Copy, Debug)]
+pub struct CodingTreeGates {
+    /// `sps_btt_flag` — when false the walker reads `split_cu_flag`
+    /// quad splits only (the Baseline shape).
+    pub sps_btt_flag: bool,
+    /// §7.3.2.2 BTT size limits (eqs. 43/44/62-67), derived once per SPS.
+    pub btt_limits: crate::split::BttSizeLimits,
+    /// `sps_suco_flag` — when true, `split_unit_coding_order_flag` may
+    /// be signalled per §7.4.9.3 and children decode right-to-left.
+    pub sps_suco_flag: bool,
+    /// §7.4.9.3 SUCO size limits (eqs. 68/69), derived once per SPS.
+    pub suco_limits: crate::split::SucoSizeLimits,
+    /// `sps_cm_init_flag` — selects the §9.3.4.2 ctxInc derivations for
+    /// the tree syntax elements (0 under Baseline).
+    pub sps_cm_init_flag: bool,
+    /// `sps_admvp_flag` — consulted by the §7.3.8.3 leaf constraint
+    /// override and the §7.4.9.3 `predModeConstraint` derivation.
+    pub sps_admvp_flag: bool,
+}
+
+impl Default for CodingTreeGates {
+    fn default() -> Self {
+        Self {
+            sps_btt_flag: false,
+            btt_limits: crate::split::BttSizeLimits::derive(6, 0, 0, 0, 0),
+            sps_suco_flag: false,
+            suco_limits: crate::split::SucoSizeLimits::derive(6, 2, 0, 0),
+            sps_cm_init_flag: false,
+            sps_admvp_flag: false,
+        }
+    }
+}
+
+impl CodingTreeGates {
+    /// Derive the gates from a parsed SPS — the one true construction
+    /// path for the decoder entry points.
+    pub fn from_sps(sps: &crate::sps::Sps) -> Self {
+        let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
+        let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
+        Self {
+            sps_btt_flag: sps.sps_btt_flag,
+            btt_limits: crate::split::BttSizeLimits::derive(
+                ctb_log2_size_y,
+                sps.log2_min_cb_size_minus2,
+                sps.log2_diff_ctu_max_14_cb_size,
+                sps.log2_diff_ctu_max_tt_cb_size,
+                sps.log2_diff_min_cb_min_tt_cb_size_minus2,
+            ),
+            sps_suco_flag: sps.sps_suco_flag,
+            suco_limits: crate::split::SucoSizeLimits::derive(
+                ctb_log2_size_y,
+                min_cb_log2_size_y,
+                sps.log2_diff_ctu_size_max_suco_cb_size,
+                sps.log2_diff_max_suco_min_suco_cb_size,
+            ),
+            sps_cm_init_flag: sps.sps_cm_init_flag,
+            sps_admvp_flag: sps.sps_admvp_flag,
+        }
+    }
+}
+
+/// Tallies of the §7.3.8.3 tree-level syntax elements beyond the
+/// Baseline `split_cu_flag`: the BTT split group, the SUCO order flag,
+/// the P/B-slice `pred_mode_constraint_type_flag`, and the local
+/// dual-tree chroma coding units decoded at §7.4.9.3 tree-split points.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeSplitStats {
+    /// `btt_split_flag` / `btt_split_dir` / `btt_split_type` bins.
+    pub btt: crate::split::BttSplitStats,
+    /// `split_unit_coding_order_flag` regular bins decoded.
+    pub suco_flag_bins: u32,
+    /// Split units whose decoded SUCO flag was 1 (mirrored child order).
+    pub suco_mirrored_units: u32,
+    /// `pred_mode_constraint_type_flag` regular bins decoded.
+    pub pred_mode_constraint_flag_bins: u32,
+    /// Non-leaf `DUAL_TREE_CHROMA` coding units decoded at §7.4.9.3
+    /// tree-split points (the local dual-tree chroma CU covering a
+    /// whole BTT subtree). Leaf-level dual-tree chroma CUs (the
+    /// Baseline I-slice shape) are not counted here.
+    pub chroma_tree_split_points: u32,
+}
+
+/// The resolved outcome of one `split_unit()`'s decision syntax
+/// (§7.3.8.3 lines 2642-2689): the quad `split_cu_flag`, the BTT
+/// [`crate::split::SplitMode`], the resolved SUCO child order, and the
+/// §7.4.9.3 `predModeConstraint` handed to BTT children.
+#[derive(Clone, Copy, Debug)]
+struct SplitResolution {
+    split_cu_flag: bool,
+    mode: crate::split::SplitMode,
+    suco_order: u32,
+    constraint: crate::split::ModeConstraint,
+}
+
+/// Decode the decision prefix of one §7.3.8.3 `split_unit()` — every
+/// syntax element up to (but excluding) the recursion / `coding_unit()`
+/// body — and resolve the split geometry. Shared by the IDR and the
+/// P/B walkers.
+///
+/// Under `sps_btt_flag == 0` this reproduces the Baseline behaviour
+/// exactly: one `split_cu_flag` bin on the `(0, 0)` context slot when
+/// the block can recurse and lies fully inside the picture, an implicit
+/// quad split when it does not. Under `sps_btt_flag == 1` it derives the
+/// §7.4.8.3 `allowSplit*` set, reads the `btt_split_flag`/`dir`/`type`
+/// group via [`crate::split::decode_btt_split`], and applies the
+/// picture-boundary implicit-split rules for blocks straddling an edge.
+#[allow(clippy::too_many_arguments)]
+fn resolve_split_unit(
+    eng: &mut CabacEngine,
+    walk: &SliceWalkInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    split_unit_order: u32,
+    constraint_current: crate::split::ModeConstraint,
+    slice_is_i: bool,
+    split_cu_flag_bins: &mut u32,
+    tree_stats: &mut TreeSplitStats,
+) -> Result<SplitResolution> {
+    use crate::cabac_init::{ctx_inc_suco_flag, MainCtxTable};
+    use crate::split::{self, SplitMode};
+
+    let gates = &walk.tree_gates;
+    let cb_w = 1u32 << log2_cb_width;
+    let cb_h = 1u32 << log2_cb_height;
+    let cb_within_picture = x0 + cb_w <= walk.pic_width && y0 + cb_h <= walk.pic_height;
+
+    let mut split_cu_flag = false;
+    let mode;
+    if !gates.sps_btt_flag {
+        // §7.3.8.3 sps_btt_flag == 0: quad split via split_cu_flag only.
+        let can_recurse =
+            log2_cb_width > walk.min_cb_log2_size_y && log2_cb_height > walk.min_cb_log2_size_y;
+        if can_recurse && cb_within_picture && (log2_cb_width > 2 || log2_cb_height > 2) {
+            let bin = eng.decode_decision(0, 0)?;
+            *split_cu_flag_bins += 1;
+            split_cu_flag = bin != 0;
+        } else if can_recurse && !cb_within_picture {
+            // Boundary CU: implicit split without reading a flag.
+            split_cu_flag = true;
+        }
+        mode = SplitMode::NoSplit;
+    } else {
+        // §7.3.8.3 sps_btt_flag == 1: the BTT split group. The
+        // §7.4.8.3 allowSplit* derivation consumes the two-valued
+        // constraint projection (only INTER matters there).
+        let allowed = split::derive_allowed_splits(
+            &gates.btt_limits,
+            log2_cb_width,
+            log2_cb_height,
+            constraint_current.to_split_constraint(),
+        );
+        if (log2_cb_width > 2 || log2_cb_height > 2) && cb_within_picture {
+            let btt = split::decode_btt_split(
+                eng,
+                &allowed,
+                gates.sps_cm_init_flag,
+                0, // eq. 1439 numSmaller — only consulted under cm_init
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                walk.pic_width,
+                walk.pic_height,
+                &mut tree_stats.btt,
+            )?;
+            mode = btt.mode;
+        } else if !cb_within_picture {
+            // btt_split_flag not present (block straddles the picture
+            // edge) → inferred 0 → the §7.4.8.3 boundary implicit-split
+            // rules pick a binary split toward the in-picture side.
+            mode = split::derive_split_mode(
+                false,
+                0,
+                0,
+                &allowed,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                walk.pic_width,
+                walk.pic_height,
+            );
+        } else {
+            // 4×4 inside the picture: nothing signalled, leaf.
+            mode = SplitMode::NoSplit;
+        }
+    }
+
+    // §7.3.8.3 line 2686: split_unit_coding_order_flag, gated on the
+    // SPS enable and the §7.4.9.3 allowSplitUnitCodingOrder predicate.
+    // When absent it is inferred equal to the inherited splitUnitOrder.
+    let suco_order = if gates.sps_suco_flag
+        && split::allow_split_unit_coding_order(
+            &gates.suco_limits,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            split_cu_flag,
+            mode,
+            walk.pic_width,
+            walk.pic_height,
+        ) {
+        let ctx_inc = if gates.sps_cm_init_flag {
+            ctx_inc_suco_flag(cb_w, cb_h)
+        } else {
+            0
+        };
+        let bin = eng.decode_decision(MainCtxTable::SucoFlag as usize, ctx_inc)?;
+        tree_stats.suco_flag_bins += 1;
+        if bin != 0 {
+            tree_stats.suco_mirrored_units += 1;
+        }
+        bin as u32
+    } else {
+        split_unit_order
+    };
+
+    // §7.3.8.3 line 2688: pred_mode_constraint_type_flag (P/B Main
+    // profile only — needSignal is identically 0 on I slices).
+    let need_signal = split::need_signal_pred_mode_constraint_type_flag(
+        gates.sps_btt_flag,
+        gates.sps_admvp_flag,
+        slice_is_i,
+        walk.chroma_format_idc,
+        constraint_current,
+        log2_cb_width,
+        log2_cb_height,
+        mode,
+    );
+    let signalled = if need_signal {
+        // Table 46 context; FL cMax = 1, ctxInc 0 (Table 95).
+        let bin = eng.decode_decision(MainCtxTable::PredModeConstraintType as usize, 0)?;
+        tree_stats.pred_mode_constraint_flag_bins += 1;
+        Some(bin != 0)
+    } else {
+        None
+    };
+    let constraint = split::derive_pred_mode_constraint(
+        gates.sps_btt_flag,
+        gates.sps_admvp_flag,
+        walk.chroma_format_idc,
+        constraint_current,
+        signalled,
+        log2_cb_width,
+        log2_cb_height,
+        mode,
+    );
+
+    Ok(SplitResolution {
+        split_cu_flag,
+        mode,
+        suco_order,
+        constraint,
+    })
 }
 
 /// Per-CTU adaptive-loop-filter applicability decoded from
@@ -1283,6 +1558,10 @@ impl Default for SliceDecodeInputs {
 pub struct SliceDecodeStats {
     pub ctus: u32,
     pub split_cu_flag_bins: u32,
+    /// Round 391: §7.3.8.3 BTT/SUCO tree-level syntax tallies
+    /// (`btt_split_*`, `split_unit_coding_order_flag`,
+    /// `pred_mode_constraint_type_flag`, tree-split-point chroma CUs).
+    pub tree: TreeSplitStats,
     pub coding_units: u32,
     pub cbf_luma_bins: u32,
     pub cbf_chroma_bins: u32,
@@ -1394,6 +1673,8 @@ pub fn decode_baseline_idr_slice(
         stats
             .alf_ctb_map
             .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
+        // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
+        // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
         decode_split_unit(
             &mut eng,
             &mut pic,
@@ -1405,6 +1686,9 @@ pub fn decode_baseline_idr_slice(
             y_ctb,
             walk.ctb_log2_size_y,
             walk.ctb_log2_size_y,
+            0,
+            0,
+            crate::split::ModeConstraint::NoConstraint,
         )?;
         stats.ctus += 1;
     }
@@ -1437,6 +1721,17 @@ pub fn decode_baseline_idr_slice(
     Ok((pic, stats))
 }
 
+/// §7.3.8.3 `split_unit()` for the I-slice (IDR) pixel walker.
+///
+/// The decision prefix (quad `split_cu_flag` under `sps_btt_flag == 0`,
+/// the `btt_split_*` group under `== 1`, the SUCO order flag, and the
+/// §7.4.9.3 constraint derivation) is decoded by [`resolve_split_unit`];
+/// this function drives the recursion geometry
+/// ([`crate::split::quad_split_children`] /
+/// [`crate::split::split_unit_children`]) and the `coding_unit()` leaves,
+/// including the local dual-tree: at a §7.4.9.3 tree-split point the
+/// whole subtree decodes luma-only CUs and one `DUAL_TREE_CHROMA` CU
+/// covering the split unit follows (spec lines 2795-2799).
 #[allow(clippy::too_many_arguments)]
 fn decode_split_unit(
     eng: &mut CabacEngine,
@@ -1449,73 +1744,152 @@ fn decode_split_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    ct_depth: u32,
+    split_unit_order: u32,
+    constraint_current: crate::split::ModeConstraint,
 ) -> Result<()> {
-    let cb_w = 1u32 << log2_cb_width;
-    let cb_h = 1u32 << log2_cb_height;
-    let cb_within_picture = x0 + cb_w <= walk.pic_width && y0 + cb_h <= walk.pic_height;
-    let can_recurse =
-        log2_cb_width > walk.min_cb_log2_size_y && log2_cb_height > walk.min_cb_log2_size_y;
-    let mut split = false;
-    if can_recurse && cb_within_picture && (log2_cb_width > 2 || log2_cb_height > 2) {
-        let bin = eng.decode_decision(0, 0)?;
-        stats.split_cu_flag_bins += 1;
-        split = bin != 0;
-    } else if can_recurse && !cb_within_picture {
-        // Boundary CU: implicit split without reading a flag.
-        split = true;
-    }
-    if split {
-        let half_w = log2_cb_width.saturating_sub(1);
-        let half_h = log2_cb_height.saturating_sub(1);
-        let x1 = x0 + (1u32 << half_w);
-        let y1 = y0 + (1u32 << half_h);
-        decode_split_unit(
-            eng, pic, stats, side_info, walk, decode, x0, y0, half_w, half_h,
+    use crate::split::{self, ModeConstraint, SplitMode};
+    let r = resolve_split_unit(
+        eng,
+        walk,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        split_unit_order,
+        constraint_current,
+        true, // IDR slices are I slices
+        &mut stats.split_cu_flag_bins,
+        &mut stats.tree,
+    )?;
+
+    if r.split_cu_flag {
+        // Quad recursion (spec lines 2690-2716). Children are handed
+        // PRED_MODE_NO_CONSTRAINT per the syntax.
+        for ch in split::quad_split_children(
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            ct_depth,
+            r.suco_order,
+            walk.pic_width,
+            walk.pic_height,
+        ) {
+            decode_split_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                walk,
+                decode,
+                ch.x0,
+                ch.y0,
+                ch.log2_cb_width,
+                ch.log2_cb_height,
+                ch.ct_depth,
+                ch.split_unit_order,
+                ModeConstraint::NoConstraint,
+            )?;
+        }
+    } else if r.mode != SplitMode::NoSplit {
+        // BTT recursion (spec lines 2717-2787): children carry the
+        // derived predModeConstraint.
+        for ch in split::split_unit_children(
+            r.mode,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            ct_depth,
+            r.suco_order,
+            split_unit_order,
+            walk.pic_width,
+            walk.pic_height,
+        ) {
+            decode_split_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                walk,
+                decode,
+                ch.x0,
+                ch.y0,
+                ch.log2_cb_width,
+                ch.log2_cb_height,
+                ch.ct_depth,
+                ch.split_unit_order,
+                r.constraint,
+            )?;
+        }
+    } else {
+        // coding_unit() leaf (spec lines 2789-2794): on an I slice a
+        // NO_CONSTRAINT leaf transitions to INTRA_IBC, making the CU a
+        // DUAL_TREE_LUMA one; inside an already-constrained subtree the
+        // leaf stays luma-only and the chroma CU belongs to the
+        // tree-split ancestor.
+        let leaf_constraint = split::leaf_pred_mode_constraint(
+            constraint_current,
+            true,
+            walk.tree_gates.sps_admvp_flag,
+            log2_cb_width,
+            log2_cb_height,
+        );
+        let tree_type = if leaf_constraint == ModeConstraint::IntraIbc {
+            TreeType::DualTreeLuma
+        } else {
+            TreeType::SingleTree
+        };
+        decode_coding_unit(
+            eng,
+            pic,
+            stats,
+            side_info,
+            walk,
+            decode,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            tree_type,
         )?;
-        if x1 < walk.pic_width {
-            decode_split_unit(
-                eng, pic, stats, side_info, walk, decode, x1, y0, half_w, half_h,
-            )?;
-        }
-        if y1 < walk.pic_height {
-            decode_split_unit(
-                eng, pic, stats, side_info, walk, decode, x0, y1, half_w, half_h,
-            )?;
-        }
-        if x1 < walk.pic_width && y1 < walk.pic_height {
-            decode_split_unit(
-                eng, pic, stats, side_info, walk, decode, x1, y1, half_w, half_h,
+        if split::is_tree_split_point(constraint_current, leaf_constraint) {
+            decode_coding_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                walk,
+                decode,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                TreeType::DualTreeChroma,
             )?;
         }
         return Ok(());
     }
-    // Leaf: dual-tree luma + chroma.
-    decode_coding_unit(
-        eng,
-        pic,
-        stats,
-        side_info,
-        walk,
-        decode,
-        x0,
-        y0,
-        log2_cb_width,
-        log2_cb_height,
-        TreeType::DualTreeLuma,
-    )?;
-    decode_coding_unit(
-        eng,
-        pic,
-        stats,
-        side_info,
-        walk,
-        decode,
-        x0,
-        y0,
-        log2_cb_width,
-        log2_cb_height,
-        TreeType::DualTreeChroma,
-    )?;
+    // Non-leaf tree-split point (spec lines 2797-2799): after the whole
+    // luma subtree, one DUAL_TREE_CHROMA coding_unit() covering the
+    // split unit.
+    if split::is_tree_split_point(constraint_current, r.constraint) {
+        stats.tree.chroma_tree_split_points += 1;
+        decode_coding_unit(
+            eng,
+            pic,
+            stats,
+            side_info,
+            walk,
+            decode,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            TreeType::DualTreeChroma,
+        )?;
+    }
     Ok(())
 }
 
@@ -10785,5 +11159,210 @@ mod tests {
         assert_eq!(l0.center, project(nb.src_l0));
         assert_eq!(l1.center, project(nb.src_l1));
         assert_ne!(l0.center, l1.center, "distinct per-list models");
+    }
+
+    /// Round 391: Main-profile BTT gates for a 32×32-CTU walk —
+    /// `sps_btt_flag = 1` with the §7.3.2.2 limits derived from
+    /// CtbLog2SizeY = 5 and MinCbLog2SizeY = 2, SUCO off.
+    fn btt_tree_gates() -> CodingTreeGates {
+        CodingTreeGates {
+            sps_btt_flag: true,
+            btt_limits: crate::split::BttSizeLimits::derive(5, 0, 0, 0, 0),
+            sps_suco_flag: false,
+            suco_limits: crate::split::SucoSizeLimits::derive(5, 2, 0, 0),
+            sps_cm_init_flag: false,
+            sps_admvp_flag: false,
+        }
+    }
+
+    /// Round 391: end-to-end §7.3.8.3 BTT coding-tree walk on the IDR
+    /// pixel path. One 32×32 CTU splits BT_HOR at the root; the top
+    /// 32×16 is a leaf, the bottom 32×16 splits TT_VER into 8×16 /
+    /// 16×16 / 8×16 leaves. Each of the four leaves decodes the
+    /// Baseline dual-tree CU pair (I slice → the leaf constraint
+    /// transitions NO_CONSTRAINT → INTRA_IBC, so luma + chroma CUs).
+    /// Verifies the exact §7.3.8.3 presence gating (six btt_split_flag
+    /// bins, two btt_split_dir, two btt_split_type, zero split_cu_flag)
+    /// and the reconstructed all-DC picture.
+    #[test]
+    fn round391_btt_idr_bt_hor_then_tt_ver_tree_decodes_to_pixels() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let mut enc = CabacEncoder::new();
+        // Leaf CU pair on a monochrome picture: the luma CU decodes
+        // intra_pred_mode = 2 (INTRA_VER, U bins "110") + cbf_luma = 0;
+        // the dual-tree chroma CU consumes no bins with
+        // chroma_format_idc = 0. INTRA_VER copies the (all-128) top
+        // reference row, so every leaf shape — including the
+        // rectangular BTT leaves — reconstructs to uniform 128 (the
+        // eq. 285 DC average is square-block-shaped by construction and
+        // would not).
+        let leaf = |enc: &mut CabacEncoder| {
+            enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+            enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+            enc.encode_decision(0, 0, 0); //   U terminator
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        };
+        // CTU (5,5): all four splits allowed → flag + dir + type present.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0); // horizontal
+        enc.encode_decision(t_type, 0, 0); // binary → SPLIT_BT_HOR
+                                           // Top child (0,0) 32×16: flag present (BT allowed) → 0 = leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        leaf(&mut enc);
+        // Bottom child (0,16) 32×16: flag=1; both axes available → dir
+        // present (1 = vertical); bt_ver + tt_ver both allowed → type
+        // present (1 = ternary) → SPLIT_TT_VER.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_type, 0, 1);
+        // TT children in order: 8×16 at x=0, 16×16 at x=8, 8×16 at x=24.
+        for _ in 0..3 {
+            enc.encode_decision(t_flag, 0, 0); // leaf
+            leaf(&mut enc);
+        }
+        enc.encode_terminate(true); // end_of_tile_one_bit
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0, // monochrome
+            tree_gates: btt_tree_gates(),
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(
+            stats.split_cu_flag_bins, 0,
+            "sps_btt_flag = 1 never reads split_cu_flag"
+        );
+        assert_eq!(stats.tree.btt.flag_bins, 6, "CTU + 2 BT + 3 TT children");
+        assert_eq!(stats.tree.btt.dir_bins, 2);
+        assert_eq!(stats.tree.btt.type_bins, 2);
+        assert_eq!(stats.tree.suco_flag_bins, 0, "SUCO disabled");
+        assert_eq!(stats.coding_units, 8, "4 leaves × (luma + chroma) CUs");
+        // INTRA_VER over the all-128 initial fill: uniform mid-grey.
+        assert!(pic.y.iter().all(|&v| v == 128));
+    }
+
+    /// Round 391: §7.3.8.3 SUCO — `split_unit_coding_order_flag = 1` on
+    /// a BT_VER split mirrors the child decode order (right column
+    /// first). The first-decoded leaf carries a large DC residual, the
+    /// second none; with the mirrored order the residual must land in
+    /// the RIGHT half of the split unit. Also pins the §7.4.9.3
+    /// allowSplitUnitCodingOrder gating: the flag is read only on the
+    /// one wider-than-tall vertically-split block (the BT_HOR root, the
+    /// square leaves and the NO_SPLIT 32×16 leaf all suppress it).
+    #[test]
+    fn round391_suco_idr_mirrored_bt_ver_decodes_right_column_first() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let t_suco = MainCtxTable::SucoFlag as usize;
+        let mut enc = CabacEncoder::new();
+        // CTU (0,0) 32×32: BT_HOR (SUCO not signallable: condition 4 —
+        // horizontal shape without quad split).
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // Top child (0,0) 32×16: BT_VER split.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_type, 0, 0);
+        // 32×16 is inside the SUCO window (MaxSucoLog2Size = 5,
+        // MinSucoLog2Size = 4), wider than tall, vertical split →
+        // split_unit_coding_order_flag present. 1 = mirrored.
+        enc.encode_decision(t_suco, 0, 1);
+        // First-decoded 16×16 child (the RIGHT one at x=16): flag=0
+        // leaf, luma CU with cbf_luma=1 and one DC level of +20.
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..19 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 19
+        }
+        enc.encode_decision(0, 0, 0); // U terminator
+        enc.encode_bypass(0); // coeff_sign_flag = 0 → +20
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // Second-decoded 16×16 child (the LEFT one at x=0): plain leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // Bottom child (0,16) 32×16: NO_SPLIT leaf (SUCO suppressed by
+                                      // condition 4 — NO_SPLIT without quad split). INTRA_HOR (U bins
+                                      // "10") copies the unavailable-left 128 column — shape-neutral
+                                      // on this rectangular leaf, and independent of the
+                                      // residual-carrying row 15 above it (INTRA_VER would copy it).
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+        enc.encode_decision(0, 0, 0); //   = 1 (INTRA_HOR)
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut gates = btt_tree_gates();
+        gates.sps_suco_flag = true;
+        // MaxSucoLog2Size = 5, MinSucoLog2Size = max(5 − 1, max(4, 2)) = 4.
+        gates.suco_limits = crate::split::SucoSizeLimits::derive(5, 2, 0, 1);
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            tree_gates: gates,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.tree.suco_flag_bins, 1, "exactly one SUCO decision");
+        assert_eq!(stats.tree.suco_mirrored_units, 1);
+        assert_eq!(stats.coding_units, 6, "3 leaves × (luma + chroma) trees");
+        // The DC residual decoded with the FIRST child must have landed
+        // in the right half (x ≥ 16) of the top 32×16 region.
+        let right_has_residual = (0..16).any(|j| (16..32).any(|i| pic.y[j * 32 + i] != 128));
+        assert!(
+            right_has_residual,
+            "mirrored order: first-decoded CU must be the right column"
+        );
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(
+                    pic.y[j * 32 + i],
+                    128,
+                    "left half must be residual-free at ({i},{j})"
+                );
+            }
+        }
+        // Bottom half untouched.
+        assert!(pic.y[16 * 32..].iter().all(|&v| v == 128));
     }
 }
