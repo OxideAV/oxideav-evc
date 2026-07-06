@@ -2720,6 +2720,19 @@ pub struct InterDecodeStats {
     /// Round 387: DMVR subblocks whose §8.5.5 refinement produced a
     /// non-zero `dMvL0` (integer and/or parametric step).
     pub dmvr_refined_subblocks: u32,
+    /// Round 391: §7.3.8.3 BTT/SUCO tree-level syntax tallies
+    /// (`btt_split_*`, `split_unit_coding_order_flag`,
+    /// `pred_mode_constraint_type_flag`, tree-split-point chroma CUs).
+    pub tree: TreeSplitStats,
+    /// Round 391: P/B coding units decoded under a §7.4.9.3
+    /// `PRED_MODE_CONSTRAINT_INTER` subtree (no `pred_mode_flag` bin —
+    /// CuPredMode inferred MODE_INTER).
+    pub inter_constrained_cus: u32,
+    /// Round 391: P/B coding units decoded under a §7.4.9.3
+    /// `PRED_MODE_CONSTRAINT_INTRA_IBC` subtree (no `cu_skip_flag` /
+    /// `pred_mode_flag` bins — luma-only intra/IBC CUs in a local dual
+    /// tree).
+    pub intra_ibc_constrained_cus: u32,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -2823,6 +2836,8 @@ pub fn decode_baseline_inter_slice(
         stats
             .alf_ctb_map
             .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
+        // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
+        // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
         decode_inter_split_unit(
             &mut eng,
             &mut pic,
@@ -2834,6 +2849,9 @@ pub fn decode_baseline_inter_slice(
             y_ctb,
             walk.ctb_log2_size_y,
             walk.ctb_log2_size_y,
+            0,
+            0,
+            crate::split::ModeConstraint::NoConstraint,
         )?;
         stats.ctus += 1;
     }
@@ -2871,6 +2889,16 @@ pub fn decode_baseline_inter_slice(
     Ok((pic, stats))
 }
 
+/// §7.3.8.3 `split_unit()` for the P/B (inter) pixel walker. Mirrors
+/// the IDR-side [`decode_split_unit`] — the decision prefix comes from
+/// the shared [`resolve_split_unit`], the recursion geometry from
+/// [`crate::split::quad_split_children`] /
+/// [`crate::split::split_unit_children`] — plus the P/B-only
+/// mode-constraint machinery: `pred_mode_constraint_type_flag` may have
+/// been signalled (resolved inside `resolve_split_unit`), an
+/// INTER-constrained subtree suppresses `pred_mode_flag`, and an
+/// INTRA_IBC-constrained subtree decodes as a local dual tree (luma-only
+/// intra/IBC CUs + one `DUAL_TREE_CHROMA` CU at the tree-split point).
 #[allow(clippy::too_many_arguments)]
 fn decode_inter_split_unit(
     eng: &mut CabacEngine,
@@ -2883,57 +2911,232 @@ fn decode_inter_split_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    ct_depth: u32,
+    split_unit_order: u32,
+    constraint_current: crate::split::ModeConstraint,
 ) -> Result<()> {
+    use crate::split::{self, ModeConstraint, SplitMode};
     let walk = inputs.walk;
-    let cb_w = 1u32 << log2_cb_width;
-    let cb_h = 1u32 << log2_cb_height;
-    let cb_within_picture = x0 + cb_w <= walk.pic_width && y0 + cb_h <= walk.pic_height;
-    let can_recurse =
-        log2_cb_width > walk.min_cb_log2_size_y && log2_cb_height > walk.min_cb_log2_size_y;
-    let mut split = false;
-    if can_recurse && cb_within_picture && (log2_cb_width > 2 || log2_cb_height > 2) {
-        let bin = eng.decode_decision(0, 0)?;
-        stats.split_cu_flag_bins += 1;
-        split = bin != 0;
-    } else if can_recurse && !cb_within_picture {
-        split = true;
-    }
-    if split {
-        let half_w = log2_cb_width.saturating_sub(1);
-        let half_h = log2_cb_height.saturating_sub(1);
-        let x1 = x0 + (1u32 << half_w);
-        let y1 = y0 + (1u32 << half_h);
-        decode_inter_split_unit(
-            eng, pic, stats, side_info, hmvp, inputs, x0, y0, half_w, half_h,
-        )?;
-        if x1 < walk.pic_width {
-            decode_inter_split_unit(
-                eng, pic, stats, side_info, hmvp, inputs, x1, y0, half_w, half_h,
-            )?;
-        }
-        if y1 < walk.pic_height {
-            decode_inter_split_unit(
-                eng, pic, stats, side_info, hmvp, inputs, x0, y1, half_w, half_h,
-            )?;
-        }
-        if x1 < walk.pic_width && y1 < walk.pic_height {
-            decode_inter_split_unit(
-                eng, pic, stats, side_info, hmvp, inputs, x1, y1, half_w, half_h,
-            )?;
-        }
-        return Ok(());
-    }
-    decode_inter_coding_unit(
+    let r = resolve_split_unit(
         eng,
-        pic,
-        stats,
-        side_info,
-        hmvp,
-        inputs,
+        &walk,
         x0,
         y0,
         log2_cb_width,
         log2_cb_height,
+        split_unit_order,
+        constraint_current,
+        false, // P/B slice
+        &mut stats.split_cu_flag_bins,
+        &mut stats.tree,
+    )?;
+
+    if r.split_cu_flag {
+        for ch in split::quad_split_children(
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            ct_depth,
+            r.suco_order,
+            walk.pic_width,
+            walk.pic_height,
+        ) {
+            decode_inter_split_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                ch.x0,
+                ch.y0,
+                ch.log2_cb_width,
+                ch.log2_cb_height,
+                ch.ct_depth,
+                ch.split_unit_order,
+                ModeConstraint::NoConstraint,
+            )?;
+        }
+    } else if r.mode != SplitMode::NoSplit {
+        for ch in split::split_unit_children(
+            r.mode,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            ct_depth,
+            r.suco_order,
+            split_unit_order,
+            walk.pic_width,
+            walk.pic_height,
+        ) {
+            decode_inter_split_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                ch.x0,
+                ch.y0,
+                ch.log2_cb_width,
+                ch.log2_cb_height,
+                ch.ct_depth,
+                ch.split_unit_order,
+                r.constraint,
+            )?;
+        }
+    } else {
+        // coding_unit() leaf (spec lines 2789-2794).
+        let leaf_constraint = split::leaf_pred_mode_constraint(
+            constraint_current,
+            false,
+            walk.tree_gates.sps_admvp_flag,
+            log2_cb_width,
+            log2_cb_height,
+        );
+        if leaf_constraint == ModeConstraint::IntraIbc {
+            // Luma-only intra/IBC CU (DUAL_TREE_LUMA): no cu_skip_flag,
+            // no pred_mode_flag (§7.3.8.4 presence gates).
+            decode_inter_constrained_intra_ibc_cu(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+            )?;
+            if split::is_tree_split_point(constraint_current, leaf_constraint) {
+                stats.coding_units += 1;
+                decode_inter_intra_cu(
+                    eng,
+                    pic,
+                    stats,
+                    side_info,
+                    walk,
+                    inputs.decode,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    TreeType::DualTreeChroma,
+                )?;
+            }
+        } else {
+            decode_inter_coding_unit(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                leaf_constraint,
+            )?;
+        }
+        return Ok(());
+    }
+    // Non-leaf tree-split point (spec lines 2797-2799): one
+    // DUAL_TREE_CHROMA coding_unit() covering the whole split unit.
+    if split::is_tree_split_point(constraint_current, r.constraint) {
+        stats.tree.chroma_tree_split_points += 1;
+        stats.coding_units += 1;
+        decode_inter_intra_cu(
+            eng,
+            pic,
+            stats,
+            side_info,
+            walk,
+            inputs.decode,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            TreeType::DualTreeChroma,
+        )?;
+    }
+    Ok(())
+}
+
+/// §7.3.8.4 `coding_unit()` for a P/B leaf inside a
+/// `PRED_MODE_CONSTRAINT_INTRA_IBC` subtree: `cu_skip_flag` and
+/// `pred_mode_flag` are both absent (presence gates at spec lines
+/// 2806-2808 / 2843-2844), so the CU is MODE_INTRA unless the
+/// `isIbcAllowed` `ibc_flag` (§7.4.9.4 — the constraint satisfies the
+/// "not NO_CONSTRAINT" arm of its last condition) selects MODE_IBC.
+/// Decodes as `DUAL_TREE_LUMA`; the chroma CU belongs to the tree-split
+/// ancestor.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_constrained_intra_ibc_cu(
+    eng: &mut CabacEngine,
+    pic: &mut YuvPicture,
+    stats: &mut InterDecodeStats,
+    side_info: &mut SideInfoGrid,
+    hmvp: &mut crate::hmvp::HmvpCandList,
+    inputs: &InterDecodeInputs<'_, '_>,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> Result<()> {
+    stats.coding_units += 1;
+    stats.intra_ibc_constrained_cus += 1;
+    let ibc_allowed = crate::ibc::is_ibc_allowed_for_size(
+        inputs.decode.sps_ibc_flag,
+        inputs.decode.log2_max_ibc_cand_size,
+        log2_cb_width,
+        log2_cb_height,
+    );
+    if ibc_allowed {
+        let ibc_bin = eng.decode_decision(0, 0)?;
+        stats.ibc_flag_bins += 1;
+        if ibc_bin != 0 {
+            stats.ibc_cus += 1;
+            let mvd_x = decode_signed_mvd(
+                eng,
+                &mut stats.ibc_abs_mvd_bins,
+                &mut stats.ibc_mvd_sign_bins,
+            )?;
+            let mvd_y = decode_signed_mvd(
+                eng,
+                &mut stats.ibc_abs_mvd_bins,
+                &mut stats.ibc_mvd_sign_bins,
+            )?;
+            return decode_inter_ibc_branch(
+                eng,
+                pic,
+                stats,
+                side_info,
+                hmvp,
+                inputs,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                MotionVector { x: mvd_x, y: mvd_y },
+            );
+        }
+    }
+    decode_inter_intra_cu(
+        eng,
+        pic,
+        stats,
+        side_info,
+        inputs.walk,
+        inputs.decode,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+        TreeType::DualTreeLuma,
     )
 }
 
@@ -3849,12 +4052,24 @@ fn decode_inter_coding_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    constraint: crate::split::ModeConstraint,
 ) -> Result<()> {
+    use crate::split::ModeConstraint;
+    debug_assert_ne!(
+        constraint,
+        ModeConstraint::IntraIbc,
+        "INTRA_IBC leaves route through decode_inter_constrained_intra_ibc_cu"
+    );
     stats.coding_units += 1;
+    if constraint == ModeConstraint::Inter {
+        stats.inter_constrained_cus += 1;
+    }
     let walk = inputs.walk;
     let n_cb_w = 1u32 << log2_cb_width;
     let n_cb_h = 1u32 << log2_cb_height;
-    // §7.3.8.4: cu_skip_flag at PRED_MODE_NO_CONSTRAINT.
+    // §7.3.8.4 lines 2806-2807: cu_skip_flag is present whenever
+    // predModeConstraint != PRED_MODE_CONSTRAINT_INTRA_IBC (both
+    // NO_CONSTRAINT and CONSTRAINT_INTER reach here).
     let cu_skip = eng.decode_decision(0, 0)? != 0;
     stats.cu_skip_flag_bins += 1;
     let pred_l0;
@@ -3938,23 +4153,37 @@ fn decode_inter_coding_unit(
         pred_l1 = mv_l1.map(|mv| (mv, 0u32));
     } else {
         // pred_mode_flag (FL cMax=1) — 1 = MODE_INTRA, 0 = MODE_INTER (per
-        // EVC convention: pred_mode_flag = 1 means INTRA).
-        let pred_mode_flag = eng.decode_decision(0, 0)?;
-        stats.pred_mode_flag_bins += 1;
-        // Round 95: §7.3.8.4 lines 2845-2846 — when `isIbcAllowed`
-        // holds (sps_ibc_flag = 1 + CB ≤ log2MaxIbcCandSize on both
-        // dims), the `ibc_flag` regular-coded bin is read next. Per
-        // §7.4.9.5: when `ibc_flag = 1`, CuPredMode is set to
-        // MODE_IBC regardless of `pred_mode_flag`. Table 90 column for
-        // `ibc_flag` → ctxTable = Table 66, ctxIdxOffset = 0; under
-        // sps_cm_init_flag = 0 (Baseline) the only available ctxIdx is
-        // 0 (Table 95).
-        let ibc_allowed = crate::ibc::is_ibc_allowed_for_size(
-            inputs.decode.sps_ibc_flag,
-            inputs.decode.log2_max_ibc_cand_size,
-            log2_cb_width,
-            log2_cb_height,
-        );
+        // EVC convention: pred_mode_flag = 1 means INTRA). §7.3.8.4 lines
+        // 2843-2844: present only under PRED_MODE_NO_CONSTRAINT; a
+        // CONSTRAINT_INTER subtree infers MODE_INTER without a bin
+        // (§7.4.9.4 CuPredMode derivation).
+        let pred_mode_flag = if constraint == ModeConstraint::NoConstraint {
+            let bin = eng.decode_decision(0, 0)?;
+            stats.pred_mode_flag_bins += 1;
+            bin
+        } else {
+            0
+        };
+        // Round 95 / round 391: §7.3.8.4 lines 2845-2846 — the
+        // `ibc_flag` bin is read when `isIbcAllowed` holds. §7.4.9.4
+        // conditions: sps_ibc_flag = 1, CB ≤ log2MaxIbcCandSize on both
+        // dims, treeType != DUAL_TREE_CHROMA, predModeConstraint !=
+        // PRED_MODE_CONSTRAINT_INTER, and (predModeConstraint !=
+        // PRED_MODE_NO_CONSTRAINT or pred_mode_flag == 1) — on this
+        // (unconstrained / INTER-constrained) path that reduces to an
+        // unconstrained CU with pred_mode_flag == 1. Round 391 fixes the
+        // round-95 behaviour that read the bin for pred_mode_flag == 0
+        // CUs too. Table 90 column for `ibc_flag` → ctxTable = Table 66,
+        // ctxIdxOffset = 0; under sps_cm_init_flag = 0 the only
+        // available ctxIdx is 0 (Table 95).
+        let ibc_allowed = constraint == ModeConstraint::NoConstraint
+            && pred_mode_flag == 1
+            && crate::ibc::is_ibc_allowed_for_size(
+                inputs.decode.sps_ibc_flag,
+                inputs.decode.log2_max_ibc_cand_size,
+                log2_cb_width,
+                log2_cb_height,
+            );
         if ibc_allowed {
             let ibc_bin = eng.decode_decision(0, 0)?;
             stats.ibc_flag_bins += 1;
@@ -3989,7 +4218,8 @@ fn decode_inter_coding_unit(
             }
         }
         if pred_mode_flag != 0 {
-            // MODE_INTRA inside a P/B slice.
+            // MODE_INTRA inside a P/B slice (single-tree: luma + chroma
+            // in one coding_unit()).
             return decode_inter_intra_cu(
                 eng,
                 pic,
@@ -4001,6 +4231,7 @@ fn decode_inter_coding_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                TreeType::SingleTree,
             );
         }
         // MODE_INTER.
@@ -5270,20 +5501,33 @@ fn decode_inter_intra_cu(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    tree_type: TreeType,
 ) -> Result<()> {
     use crate::intra::IntraMode;
     use crate::picture::intra_reconstruct_cb;
-    let intra_idx = eng.decode_u_regular(0, |_| 0)?;
-    let intra_mode = IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
-        Error::invalid(format!(
-            "evc inter decode: intra_pred_mode {intra_idx} out of range"
-        ))
-    })?;
+    // §7.3.8.4: intra_pred_mode is read only when
+    // `treeType != DUAL_TREE_CHROMA`. A standalone DUAL_TREE_CHROMA CU
+    // (the local-dual-tree chroma at a §7.4.9.3 tree-split point) uses
+    // INTRA_DC, mirroring the IDR-side round-5 simplification.
+    let is_luma_tree = tree_type != TreeType::DualTreeChroma;
+    let intra_mode = if is_luma_tree {
+        let intra_idx = eng.decode_u_regular(0, |_| 0)?;
+        IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc inter decode: intra_pred_mode {intra_idx} out of range"
+            ))
+        })?
+    } else {
+        IntraMode::Dc
+    };
     let log2_tb_w = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_h = log2_cb_height.min(walk.max_tb_log2_size_y);
-    let chroma_present = walk.chroma_format_idc != 0;
-    let cbf_luma = eng.decode_decision(0, 0)?;
-    stats.cbf_luma_bins += 1;
+    let chroma_present = walk.chroma_format_idc != 0 && tree_type != TreeType::DualTreeLuma;
+    let mut cbf_luma = 0u8;
+    if is_luma_tree {
+        cbf_luma = eng.decode_decision(0, 0)?;
+        stats.cbf_luma_bins += 1;
+    }
     let mut cbf_cb = 0u8;
     let mut cbf_cr = 0u8;
     if chroma_present {
@@ -5292,39 +5536,41 @@ fn decode_inter_intra_cu(
         stats.cbf_chroma_bins += 2;
     }
     let cu_qp = decode.slice_qp.clamp(0, 51);
-    // Stamp side-info for the deblocking pass.
-    side_info.stamp_block(
-        x0,
-        y0,
-        1u32 << log2_cb_width,
-        1u32 << log2_cb_height,
-        CuSideInfo {
-            pred_mode: CuPredMode::Intra,
-            cbf_luma,
-            ..Default::default()
-        },
-    );
-    let n = (1usize << log2_tb_w) * (1usize << log2_tb_h);
-    let mut residual = vec![0i32; n];
-    if cbf_luma != 0 {
-        let mut levels = vec![0i32; n];
-        decode_residual_coding_rle(
-            eng,
-            &mut levels,
-            &mut stats.coeff_runs,
-            log2_tb_w,
-            log2_tb_h,
-        )?;
-        scale_and_inverse_transform(
-            &levels,
-            &mut residual,
-            1usize << log2_tb_w,
-            1usize << log2_tb_h,
-            cu_qp,
-            decode.bit_depth_luma,
-        )?;
+    if is_luma_tree {
+        // Stamp side-info for the deblocking pass.
+        side_info.stamp_block(
+            x0,
+            y0,
+            1u32 << log2_cb_width,
+            1u32 << log2_cb_height,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                cbf_luma,
+                ..Default::default()
+            },
+        );
+        let n = (1usize << log2_tb_w) * (1usize << log2_tb_h);
+        let mut residual = vec![0i32; n];
+        if cbf_luma != 0 {
+            let mut levels = vec![0i32; n];
+            decode_residual_coding_rle(
+                eng,
+                &mut levels,
+                &mut stats.coeff_runs,
+                log2_tb_w,
+                log2_tb_h,
+            )?;
+            scale_and_inverse_transform(
+                &levels,
+                &mut residual,
+                1usize << log2_tb_w,
+                1usize << log2_tb_h,
+                cu_qp,
+                decode.bit_depth_luma,
+            )?;
+        }
+        intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, intra_mode, 0, &residual)?;
     }
-    intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, intra_mode, 0, &residual)?;
     if chroma_present {
         let log2_c_w = log2_tb_w.saturating_sub(1);
         let log2_c_h = log2_tb_h.saturating_sub(1);
@@ -11364,5 +11610,172 @@ mod tests {
         }
         // Bottom half untouched.
         assert!(pic.y[16 * 32..].iter().all(|&v| v == 128));
+    }
+
+    /// Round 391: the §7.3.8.3 BTT walk + §7.4.9.3 mode-constraint
+    /// machinery on a P slice (`sps_admvp_flag == 1`). One 32×32 CTU
+    /// BTT-splits down to two 8×8 blocks that binary-split further —
+    /// the 64-luma-sample BT trigger — so `pred_mode_constraint_type_
+    /// flag` is signalled for each:
+    ///
+    /// * the first signals 0 → `PRED_MODE_CONSTRAINT_INTER`: its two
+    ///   4×8 children read `cu_skip_flag` but no `pred_mode_flag`;
+    /// * the second signals 1 → `PRED_MODE_CONSTRAINT_INTRA_IBC`: its
+    ///   two 4×8 children are luma-only intra CUs (no `cu_skip_flag`,
+    ///   no `pred_mode_flag`) and one `DUAL_TREE_CHROMA` CU covering
+    ///   the 8×8 follows at the tree-split point (the local dual tree).
+    ///
+    /// Every unconstrained leaf is an admvp cu_skip zero-MV merge CU.
+    /// Pins the exact presence-gating tallies of all three layers.
+    #[test]
+    fn round391_pb_btt_pred_mode_constraint_inter_and_local_dual_tree() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        use crate::inter::RefPictureView;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let t_pmc = MainCtxTable::PredModeConstraintType as usize;
+        let ref_y = vec![200u8; 32 * 32];
+        let ref_cb = vec![128u8; 16 * 16];
+        let ref_cr = vec![128u8; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        // An admvp cu_skip zero-MV merge leaf: cu_skip = 1, merge_idx =
+        // 0 (TR, single 0 bin), then the walker's cbf triplet.
+        let skip_leaf = |enc: &mut CabacEncoder| {
+            enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+            enc.encode_decision(0, 0, 0); // merge_idx = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        };
+        // (0,0,5,5) → BT_HOR.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // A (0,0) 32×16 → BT_VER.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_type, 0, 0);
+        // A1 (0,0) 16×16 → BT_HOR.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // (0,0) 16×8 → BT_VER.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_type, 0, 0);
+        // (0,0) 8×8 → BT_VER (8×8 has no TT option → btt_split_type
+        // inferred 0, no bin). 64-sample BT split on a P slice with
+        // admvp → pred_mode_constraint_type_flag signalled: 0 = INTER.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_pmc, 0, 0);
+        // Its two 4×8 children: every further split is disallowed under
+        // the INTER constraint (no btt_split_flag bin) → skip leaves
+        // with no pred_mode_flag.
+        skip_leaf(&mut enc);
+        skip_leaf(&mut enc);
+        // (8,0) 8×8 → BT_VER, pred_mode_constraint_type_flag = 1 =
+        // INTRA_IBC → local dual tree.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 1);
+        enc.encode_decision(t_pmc, 0, 1);
+        // Its two 4×8 children: BT_HOR is allowed again (the INTER
+        // 4×4-outcome carve-outs don't apply) → a btt_split_flag = 0
+        // bin, then a luma-only intra CU (intra_pred_mode = 0 DC,
+        // cbf_luma = 0) — no cu_skip_flag, no pred_mode_flag.
+        for _ in 0..2 {
+            enc.encode_decision(t_flag, 0, 0);
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        }
+        // Tree-split point: one DUAL_TREE_CHROMA CU covering the 8×8.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // (0,8) 16×8 leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        skip_leaf(&mut enc);
+        // A2 (16,0) 16×16 leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        skip_leaf(&mut enc);
+        // B (0,16) 32×16 leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        skip_leaf(&mut enc);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut gates = btt_tree_gates();
+        gates.sps_admvp_flag = true;
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            tree_gates: gates,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let tool_gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: tool_gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (_pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.split_cu_flag_bins, 0);
+        assert_eq!(
+            stats.tree.btt.flag_bins, 11,
+            "5 split nodes + 2 IntraIbc 4×8 leaves + 4 unconstrained leaves \
+             (the 2 INTER-constrained 4×8 leaves allow no split → no bin)"
+        );
+        assert_eq!(stats.tree.btt.dir_bins, 6);
+        assert_eq!(
+            stats.tree.btt.type_bins, 4,
+            "the two 8×8 splits infer btt_split_type (no TT option)"
+        );
+        assert_eq!(stats.tree.pred_mode_constraint_flag_bins, 2);
+        assert_eq!(stats.inter_constrained_cus, 2);
+        assert_eq!(stats.intra_ibc_constrained_cus, 2);
+        assert_eq!(stats.tree.chroma_tree_split_points, 1);
+        assert_eq!(
+            stats.cu_skip_flag_bins, 5,
+            "2 INTER-constrained + 3 unconstrained leaves; IntraIbc CUs read none"
+        );
+        assert_eq!(stats.admvp_skip_cus, 5);
+        assert_eq!(
+            stats.pred_mode_flag_bins, 0,
+            "all unconstrained CUs were skip; constrained CUs never signal it"
+        );
+        assert_eq!(
+            stats.coding_units, 8,
+            "5 skip + 2 luma-only intra + 1 dual-tree chroma"
+        );
     }
 }

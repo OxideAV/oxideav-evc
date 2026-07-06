@@ -606,9 +606,11 @@ impl EvcDecoder {
         // P/B slices route each coding unit through the §7.3.8.4
         // Main-profile syntax drivers (merge/MMVD/affine/explicit-AMVP)
         // via the InterToolGates threaded below.
-        if sps.sps_btt_flag
-            || sps.sps_suco_flag
-            || sps.sps_eipd_flag
+        // Round 391: sps_btt_flag / sps_suco_flag are lifted — the P/B
+        // walker decodes the §7.3.8.3 BTT split group, the SUCO order
+        // flag and the §7.4.9.3 pred_mode_constraint machinery via the
+        // threaded CodingTreeGates.
+        if sps.sps_eipd_flag
             || sps.sps_addb_flag
             || sps.sps_dquant_flag
             || sps.sps_ats_flag
