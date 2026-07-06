@@ -256,8 +256,9 @@ impl EvcDecoder {
     ///    `y` plane in-place, which iterates §8.9.5 → eq. 1374-1376 per
     ///    sample.
     ///
-    /// 8-bit only — `YuvPicture` stores samples as `u8`, matching the
-    /// only `bit_depth_luma_minus8 == 0` case we currently materialise.
+    /// 8-bit code space — the §8.9.3 LUT is 256-entry, so >8-bit
+    /// pictures clamp their index defensively (10-bit DRA is a
+    /// documented follow-up).
     ///
     /// **This method is independent of the legacy round-148
     /// [`dra::apply_dra`] path used by [`Self::apply_post_filters`].**
@@ -1015,7 +1016,11 @@ impl EvcDecoder {
                 }
             }
         }
-        if sps.sps_dra_flag {
+        if sps.sps_dra_flag && pic.bit_depth == 8 {
+            // The DRA apply path is 8-bit-code-space (256-entry LUTs);
+            // >8-bit DRA application is a documented follow-up, so
+            // high-bit-depth pictures skip the mapping rather than
+            // clamp through an 8-bit LUT.
             if let Some(dra_data) = self.dra_aps_for_pps(in_.dra_aps_id) {
                 dra::apply_dra(pic, dra_data, bd_y, bd_c);
             }
@@ -1136,22 +1141,53 @@ fn apply_chroma_alf_masked_or_whole_plane(
 fn picture_to_video_frame(pic: &crate::picture::YuvPicture, pts: Option<i64>) -> VideoFrame {
     let y_stride = pic.y_stride();
     let c_stride = pic.c_stride();
-    VideoFrame {
-        pts,
-        planes: vec![
-            VideoPlane {
-                stride: y_stride,
-                data: pic.y.clone(),
-            },
-            VideoPlane {
-                stride: c_stride,
-                data: pic.cb.clone(),
-            },
-            VideoPlane {
-                stride: c_stride,
-                data: pic.cr.clone(),
-            },
-        ],
+    if pic.bit_depth <= 8 {
+        // 8-bit output: one byte per sample (Yuv420P-family layout).
+        let pack8 = |src: &[u16]| -> Vec<u8> { src.iter().map(|&v| v as u8).collect() };
+        VideoFrame {
+            pts,
+            planes: vec![
+                VideoPlane {
+                    stride: y_stride,
+                    data: pack8(&pic.y),
+                },
+                VideoPlane {
+                    stride: c_stride,
+                    data: pack8(&pic.cb),
+                },
+                VideoPlane {
+                    stride: c_stride,
+                    data: pack8(&pic.cr),
+                },
+            ],
+        }
+    } else {
+        // High-bit-depth output: two little-endian bytes per sample
+        // (the Yuv420P10Le-family layout); strides are in bytes.
+        let pack16 = |src: &[u16]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(src.len() * 2);
+            for &v in src {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        };
+        VideoFrame {
+            pts,
+            planes: vec![
+                VideoPlane {
+                    stride: y_stride * 2,
+                    data: pack16(&pic.y),
+                },
+                VideoPlane {
+                    stride: c_stride * 2,
+                    data: pack16(&pic.cb),
+                },
+                VideoPlane {
+                    stride: c_stride * 2,
+                    data: pack16(&pic.cr),
+                },
+            ],
+        }
     }
 }
 
@@ -1610,7 +1646,7 @@ mod tests {
         let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
         // Seed luma with a known pattern so we can detect any mutation.
         for (i, v) in pic.y.iter_mut().enumerate() {
-            *v = (i as u8).wrapping_mul(17);
+            *v = (i as u16).wrapping_mul(17);
         }
         let before = pic.y.clone();
         let applied = dec
@@ -1657,14 +1693,14 @@ mod tests {
         // so `pic.y[i] = i`.
         let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
         for (i, v) in pic.y.iter_mut().enumerate() {
-            *v = i as u8;
+            *v = i as u16;
         }
         let applied = dec
             .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(7))
             .expect("identity scale must not error");
         assert!(applied, "populated slot ⇒ Ok(true)");
         for (i, &v) in pic.y.iter().enumerate() {
-            assert_eq!(v, i as u8, "identity LUT failed at i = {i}: got {v}");
+            assert_eq!(v, i as u16, "identity LUT failed at i = {i}: got {v}");
         }
     }
 
@@ -1684,7 +1720,7 @@ mod tests {
         let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
         // 16 samples covering the input domain in 16-wide steps.
         for (i, v) in pic.y.iter_mut().enumerate() {
-            *v = (i as u8).saturating_mul(16);
+            *v = (i as u16).saturating_mul(16);
         }
         let applied = dec
             .apply_luma_inverse_mapping_spec_faithful(&mut pic, Some(2))
@@ -1771,7 +1807,7 @@ mod tests {
 
         let mut pic = YuvPicture::new(4, 4, 1, 8).unwrap();
         for (i, v) in pic.y.iter_mut().enumerate() {
-            *v = (i as u8) * 16;
+            *v = (i as u16) * 16;
         }
         let before = pic.y.clone();
         let applied = dec
@@ -1780,5 +1816,33 @@ mod tests {
         assert!(applied, "spec-faithful path reads dra_syntax_aps[4]");
         // Identity scale ⇒ luma plane unchanged.
         assert_eq!(pic.y, before);
+    }
+
+    /// Round 391: `picture_to_video_frame` packs 8-bit pictures one
+    /// byte per sample and >8-bit pictures as two little-endian bytes
+    /// per sample (the Yuv420P10Le-family layout) with byte strides.
+    #[test]
+    fn round391_video_frame_packing_8_and_10_bit() {
+        let mut pic8 = crate::picture::YuvPicture::new(4, 4, 1, 8).unwrap();
+        pic8.y[0] = 200;
+        let f8 = picture_to_video_frame(&pic8, Some(7));
+        assert_eq!(f8.planes[0].stride, 4);
+        assert_eq!(f8.planes[0].data.len(), 16);
+        assert_eq!(f8.planes[0].data[0], 200);
+        assert_eq!(f8.planes[1].data.len(), 4);
+
+        let mut pic10 = crate::picture::YuvPicture::new(4, 4, 1, 10).unwrap();
+        pic10.y[0] = 700; // 0x02BC — exceeds the 8-bit range
+        let f10 = picture_to_video_frame(&pic10, Some(7));
+        assert_eq!(f10.planes[0].stride, 8, "byte stride = 2 × width");
+        assert_eq!(f10.planes[0].data.len(), 32);
+        assert_eq!(
+            &f10.planes[0].data[0..2],
+            &700u16.to_le_bytes(),
+            "little-endian 10-bit sample"
+        );
+        // Mid-level fill 512 = 0x0200 for the untouched samples.
+        assert_eq!(&f10.planes[0].data[2..4], &512u16.to_le_bytes());
+        assert_eq!(&f10.planes[1].data[0..2], &512u16.to_le_bytes());
     }
 }

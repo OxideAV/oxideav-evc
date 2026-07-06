@@ -132,9 +132,9 @@ pub fn round_motion_vector(mv: MotionVector, right_shift: u32, left_shift: u32) 
 /// the decoder's reference-frame cache; this view is `Copy`-cheap.
 #[derive(Clone, Copy, Debug)]
 pub struct RefPictureView<'a> {
-    pub y: &'a [u8],
-    pub cb: &'a [u8],
-    pub cr: &'a [u8],
+    pub y: &'a [u16],
+    pub cb: &'a [u16],
+    pub cr: &'a [u16],
     pub width: u32,
     pub height: u32,
     pub y_stride: usize,
@@ -1787,14 +1787,14 @@ mod tests {
     /// reference verbatim.
     #[test]
     fn luma_zero_mv_copies_reference() {
-        let mut y = vec![0u8; 16 * 16];
+        let mut y = vec![0u16; 16 * 16];
         for j in 0..16 {
             for i in 0..16 {
-                y[j * 16 + i] = (i * 16 + j) as u8;
+                y[j * 16 + i] = (i * 16 + j) as u16;
             }
         }
-        let cb = vec![128u8; 64];
-        let cr = vec![128u8; 64];
+        let cb = vec![128u16; 64];
+        let cr = vec![128u16; 64];
         let refp = RefPictureView {
             y: &y,
             cb: &cb,
@@ -1810,7 +1810,7 @@ mod tests {
         for j in 0..4 {
             for i in 0..4 {
                 assert_eq!(
-                    out[j * 4 + i] as u8,
+                    out[j * 4 + i] as u16,
                     y[(4 + j) * 16 + (4 + i)],
                     "row {j} col {i}"
                 );
@@ -1848,9 +1848,9 @@ mod tests {
     /// signal at the same DC value.
     #[test]
     fn luma_half_pel_filter_dc_invariant() {
-        let y = vec![100u8; 32 * 32];
-        let cb = vec![128u8; 16 * 16];
-        let cr = vec![128u8; 16 * 16];
+        let y = vec![100u16; 32 * 32];
+        let cb = vec![128u16; 16 * 16];
+        let cr = vec![128u16; 16 * 16];
         let refp = RefPictureView {
             y: &y,
             cb: &cb,
@@ -1874,9 +1874,9 @@ mod tests {
     /// Non-Baseline luma phase is rejected.
     #[test]
     fn rejects_non_baseline_luma_phase() {
-        let y = vec![0u8; 16 * 16];
-        let cb = vec![0u8; 64];
-        let cr = vec![0u8; 64];
+        let y = vec![0u16; 16 * 16];
+        let cb = vec![0u16; 64];
+        let cr = vec![0u16; 64];
         let refp = RefPictureView {
             y: &y,
             cb: &cb,
@@ -3053,13 +3053,13 @@ mod tests {
     /// Build a 32×32 reference with a horizontal luma ramp (y = 4·x) and
     /// distinct flat chroma.
     fn ramp_ref<'a>(
-        y: &'a mut Vec<u8>,
-        cb: &'a mut Vec<u8>,
-        cr: &'a mut Vec<u8>,
+        y: &'a mut Vec<u16>,
+        cb: &'a mut Vec<u16>,
+        cr: &'a mut Vec<u16>,
     ) -> RefPictureView<'a> {
-        *y = (0..32 * 32).map(|i| ((i % 32) * 4) as u8).collect();
-        *cb = (0..16 * 16).map(|i| ((i % 16) * 8) as u8).collect();
-        *cr = vec![77u8; 16 * 16];
+        *y = (0..32 * 32).map(|i| ((i % 32) * 4) as u16).collect();
+        *cb = (0..16 * 16).map(|i| ((i % 16) * 8) as u16).collect();
+        *cr = vec![77u16; 16 * 16];
         RefPictureView {
             y,
             cb,

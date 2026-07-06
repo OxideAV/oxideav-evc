@@ -386,10 +386,10 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
                     pic.y[row + x + 1] as i32,
                 ];
                 filter_edge_4tap(&mut s, s_t_prime, max_val);
-                pic.y[row + x - 2] = s[0] as u8;
-                pic.y[row + x - 1] = s[1] as u8;
-                pic.y[row + x] = s[2] as u8;
-                pic.y[row + x + 1] = s[3] as u8;
+                pic.y[row + x - 2] = s[0] as u16;
+                pic.y[row + x - 1] = s[1] as u16;
+                pic.y[row + x] = s[2] as u16;
+                pic.y[row + x + 1] = s[3] as u16;
             }
             edges += 1;
             y += 4;
@@ -418,10 +418,10 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
                     pic.y[(y + 1) * stride + col] as i32,
                 ];
                 filter_edge_4tap(&mut s, s_t_prime, max_val);
-                pic.y[(y - 2) * stride + col] = s[0] as u8;
-                pic.y[(y - 1) * stride + col] = s[1] as u8;
-                pic.y[y * stride + col] = s[2] as u8;
-                pic.y[(y + 1) * stride + col] = s[3] as u8;
+                pic.y[(y - 2) * stride + col] = s[0] as u16;
+                pic.y[(y - 1) * stride + col] = s[1] as u16;
+                pic.y[y * stride + col] = s[2] as u16;
+                pic.y[(y + 1) * stride + col] = s[3] as u16;
             }
             edges += 1;
             x += 4;
@@ -548,8 +548,8 @@ pub fn deblock_chroma(
                     plane[row + xc + 1] as i32,
                 ];
                 filter_chroma_edge_2tap(&mut s, stp_use, max_val);
-                plane[row + xc - 1] = s[1] as u8;
-                plane[row + xc] = s[2] as u8;
+                plane[row + xc - 1] = s[1] as u16;
+                plane[row + xc] = s[2] as u16;
             }
             edges += 1;
             yc += 4;
@@ -593,8 +593,8 @@ pub fn deblock_chroma(
                     plane[(yc + 1) * stride + col] as i32,
                 ];
                 filter_chroma_edge_2tap(&mut s, stp_use, max_val);
-                plane[(yc - 1) * stride + col] = s[1] as u8;
-                plane[yc * stride + col] = s[2] as u8;
+                plane[(yc - 1) * stride + col] = s[1] as u16;
+                plane[yc * stride + col] = s[2] as u16;
             }
             edges += 1;
             xc += 4;

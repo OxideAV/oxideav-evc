@@ -628,15 +628,15 @@ mod tests {
         let mut p = YuvPicture::new(w, h, 1, 8).expect("pic alloc");
         for y in 0..(h as usize) {
             for x in 0..(w as usize) {
-                p.y[y * w as usize + x] = ((x + y) & 0xFF) as u8;
+                p.y[y * w as usize + x] = ((x + y) & 0xFF) as u16;
             }
         }
         let cw = (w as usize) / 2;
         let ch = (h as usize) / 2;
         for y in 0..ch {
             for x in 0..cw {
-                p.cb[y * cw + x] = (x & 0xFF) as u8;
-                p.cr[y * cw + x] = (y & 0xFF) as u8;
+                p.cb[y * cw + x] = (x & 0xFF) as u16;
+                p.cr[y * cw + x] = (y & 0xFF) as u16;
             }
         }
         p

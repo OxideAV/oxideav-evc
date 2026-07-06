@@ -331,7 +331,7 @@ pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_d
 
     // Snapshot the pre-DRA luma plane: §8.9.4 inputs require decPictureL
     // (the decoded, pre-mapping luma) as the segment-index source.
-    let pre_dra_luma: Option<Vec<u8>> = if pic.chroma_format_idc != 0 {
+    let pre_dra_luma: Option<Vec<u16>> = if pic.chroma_format_idc != 0 {
         Some(pic.y.clone())
     } else {
         None
@@ -339,7 +339,9 @@ pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_d
 
     let lut = build_luma_lut(dra, bit_depth_luma);
     for v in pic.y.iter_mut() {
-        *v = lut[*v as usize];
+        // 8-bit code-space LUT; >8-bit samples clamp defensively (the
+        // decoder gates DRA application on bit_depth == 8).
+        *v = lut[(*v).min(255) as usize] as u16;
     }
 
     if pic.chroma_format_idc != 0 {
@@ -383,8 +385,8 @@ pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_d
 
 #[allow(clippy::too_many_arguments)]
 fn apply_chroma_plane_offset(
-    plane: &mut [u8],
-    pre_y: &[u8],
+    plane: &mut [u16],
+    pre_y: &[u16],
     luma_w: usize,
     luma_h: usize,
     chroma_w: usize,
@@ -407,7 +409,7 @@ fn apply_chroma_plane_offset(
             let seg = find_range_idx(luma_sample, ranges, num_ranges);
             let c_off = dra.chroma_qp_offset[seg] as i32;
             let v = plane[row_off_chroma + x] as i32;
-            plane[row_off_chroma + x] = (v + c_off).clamp(0, max_c) as u8;
+            plane[row_off_chroma + x] = (v + c_off).clamp(0, max_c) as u16;
         }
     }
 }
@@ -994,13 +996,15 @@ pub fn apply_luma_inverse_mapping(plane: &mut [u16], derived: &DraDerived, bit_d
 /// holding 8-bit pictures don't need to widen-then-narrow. Internally
 /// builds a 256-entry LUT via [`build_inv_luma_lut_8bit`] and applies it
 /// to every sample.
-pub fn apply_luma_inverse_mapping_u8(plane: &mut [u8], derived: &DraDerived) {
+pub fn apply_luma_inverse_mapping_u8(plane: &mut [u16], derived: &DraDerived) {
     if derived.num_ranges == 0 {
         return;
     }
     let lut = build_inv_luma_lut_8bit(derived);
     for sample in plane.iter_mut() {
-        *sample = lut[*sample as usize];
+        // 8-bit code-space LUT; >8-bit samples clamp defensively (the
+        // decoder gates DRA application on bit_depth == 8).
+        *sample = lut[(*sample).min(255) as usize] as u16;
     }
 }
 
@@ -1440,8 +1444,8 @@ pub fn map_one_chroma_sample(chroma_sample: i64, chroma_scale: i64, bit_depth_ch
 /// No-ops when `chroma_derived.num_ranges_l == 0` (empty state).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_chroma_inverse_mapping_u8(
-    plane: &mut [u8],
-    pre_luma: &[u8],
+    plane: &mut [u16],
+    pre_luma: &[u16],
     luma_w: usize,
     luma_h: usize,
     chroma_w: usize,
@@ -1466,7 +1470,7 @@ pub fn apply_chroma_inverse_mapping_u8(
             let chroma_scale = chroma_scale_for_luma_sample(luma_sample, chroma_derived);
             let chroma_sample = plane[row_off_chroma + x] as i64;
             plane[row_off_chroma + x] =
-                map_one_chroma_sample(chroma_sample, chroma_scale, bit_depth_chroma) as u8;
+                map_one_chroma_sample(chroma_sample, chroma_scale, bit_depth_chroma) as u16;
         }
     }
 }
@@ -2533,7 +2537,7 @@ mod tests {
     fn apply_dra_identity_mapping_preserves_picture() {
         let mut pic = crate::picture::YuvPicture::new(8, 8, 1, 8).unwrap();
         for (i, v) in pic.y.iter_mut().enumerate() {
-            *v = (i % 256) as u8;
+            *v = (i % 256) as u16;
         }
         let snapshot = pic.y.clone();
         // Single segment, scale = 1.0 → identity LUT.
@@ -2672,9 +2676,9 @@ mod tests {
                     2
                 };
                 let luma_val = match seg {
-                    0 => 0u8,
-                    1 => 128u8,
-                    _ => 192u8,
+                    0 => 0u16,
+                    1 => 128u16,
+                    _ => 192u16,
                 };
                 pic.y[y * 8 + x] = luma_val;
             }
@@ -2715,12 +2719,12 @@ mod tests {
                 };
                 assert_eq!(
                     pic.cb[y * 8 + x],
-                    (100 + expect_off) as u8,
+                    (100 + expect_off) as u16,
                     "Cb at ({x},{y}) wrong segment offset"
                 );
                 assert_eq!(
                     pic.cr[y * 8 + x],
-                    (100 + expect_off) as u8,
+                    (100 + expect_off) as u16,
                     "Cr at ({x},{y}) wrong segment offset"
                 );
             }
@@ -2807,7 +2811,7 @@ mod tests {
         // rows 2,3 read luma rows 4,6 (both seg 1 → +9).
         for y in 0..4 {
             for x in 0..4 {
-                let expect = if y < 2 { 63u8 } else { 69u8 };
+                let expect = if y < 2 { 63u16 } else { 69u16 };
                 assert_eq!(
                     pic.cb[y * 4 + x],
                     expect,
@@ -3357,8 +3361,8 @@ mod tests {
         der.inv_luma_scales[0] = 512;
         der.dra_offsets[0] = 0;
         let lut = build_inv_luma_lut_8bit(&der);
-        let mut plane = vec![0u8, 1, 50, 128, 200, 255];
-        let expected: Vec<u8> = plane.iter().map(|&v| lut[v as usize]).collect();
+        let mut plane = vec![0u16, 1, 50, 128, 200, 255];
+        let expected: Vec<u16> = plane.iter().map(|&v| lut[v as usize] as u16).collect();
         apply_luma_inverse_mapping_u8(&mut plane, &der);
         assert_eq!(plane, expected);
         // For this identity-Q18 case the LUT is identity.
@@ -3374,9 +3378,9 @@ mod tests {
         let mut plane = vec![10u16, 100, 1000];
         apply_luma_inverse_mapping(&mut plane, &der, 10);
         assert_eq!(plane, vec![10u16, 100, 1000]);
-        let mut plane8 = vec![10u8, 100, 250];
+        let mut plane8 = vec![10u16, 100, 250];
         apply_luma_inverse_mapping_u8(&mut plane8, &der);
-        assert_eq!(plane8, vec![10u8, 100, 250]);
+        assert_eq!(plane8, vec![10u16, 100, 250]);
     }
 
     #[test]
@@ -4984,8 +4988,8 @@ mod tests {
     fn round321_apply_chroma_plane_empty_state_is_noop() {
         // num_ranges_l == 0 ⇒ the apply must leave the plane untouched.
         let derived = DraChromaDerived::empty(ChromaIdx::Cb);
-        let pre_luma = vec![100u8; 4 * 4];
-        let mut plane = vec![60u8; 2 * 2];
+        let pre_luma = vec![100u16; 4 * 4];
+        let mut plane = vec![60u16; 2 * 2];
         let before = plane.clone();
         apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &derived, 8);
         assert_eq!(plane, before);
@@ -5005,8 +5009,8 @@ mod tests {
         // Sanity: the derived chromaScale is the identity 512.
         assert_eq!(chroma_scale_for_luma_sample(50, &c), 512);
 
-        let pre_luma: Vec<u8> = (0..(4 * 4)).map(|i| (i * 7) as u8).collect();
-        let mut plane: Vec<u8> = (0..(2 * 2)).map(|i| (i * 30 + 10) as u8).collect();
+        let pre_luma: Vec<u16> = (0..(4 * 4)).map(|i| (i * 7) as u16).collect();
+        let mut plane: Vec<u16> = (0..(2 * 2)).map(|i| (i * 30 + 10) as u16).collect();
         let before = plane.clone();
         apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &c, 8);
         assert_eq!(plane, before, "identity chromaScale ⇒ plane unchanged");
@@ -5028,9 +5032,9 @@ mod tests {
         assert_eq!(scale, 1024, "forward 256 ⇒ inverse chromaScale 1024");
 
         // 2×2 chroma plane; luma constant so the scale is uniform.
-        let pre_luma = vec![40u8; 4 * 4];
+        let pre_luma = vec![40u16; 4 * 4];
         // Samples: 138 (above pivot), 118 (below), 128 (pivot), 200.
-        let mut plane = vec![138u8, 118u8, 128u8, 200u8];
+        let mut plane = vec![138u16, 118u16, 128u16, 200u16];
         apply_chroma_inverse_mapping_u8(&mut plane, &pre_luma, 4, 4, 2, 2, 2, 2, &c, 8);
 
         // Hand-evaluate eq. 1377-1382 with chromaScale = 1024, pivot 128.
@@ -5058,9 +5062,9 @@ mod tests {
         let c = derive_dra_chroma_state(&syn, &der, ChromaIdx::Cb, 8).unwrap();
 
         // Two luma planes with different content, same chroma plane.
-        let pre_luma_lo = vec![10u8; 4 * 4];
-        let pre_luma_hi = vec![240u8; 4 * 4];
-        let chroma_src = vec![160u8, 96u8, 128u8, 50u8];
+        let pre_luma_lo = vec![10u16; 4 * 4];
+        let pre_luma_hi = vec![240u16; 4 * 4];
+        let chroma_src = vec![160u16, 96u16, 128u16, 50u16];
 
         let mut a = chroma_src.clone();
         let mut b = chroma_src.clone();

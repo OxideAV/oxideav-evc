@@ -465,18 +465,18 @@ mod tests {
     // --- §8.5.5.2 bilinear interpolation + the refs-level driver ---------
 
     /// Deterministic "generic" 8-bit texture.
-    fn texture(x: i32, y: i32) -> u8 {
-        (((x * 37 + y * 101) ^ (x * y * 13)) & 0xff) as u8
+    fn texture(x: i32, y: i32) -> u16 {
+        (((x * 37 + y * 101) ^ (x * y * 13)) & 0xff) as u16
     }
 
-    fn make_ref(shift_x: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let y: Vec<u8> = (0i32..32 * 32)
+    fn make_ref(shift_x: i32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let y: Vec<u16> = (0i32..32 * 32)
             .map(|i| texture(i % 32 - shift_x, i / 32))
             .collect();
-        (y, vec![128u8; 16 * 16], vec![128u8; 16 * 16])
+        (y, vec![128u16; 16 * 16], vec![128u16; 16 * 16])
     }
 
-    fn view<'a>(y: &'a [u8], cb: &'a [u8], cr: &'a [u8]) -> crate::inter::RefPictureView<'a> {
+    fn view<'a>(y: &'a [u16], cb: &'a [u16], cr: &'a [u16]) -> crate::inter::RefPictureView<'a> {
         crate::inter::RefPictureView {
             y,
             cb,

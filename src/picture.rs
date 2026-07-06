@@ -1,53 +1,57 @@
 //! EVC reconstructed picture buffer + per-CU pipeline glue
 //! (ISO/IEC 23094-1 §8.7.5).
 //!
-//! Round-3 scope: a single 8-bit YUV frame buffer (yuv420p only) plus the
-//! intra-prediction reference-sample fetch and the picture-construction
-//! step `recSamples = clip(predSamples + resSamples)` (eq. 1091). The
+//! The frame buffer holds one `u16` per sample so every §7.4.3.1 bit
+//! depth (`BitDepthY = 8 + bit_depth_luma_minus8`, with 8 and 10 the
+//! profile-relevant values) flows through the same reconstruction
+//! chain; the intra-prediction reference-sample fetch and the
+//! picture-construction step `recSamples = clip(predSamples +
+//! resSamples)` (eq. 1091) clamp against `(1 << bit_depth) − 1`. The
 //! picture buffer is initialised with `1 << (bit_depth − 1)` so that a
 //! brand-new IDR picture's first CU finds the spec-mandated "not
 //! available" substitution value already in place at every neighbour
 //! lookup.
-//!
-//! 10-bit support, deblocking, ALF and DRA are deferred to round 4.
 
 use oxideav_core::{Error, Result};
 
 use crate::intra::{predict, IntraMode, RefSamples};
 
-/// Reconstructed picture buffer for a yuv420p 8-bit frame.
+/// Reconstructed picture buffer for a planar YUV frame.
 ///
 /// Coordinates are in luma sample units; chroma planes are accessed via
 /// the `cb` / `cr` helpers and use sub-sampled coordinates internally
-/// (`SubWidthC = SubHeightC = 2` for 4:2:0).
+/// (`SubWidthC = SubHeightC = 2` for 4:2:0). Samples are stored as
+/// `u16` regardless of bit depth (8-bit content occupies 0..=255).
 #[derive(Debug, Clone)]
 pub struct YuvPicture {
     pub width: u32,
     pub height: u32,
     pub chroma_format_idc: u32,
-    /// Bit depth — round 3 only supports 8.
+    /// `BitDepthY` / `BitDepthC` (§7.4.3.1 eqs. 46/48; the decoder
+    /// requires them equal). 8..=16.
     pub bit_depth: u32,
-    pub y: Vec<u8>,
-    pub cb: Vec<u8>,
-    pub cr: Vec<u8>,
+    pub y: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
 }
 
 impl YuvPicture {
     /// Allocate a YUV picture of the given dimensions, pre-filled with
     /// the spec's "not available" substitution value
-    /// (`1 << (bit_depth - 1) = 128` for 8-bit). This means an IDR
-    /// slice's first CU finds neighbour samples that already match what
-    /// §8.4.4.2 would compute for the missing-neighbour case.
+    /// (`1 << (bit_depth - 1)` — 128 for 8-bit, 512 for 10-bit). This
+    /// means an IDR slice's first CU finds neighbour samples that
+    /// already match what §8.4.4.2 would compute for the
+    /// missing-neighbour case.
     pub fn new(width: u32, height: u32, chroma_format_idc: u32, bit_depth: u32) -> Result<Self> {
-        if bit_depth != 8 {
+        if !(8..=16).contains(&bit_depth) {
             return Err(Error::unsupported(format!(
-                "evc picture: round-3 supports 8-bit only (got {bit_depth})"
+                "evc picture: bit depth {bit_depth} outside 8..=16"
             )));
         }
         if width == 0 || height == 0 {
             return Err(Error::invalid("evc picture: zero dimensions"));
         }
-        let fill: u8 = 1u8 << (bit_depth - 1);
+        let fill: u16 = 1u16 << (bit_depth - 1);
         let n_y = (width as usize) * (height as usize);
         let (cw, ch) = chroma_dims(width, height, chroma_format_idc)?;
         let n_c = cw * ch;
@@ -271,7 +275,7 @@ impl YuvPicture {
                 if xx >= self.width as usize {
                     break;
                 }
-                self.y[yy * stride + xx] = out[j * n_cb_w + i] as u8;
+                self.y[yy * stride + xx] = out[j * n_cb_w + i] as u16;
             }
         }
         true
@@ -299,13 +303,13 @@ impl YuvPicture {
                 if xx >= w {
                     break;
                 }
-                let v = samples[j * n_cb_w + i].clamp(0, max_val) as u8;
+                let v = samples[j * n_cb_w + i].clamp(0, max_val) as u16;
                 plane[yy * stride + xx] = v;
             }
         }
     }
 
-    fn plane_view(&self, c_idx: u32) -> (&[u8], usize, usize, usize) {
+    fn plane_view(&self, c_idx: u32) -> (&[u16], usize, usize, usize) {
         match c_idx {
             0 => (
                 &self.y[..],
@@ -327,7 +331,7 @@ impl YuvPicture {
         }
     }
 
-    fn plane_view_mut(&mut self, c_idx: u32) -> (&mut [u8], usize, usize, usize) {
+    fn plane_view_mut(&mut self, c_idx: u32) -> (&mut [u16], usize, usize, usize) {
         let stride_c = self.c_stride();
         let (cw, ch) =
             chroma_dims(self.width, self.height, self.chroma_format_idc).unwrap_or((0, 0));
@@ -506,11 +510,20 @@ mod tests {
         assert!(pic.cr.iter().all(|&b| b == 128));
     }
 
-    /// Reject 10-bit pictures (round 3 is 8-bit only).
+    /// Round 391: 10-bit pictures allocate with the §8.4.4.2
+    /// mid-level fill `1 << (bit_depth − 1) = 512`; bit depths outside
+    /// 8..=16 are rejected.
     #[test]
-    fn rejects_10bit() {
-        let err = YuvPicture::new(16, 16, 1, 10).unwrap_err();
-        assert!(format!("{err}").contains("8-bit only"));
+    fn accepts_10bit_rejects_out_of_range() {
+        let pic = YuvPicture::new(16, 16, 1, 10).unwrap();
+        assert_eq!(pic.bit_depth, 10);
+        assert!(pic.y.iter().all(|&v| v == 512));
+        assert!(pic.cb.iter().all(|&v| v == 512));
+        assert!(pic.cr.iter().all(|&v| v == 512));
+        let err = YuvPicture::new(16, 16, 1, 17).unwrap_err();
+        assert!(format!("{err}").contains("outside 8..=16"));
+        let err = YuvPicture::new(16, 16, 1, 7).unwrap_err();
+        assert!(format!("{err}").contains("outside 8..=16"));
     }
 
     /// Reject zero dimensions.
@@ -623,7 +636,7 @@ mod tests {
         let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
         // Seed the row above an 8×8 block at (0, 8) with a ramp.
         for i in 0..8usize {
-            pic.y[7 * 16 + i] = (10 + i * 5) as u8;
+            pic.y[7 * 16 + i] = (10 + i * 5) as u16;
         }
         let res = vec![3i32; 64];
         intra_reconstruct_cb_eipd(&mut pic, 0, 8, 3, 3, INTRA_VER, 0, false, false, &res).unwrap();

@@ -1629,9 +1629,13 @@ pub fn decode_baseline_idr_slice(
             walk.min_cb_log2_size_y
         )));
     }
-    if decode.bit_depth_luma != 8 || decode.bit_depth_chroma != 8 {
+    // Round 391: high bit depth flows through the whole reconstruction
+    // chain (u16 planes; every clamp/scale is bit-depth-parameterized).
+    // The decoder requires BitDepthY == BitDepthC (§7.4.3.1 profiles
+    // signal them jointly); YuvPicture::new bounds the value to 8..=16.
+    if decode.bit_depth_luma != decode.bit_depth_chroma {
         return Err(Error::unsupported(format!(
-            "evc decode: round-3 supports 8-bit only (luma={}, chroma={})",
+            "evc decode: BitDepthY {} != BitDepthC {} unsupported",
             decode.bit_depth_luma, decode.bit_depth_chroma
         )));
     }
@@ -2506,7 +2510,7 @@ fn add_chroma_residual_to_block(
                 break;
             }
             let cur = plane[yy * stride + xx] as i32;
-            let v = (cur + residual[j * n_cb_w + i]).clamp(0, max_val) as u8;
+            let v = (cur + residual[j * n_cb_w + i]).clamp(0, max_val) as u16;
             plane[yy * stride + xx] = v;
         }
     }
@@ -2761,10 +2765,13 @@ pub fn decode_baseline_inter_slice(
             walk.ctb_log2_size_y
         )));
     }
-    if decode.bit_depth_luma != 8 || decode.bit_depth_chroma != 8 {
-        return Err(Error::unsupported(
-            "evc inter decode: round-4 is 8-bit only",
-        ));
+    // Round 391: high bit depth is supported end-to-end (u16 planes);
+    // only mismatched luma/chroma depths are rejected.
+    if decode.bit_depth_luma != decode.bit_depth_chroma {
+        return Err(Error::unsupported(format!(
+            "evc inter decode: BitDepthY {} != BitDepthC {} unsupported",
+            decode.bit_depth_luma, decode.bit_depth_chroma
+        )));
     }
     // Round-9: each list must hold at least num_ref_idx_active_minus1[i] + 1
     // entries so per-CU `ref_idx_l*` lookups never index past the DPB.
@@ -6389,18 +6396,18 @@ mod tests {
         use crate::inter::RefPictureView;
         // Reference picture: a 32×32 Y plane with a recognizable gradient,
         // pre-filled chroma at 128.
-        let mut ref_y = vec![0u8; 32 * 32];
+        let mut ref_y = vec![0u16; 32 * 32];
         for j in 0..32 {
             for i in 0..32 {
-                ref_y[j * 32 + i] = ((i * 4 + j) & 0xFF) as u8;
+                ref_y[j * 32 + i] = ((i * 4 + j) & 0xFF) as u16;
             }
         }
-        let mut ref_cb = vec![0u8; 16 * 16];
-        let mut ref_cr = vec![0u8; 16 * 16];
+        let mut ref_cb = vec![0u16; 16 * 16];
+        let mut ref_cr = vec![0u16; 16 * 16];
         for j in 0..16 {
             for i in 0..16 {
-                ref_cb[j * 16 + i] = (100 + (i + j)) as u8;
-                ref_cr[j * 16 + i] = (200 - (i + j)) as u8;
+                ref_cb[j * 16 + i] = (100 + (i + j)) as u16;
+                ref_cr[j * 16 + i] = (200 - (i + j)) as u16;
             }
         }
         let ref_view = RefPictureView {
@@ -6506,12 +6513,12 @@ mod tests {
     fn round4_end_to_end_decode_b_slice_zero_mv_averages_references() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref0_y = vec![100u8; 16 * 16];
-        let ref0_cb = vec![100u8; 8 * 8];
-        let ref0_cr = vec![100u8; 8 * 8];
-        let ref1_y = vec![200u8; 16 * 16];
-        let ref1_cb = vec![200u8; 8 * 8];
-        let ref1_cr = vec![200u8; 8 * 8];
+        let ref0_y = vec![100u16; 16 * 16];
+        let ref0_cb = vec![100u16; 8 * 8];
+        let ref0_cr = vec![100u16; 8 * 8];
+        let ref1_y = vec![200u16; 16 * 16];
+        let ref1_cb = vec![200u16; 8 * 8];
+        let ref1_cr = vec![200u16; 8 * 8];
         let view0 = RefPictureView {
             y: &ref0_y,
             cb: &ref0_cb,
@@ -6730,9 +6737,9 @@ mod tests {
     #[test]
     fn inter_decode_with_residual_dc_only_p_slice() {
         use crate::cabac::CabacEncoder;
-        let ref_y = vec![200u8; 4 * 4];
-        let ref_cb = vec![100u8; 2 * 2];
-        let ref_cr = vec![80u8; 2 * 2];
+        let ref_y = vec![200u16; 4 * 4];
+        let ref_cb = vec![100u16; 2 * 2];
+        let ref_cr = vec![80u16; 2 * 2];
         let view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -7083,12 +7090,12 @@ mod tests {
     fn round9_multiref_dpb_two_entry_l0() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref0_y = vec![200u8; 16 * 16];
-        let ref0_cb = vec![100u8; 8 * 8];
-        let ref0_cr = vec![80u8; 8 * 8];
-        let ref1_y = vec![50u8; 16 * 16];
-        let ref1_cb = vec![60u8; 8 * 8];
-        let ref1_cr = vec![70u8; 8 * 8];
+        let ref0_y = vec![200u16; 16 * 16];
+        let ref0_cb = vec![100u16; 8 * 8];
+        let ref0_cr = vec![80u16; 8 * 8];
+        let ref1_y = vec![50u16; 16 * 16];
+        let ref1_cb = vec![60u16; 8 * 8];
+        let ref1_cr = vec![70u16; 8 * 8];
         let view0 = RefPictureView {
             y: &ref0_y,
             cb: &ref0_cb,
@@ -7206,9 +7213,9 @@ mod tests {
     #[test]
     fn round9_rejects_oversized_active_count() {
         use crate::inter::RefPictureView;
-        let ref0_y = vec![100u8; 16 * 16];
-        let ref0_cb = vec![100u8; 64];
-        let ref0_cr = vec![100u8; 64];
+        let ref0_y = vec![100u16; 16 * 16];
+        let ref0_cb = vec![100u16; 64];
+        let ref0_cr = vec![100u16; 64];
         let view = RefPictureView {
             y: &ref0_y,
             cb: &ref0_cb,
@@ -7397,7 +7404,7 @@ mod tests {
         let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
         // Stamp a distinctive 4×4 luma pattern at the (0,0) CU.
         // Values chosen to be uniquely identifiable in the right-half copy.
-        let cu0_samples: [u8; 16] = [
+        let cu0_samples: [u16; 16] = [
             10, 20, 30, 40, //
             50, 60, 70, 80, //
             90, 100, 110, 120, //
@@ -7610,9 +7617,9 @@ mod tests {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
         // Reference picture: uniform 200 for trivial verification.
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -7686,9 +7693,9 @@ mod tests {
     fn round381_admvp_cu_skip_regular_merge() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -7768,9 +7775,9 @@ mod tests {
     fn round381_admvp_nonskip_merge_mode() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -7845,9 +7852,9 @@ mod tests {
     fn round381_admvp_nonskip_explicit_amvp() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -8110,12 +8117,12 @@ mod tests {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
         // Gradient reference so the MC offset is observable.
-        let mut ref_y = vec![0u8; 32 * 32];
+        let mut ref_y = vec![0u16; 32 * 32];
         for (i, px) in ref_y.iter_mut().enumerate() {
-            *px = (i % 251) as u8;
+            *px = (i % 251) as u16;
         }
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -8345,12 +8352,12 @@ mod tests {
     fn round384_admvp_affine_merge_zero_cpmv_e2e() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let mut ref_y = vec![0u8; 32 * 32];
+        let mut ref_y = vec![0u16; 32 * 32];
         for (i, px) in ref_y.iter_mut().enumerate() {
-            *px = (i % 251) as u8;
+            *px = (i % 251) as u16;
         }
-        let ref_cb = vec![90u8; 16 * 16];
-        let ref_cr = vec![160u8; 16 * 16];
+        let ref_cb = vec![90u16; 16 * 16];
+        let ref_cr = vec![160u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -8564,12 +8571,12 @@ mod tests {
     fn round384_explicit_affine_zero_mvp_e2e() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let mut ref_y = vec![0u8; 16 * 16];
+        let mut ref_y = vec![0u16; 16 * 16];
         for (i, px) in ref_y.iter_mut().enumerate() {
-            *px = (i % 250) as u8;
+            *px = (i % 250) as u16;
         }
-        let ref_cb = vec![100u8; 8 * 8];
-        let ref_cr = vec![150u8; 8 * 8];
+        let ref_cb = vec![100u16; 8 * 8];
+        let ref_cr = vec![150u16; 8 * 8];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -8871,9 +8878,9 @@ mod tests {
     fn round381_admvp_cu_skip_b_slice_bipred() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let mk = || RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -8943,9 +8950,9 @@ mod tests {
     fn round100_inter_skip_cu_consumes_no_cu_qp_delta_bins() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -9175,7 +9182,7 @@ mod tests {
         // with QP. cbf_luma = 1.
         let mut levels = vec![0i32; 16];
         levels[0] = 5;
-        let run = |qp: i32| -> Vec<u8> {
+        let run = |qp: i32| -> Vec<u16> {
             let mut pic = mk_pic();
             let mut side_info = SideInfoGrid::new(8, 4);
             apply_ibc_branch_predict_and_reconstruct(
@@ -9208,7 +9215,7 @@ mod tests {
         // The higher QP scales the same DC level to a larger residual, so
         // the QP-40 reconstruction deviates further from the predictor
         // (uniform 100) than the QP-22 one.
-        let dev = |r: &[u8]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
+        let dev = |r: &[u16]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
         assert!(
             dev(&recon_hi) > dev(&recon_lo),
             "higher QP → larger residual deviation from the predictor"
@@ -9252,7 +9259,7 @@ mod tests {
         let mut levels = vec![0i32; 16];
         levels[0] = 5;
         let empty_c: Vec<i32> = Vec::new();
-        let run = |qp: i32| -> Vec<u8> {
+        let run = |qp: i32| -> Vec<u16> {
             let mut pic = mk_pic();
             let mut side_info = SideInfoGrid::new(8, 4);
             let mut hmvp = crate::hmvp::HmvpCandList::new();
@@ -9287,7 +9294,7 @@ mod tests {
             recon_lo, recon_hi,
             "per-CU QP must change the inter IBC residual reconstruction"
         );
-        let dev = |r: &[u8]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
+        let dev = |r: &[u16]| -> i32 { r.iter().map(|&v| (v as i32 - 100).abs()).sum() };
         assert!(
             dev(&recon_hi) > dev(&recon_lo),
             "higher QP → larger residual deviation from the predictor"
@@ -9302,9 +9309,9 @@ mod tests {
     fn round95_inter_decode_skips_ibc_flag_when_cu_exceeds_cand_size() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -9381,7 +9388,7 @@ mod tests {
     #[test]
     fn round95_inter_ibc_branch_predicts_from_left_neighbour() {
         let mut pic = YuvPicture::new(8, 4, 0, 8).unwrap();
-        let cu0_samples: [u8; 16] = [
+        let cu0_samples: [u16; 16] = [
             10, 20, 30, 40, //
             50, 60, 70, 80, //
             90, 100, 110, 120, //
@@ -9532,7 +9539,7 @@ mod tests {
         // verify the copy.
         for j in 0..8 {
             for i in 0..8 {
-                pic.y[j * 16 + i] = ((i + j * 8) as u8).wrapping_add(40);
+                pic.y[j * 16 + i] = ((i + j * 8) as u16).wrapping_add(40);
             }
         }
         // Chroma: a known fill on the left half (4×4 chroma block for
@@ -9591,7 +9598,7 @@ mod tests {
         // Verify the right-half luma matches the left-half pattern.
         for j in 0..8 {
             for i in 0..8 {
-                let expected = ((i + j * 8) as u8).wrapping_add(40);
+                let expected = ((i + j * 8) as u16).wrapping_add(40);
                 let actual = pic.y[j * 16 + (8 + i)];
                 assert_eq!(
                     actual, expected,
@@ -10703,18 +10710,18 @@ mod tests {
     /// border clamp, so the DMVR bilateral match at `dMvL0 = (16, 0)` is
     /// *exactly* zero everywhere — including the plane-padding columns —
     /// and the refined bi-prediction reproduces `base` bit-exactly.
-    fn dmvr_base(x: i32) -> u8 {
-        (x.clamp(1, 30) * 8) as u8
+    fn dmvr_base(x: i32) -> u16 {
+        (x.clamp(1, 30) * 8) as u16
     }
 
-    fn dmvr_ref_planes(shift_x: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let y: Vec<u8> = (0i32..32 * 32)
+    fn dmvr_ref_planes(shift_x: i32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let y: Vec<u16> = (0i32..32 * 32)
             .map(|i| dmvr_base(i % 32 - shift_x))
             .collect();
-        (y, vec![128u8; 16 * 16], vec![128u8; 16 * 16])
+        (y, vec![128u16; 16 * 16], vec![128u16; 16 * 16])
     }
 
-    fn dmvr_view<'a>(y: &'a [u8], cb: &'a [u8], cr: &'a [u8]) -> RefPictureView<'a> {
+    fn dmvr_view<'a>(y: &'a [u16], cb: &'a [u16], cr: &'a [u16]) -> RefPictureView<'a> {
         RefPictureView {
             y,
             cb,
@@ -11150,12 +11157,12 @@ mod tests {
     fn round387_e2e_affine_cu_chain_inherits_across_cus() {
         use crate::cabac::CabacEncoder;
         use crate::inter::RefPictureView;
-        let mut ref_y = vec![0u8; 32 * 16];
+        let mut ref_y = vec![0u16; 32 * 16];
         for (i, px) in ref_y.iter_mut().enumerate() {
-            *px = (i % 249) as u8;
+            *px = (i % 249) as u16;
         }
-        let ref_cb = vec![128u8; 16 * 8];
-        let ref_cr = vec![128u8; 16 * 8];
+        let ref_cb = vec![128u16; 16 * 8];
+        let ref_cr = vec![128u16; 16 * 8];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -11297,12 +11304,12 @@ mod tests {
         // --- Picture 2 (POC 4, P): ColPic = picture 1 (POC 2). The
         // collocated cell's refined L0 motion is (0,0) + delta (16,0) →
         // (4, 0) in 1/4-pel; identity POC scaling ((4−2)/(2−0) = 1).
-        let mut ref2_y = vec![0u8; 32 * 32];
+        let mut ref2_y = vec![0u16; 32 * 32];
         for (i, px) in ref2_y.iter_mut().enumerate() {
-            *px = (i % 247) as u8;
+            *px = (i % 247) as u16;
         }
-        let ref2_cb = vec![128u8; 16 * 16];
-        let ref2_cr = vec![128u8; 16 * 16];
+        let ref2_cb = vec![128u16; 16 * 16];
+        let ref2_cr = vec![128u16; 16 * 16];
         let ref2 = RefPictureView {
             y: &ref2_y,
             cb: &ref2_cb,
@@ -11636,9 +11643,9 @@ mod tests {
         let t_dir = MainCtxTable::BttSplitDir as usize;
         let t_type = MainCtxTable::BttSplitType as usize;
         let t_pmc = MainCtxTable::PredModeConstraintType as usize;
-        let ref_y = vec![200u8; 32 * 32];
-        let ref_cb = vec![128u8; 16 * 16];
-        let ref_cr = vec![128u8; 16 * 16];
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
         let ref_view = RefPictureView {
             y: &ref_y,
             cb: &ref_cb,
@@ -11777,5 +11784,116 @@ mod tests {
             stats.coding_units, 8,
             "5 skip + 2 luma-only intra + 1 dual-tree chroma"
         );
+    }
+
+    /// Round 391: 10-bit IDR decode end-to-end. A 4×4 picture (one CU)
+    /// with `bit_depth = 10` reconstructs INTRA_DC over the 10-bit
+    /// mid-level fill (512) plus a positive DC residual — the resulting
+    /// samples exceed the 8-bit range, proving the u16 plane +
+    /// bit-depth-parameterized dequant/clip chain end-to-end.
+    #[test]
+    fn round391_idr_decode_10bit_dc_residual() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..29 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 29
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 30
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 10,
+            bit_depth_chroma: 10,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(pic.bit_depth, 10);
+        assert_eq!(stats.coeff_runs, 1);
+        // The DC prediction is the 10-bit mid-level (512); the positive
+        // scan-position-0 coefficient adds a positive residual at every
+        // sample (under the literal eq. 1062 basis orientation the
+        // per-sample magnitudes vary), so the whole plane sits strictly
+        // above the 8-bit ceiling's reach of the old pipeline.
+        assert!(
+            pic.y.iter().all(|&v| v > 512),
+            "positive residual must lift every sample above the 10-bit mid-level: {:?}",
+            &pic.y[..]
+        );
+        // Chroma untouched at the 10-bit mid-level.
+        assert!(pic.cb.iter().all(|&v| v == 512));
+        assert!(pic.cr.iter().all(|&v| v == 512));
+    }
+
+    /// Round 391: 10-bit P-slice decode end-to-end. A zero-MV skip CU
+    /// copies a 10-bit reference plane whose samples exceed the 8-bit
+    /// range (Y = 700, Cb = 300, Cr = 900) bit-exactly through the
+    /// motion-compensation path.
+    #[test]
+    fn round391_inter_decode_10bit_skip_copies_wide_samples() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![700u16; 4 * 4];
+        let ref_cb = vec![300u16; 2 * 2];
+        let ref_cr = vec![900u16; 2 * 2];
+        let view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 4,
+            height: 4,
+            y_stride: 4,
+            c_stride: 2,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // mvp_idx_l0 = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 10,
+            bit_depth_chroma: 10,
+            ..Default::default()
+        };
+        let ref_list_l0 = [view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, _stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(pic.bit_depth, 10);
+        assert!(pic.y.iter().all(|&v| v == 700), "zero-MV copy of Y=700");
+        assert!(pic.cb.iter().all(|&v| v == 300));
+        assert!(pic.cr.iter().all(|&v| v == 900));
     }
 }

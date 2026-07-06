@@ -673,7 +673,7 @@ pub fn apply_alf_luma(pic: &mut YuvPicture, filter: &AlfLumaFilter, bit_depth: u
             sum += coef[12] as i32 * src[row * stride + col] as i32;
             // Eq. 1287/1288: (sum + 256) >> 9, clipped to bit-depth.
             let out = ((sum + 256) >> 9).clamp(0, max_val);
-            pic.y[row * stride + col] = out as u8;
+            pic.y[row * stride + col] = out as u16;
         }
     }
 }
@@ -727,7 +727,7 @@ pub fn apply_alf_chroma(
             }
             sum += coef[6] as i32 * plane[row * stride + col] as i32;
             let out = ((sum + 256) >> 9).clamp(0, max_val);
-            dst[row * stride + col] = out as u8;
+            dst[row * stride + col] = out as u16;
         }
     }
 }
@@ -870,7 +870,7 @@ pub fn apply_alf_luma_masked(
                     }
                     sum += coef[12] as i32 * src[row * stride + col] as i32;
                     let out = ((sum + 256) >> 9).clamp(0, max_val);
-                    pic.y[row * stride + col] = out as u8;
+                    pic.y[row * stride + col] = out as u16;
                 }
             }
         }
@@ -972,7 +972,7 @@ pub fn apply_alf_chroma_masked(
                     }
                     sum += coef[6] as i32 * snapshot[cy * stride + cx] as i32;
                     let out = ((sum + 256) >> 9).clamp(0, max_val);
-                    dst[cy * stride + cx] = out as u8;
+                    dst[cy * stride + cx] = out as u16;
                 }
             }
         }
@@ -1086,7 +1086,7 @@ const ALF_VAR_TAB: [u8; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
 /// extent, matching the spec's behaviour that the §8.8.4.5 boundary-padding
 /// process supplies the nearest in-picture sample for off-edge reads.
 #[inline]
-fn rec_sample_clamped(src: &[u8], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
+fn rec_sample_clamped(src: &[u16], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
     let xc = x.clamp(0, w as i32 - 1) as usize;
     let yc = y.clamp(0, h as i32 - 1) as usize;
     src[yc * stride + xc] as i32
@@ -1112,7 +1112,7 @@ fn rec_sample_clamped(src: &[u8], stride: usize, w: usize, h: usize, x: i32, y: 
 /// `bit_depth` is `BitDepthY`, used by eq. 1316's `>> (BitDepthY − 2)` shift.
 #[allow(clippy::too_many_arguments)]
 pub fn derive_alf_classification(
-    src: &[u8],
+    src: &[u16],
     stride: usize,
     w: usize,
     h: usize,
@@ -1329,7 +1329,7 @@ pub fn apply_alf_luma_classified(
             sum += coef[12] as i32 * src[py * stride + px] as i32;
             // Eq. 1287/1288: clip ((sum + 256) >> 9).
             let out = ((sum + 256) >> 9).clamp(0, max_val);
-            pic.y[py * stride + px] = out as u8;
+            pic.y[py * stride + px] = out as u16;
         }
     }
 }
@@ -1799,7 +1799,7 @@ mod tests {
         let make = || {
             let mut pic = crate::picture::YuvPicture::new(64, 32, 0, 8).unwrap();
             for (i, v) in pic.y.iter_mut().enumerate() {
-                *v = (i % 200) as u8;
+                *v = (i % 200) as u16;
             }
             pic
         };
@@ -1861,7 +1861,7 @@ mod tests {
     /// typo in the SUT would not be mirrored here.
     #[allow(clippy::too_many_arguments)]
     fn classify_ref(
-        src: &[u8],
+        src: &[u16],
         stride: usize,
         w: usize,
         h: usize,
@@ -1948,7 +1948,7 @@ mod tests {
         // the same value, but the spec still defines it as 3 here.
         let w = 16;
         let h = 16;
-        let src = vec![100u8; w * h];
+        let src = vec![100u16; w * h];
         let cls = derive_alf_classification(&src, w, w, h, 0, 0, 8, 8, 8);
         assert_eq!(cls.blk_width, 8);
         assert_eq!(cls.blk_height, 8);
@@ -1967,7 +1967,7 @@ mod tests {
         // class.
         let w = 32;
         let h = 32;
-        let mut src = vec![0u8; w * h];
+        let mut src = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 src[y * w + x] = if x < 16 { 40 } else { 200 };
@@ -1995,10 +1995,10 @@ mod tests {
         let w = 40;
         let h = 36;
         let mut state: u32 = 0x1234_5678;
-        let mut src = vec![0u8; w * h];
+        let mut src = vec![0u16; w * h];
         for v in src.iter_mut() {
             state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            *v = (state >> 16) as u8;
+            *v = (state >> 16) as u16;
         }
         // Two CTBs: a full 32×32 at (0,0) and an 8×4 edge block at (32,32).
         for &(xc, yc, bw, bh) in &[(0usize, 0usize, 32usize, 32usize), (32, 32, 8, 4)] {
@@ -2016,7 +2016,7 @@ mod tests {
         // filtIdx is bumped by the eq.1320 offset and is non-zero.
         let w = 32;
         let h = 32;
-        let mut src = vec![0u8; w * h];
+        let mut src = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 src[y * w + x] = if y < 16 { 30 } else { 220 };
@@ -2040,7 +2040,7 @@ mod tests {
         // 0..24 and no transposeIdx escapes 0..3 (eq. 1320 offset bound).
         let w = 24;
         let h = 24;
-        let mut src = vec![0u8; w * h];
+        let mut src = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 src[y * w + x] = if (x + y) % 2 == 0 { 0 } else { 255 };
@@ -2096,11 +2096,11 @@ mod tests {
         // block classifies lower than at 8-bit (or equal, never higher).
         let w = 32;
         let h = 32;
-        let mut src = vec![0u8; w * h];
+        let mut src = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 // Gentle ramp → small but non-zero activity.
-                src[y * w + x] = ((x + y) as u32 % 64 + 64) as u8;
+                src[y * w + x] = ((x + y) as u32 % 64 + 64) as u16;
             }
         }
         let c8 = derive_alf_classification(&src, w, w, h, 0, 0, 16, 16, 8);
@@ -2549,7 +2549,7 @@ mod tests {
     /// transcribed from the spec equation; mirrors what
     /// [`apply_alf_chroma`] / [`apply_alf_chroma_masked`] should produce.
     fn eq_1321_ref(
-        plane: &[u8],
+        plane: &[u16],
         stride: usize,
         cw: usize,
         ch: usize,
@@ -2585,7 +2585,7 @@ mod tests {
         let ch = pic.cb.len() / stride;
         for y in 0..ch {
             for x in 0..cw {
-                pic.cb[y * stride + x] = ((x * 7 + y * 11 + 50) % 200 + 20) as u8;
+                pic.cb[y * stride + x] = ((x * 7 + y * 11 + 50) % 200 + 20) as u16;
             }
         }
         // Non-trivial coefficients spread across all six spatial taps —
@@ -2621,8 +2621,8 @@ mod tests {
         // Fill Cb / Cr with two different deterministic patterns.
         for y in 0..ch {
             for x in 0..cw {
-                pic_a.cb[y * stride + x] = ((x * 3 + y * 5 + 40) % 220 + 10) as u8;
-                pic_a.cr[y * stride + x] = ((x * 5 + y * 3 + 100) % 180 + 30) as u8;
+                pic_a.cb[y * stride + x] = ((x * 3 + y * 5 + 40) % 220 + 10) as u16;
+                pic_a.cr[y * stride + x] = ((x * 5 + y * 3 + 100) % 180 + 30) as u16;
             }
         }
         pic_b.cb.copy_from_slice(&pic_a.cb);
