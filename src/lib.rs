@@ -1850,4 +1850,105 @@ mod tests {
         assert!(pic.cb.iter().all(|&v| v == 512));
         assert!(pic.cr.iter().all(|&v| v == 512));
     }
+
+    /// Round 391: full NAL-stream 10-bit decode through the registered
+    /// decoder factory. SPS (`bit_depth_luma_minus8 = 2`) + PPS + IDR
+    /// wrapped as length-prefixed NALs; `receive_frame` must emit
+    /// little-endian 16-bit planes (Yuv420P10Le-family layout) whose
+    /// residual-free samples sit at the 10-bit mid-level 512.
+    #[test]
+    fn round391_make_decoder_decodes_10bit_idr_to_le16_frame() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+
+        // 10-bit 32x32 4:2:0 Baseline SPS.
+        let mut sps_body = BitEmitter::new();
+        sps_body.ue(0); // sps_id
+        sps_body.u(8, 0); // profile_idc
+        sps_body.u(8, 30); // level_idc
+        sps_body.u(32, 0); // toolset_idc_h
+        sps_body.u(32, 0); // toolset_idc_l
+        sps_body.ue(1); // chroma_format_idc 4:2:0
+        sps_body.ue(32);
+        sps_body.ue(32);
+        sps_body.ue(2); // bit_depth_luma_minus8 = 2
+        sps_body.ue(2); // bit_depth_chroma_minus8 = 2
+        for _ in 0..13 {
+            sps_body.u(1, 0);
+        }
+        sps_body.ue(1); // log2_sub_gop_length
+        sps_body.ue(1); // max_num_tid0_ref_pics
+        sps_body.u(1, 0);
+        sps_body.u(1, 0);
+        sps_body.u(1, 0);
+        sps_body.finish_with_trailing_bits();
+        let sps_rbsp = sps_body.into_bytes();
+        let pps_rbsp = build_baseline_pps_rbsp();
+
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2);
+        hdr.u(1, 0);
+        hdr.u(1, 0);
+        hdr.u(6, 22);
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut idr_rbsp = hdr.into_bytes();
+        // One 32x32 CTU: quad split into four residual-free DC leaves.
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // child split = 0
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        idr_rbsp.extend_from_slice(&enc.finish());
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp));
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp));
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp));
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let frame = dec.receive_frame().unwrap();
+        let video = match frame {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("expected video frame"),
+        };
+        assert_eq!(video.planes.len(), 3);
+        // Byte stride = 2 × width; every sample is LE 512 (0x00, 0x02).
+        assert_eq!(video.planes[0].stride, 64);
+        assert_eq!(video.planes[0].data.len(), 32 * 32 * 2);
+        assert!(video.planes[0]
+            .data
+            .chunks_exact(2)
+            .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512));
+        assert_eq!(video.planes[1].stride, 32);
+        assert_eq!(video.planes[1].data.len(), 16 * 16 * 2);
+        assert!(video.planes[1]
+            .data
+            .chunks_exact(2)
+            .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512));
+    }
 }

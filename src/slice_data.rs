@@ -11896,4 +11896,126 @@ mod tests {
         assert!(pic.cb.iter().all(|&v| v == 300));
         assert!(pic.cr.iter().all(|&v| v == 900));
     }
+
+    /// Round 391: SUCO over the **quad** split (`sps_btt_flag == 0`,
+    /// `sps_suco_flag == 1`): `split_cu_flag = 1` on a 32×32 CTU makes
+    /// `allowSplitUnitCodingOrder` hold (§7.4.9.3 conditions 3/4 are
+    /// quad-split-exempt), the mirrored flag reorders the quadrants
+    /// TR → TL → BR → BL, and the first-decoded (top-right) quadrant's
+    /// DC residual proves the order by pixel placement.
+    #[test]
+    fn round391_suco_quad_split_mirrors_quadrant_order() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_suco = MainCtxTable::SucoFlag as usize;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
+        enc.encode_decision(t_suco, 0, 1); // split_unit_coding_order_flag = 1
+                                           // First-decoded quadrant (TR at (16,0)): DC + level +20.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..19 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 19
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 20
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // TL, BR, BL: plain DC leaves.
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let gates = CodingTreeGates {
+            sps_suco_flag: true,
+            // MaxSucoLog2Size = 5, MinSucoLog2Size = 4.
+            suco_limits: crate::split::SucoSizeLimits::derive(5, 2, 0, 1),
+            ..Default::default()
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4, // 16×16 leaves — one split level
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            tree_gates: gates,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.split_cu_flag_bins, 1);
+        assert_eq!(stats.tree.suco_flag_bins, 1);
+        assert_eq!(stats.tree.suco_mirrored_units, 1);
+        assert_eq!(stats.coding_units, 8);
+        // Residual landed in the top-right quadrant only.
+        let tr_has_residual = (0..16).any(|j| (16..32).any(|i| pic.y[j * 32 + i] != 128));
+        assert!(tr_has_residual, "first-decoded quadrant must be top-right");
+        assert!((0..16).all(|j| (0..16).all(|i| pic.y[j * 32 + i] == 128)));
+        assert!(pic.y[16 * 32..].iter().all(|&v| v == 128));
+    }
+
+    /// Round 391: BTT picture-boundary implicit splits. A 48×32
+    /// monochrome picture under a 32×32 CTU leaves the second CTU half
+    /// outside the picture: no `btt_split_flag` is signalled there —
+    /// the §7.4.8.3 boundary rules force SPLIT_BT_VER toward the
+    /// in-picture columns and only the in-picture child is visited.
+    #[test]
+    fn round391_btt_boundary_ctu_implicit_vertical_split() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let mut enc = CabacEncoder::new();
+        let leaf = |enc: &mut CabacEncoder| {
+            enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+            enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+            enc.encode_decision(0, 0, 0); //   U terminator
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        };
+        // CTU 0 (fully inside): btt_split_flag = 0 → 32×32 leaf.
+        enc.encode_decision(t_flag, 0, 0);
+        leaf(&mut enc);
+        // CTU 1 (straddles the right edge): NO bins at the CTU level —
+        // the implicit SPLIT_BT_VER recurses into the single in-picture
+        // 16×32 child, which reads its own flag.
+        enc.encode_decision(t_flag, 0, 0);
+        leaf(&mut enc);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 48,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 0, // monochrome
+            tree_gates: btt_tree_gates(),
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 2);
+        assert_eq!(
+            stats.tree.btt.flag_bins, 2,
+            "CTU 0 + the in-picture 16×32 child; the boundary CTU itself signals nothing"
+        );
+        assert_eq!(stats.tree.btt.dir_bins, 0);
+        assert_eq!(stats.tree.btt.type_bins, 0);
+        assert_eq!(stats.coding_units, 4, "two leaves × (luma + chroma)");
+        assert!(pic.y.iter().all(|&v| v == 128));
+    }
 }
