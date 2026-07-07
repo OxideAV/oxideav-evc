@@ -554,13 +554,14 @@ pub struct BttSplit {
 ///   the chosen direction. FL(cMax = 1), context Table 44, ctxInc 0
 ///   unconditionally. Inferred via [`infer_btt_split_type`] when absent.
 ///
-/// `cm_init` is `sps_cm_init_flag`; `num_smaller` is the eq. (1439)
-/// neighbour count (ignored when `cm_init` is `false`).
+/// `sel` is the slice's §9.3.4.2.1 context selector (`sps_cm_init_flag`
+/// plus `initType`); `num_smaller` is the eq. (1439) neighbour count
+/// (ignored when `sel.cm_init` is `false`).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_btt_split(
     eng: &mut CabacEngine,
     allowed: &AllowedSplits,
-    cm_init: bool,
+    sel: crate::cabac_init::CtxSel,
     num_smaller: u32,
     x0: u32,
     y0: u32,
@@ -577,12 +578,13 @@ pub fn decode_btt_split(
     // Present only when at least one BTT split is allowed; otherwise it is
     // inferred to 0 (spec line 5424).
     let flag = if allowed.any() {
-        let ctx_inc = if cm_init {
+        let ctx_inc = if sel.cm_init {
             ctx_inc_btt_split_flag(num_smaller, n_cb_w, n_cb_h)
         } else {
             0
         };
-        let bin = eng.decode_decision(MainCtxTable::BttSplitFlag as usize, ctx_inc)?;
+        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitFlag, ctx_inc);
+        let bin = eng.decode_decision(t, i)?;
         stats.flag_bins += 1;
         bin != 0
     } else {
@@ -614,7 +616,7 @@ pub fn decode_btt_split(
 
     // --- btt_split_dir (spec lines 2653-2655) ---
     let dir = if btt_split_dir_present(allowed) {
-        let ctx_inc = if cm_init {
+        let ctx_inc = if sel.cm_init {
             // Table 95: log2CbWidth − log2CbHeight + 2, clamped to the
             // Table 43 range (5 entries per init_type: indices 0..=4).
             let raw = log2_cb_width as i32 - log2_cb_height as i32 + 2;
@@ -622,7 +624,8 @@ pub fn decode_btt_split(
         } else {
             0
         };
-        let bin = eng.decode_decision(MainCtxTable::BttSplitDir as usize, ctx_inc)?;
+        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitDir, ctx_inc);
+        let bin = eng.decode_decision(t, i)?;
         stats.dir_bins += 1;
         bin as u32
     } else {
@@ -632,7 +635,8 @@ pub fn decode_btt_split(
     // --- btt_split_type (spec lines 2656-2658) ---
     let split_type = if btt_split_type_present(allowed, dir) {
         // Table 44 / Table 95: single context, ctxInc 0 unconditionally.
-        let bin = eng.decode_decision(MainCtxTable::BttSplitType as usize, 0)?;
+        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitType, 0);
+        let bin = eng.decode_decision(t, i)?;
         stats.type_bins += 1;
         bin as u32
     } else {
@@ -1426,7 +1430,7 @@ mod tests {
         let out = decode_btt_split(
             &mut eng,
             &ALL_ALLOWED,
-            false,
+            crate::cabac_init::CtxSel::baseline(),
             0,
             0,
             0,
@@ -1458,7 +1462,7 @@ mod tests {
         let out = decode_btt_split(
             &mut eng,
             &ALL_ALLOWED,
-            false,
+            crate::cabac_init::CtxSel::baseline(),
             0,
             0,
             0,
@@ -1488,7 +1492,7 @@ mod tests {
         let out = decode_btt_split(
             &mut eng,
             &ALL_ALLOWED,
-            false,
+            crate::cabac_init::CtxSel::baseline(),
             0,
             0,
             0,
@@ -1513,7 +1517,7 @@ mod tests {
         let out = decode_btt_split(
             &mut eng,
             &ALL_ALLOWED,
-            false,
+            crate::cabac_init::CtxSel::baseline(),
             0,
             0,
             0,
@@ -1548,7 +1552,17 @@ mod tests {
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
         let out = decode_btt_split(
-            &mut eng, &allowed, false, 0, 0, 0, 5, 5, 256, 256, &mut stats,
+            &mut eng,
+            &allowed,
+            crate::cabac_init::CtxSel::baseline(),
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
         )
         .unwrap();
         assert_eq!(out.mode, SplitMode::SplitBtVer);
@@ -1572,7 +1586,17 @@ mod tests {
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
         let out = decode_btt_split(
-            &mut eng, &allowed, false, 0, 0, 0, 5, 5, 256, 256, &mut stats,
+            &mut eng,
+            &allowed,
+            crate::cabac_init::CtxSel::baseline(),
+            0,
+            0,
+            0,
+            5,
+            5,
+            256,
+            256,
+            &mut stats,
         )
         .unwrap();
         assert_eq!(out.mode, SplitMode::SplitBtHor);
@@ -1595,8 +1619,20 @@ mod tests {
         let rbsp = engine_for(&[]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
-        let out =
-            decode_btt_split(&mut eng, &none, false, 0, 0, 0, 4, 4, 256, 256, &mut stats).unwrap();
+        let out = decode_btt_split(
+            &mut eng,
+            &none,
+            crate::cabac_init::CtxSel::baseline(),
+            0,
+            0,
+            0,
+            4,
+            4,
+            256,
+            256,
+            &mut stats,
+        )
+        .unwrap();
         assert_eq!(out.mode, SplitMode::NoSplit);
         assert!(!out.flag);
         assert_eq!(stats.flag_bins, 0);

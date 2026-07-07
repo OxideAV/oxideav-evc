@@ -319,12 +319,15 @@ pub fn decode_idr_slice(
     // walker decodes the full §7.3.8.3 split_unit() syntax (BTT split
     // group + split_unit_coding_order_flag) via the threaded
     // `CodingTreeGates`.
+    // Round 397: sps_cm_init_flag is lifted — the walkers initialise the
+    // §9.3.2.2 Main-profile context tables at the slice QP and route
+    // every regular bin through the §9.3.4.2.1
+    // `ctxIdx = ctxIdxOffset + ctxInc` selection (`CtxSel`).
     if sps.sps_eipd_flag
         || sps.sps_addb_flag
         || sps.sps_dquant_flag
         || sps.sps_ats_flag
         || sps.sps_adcc_flag
-        || sps.sps_cm_init_flag
     {
         return Err(Error::unsupported(
             "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",

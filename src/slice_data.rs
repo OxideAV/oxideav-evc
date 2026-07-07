@@ -275,13 +275,23 @@ fn resolve_split_unit(
     split_unit_order: u32,
     constraint_current: crate::split::ModeConstraint,
     slice_is_i: bool,
+    num_smaller: u32,
     split_cu_flag_bins: &mut u32,
     tree_stats: &mut TreeSplitStats,
 ) -> Result<SplitResolution> {
-    use crate::cabac_init::{ctx_inc_suco_flag, MainCtxTable};
+    use crate::cabac::InitType;
+    use crate::cabac_init::{ctx_inc_suco_flag, CtxSel, MainCtxTable};
     use crate::split::{self, SplitMode};
 
     let gates = &walk.tree_gates;
+    let sel = CtxSel::new(
+        gates.sps_cm_init_flag,
+        if slice_is_i {
+            InitType::I
+        } else {
+            InitType::Pb
+        },
+    );
     let cb_w = 1u32 << log2_cb_width;
     let cb_h = 1u32 << log2_cb_height;
     let cb_within_picture = x0 + cb_w <= walk.pic_width && y0 + cb_h <= walk.pic_height;
@@ -293,7 +303,10 @@ fn resolve_split_unit(
         let can_recurse =
             log2_cb_width > walk.min_cb_log2_size_y && log2_cb_height > walk.min_cb_log2_size_y;
         if can_recurse && cb_within_picture && (log2_cb_width > 2 || log2_cb_height > 2) {
-            let bin = eng.decode_decision(0, 0)?;
+            // Table 41 (ctxInc 0, Table 95); Baseline keeps the legacy
+            // (0, 0) collapse.
+            let (t, i) = sel.ctx(MainCtxTable::SplitCuFlag, 0);
+            let bin = eng.decode_decision(t, i)?;
             *split_cu_flag_bins += 1;
             split_cu_flag = bin != 0;
         } else if can_recurse && !cb_within_picture {
@@ -315,8 +328,8 @@ fn resolve_split_unit(
             let btt = split::decode_btt_split(
                 eng,
                 &allowed,
-                gates.sps_cm_init_flag,
-                0, // eq. 1439 numSmaller — only consulted under cm_init
+                sel,
+                num_smaller,
                 x0,
                 y0,
                 log2_cb_width,
@@ -368,7 +381,8 @@ fn resolve_split_unit(
         } else {
             0
         };
-        let bin = eng.decode_decision(MainCtxTable::SucoFlag as usize, ctx_inc)?;
+        let (t, i) = sel.tree_ctx(MainCtxTable::SucoFlag, ctx_inc);
+        let bin = eng.decode_decision(t, i)?;
         tree_stats.suco_flag_bins += 1;
         if bin != 0 {
             tree_stats.suco_mirrored_units += 1;
@@ -392,7 +406,8 @@ fn resolve_split_unit(
     );
     let signalled = if need_signal {
         // Table 46 context; FL cMax = 1, ctxInc 0 (Table 95).
-        let bin = eng.decode_decision(MainCtxTable::PredModeConstraintType as usize, 0)?;
+        let (t, i) = sel.tree_ctx(MainCtxTable::PredModeConstraintType, 0);
+        let bin = eng.decode_decision(t, i)?;
         tree_stats.pred_mode_constraint_flag_bins += 1;
         Some(bin != 0)
     } else {
@@ -1165,16 +1180,22 @@ fn zigzag_scan(blk_w: usize, blk_h: usize) -> Vec<usize> {
 /// by `y * (1<<log2W) + x`). The buffer is **not** zeroed; callers are
 /// expected to pass a freshly allocated `vec![0i32; n]`.
 ///
-/// Bins consumed (`sps_cm_init_flag = 0` Baseline path):
-/// * `coeff_zero_run`: U-binarised, all bins → ctx (0, 0).
-/// * `coeff_abs_level_minus1`: U-binarised, all bins → ctx (0, 0). The
-///   spec's per-bin context derivation in §9.3.4.2.2 (eq. 1434/1435)
-///   becomes a no-op under `sps_cm_init_flag = 0` because every
-///   context starts at the same default.
+/// Bins consumed:
+/// * `coeff_zero_run`: U-binarised, Table 84. Under
+///   `sps_cm_init_flag == 1` each bin's ctxInc is the §9.3.4.2.2
+///   eq. 1434/1435 value driven by `cIdx`, the bin position and the
+///   §7.3.8.7 `PrevLevel` chain (initialised to 6, then the previous
+///   coefficient's absolute level); under `== 0` all bins collapse to
+///   the legacy `(0, 0)` slot.
+/// * `coeff_abs_level_minus1`: U-binarised, Table 85, same §9.3.4.2.2
+///   ctxInc derivation.
 /// * `coeff_sign_flag`: bypass.
-/// * `coeff_last_flag` (only if `ScanPos < total - 1`): ctx (0, 0).
+/// * `coeff_last_flag` (only if `ScanPos < total - 1`): Table 86,
+///   ctxInc `cIdx == 0 ? 0 : 1` (Table 95).
 fn decode_residual_coding_rle(
     eng: &mut CabacEngine,
+    sel: crate::cabac_init::CtxSel,
+    c_idx: u32,
     levels: &mut [i32],
     coeff_runs_counter: &mut u32,
     log2_tb_width: u32,
@@ -1199,9 +1220,21 @@ fn decode_residual_coding_rle(
     }
     let scan = zigzag_scan(blk_w, blk_h);
     let mut scan_pos: u32 = 0;
+    // §7.3.8.7: PrevLevel starts at 6 and tracks the previous non-zero
+    // coefficient's absolute level (feeds the §9.3.4.2.2 ctxInc).
+    let mut prev_level: u32 = 6;
+    use crate::cabac_init::{ctx_inc_coeff_zero_run, MainCtxTable};
     loop {
-        // coeff_zero_run U.
-        let zr = eng.decode_u_regular(0, |_| 0)?;
+        // coeff_zero_run U (Table 84).
+        let zr = if sel.cm_init {
+            let table = MainCtxTable::CoeffZeroRun;
+            let off = table.ctx_idx_offset(sel.init_type);
+            eng.decode_u_regular(table.as_usize(), |bin_idx| {
+                off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
+            })?
+        } else {
+            eng.decode_u_regular(0, |_| 0)?
+        };
         scan_pos = scan_pos
             .checked_add(zr)
             .ok_or_else(|| Error::invalid("evc residual_coding_rle: scan_pos overflow"))?;
@@ -1210,8 +1243,16 @@ fn decode_residual_coding_rle(
                 "evc residual_coding_rle: zero-run pushed past block size",
             ));
         }
-        // coeff_abs_level_minus1 U.
-        let lvl_minus1 = eng.decode_u_regular(0, |_| 0)?;
+        // coeff_abs_level_minus1 U (Table 85, same §9.3.4.2.2 ctxInc).
+        let lvl_minus1 = if sel.cm_init {
+            let table = MainCtxTable::CoeffAbsLevelMinus1;
+            let off = table.ctx_idx_offset(sel.init_type);
+            eng.decode_u_regular(table.as_usize(), |bin_idx| {
+                off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
+            })?
+        } else {
+            eng.decode_u_regular(0, |_| 0)?
+        };
         let abs_lvl = (lvl_minus1 as i32) + 1;
         // coeff_sign_flag bypass.
         let sign = eng.decode_bypass()?;
@@ -1225,13 +1266,17 @@ fn decode_residual_coding_rle(
             .ok_or_else(|| Error::invalid("evc residual_coding_rle: scan index out of bounds"))?;
         levels[blk_pos] = level;
         *coeff_runs_counter += 1;
-        // coeff_last_flag if not at the end.
+        // coeff_last_flag if not at the end (Table 86, ctxInc by cIdx).
         let last_pos_reached = scan_pos as usize == total - 1;
         let coeff_last = if !last_pos_reached {
-            eng.decode_decision(0, 0)?
+            let inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, i) = sel.ctx(MainCtxTable::CoeffLastFlag, inc);
+            eng.decode_decision(t, i)?
         } else {
             1
         };
+        // §7.3.8.7: PrevLevel = coeff_abs_level_minus1 + 1.
+        prev_level = lvl_minus1 + 1;
         scan_pos += 1;
         if coeff_last != 0 || (scan_pos as usize) >= total {
             return Ok(());
@@ -1646,6 +1691,17 @@ pub fn decode_baseline_idr_slice(
         decode.bit_depth_luma,
     )?;
     let mut eng = CabacEngine::new(rbsp)?;
+    // §9.3.2.2: under `sps_cm_init_flag == 1` initialise every
+    // Main-profile context table from the Tables 40-90 initValues at the
+    // slice QP (initType 0 — I slice). Under `== 0` all contexts keep
+    // the case-1 default `(256, 0)`.
+    if walk.tree_gates.sps_cm_init_flag {
+        crate::cabac_init::init_main_profile_contexts(
+            &mut eng,
+            crate::cabac::InitType::I,
+            decode.slice_qp,
+        )?;
+    }
     let mut stats = SliceDecodeStats {
         alf_ctb_map: crate::alf::AlfCtbMap::new(
             walk.pic_width,
@@ -1725,6 +1781,106 @@ pub fn decode_baseline_idr_slice(
     Ok((pic, stats))
 }
 
+/// §9.3.4.2.5 eq. 1439 — `numSmaller`: the count of available L/A/R
+/// neighbour luma coding blocks strictly smaller than the current block
+/// along the compared axis (`CbHeight < nCbH` for the left/right
+/// columns, `CbWidth < nCbW` for the above row). The neighbour
+/// positions are `(x0 − 1, y0)`, `(x0, y0 − 1)` and `(x0 + nCbW, y0)`.
+///
+/// A neighbour is *available* (§6.4.1) when it lies inside the picture
+/// and its covering luma CU has already been decoded — probed here via
+/// the side-info grid (`cu_log2_w != 0` marks a stamped cell; the
+/// walkers stamp every luma CU with its covering-CB geometry). Only
+/// consulted under `sps_cm_init_flag == 1` (the eq. 1440 ctxInc);
+/// returns 0 otherwise so the Baseline path never touches the grid.
+fn btt_num_smaller(
+    side_info: &SideInfoGrid,
+    walk: &SliceWalkInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> u32 {
+    if !walk.tree_gates.sps_cm_init_flag || !walk.tree_gates.sps_btt_flag {
+        return 0;
+    }
+    let n_cb_w = 1i64 << log2_cb_width;
+    let n_cb_h = 1i64 << log2_cb_height;
+    let probe = |x: i64, y: i64| -> Option<(u32, u32)> {
+        if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
+            return None;
+        }
+        let xc = (x as u32 >> 2) as usize;
+        let yc = (y as u32 >> 2) as usize;
+        if xc >= side_info.w_cells || yc >= side_info.h_cells {
+            return None;
+        }
+        let cell = side_info.at(xc, yc);
+        if cell.cu_log2_w == 0 {
+            return None; // not yet decoded → unavailable
+        }
+        Some((1u32 << cell.cu_log2_w, 1u32 << cell.cu_log2_h))
+    };
+    let mut n = 0u32;
+    if let Some((_, h)) = probe(x0 as i64 - 1, y0 as i64) {
+        if (h as i64) < n_cb_h {
+            n += 1;
+        }
+    }
+    if let Some((w, _)) = probe(x0 as i64, y0 as i64 - 1) {
+        if (w as i64) < n_cb_w {
+            n += 1;
+        }
+    }
+    if let Some((_, h)) = probe(x0 as i64 + n_cb_w, y0 as i64) {
+        if (h as i64) < n_cb_h {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// §9.3.4.2.4 eq. 1438 — neighbour-flag ctxInc for `affine_flag`,
+/// `cu_skip_flag`, `pred_mode_flag` and `ibc_flag` (Table 96).
+///
+/// The neighbour positions are `(x0 − 1, y0 + nCbH − 1)`,
+/// `(x0, y0 − 1)` and `(x0 + nCbW, y0 + nCbH − 1)`; availability is the
+/// same already-decoded side-info-grid probe as [`btt_num_smaller`].
+/// `cond` evaluates the Table 96 condition on the neighbouring cell.
+#[allow(clippy::too_many_arguments)]
+fn ctx_inc_neighbour_cells(
+    side_info: &SideInfoGrid,
+    walk: &SliceWalkInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    num_ctx: u32,
+    cond: impl Fn(&CuSideInfo) -> bool,
+) -> usize {
+    let n_cb_w = 1i64 << log2_cb_width;
+    let n_cb_h = 1i64 << log2_cb_height;
+    let probe = |x: i64, y: i64| -> u32 {
+        if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
+            return 0;
+        }
+        let xc = (x as u32 >> 2) as usize;
+        let yc = (y as u32 >> 2) as usize;
+        if xc >= side_info.w_cells || yc >= side_info.h_cells {
+            return 0;
+        }
+        let cell = side_info.at(xc, yc);
+        if cell.cu_log2_w == 0 {
+            return 0;
+        }
+        cond(&cell) as u32
+    };
+    let cond_l = probe(x0 as i64 - 1, y0 as i64 + n_cb_h - 1);
+    let cond_a = probe(x0 as i64, y0 as i64 - 1);
+    let cond_r = probe(x0 as i64 + n_cb_w, y0 as i64 + n_cb_h - 1);
+    crate::cabac_init::ctx_inc_neighbour_sum(cond_l, cond_a, cond_r, num_ctx)
+}
+
 /// §7.3.8.3 `split_unit()` for the I-slice (IDR) pixel walker.
 ///
 /// The decision prefix (quad `split_cu_flag` under `sps_btt_flag == 0`,
@@ -1753,6 +1909,7 @@ fn decode_split_unit(
     constraint_current: crate::split::ModeConstraint,
 ) -> Result<()> {
     use crate::split::{self, ModeConstraint, SplitMode};
+    let num_smaller = btt_num_smaller(side_info, walk, x0, y0, log2_cb_width, log2_cb_height);
     let r = resolve_split_unit(
         eng,
         walk,
@@ -1763,6 +1920,7 @@ fn decode_split_unit(
         split_unit_order,
         constraint_current,
         true, // IDR slices are I slices
+        num_smaller,
         &mut stats.split_cu_flag_bins,
         &mut stats.tree,
     )?;
@@ -1930,8 +2088,27 @@ fn decode_coding_unit(
             log2_cb_width,
             log2_cb_height,
         );
+    let sel =
+        crate::cabac_init::CtxSel::new(walk.tree_gates.sps_cm_init_flag, crate::cabac::InitType::I);
     if ibc_allowed {
-        let ibc_bin = eng.decode_decision(0, 0)?;
+        // Table 66; ctxInc under `sps_cm_init_flag == 1` is the
+        // §9.3.4.2.4 neighbour-ibc_flag sum (Table 96, numCtx = 2).
+        let (t, i) = if sel.cm_init {
+            let inc = ctx_inc_neighbour_cells(
+                side_info,
+                walk,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                2,
+                |c| c.pred_mode == CuPredMode::Ibc,
+            );
+            sel.ctx(crate::cabac_init::MainCtxTable::IbcFlag, inc)
+        } else {
+            (0, 0)
+        };
+        let ibc_bin = eng.decode_decision(t, i)?;
         stats.ibc_flag_bins += 1;
         if ibc_bin != 0 {
             stats.ibc_cus += 1;
@@ -1979,7 +2156,15 @@ fn decode_coding_unit(
     // capped to 4 leading 1s; the value is the number of leading 1s.
     // sps_cm_init_flag=0 → all bins land on (ctxTable=0, ctxIdx=0).
     let intra_idx = if is_luma_tree {
-        let v = eng.decode_u_regular(0, |_| 0)?;
+        // Table 62; Table 95 ctxInc: bin0 → 0, every later bin → 1
+        // (under `sps_cm_init_flag == 0` all bins collapse to (0, 0)).
+        let v = if sel.cm_init {
+            let table = crate::cabac_init::MainCtxTable::IntraPredMode;
+            let off = table.ctx_idx_offset(sel.init_type);
+            eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
+        } else {
+            eng.decode_u_regular(0, |_| 0)?
+        };
         stats.intra_pred_mode_bins += 1;
         v
     } else {
@@ -2058,6 +2243,8 @@ fn decode_ibc_branch(
 ) -> Result<()> {
     let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_height = log2_cb_height.min(walk.max_tb_log2_size_y);
+    let sel =
+        crate::cabac_init::CtxSel::new(walk.tree_gates.sps_cm_init_flag, crate::cabac::InitType::I);
     // `cbf_all` of line 3028 only fires for SINGLE_TREE; round 90
     // restricts IBC to DUAL_TREE_LUMA (the dual-tree chroma sibling
     // is handled separately) so we follow the DUAL_TREE_LUMA
@@ -2094,7 +2281,8 @@ fn decode_ibc_branch(
     // legal 8-bit-depth range [0, 51].
     let mut qp_delta: i32 = 0;
     if walk.cu_qp_delta_enabled && cbf_luma != 0 {
-        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
@@ -2113,6 +2301,8 @@ fn decode_ibc_branch(
     if cbf_luma != 0 {
         decode_residual_coding_rle(
             eng,
+            sel,
+            0,
             &mut residual_levels_y,
             &mut stats.coeff_runs,
             log2_tb_width,
@@ -2235,6 +2425,10 @@ fn apply_ibc_branch_predict_and_reconstruct(
                 cbf_luma,
                 mv_l0_x: mv_l.x,
                 mv_l0_y: mv_l.y,
+                cu_x0: x0 as u16,
+                cu_y0: y0 as u16,
+                cu_log2_w: log2_cb_width as u8,
+                cu_log2_h: log2_cb_height as u8,
                 ..Default::default()
             },
         );
@@ -2261,12 +2455,17 @@ fn decode_transform_unit(
     let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_height = log2_cb_height.min(walk.max_tb_log2_size_y);
     let chroma_present = walk.chroma_format_idc != 0;
+    let sel =
+        crate::cabac_init::CtxSel::new(walk.tree_gates.sps_cm_init_flag, crate::cabac::InitType::I);
     let mut cbf_cb = 0u32;
     let mut cbf_cr = 0u32;
     let mut cbf_luma = 0u32;
     if tree_type != TreeType::DualTreeLuma && chroma_present {
-        cbf_cb = eng.decode_decision(0, 0)? as u32;
-        cbf_cr = eng.decode_decision(0, 0)? as u32;
+        // Tables 76 / 77, ctxInc 0 (Table 95).
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+        cbf_cb = eng.decode_decision(t, i)? as u32;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+        cbf_cr = eng.decode_decision(t, i)? as u32;
         stats.cbf_chroma_bins += 2;
     }
     let is_split =
@@ -2274,12 +2473,16 @@ fn decode_transform_unit(
     let is_intra = true;
     if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0) && tree_type != TreeType::DualTreeChroma
     {
-        cbf_luma = eng.decode_decision(0, 0)? as u32;
+        // Table 75, ctxInc 0 (Table 95).
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+        cbf_luma = eng.decode_decision(t, i)? as u32;
         stats.cbf_luma_bins += 1;
     }
     let mut qp_delta: i32 = 0;
     if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
-        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        // Table 78; U binarisation with ctxInc 0 for every bin (Table 95).
+        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
@@ -2302,6 +2505,10 @@ fn decode_transform_unit(
             CuSideInfo {
                 pred_mode: CuPredMode::Intra,
                 cbf_luma: cbf_luma as u8,
+                cu_x0: x0 as u16,
+                cu_y0: y0 as u16,
+                cu_log2_w: log2_cb_width as u8,
+                cu_log2_h: log2_cb_height as u8,
                 ..Default::default()
             },
         );
@@ -2315,6 +2522,8 @@ fn decode_transform_unit(
                 let mut levels = vec![0i32; n];
                 decode_residual_coding_rle(
                     eng,
+                    sel,
+                    0,
                     &mut levels,
                     &mut stats.coeff_runs,
                     log2_tb_width,
@@ -2356,6 +2565,8 @@ fn decode_transform_unit(
                     let mut levels = vec![0i32; n_c];
                     decode_residual_coding_rle(
                         eng,
+                        sel,
+                        1,
                         &mut levels,
                         &mut stats.coeff_runs,
                         log2_c_w,
@@ -2374,6 +2585,8 @@ fn decode_transform_unit(
                     let mut levels = vec![0i32; n_c];
                     decode_residual_coding_rle(
                         eng,
+                        sel,
+                        2,
                         &mut levels,
                         &mut stats.coeff_runs,
                         log2_c_w,
@@ -2808,6 +3021,14 @@ pub fn decode_baseline_inter_slice(
         decode.bit_depth_luma,
     )?;
     let mut eng = CabacEngine::new(rbsp)?;
+    // §9.3.2.2: Main-profile context init (initType 1 — P/B slice).
+    if walk.tree_gates.sps_cm_init_flag {
+        crate::cabac_init::init_main_profile_contexts(
+            &mut eng,
+            crate::cabac::InitType::Pb,
+            decode.slice_qp,
+        )?;
+    }
     let mut stats = InterDecodeStats {
         alf_ctb_map: crate::alf::AlfCtbMap::new(
             walk.pic_width,
@@ -2924,6 +3145,7 @@ fn decode_inter_split_unit(
 ) -> Result<()> {
     use crate::split::{self, ModeConstraint, SplitMode};
     let walk = inputs.walk;
+    let num_smaller = btt_num_smaller(side_info, &walk, x0, y0, log2_cb_width, log2_cb_height);
     let r = resolve_split_unit(
         eng,
         &walk,
@@ -2934,6 +3156,7 @@ fn decode_inter_split_unit(
         split_unit_order,
         constraint_current,
         false, // P/B slice
+        num_smaller,
         &mut stats.split_cu_flag_bins,
         &mut stats.tree,
     )?;
@@ -4450,13 +4673,20 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     // round-5 path decodes residual coefficients when CBF=1 and adds
     // them to the inter-prediction samples before clipping.
     let chroma_present = walk.chroma_format_idc != 0;
-    let cbf_luma = eng.decode_decision(0, 0)?;
+    let sel = crate::cabac_init::CtxSel::new(
+        walk.tree_gates.sps_cm_init_flag,
+        crate::cabac::InitType::Pb,
+    );
+    let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+    let cbf_luma = eng.decode_decision(t, i)?;
     stats.cbf_luma_bins += 1;
     let mut cbf_cb = 0u8;
     let mut cbf_cr = 0u8;
     if chroma_present {
-        cbf_cb = eng.decode_decision(0, 0)?;
-        cbf_cr = eng.decode_decision(0, 0)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+        cbf_cb = eng.decode_decision(t, i)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+        cbf_cr = eng.decode_decision(t, i)?;
         stats.cbf_chroma_bins += 2;
     }
     // §7.3.8.5 transform_unit() cu_qp_delta. The presence condition is
@@ -4471,7 +4701,8 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     // clamped to the legal 8-bit-depth QP range [0, 51].
     let mut qp_delta: i32 = 0;
     if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
-        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
@@ -4504,6 +4735,10 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                     mv_l1_y: pred_l1.map(|(m, _)| m.y).unwrap_or(0),
                     ref_idx_l0: pred_l0.map(|(_, r)| r as i8).unwrap_or(-1),
                     ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
+                    cu_x0: x0 as u16,
+                    cu_y0: y0 as u16,
+                    cu_log2_w: n_cb_w.trailing_zeros() as u8,
+                    cu_log2_h: n_cb_h.trailing_zeros() as u8,
                     ..Default::default()
                 },
             );
@@ -4532,6 +4767,8 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
         let mut levels = vec![0i32; n_y];
         decode_residual_coding_rle(
             eng,
+            sel,
+            0,
             &mut levels,
             &mut stats.coeff_runs,
             log2_tb_w,
@@ -4558,7 +4795,15 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     let mut residual_cr_vec: Vec<i32> = Vec::new();
     if chroma_present && cbf_cb != 0 {
         let mut levels = vec![0i32; n_c];
-        decode_residual_coding_rle(eng, &mut levels, &mut stats.coeff_runs, log2_c_w, log2_c_h)?;
+        decode_residual_coding_rle(
+            eng,
+            sel,
+            1,
+            &mut levels,
+            &mut stats.coeff_runs,
+            log2_c_w,
+            log2_c_h,
+        )?;
         let mut res = vec![0i32; n_c];
         scale_and_inverse_transform(
             &levels,
@@ -4572,7 +4817,15 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     }
     if chroma_present && cbf_cr != 0 {
         let mut levels = vec![0i32; n_c];
-        decode_residual_coding_rle(eng, &mut levels, &mut stats.coeff_runs, log2_c_w, log2_c_h)?;
+        decode_residual_coding_rle(
+            eng,
+            sel,
+            2,
+            &mut levels,
+            &mut stats.coeff_runs,
+            log2_c_w,
+            log2_c_h,
+        )?;
         let mut res = vec![0i32; n_c];
         scale_and_inverse_transform(
             &levels,
@@ -5517,8 +5770,19 @@ fn decode_inter_intra_cu(
     // (the local-dual-tree chroma at a §7.4.9.3 tree-split point) uses
     // INTRA_DC, mirroring the IDR-side round-5 simplification.
     let is_luma_tree = tree_type != TreeType::DualTreeChroma;
+    let sel = crate::cabac_init::CtxSel::new(
+        walk.tree_gates.sps_cm_init_flag,
+        crate::cabac::InitType::Pb,
+    );
     let intra_mode = if is_luma_tree {
-        let intra_idx = eng.decode_u_regular(0, |_| 0)?;
+        // Table 62; Table 95 ctxInc: bin0 → 0, later bins → 1.
+        let intra_idx = if sel.cm_init {
+            let table = crate::cabac_init::MainCtxTable::IntraPredMode;
+            let off = table.ctx_idx_offset(sel.init_type);
+            eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
+        } else {
+            eng.decode_u_regular(0, |_| 0)?
+        };
         IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
             Error::invalid(format!(
                 "evc inter decode: intra_pred_mode {intra_idx} out of range"
@@ -5532,14 +5796,17 @@ fn decode_inter_intra_cu(
     let chroma_present = walk.chroma_format_idc != 0 && tree_type != TreeType::DualTreeLuma;
     let mut cbf_luma = 0u8;
     if is_luma_tree {
-        cbf_luma = eng.decode_decision(0, 0)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+        cbf_luma = eng.decode_decision(t, i)?;
         stats.cbf_luma_bins += 1;
     }
     let mut cbf_cb = 0u8;
     let mut cbf_cr = 0u8;
     if chroma_present {
-        cbf_cb = eng.decode_decision(0, 0)?;
-        cbf_cr = eng.decode_decision(0, 0)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+        cbf_cb = eng.decode_decision(t, i)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+        cbf_cr = eng.decode_decision(t, i)?;
         stats.cbf_chroma_bins += 2;
     }
     let cu_qp = decode.slice_qp.clamp(0, 51);
@@ -5553,6 +5820,10 @@ fn decode_inter_intra_cu(
             CuSideInfo {
                 pred_mode: CuPredMode::Intra,
                 cbf_luma,
+                cu_x0: x0 as u16,
+                cu_y0: y0 as u16,
+                cu_log2_w: log2_cb_width as u8,
+                cu_log2_h: log2_cb_height as u8,
                 ..Default::default()
             },
         );
@@ -5562,6 +5833,8 @@ fn decode_inter_intra_cu(
             let mut levels = vec![0i32; n];
             decode_residual_coding_rle(
                 eng,
+                sel,
+                0,
                 &mut levels,
                 &mut stats.coeff_runs,
                 log2_tb_w,
@@ -5588,6 +5861,8 @@ fn decode_inter_intra_cu(
             let mut levels = vec![0i32; n_c];
             decode_residual_coding_rle(
                 eng,
+                sel,
+                1,
                 &mut levels,
                 &mut stats.coeff_runs,
                 log2_c_w,
@@ -5606,6 +5881,8 @@ fn decode_inter_intra_cu(
             let mut levels = vec![0i32; n_c];
             decode_residual_coding_rle(
                 eng,
+                sel,
+                2,
                 &mut levels,
                 &mut stats.coeff_runs,
                 log2_c_w,
@@ -5676,13 +5953,20 @@ fn decode_inter_ibc_branch(
     // `decode_inter_coding_unit` pattern. The `cbf_all` optimisation
     // is a deferred follow-up since the test corpus drives all-zero
     // cbf paths.
-    let cbf_luma = eng.decode_decision(0, 0)?;
+    let sel = crate::cabac_init::CtxSel::new(
+        walk.tree_gates.sps_cm_init_flag,
+        crate::cabac::InitType::Pb,
+    );
+    let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+    let cbf_luma = eng.decode_decision(t, i)?;
     stats.cbf_luma_bins += 1;
     let mut cbf_cb = 0u8;
     let mut cbf_cr = 0u8;
     if chroma_present {
-        cbf_cb = eng.decode_decision(0, 0)?;
-        cbf_cr = eng.decode_decision(0, 0)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+        cbf_cb = eng.decode_decision(t, i)?;
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+        cbf_cr = eng.decode_decision(t, i)?;
         stats.cbf_chroma_bins += 2;
     }
     // §7.3.8.5 transform_unit() cu_qp_delta (line 3073-3078). The presence
@@ -5697,7 +5981,8 @@ fn decode_inter_ibc_branch(
     // clamped to [0, 51].
     let mut qp_delta: i32 = 0;
     if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
-        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
@@ -5715,6 +6000,8 @@ fn decode_inter_ibc_branch(
     if cbf_luma != 0 {
         decode_residual_coding_rle(
             eng,
+            sel,
+            0,
             &mut residual_levels_y,
             &mut stats.coeff_runs,
             log2_tb_width,
@@ -5735,6 +6022,8 @@ fn decode_inter_ibc_branch(
     if chroma_present && cbf_cb != 0 {
         decode_residual_coding_rle(
             eng,
+            sel,
+            1,
             &mut residual_levels_cb,
             &mut stats.coeff_runs,
             log2_c_w,
@@ -5744,6 +6033,8 @@ fn decode_inter_ibc_branch(
     if chroma_present && cbf_cr != 0 {
         decode_residual_coding_rle(
             eng,
+            sel,
+            2,
             &mut residual_levels_cr,
             &mut stats.coeff_runs,
             log2_c_w,
@@ -5934,6 +6225,10 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
             cbf_luma,
             mv_l0_x: mv_l.x,
             mv_l0_y: mv_l.y,
+            cu_x0: x0 as u16,
+            cu_y0: y0 as u16,
+            cu_log2_w: log2_cb_width as u8,
+            cu_log2_h: log2_cb_height as u8,
             ..Default::default()
         },
     );
@@ -6647,7 +6942,16 @@ mod tests {
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut levels = vec![0i32; 16];
         let mut runs = 0u32;
-        decode_residual_coding_rle(&mut eng, &mut levels, &mut runs, 2, 2).unwrap();
+        decode_residual_coding_rle(
+            &mut eng,
+            crate::cabac_init::CtxSel::baseline(),
+            0,
+            &mut levels,
+            &mut runs,
+            2,
+            2,
+        )
+        .unwrap();
         assert_eq!(runs, 1);
         // Scan position 0 maps to (0, 0) → flat index 0. The magnitude
         // must be 5; sign depends on the test encoder's bypass behaviour
@@ -12017,5 +12321,312 @@ mod tests {
         assert_eq!(stats.tree.btt.type_bins, 0);
         assert_eq!(stats.coding_units, 4, "two leaves × (luma + chroma)");
         assert!(pic.y.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: §9.3.2.2 + §9.3.4.2.1 — `sps_cm_init_flag == 1` on the
+    /// IDR BTT pixel walk. The engine initialises every Main-profile
+    /// context table from the Tables 40-90 initValues at the slice QP,
+    /// and each regular bin routes to its per-element table at
+    /// `ctxIdx = ctxIdxOffset(initType = 0) + ctxInc`:
+    ///
+    /// * `btt_split_flag` → Table 42 at the §9.3.4.2.5 eq. 1440 ctxInc —
+    ///   including a **numSmaller = 1** read on the second 32×16 child
+    ///   (its above neighbour is a finished 16×16 CU),
+    /// * `btt_split_dir` → Table 43 at `log2W − log2H + 2`,
+    /// * `btt_split_type` → Table 44,
+    /// * `intra_pred_mode` → Table 62 (bin0 ctxInc 0, later bins 1),
+    /// * `cbf_luma` / `cbf_cb` / `cbf_cr` → Tables 75/76/77,
+    /// * `coeff_zero_run` / `coeff_abs_level_minus1` → Tables 84/85 at
+    ///   the §9.3.4.2.2 eq. 1434/1435 ctxInc driven by the §7.3.8.7
+    ///   `PrevLevel` chain (+12 on the chroma block),
+    /// * `coeff_last_flag` → Table 86 at `cIdx == 0 ? 0 : 1`.
+    ///
+    /// One 32×32 CTU splits BT_HOR, both 32×16 children split BT_VER →
+    /// four square 16×16 leaves. Only the last (bottom-right) leaf
+    /// carries residuals (luma DC + Cb DC), so every prediction is a
+    /// flat 128 and the reconstruction isolates the residual exactly.
+    /// The test encoder starts from the identical §9.3.2.2 case-2
+    /// context state, so the roundtrip proves init + offset + ctxInc
+    /// agree end-to-end.
+    #[test]
+    fn round397_cm_init_idr_btt_residual_decodes_with_main_contexts() {
+        use crate::cabac::{CabacEncoder, InitType};
+        use crate::cabac_init::{ctx_inc_btt_split_flag, ctx_inc_coeff_zero_run, MainCtxTable};
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let t_intra = MainCtxTable::IntraPredMode as usize;
+        let t_cbf_l = MainCtxTable::CbfLuma as usize;
+        let t_cbf_cb = MainCtxTable::CbfCb as usize;
+        let t_cbf_cr = MainCtxTable::CbfCr as usize;
+        let t_run = MainCtxTable::CoeffZeroRun as usize;
+        let t_lvl = MainCtxTable::CoeffAbsLevelMinus1 as usize;
+        let t_last = MainCtxTable::CoeffLastFlag as usize;
+        let slice_qp = 30;
+
+        let mut enc = CabacEncoder::new();
+        enc.init_main_profile(InitType::I, slice_qp);
+
+        // DC-only residual: zero_run = 0, level +60 (59 "1" bins under
+        // the 64-bin U cap), positive sign, last = 1. The §9.3.4.2.2
+        // ctxInc chain starts from PrevLevel = 6.
+        let dc_residual = |enc: &mut CabacEncoder, c_idx: u32| {
+            enc.encode_decision(t_run, ctx_inc_coeff_zero_run(0, c_idx, 6), 0);
+            for bin_idx in 0..59 {
+                enc.encode_decision(t_lvl, ctx_inc_coeff_zero_run(bin_idx, c_idx, 6), 1);
+            }
+            enc.encode_decision(t_lvl, ctx_inc_coeff_zero_run(59, c_idx, 6), 0);
+            enc.encode_bypass(0); // coeff_sign_flag → +60
+            enc.encode_decision(t_last, if c_idx == 0 { 0 } else { 1 }, 1);
+        };
+        // An empty leaf CU pair: intra_pred_mode = 0 (DC, single U bin
+        // "0" at Table 62 ctxInc 0), all CBFs zero.
+        let empty_leaf = |enc: &mut CabacEncoder| {
+            enc.encode_decision(t_intra, 0, 0);
+            enc.encode_decision(t_cbf_l, 0, 0);
+            enc.encode_decision(t_cbf_cb, 0, 0);
+            enc.encode_decision(t_cbf_cr, 0, 0);
+        };
+
+        // CTU 32×32: BT_HOR (flag ctxInc 6 = Table 97 ctxSetIdx 2 · 3,
+        // dir ctxInc 5 − 5 + 2 = 2, type 0 = binary).
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 32, 32), 1);
+        enc.encode_decision(t_dir, 2, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // Top 32×16 child: BT_VER (dir ctxInc 5 − 4 + 2 = 3), nothing
+        // decoded yet → numSmaller 0.
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 32, 16), 1);
+        enc.encode_decision(t_dir, 3, 1);
+        enc.encode_decision(t_type, 0, 0);
+        // Leaves (0,0) and (16,0), both empty.
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
+        empty_leaf(&mut enc);
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
+        empty_leaf(&mut enc);
+        // Bottom 32×16 child: its above neighbour is now a finished
+        // 16×16 CU (CbWidth 16 < 32) → **numSmaller = 1**.
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(1, 32, 16), 1);
+        enc.encode_decision(t_dir, 3, 1);
+        enc.encode_decision(t_type, 0, 0);
+        // Leaf (0,16): empty.
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
+        empty_leaf(&mut enc);
+        // Leaf (16,16): luma DC residual + Cb DC residual.
+        enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
+        enc.encode_decision(t_intra, 0, 0); // DC
+        enc.encode_decision(t_cbf_l, 0, 1);
+        dc_residual(&mut enc, 0);
+        enc.encode_decision(t_cbf_cb, 0, 1);
+        enc.encode_decision(t_cbf_cr, 0, 0);
+        dc_residual(&mut enc, 1);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut gates = btt_tree_gates();
+        gates.sps_cm_init_flag = true;
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            tree_gates: gates,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.tree.btt.flag_bins, 7, "root + 2 children + 4 leaves");
+        assert_eq!(stats.tree.btt.dir_bins, 3);
+        assert_eq!(stats.tree.btt.type_bins, 3);
+        assert_eq!(stats.intra_pred_mode_bins, 4);
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        assert_eq!(stats.coeff_runs, 2, "one luma + one Cb DC coefficient");
+        assert_eq!(stats.coding_units, 8, "4 leaves × (luma + chroma)");
+        // Every prediction is DC over flat-128 references → 128. Only
+        // the bottom-right quadrant carries the residual; its exact
+        // per-sample shape follows the spec-literal eq. 1062 inverse
+        // cascade (the standing orientation question), so assert the
+        // residual's energy and confinement rather than flatness:
+        // everything outside the quadrant is untouched, and the
+        // quadrant's mean sits well above 128.
+        let mut sum: i64 = 0;
+        for j in 0..32 {
+            for i in 0..32 {
+                let v = pic.y[j * 32 + i] as i64;
+                if i >= 16 && j >= 16 {
+                    sum += v;
+                } else {
+                    assert_eq!(v, 128, "luma at ({i},{j}) must be untouched");
+                }
+            }
+        }
+        let mean_y = sum / 256;
+        assert!(
+            mean_y >= 131,
+            "bottom-right leaf must carry the +60 DC residual (mean {mean_y})"
+        );
+        // Cb: only the bottom-right 8×8 chroma quadrant is shifted; Cr
+        // stays flat.
+        let mut sum_cb: i64 = 0;
+        for j in 0..16 {
+            for i in 0..16 {
+                let v = pic.cb[j * 16 + i] as i64;
+                if i >= 8 && j >= 8 {
+                    sum_cb += v;
+                } else {
+                    assert_eq!(v, 128, "cb at ({i},{j}) must be untouched");
+                }
+            }
+        }
+        let mean_cb = sum_cb / 64;
+        assert!(
+            mean_cb >= 131,
+            "cb bottom-right must carry the +60 DC residual (mean {mean_cb})"
+        );
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: `btt_num_smaller` (§9.3.4.2.5 eq. 1439) probes the
+    /// side-info grid for already-decoded smaller neighbours: left/right
+    /// compare CbHeight, above compares CbWidth; unstamped and
+    /// out-of-picture neighbours are unavailable.
+    #[test]
+    fn round397_btt_num_smaller_grid_probes() {
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            tree_gates: CodingTreeGates {
+                sps_btt_flag: true,
+                sps_cm_init_flag: true,
+                ..btt_tree_gates()
+            },
+            ..Default::default()
+        };
+        let mut grid = SideInfoGrid::new(64, 64);
+        // Nothing decoded yet → 0.
+        assert_eq!(btt_num_smaller(&grid, &walk, 16, 16, 4, 4), 0);
+        // Left neighbour: an 8×8 CU at (8, 16) (CbHeight 8 < 16).
+        grid.stamp_block(
+            8,
+            16,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                cu_x0: 8,
+                cu_y0: 16,
+                cu_log2_w: 3,
+                cu_log2_h: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(btt_num_smaller(&grid, &walk, 16, 16, 4, 4), 1);
+        // Above neighbour: a 32×16 CU covering (16, 0) — CbWidth 32 is
+        // NOT smaller than 16 → still 1.
+        grid.stamp_block(
+            0,
+            0,
+            32,
+            16,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                cu_x0: 0,
+                cu_y0: 0,
+                cu_log2_w: 5,
+                cu_log2_h: 4,
+                ..Default::default()
+            },
+        );
+        assert_eq!(btt_num_smaller(&grid, &walk, 16, 16, 4, 4), 1);
+        // Right neighbour at (32, 16): an 8×8 CU (CbHeight 8 < 16) → 2.
+        grid.stamp_block(
+            32,
+            16,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                cu_x0: 32,
+                cu_y0: 16,
+                cu_log2_w: 3,
+                cu_log2_h: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(btt_num_smaller(&grid, &walk, 16, 16, 4, 4), 2);
+        // Baseline (cm_init off) never consults the grid.
+        let mut base = walk;
+        base.tree_gates.sps_cm_init_flag = false;
+        assert_eq!(btt_num_smaller(&grid, &base, 16, 16, 4, 4), 0);
+    }
+
+    /// Round 397: `ctx_inc_neighbour_cells` (§9.3.4.2.4 eq. 1438 +
+    /// Table 96) — the L/A/R probe positions are
+    /// `(x0 − 1, y0 + nCbH − 1)`, `(x0, y0 − 1)`,
+    /// `(x0 + nCbW, y0 + nCbH − 1)`, and the sum clamps to numCtx − 1.
+    #[test]
+    fn round397_ctx_inc_neighbour_cells_probes() {
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ..Default::default()
+        };
+        let mut grid = SideInfoGrid::new(64, 64);
+        let is_ibc = |c: &CuSideInfo| c.pred_mode == CuPredMode::Ibc;
+        assert_eq!(
+            ctx_inc_neighbour_cells(&grid, &walk, 16, 16, 3, 3, 2, is_ibc),
+            0
+        );
+        // Left IBC CU covering (15, 23).
+        grid.stamp_block(
+            8,
+            16,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Ibc,
+                cu_x0: 8,
+                cu_y0: 16,
+                cu_log2_w: 3,
+                cu_log2_h: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx_inc_neighbour_cells(&grid, &walk, 16, 16, 3, 3, 2, is_ibc),
+            1
+        );
+        // Above IBC CU covering (16, 15) → sum 2, clamped to numCtx−1 = 1.
+        grid.stamp_block(
+            16,
+            8,
+            8,
+            8,
+            CuSideInfo {
+                pred_mode: CuPredMode::Ibc,
+                cu_x0: 16,
+                cu_y0: 8,
+                cu_log2_w: 3,
+                cu_log2_h: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx_inc_neighbour_cells(&grid, &walk, 16, 16, 3, 3, 2, is_ibc),
+            1,
+            "eq. 1438 clamps to numCtx − 1"
+        );
+        assert_eq!(
+            ctx_inc_neighbour_cells(&grid, &walk, 16, 16, 3, 3, 3, is_ibc),
+            2,
+            "numCtx = 3 admits the full sum"
+        );
     }
 }

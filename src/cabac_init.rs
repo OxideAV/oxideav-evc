@@ -524,6 +524,16 @@ impl MainCtxTable {
     /// `init_type` per Table 39. The two halves of every shared table
     /// are equal in size; for I slices we use the first half, for P/B
     /// the second.
+    /// §9.3.4.2.1 — `ctxIdxOffset`: "the lowest value of ctxIdx in
+    /// Table 39 depending on the current value of initType". Decode-time
+    /// `ctxIdx = ctxIdxOffset + ctxInc`; the offset is the start of the
+    /// [`Self::init_type_range`] that
+    /// [`init_main_profile_contexts`] initialised for the slice.
+    #[inline]
+    pub fn ctx_idx_offset(self, init_type: InitType) -> usize {
+        self.init_type_range(init_type).0
+    }
+
     pub fn init_type_range(self, init_type: InitType) -> (usize, usize) {
         let len = self.init_values().len();
         // Most tables split exactly in half. Three special-cases:
@@ -591,6 +601,79 @@ pub fn init_main_profile_contexts(
         }
     }
     Ok(())
+}
+
+/// §9.3.4.2.1 — the per-slice **context selector** the pixel walkers
+/// thread through every regular-bin read.
+///
+/// Under `sps_cm_init_flag == 1` a syntax element's bin lands on its
+/// Main-profile context table (Tables 40-90) at
+/// `ctxIdx = ctxIdxOffset + ctxInc`, where per §9.3.4.2.1 the
+/// `ctxIdxOffset` is "the lowest value of ctxIdx in Table 39 depending
+/// on the current value of initType" — i.e.
+/// [`MainCtxTable::ctx_idx_offset`] (`initType` is 1 for P/B slices, 0
+/// otherwise, per §9.3.2.2). [`init_main_profile_contexts`] initialises
+/// exactly that ctxIdx range from the printed initValue lists, so the
+/// decode-side offset and the init-side range always agree.
+///
+/// Under `sps_cm_init_flag == 0` the selector preserves the crate's
+/// established Baseline collapse: [`CtxSel::ctx`] routes to the single
+/// `(0, 0)` slot (the historical Baseline-walker convention every
+/// existing fixture encodes against), while [`CtxSel::tree_ctx`] keeps
+/// the §7.3.8.3 tree elements on their per-element table at ctxIdx 0
+/// (the round-391 convention). Both conventions initialise every
+/// context to the same §9.3.2.2 case-1 default `(256, 0)`, so the
+/// collapse only merges *adaptation trajectories*, never initial
+/// probabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CtxSel {
+    /// `sps_cm_init_flag` (§7.4.3.1).
+    pub cm_init: bool,
+    /// §9.3.2.2 `initType`: [`InitType::I`] for I slices, [`InitType::Pb`]
+    /// for P/B slices.
+    pub init_type: InitType,
+}
+
+impl CtxSel {
+    /// Build the selector for a slice.
+    pub fn new(cm_init: bool, init_type: InitType) -> Self {
+        Self { cm_init, init_type }
+    }
+
+    /// The Baseline shape: `sps_cm_init_flag == 0`, I-slice init type.
+    pub fn baseline() -> Self {
+        Self::new(false, InitType::I)
+    }
+
+    /// `(ctxTable, ctxIdx)` for a syntax element whose Baseline
+    /// (`sps_cm_init_flag == 0`) bins collapse to the legacy `(0, 0)`
+    /// slot.
+    #[inline]
+    pub fn ctx(self, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
+        if self.cm_init {
+            (
+                table.as_usize(),
+                table.ctx_idx_offset(self.init_type) + ctx_inc,
+            )
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// `(ctxTable, ctxIdx)` for a §7.3.8.3 tree element that the crate
+    /// keeps on its per-element table (at ctxIdx 0) even under
+    /// `sps_cm_init_flag == 0` — the round-391 `split_unit()` convention.
+    #[inline]
+    pub fn tree_ctx(self, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
+        if self.cm_init {
+            (
+                table.as_usize(),
+                table.ctx_idx_offset(self.init_type) + ctx_inc,
+            )
+        } else {
+            (table.as_usize(), 0)
+        }
+    }
 }
 
 // =====================================================================

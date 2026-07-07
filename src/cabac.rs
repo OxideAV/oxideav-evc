@@ -596,6 +596,29 @@ impl CabacEncoder {
         }
     }
 
+    /// Install a context variable (test fixtures that encode against
+    /// Main-profile-initialised contexts — the encoder dual of
+    /// [`CabacEngine::set_context`]).
+    pub(crate) fn set_context(&mut self, ctx_table: usize, ctx_idx: usize, var: ContextVar) {
+        self.ctx[ctx_table][ctx_idx] = var;
+    }
+
+    /// §9.3.2.2 case 2 — initialise every Main-profile context table
+    /// from the Tables 40-90 initValues at `slice_qp`, mirroring
+    /// [`crate::cabac_init::init_main_profile_contexts`] so a test
+    /// encoder and the decoder start from identical context state.
+    pub(crate) fn init_main_profile(&mut self, init_type: InitType, slice_qp: i32) {
+        use crate::cabac_init::MainCtxTable;
+        for &table in MainCtxTable::ALL {
+            let (start, end) = table.init_type_range(init_type);
+            let values = table.init_values();
+            for (ctx_idx, &init_value) in values.iter().enumerate().take(end).skip(start) {
+                let var = init_contexts_from_init_value(init_value, slice_qp);
+                self.set_context(table.as_usize(), ctx_idx, var);
+            }
+        }
+    }
+
     pub(crate) fn finish(self) -> Vec<u8> {
         // Pack MSB-first, padding the final byte with 1-bits (any
         // decoder over-read during a trailing renormalisation stays in
