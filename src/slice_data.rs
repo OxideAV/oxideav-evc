@@ -73,6 +73,11 @@ pub struct SliceWalkInputs {
     /// `cu_qp_delta_enabled_flag` (PPS). When false, `cu_qp_delta_*` is
     /// not in the bitstream.
     pub cu_qp_delta_enabled: bool,
+    /// `sps_adcc_flag` (§7.4.3.1) — advanced residual coding. When true
+    /// every `residual_coding()` invocation routes to the §7.3.8.8
+    /// `residual_coding_adv()` layer instead of the §7.3.8.7 run-length
+    /// coding.
+    pub sps_adcc_flag: bool,
     /// `sps_eipd_flag` (§7.4.3.1) — extended intra prediction. When
     /// true the `coding_unit()` intra syntax switches to the §7.3.8.4
     /// MPM/PIMS/rem-mode group and reconstruction runs the §8.4.4 EIPD
@@ -135,6 +140,7 @@ impl Default for SliceWalkInputs {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            sps_adcc_flag: false,
             sps_eipd_flag: false,
             sps_dquant_flag: false,
             cu_qp_delta_area: 6,
@@ -1203,6 +1209,48 @@ fn zigzag_scan(blk_w: usize, blk_h: usize) -> Vec<usize> {
     zz
 }
 
+/// §7.3.8.6 `residual_coding()` — dispatch one transform block's
+/// residual decode on `sps_adcc_flag`: the §7.3.8.8 advanced coding
+/// ([`crate::adcc::decode_residual_coding_adv`]) or the §7.3.8.7
+/// run-length coding ([`decode_residual_coding_rle`]).
+#[allow(clippy::too_many_arguments)]
+fn decode_residual_block(
+    eng: &mut CabacEngine,
+    sel: crate::cabac_init::CtxSel,
+    walk: &SliceWalkInputs,
+    c_idx: u32,
+    levels: &mut [i32],
+    coeff_runs_counter: &mut u32,
+    adcc_stats: &mut crate::adcc::AdccStats,
+    log2_tb_width: u32,
+    log2_tb_height: u32,
+) -> Result<()> {
+    if walk.sps_adcc_flag {
+        crate::adcc::decode_residual_coding_adv(
+            eng,
+            sel,
+            c_idx,
+            // ChromaArrayType == chroma_format_idc (no
+            // separate_colour_plane in EVC).
+            walk.chroma_format_idc,
+            levels,
+            adcc_stats,
+            log2_tb_width,
+            log2_tb_height,
+        )
+    } else {
+        decode_residual_coding_rle(
+            eng,
+            sel,
+            c_idx,
+            levels,
+            coeff_runs_counter,
+            log2_tb_width,
+            log2_tb_height,
+        )
+    }
+}
+
 /// Decode a `residual_coding_rle()` invocation per §7.3.8.7 directly into
 /// a `levels` buffer (length `1 << (log2W + log2H)`, row-major indexed
 /// by `y * (1<<log2W) + x`). The buffer is **not** zeroed; callers are
@@ -1632,6 +1680,8 @@ pub struct SliceDecodeStats {
     pub ctus: u32,
     /// §7.3.8.4 `sps_eipd_flag == 1` intra-mode syntax tallies.
     pub eipd: crate::eipd_syntax::EipdSyntaxStats,
+    /// §7.3.8.8 `sps_adcc_flag == 1` residual-coding tallies.
+    pub adcc: crate::adcc::AdccStats,
     pub split_cu_flag_bins: u32,
     /// Round 391: §7.3.8.3 BTT/SUCO tree-level syntax tallies
     /// (`btt_split_*`, `split_unit_coding_order_flag`,
@@ -2587,12 +2637,14 @@ fn decode_ibc_branch(
     let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
     let mut residual_levels_y = vec![0i32; n_tb];
     if cbf_luma != 0 {
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            walk,
             0,
             &mut residual_levels_y,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_tb_width,
             log2_tb_height,
         )?;
@@ -2818,12 +2870,14 @@ fn decode_transform_unit(
             let mut residual = vec![0i32; n];
             if cbf_luma != 0 {
                 let mut levels = vec![0i32; n];
-                decode_residual_coding_rle(
+                decode_residual_block(
                     eng,
                     sel,
+                    walk,
                     0,
                     &mut levels,
                     &mut stats.coeff_runs,
+                    &mut stats.adcc,
                     log2_tb_width,
                     log2_tb_height,
                 )?;
@@ -2878,12 +2932,14 @@ fn decode_transform_unit(
                 let mut res_cr = vec![0i32; n_c];
                 if cbf_cb != 0 {
                     let mut levels = vec![0i32; n_c];
-                    decode_residual_coding_rle(
+                    decode_residual_block(
                         eng,
                         sel,
+                        walk,
                         1,
                         &mut levels,
                         &mut stats.coeff_runs,
+                        &mut stats.adcc,
                         log2_c_w,
                         log2_c_h,
                     )?;
@@ -2898,12 +2954,14 @@ fn decode_transform_unit(
                 }
                 if cbf_cr != 0 {
                     let mut levels = vec![0i32; n_c];
-                    decode_residual_coding_rle(
+                    decode_residual_block(
                         eng,
                         sel,
+                        walk,
                         2,
                         &mut levels,
                         &mut stats.coeff_runs,
+                        &mut stats.adcc,
                         log2_c_w,
                         log2_c_h,
                     )?;
@@ -3195,6 +3253,8 @@ pub struct InterDecodeStats {
     pub ctus: u32,
     /// §7.3.8.4 `sps_eipd_flag == 1` intra-mode syntax tallies.
     pub eipd: crate::eipd_syntax::EipdSyntaxStats,
+    /// §7.3.8.8 `sps_adcc_flag == 1` residual-coding tallies.
+    pub adcc: crate::adcc::AdccStats,
     pub split_cu_flag_bins: u32,
     pub coding_units: u32,
     pub cu_skip_flag_bins: u32,
@@ -5391,12 +5451,14 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     let mut residual_y_vec: Vec<i32> = Vec::new();
     if cbf_luma != 0 {
         let mut levels = vec![0i32; n_y];
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             0,
             &mut levels,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_tb_w,
             log2_tb_h,
         )?;
@@ -5421,12 +5483,14 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     let mut residual_cr_vec: Vec<i32> = Vec::new();
     if chroma_present && cbf_cb != 0 {
         let mut levels = vec![0i32; n_c];
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             1,
             &mut levels,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_c_w,
             log2_c_h,
         )?;
@@ -5443,12 +5507,14 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     }
     if chroma_present && cbf_cr != 0 {
         let mut levels = vec![0i32; n_c];
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             2,
             &mut levels,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_c_w,
             log2_c_h,
         )?;
@@ -6513,12 +6579,14 @@ fn decode_inter_intra_cu(
         let mut residual = vec![0i32; n];
         if cbf_luma != 0 {
             let mut levels = vec![0i32; n];
-            decode_residual_coding_rle(
+            decode_residual_block(
                 eng,
                 sel,
+                &walk,
                 0,
                 &mut levels,
                 &mut stats.coeff_runs,
+                &mut stats.adcc,
                 log2_tb_w,
                 log2_tb_h,
             )?;
@@ -6560,12 +6628,14 @@ fn decode_inter_intra_cu(
         let mut res_cr = vec![0i32; n_c];
         if cbf_cb != 0 {
             let mut levels = vec![0i32; n_c];
-            decode_residual_coding_rle(
+            decode_residual_block(
                 eng,
                 sel,
+                &walk,
                 1,
                 &mut levels,
                 &mut stats.coeff_runs,
+                &mut stats.adcc,
                 log2_c_w,
                 log2_c_h,
             )?;
@@ -6580,12 +6650,14 @@ fn decode_inter_intra_cu(
         }
         if cbf_cr != 0 {
             let mut levels = vec![0i32; n_c];
-            decode_residual_coding_rle(
+            decode_residual_block(
                 eng,
                 sel,
+                &walk,
                 2,
                 &mut levels,
                 &mut stats.coeff_runs,
+                &mut stats.adcc,
                 log2_c_w,
                 log2_c_h,
             )?;
@@ -6735,12 +6807,14 @@ fn decode_inter_ibc_branch(
     let n_tb_y = (1usize << log2_tb_width) * (1usize << log2_tb_height);
     let mut residual_levels_y = vec![0i32; n_tb_y];
     if cbf_luma != 0 {
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             0,
             &mut residual_levels_y,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_tb_width,
             log2_tb_height,
         )?;
@@ -6757,23 +6831,27 @@ fn decode_inter_ibc_branch(
     let mut residual_levels_cb = vec![0i32; n_tb_c];
     let mut residual_levels_cr = vec![0i32; n_tb_c];
     if chroma_present && cbf_cb != 0 {
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             1,
             &mut residual_levels_cb,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_c_w,
             log2_c_h,
         )?;
     }
     if chroma_present && cbf_cr != 0 {
-        decode_residual_coding_rle(
+        decode_residual_block(
             eng,
             sel,
+            &walk,
             2,
             &mut residual_levels_cr,
             &mut stats.coeff_runs,
+            &mut stats.adcc,
             log2_c_w,
             log2_c_h,
         )?;
@@ -13995,5 +14073,226 @@ mod tests {
         // DC intra over unavailable refs on a P slice: flat mid-level.
         assert!(pic.y.iter().all(|&v| v == 128));
         assert!(pic.cb.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: ADCC (`sps_adcc_flag == 1`) through the IDR pixel
+    /// walker under `sps_cm_init_flag == 1` — the §7.3.8.6 dispatch
+    /// routes the luma TU to `residual_coding_adv()`: last-significant
+    /// prefixes on Tables 87/88, one inferred-sig DC coefficient, a
+    /// greaterA "0" on Table 90 and a bypass sign, reconstructed
+    /// through the standard dequant/IDCT chain. Presence tallies pin
+    /// the exact bin budget; the RLE counter stays zero.
+    #[test]
+    fn round397_adcc_idr_dc_coefficient_decodes_to_pixels() {
+        use crate::cabac::{CabacEncoder, InitType};
+        use crate::cabac_init::{
+            ctx_inc_coeff_abs_level_greater_a, ctx_inc_last_sig_coeff_prefix, MainCtxTable,
+        };
+        let slice_qp = 51;
+        let mut enc = CabacEncoder::new();
+        enc.init_main_profile(InitType::I, slice_qp);
+        let t41 = MainCtxTable::SplitCuFlag as usize;
+        let t62 = MainCtxTable::IntraPredMode as usize;
+        let t75 = MainCtxTable::CbfLuma as usize;
+        let t76 = MainCtxTable::CbfCb as usize;
+        let t77 = MainCtxTable::CbfCr as usize;
+        let t87 = MainCtxTable::LastSigCoeffXPrefix as usize;
+        let t88 = MainCtxTable::LastSigCoeffYPrefix as usize;
+        let t90 = MainCtxTable::CoeffAbsLevelGreaterFlag as usize;
+        enc.encode_decision(t41, 0, 0); // split_cu_flag = 0 → 32×32 CU
+        enc.encode_decision(t62, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(t75, 0, 1); // cbf_luma = 1
+                                        // residual_coding_adv: last = (0,0).
+        let xi = |b: u32| ctx_inc_last_sig_coeff_prefix(b, 0, 5, 1);
+        enc.encode_decision(t87, xi(0), 0); // x_prefix = 0
+        enc.encode_decision(t88, xi(0), 0); // y_prefix = 0
+                                            // greaterA[0] + greaterB[0] at the last position (ctxInc 0) then
+                                            // a Rice-0 remaining of 2 → DC level +5 (visible at this QP).
+        enc.encode_decision(t90, ctx_inc_coeff_abs_level_greater_a(0, 0, 0, true, 0), 1);
+        enc.encode_decision(t90, 0, 1); // greaterB (last → ctxInc 0)
+        enc.encode_bypass(1); // remaining = 2 → TR bypass "110"
+        enc.encode_bypass(1);
+        enc.encode_bypass(0);
+        enc.encode_bypass(0); // sign +
+                              // Chroma CU: no residual.
+        enc.encode_decision(t76, 0, 0); // cbf_cb = 0
+        enc.encode_decision(t77, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_adcc_flag: true,
+            ..Default::default()
+        };
+        walk.tree_gates.sps_cm_init_flag = true;
+        let decode = SliceDecodeInputs {
+            slice_qp,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.adcc.blocks, 1);
+        assert_eq!(stats.adcc.last_sig_prefix_bins, 2);
+        assert_eq!(stats.adcc.sig_coeff_bins, 0, "last position inferred");
+        assert_eq!(stats.adcc.greater_a_bins, 1);
+        assert_eq!(stats.adcc.greater_b_bins, 1);
+        assert_eq!(stats.adcc.remaining_syms, 1);
+        assert_eq!(stats.adcc.sign_bins, 1);
+        assert_eq!(stats.coeff_runs, 0, "RLE path never runs under adcc");
+        assert_eq!(stats.coding_units, 2);
+        // The +5 DC at qp 51 shifts the whole (DC-predicted 128) CU.
+        assert!(
+            pic.y.iter().any(|&v| v != 128),
+            "the ADCC DC coefficient must reach the pixels"
+        );
+        assert!(pic.cb.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: ADCC multi-coefficient escape path end-to-end on a
+    /// chroma TU (cIdx = 1 stencils + the +12-free ADCC contexts differ
+    /// from luma), Baseline `(0, 0)` collapse: `(0,0) = +5` via
+    /// greaterA + greaterB + a Rice-0 remaining, `(1,0) = −1` as the
+    /// last coefficient.
+    #[test]
+    fn round397_adcc_idr_chroma_escape_path() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // Chroma CU: cbf_cb = 1, cbf_cr = 0.
+        enc.encode_decision(0, 0, 1);
+        enc.encode_decision(0, 0, 0);
+        // residual_coding_adv on the 16×16 Cb block: last = (1, 0).
+        enc.encode_decision(0, 0, 1); // x_prefix TR "10"
+        enc.encode_decision(0, 0, 0);
+        enc.encode_decision(0, 0, 0); // y_prefix = 0
+        enc.encode_decision(0, 0, 1); // sig at (0,0)
+        enc.encode_decision(0, 0, 0); // greaterA n=0 (last) = 0
+        enc.encode_decision(0, 0, 1); // greaterA n=1 = 1
+        enc.encode_decision(0, 0, 1); // greaterB n=1 = 1
+        enc.encode_bypass(1); // remaining = 2 → TR bypass "110"
+        enc.encode_bypass(1);
+        enc.encode_bypass(0);
+        enc.encode_bypass(1); // sign (1,0) = −
+        enc.encode_bypass(0); // sign (0,0) = +
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_adcc_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 40,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.adcc.blocks, 1);
+        assert_eq!(stats.adcc.last_sig_prefix_bins, 3);
+        assert_eq!(stats.adcc.sig_coeff_bins, 1);
+        assert_eq!(stats.adcc.greater_a_bins, 2);
+        assert_eq!(stats.adcc.greater_b_bins, 1);
+        assert_eq!(stats.adcc.remaining_syms, 1);
+        assert_eq!(stats.adcc.sign_bins, 2);
+        // Cb carries the residual; luma + Cr untouched.
+        assert!(pic.cb.iter().any(|&v| v != 128), "cb must be shifted");
+        assert!(pic.y.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: ADCC on the P/B walker — an inter CU with
+    /// `cbf_luma == 1` routes its residual through
+    /// `residual_coding_adv()` (a single +1 DC on top of the zero-MV
+    /// skip-free merge prediction).
+    #[test]
+    fn round397_adcc_pb_inter_residual() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![100u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // adcc: DC +5 (A + B + remaining 2).
+        enc.encode_decision(0, 0, 0); // x_prefix = 0
+        enc.encode_decision(0, 0, 0); // y_prefix = 0
+        enc.encode_decision(0, 0, 1); // greaterA[0] = 1
+        enc.encode_decision(0, 0, 1); // greaterB[0] = 1
+        enc.encode_bypass(1); // remaining = 2 → "110"
+        enc.encode_bypass(1);
+        enc.encode_bypass(0);
+        enc.encode_bypass(0); // sign +
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_adcc_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 51,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.adcc.blocks, 1);
+        assert_eq!(stats.adcc.sign_bins, 1);
+        assert_eq!(stats.coeff_runs, 0);
+        // The +1 DC on top of the all-100 merge copy shifts the luma.
+        assert!(pic.y.iter().any(|&v| v != 100), "residual must land");
+        assert!(pic.y.iter().all(|&v| v >= 100), "positive DC shift only");
     }
 }

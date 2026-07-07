@@ -75,6 +75,7 @@
 //! spec-only — clauses, equations, and table numbers cite the
 //! Recommendation directly.
 
+pub mod adcc;
 pub mod affine;
 pub mod affine_cand;
 pub mod affine_syntax;
@@ -277,6 +278,7 @@ pub fn walk_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_adcc_flag: sps.sps_adcc_flag,
         sps_eipd_flag: sps.sps_eipd_flag,
         sps_dquant_flag: sps.sps_dquant_flag,
         cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
@@ -332,7 +334,9 @@ pub fn decode_idr_slice(
     // Round 397: sps_eipd_flag is lifted — the coding_unit() walker
     // decodes the §7.3.8.4 MPM/PIMS/rem-mode group + the chroma mode
     // and reconstructs through the §8.4.4 EIPD kernels.
-    if sps.sps_addb_flag || sps.sps_ats_flag || sps.sps_adcc_flag {
+    // Round 397: sps_adcc_flag is lifted — residual_coding() routes to
+    // the §7.3.8.8 residual_coding_adv() layer.
+    if sps.sps_addb_flag || sps.sps_ats_flag {
         return Err(Error::unsupported(
             "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
         ));
@@ -372,6 +376,7 @@ pub fn decode_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_adcc_flag: sps.sps_adcc_flag,
         sps_eipd_flag: sps.sps_eipd_flag,
         sps_dquant_flag: sps.sps_dquant_flag,
         cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
