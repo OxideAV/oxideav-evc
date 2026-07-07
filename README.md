@@ -10,15 +10,18 @@ framework but usable standalone.
 
 ## Status
 
-A working **Baseline-profile** decoder: IDR + P + B slices, 8- and
+A working **Baseline-profile** decoder — IDR + P + B slices, 8- and
 10-bit (any §7.4.3.1 depth 8..=16 flows through the u16 reconstruction
 chain) 4:2:0, with residual coding (RLE + dequant + inverse DCT-II for transform sizes
 up to 64×64), intra prediction (the 5-mode Baseline set), inter
 prediction (8-tap luma / 4-tap chroma sub-pel interpolation, AMVP
-candidate construction, default-weighted bipred), deblocking
-(`sps_addb_flag == 0` luma + chroma), a multi-reference DPB with POC
+candidate construction, default-weighted bipred), deblocking (§8.8.2
+and the §8.8.3 ADDB flavours), a multi-reference DPB with POC
 reordering, spatial-neighbour MV grid AMVP, the HMVP candidate list, and
-reference-picture-list parsing for non-IDR slices.
+reference-picture-list parsing for non-IDR slices — plus, as of round
+397, nearly the whole **Main-profile** decode toolset (BTT/SUCO,
+ADMVP/affine/AMVR/MMVD/DMVR/HMVP, cm_init CABAC, DQUANT, EIPD, ADCC,
+ADDB, IBC; ATS remains the one gated tool).
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
@@ -26,7 +29,7 @@ The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `affine` / `affine_cand` / `affine_syntax`,
 `amvr_syntax` / `mmvd_syntax`, `dmvr`,
 `eipd` / `eipd_mode` / `eipd_ref` / `eipd_syntax`,
-`ats`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
+`ats`, `adcc`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
 `neighbour`, `picture`, and the registered `decoder`
 factory. All clause / equation / table numbers cite ISO/IEC
 23094-1:2020(E) directly.
@@ -365,11 +368,53 @@ front-ends. Each decoded P/B picture's motion field + reference POCs
 are retained in its DPB entry so it can serve as a later slice's
 `ColPic`.
 
-The remaining Main-profile syntax-decode tools (EIPD leaf selection /
-ADCC residual coding / `sps_cm_init_flag` context models / ATS in the
-walkers / advanced deblocking / DQUANT) still surface
-`Error::Unsupported` at the decoder gates even where their per-tool
-syntax/derivation modules exist.
+As of round 397 five more Main-profile tools are wired to pixels and
+lifted from the decoder gates:
+
+* **`sps_cm_init_flag == 1` context machinery** — the walkers
+  initialise the §9.3.2.2 Main-profile context tables (Tables 40-90 at
+  the slice QP, initType 0/1) and route every regular bin through the
+  §9.3.4.2.1 `ctxIdx = ctxIdxOffset + ctxInc` selection
+  (`cabac_init::CtxSel`, plus the initType offsets in every syntax
+  module via `EipdCtx::for_slice`). The real §9.3.4.2.5 eq. 1439
+  `numSmaller`, the §9.3.4.2.4 eq. 1438 neighbour sums
+  (cu_skip/pred_mode/ibc/affine), the §9.3.4.2.2 `PrevLevel` chain on
+  the RLE residual, the Table-95-exact `ref_idx` (regular 0/1 then
+  bypass) and `abs_mvd` (regular bin0 EG0) reads are all in. Under
+  `sps_cm_init_flag == 0` the crate keeps its historical single-`(0,0)`
+  collapse (initial probabilities identical; only adaptation
+  trajectories merge — no conformance stream exists in docs/ to
+  arbitrate the spec-literal shared-`ctxTable 0` alternative).
+* **DQUANT (`sps_dquant_flag == 1`)** — the §7.3.8.3 `cuQpDeltaCode`
+  marks thread the split recursion, the §7.3.8.5 two-arm presence gate
+  (code-1 cbf-gated, code-2 once-per-area even cbf-less) drives the
+  reads, and each delta folds into the §8.7.1 eq. 1042
+  `QpY = (QpY_PREV + CuQpDelta + 52) % 52` chain (`QpState`; the
+  modular wrap replaced the historical clamp).
+* **EIPD leaf selection** — luma trees read the §7.3.8.4
+  MPM/PIMS/rem-mode group resolved through the §8.4.2 three-list
+  derivation over real grid neighbours (per-cell `intra_luma_mode`
+  stamps), chroma trees resolve `intra_chroma_pred_mode` per §8.4.3
+  against the co-located luma mode, and reconstruction runs the §8.4.4
+  kernels via `intra_reconstruct_cb_eipd` with a grid-probed SUCO
+  right column.
+* **ADCC (`sps_adcc_flag == 1`)** — the §7.3.8.8
+  `residual_coding_adv()` layer (`adcc` module) at the shared §7.3.8.6
+  dispatch: last-significant prefixes/suffixes (Tables 87/88 +
+  eqs. 149-152), the reverse coefficient-group walk with the
+  §9.3.4.2.7-.9 neighbour-stencil contexts (Tables 89/90), the
+  §9.3.3.8 bypass `coeff_abs_level_remaining` (Rice via §9.3.4.2.10 +
+  Table 98) and the MSB-first `coeff_signs_group`.
+* **ADDB (`sps_addb_flag == 1`)** — the §8.8.3 advanced deblocking
+  filter: the §8.8.3.4 boundary-strength cascade over the side-info
+  grid, §8.8.3.5 thresholds from the per-CU QpY + the slice
+  alpha/beta offsets (Tables 34/35), the §8.8.3.6 weak and §8.8.3.7
+  strong filters, per coding block with the §8.8.3.2 `splitTH` split
+  and 4:2:0 chroma-style filtering.
+
+Of the named Main-profile decode tools only **ATS in the walkers**
+(`sps_ats_flag`) still surfaces `Error::Unsupported` at the decoder
+gates (its syntax + transform layers are complete, see above).
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
 §7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
@@ -404,10 +449,11 @@ reconstruction (when `cbf_luma && sps_htdf_flag`) and threading the real
 
 ### Not yet supported
 
-- Advanced deblocking (`sps_addb_flag == 1`).
+- ATS in the pixel walkers (`sps_ats_flag == 1` still gates the
+  decoder; the §7.3.8.5 syntax + §8.7.4 transform kernels are done).
 - DRA post-filter application on >8-bit pictures (the §8.9 apply is
   8-bit-code-space; high-bit-depth pictures skip it).
-- Full Main-profile picture reconstruction (see above).
+- Multi-tile pixel reconstruction (single-tile slices only).
 
 ## Usage
 
