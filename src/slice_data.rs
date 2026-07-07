@@ -2117,11 +2117,13 @@ fn decode_coding_unit(
             // implements `abs (EG-0 bypass) + optional sign bypass`.
             let mvd_x = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.ibc_abs_mvd_bins,
                 &mut stats.ibc_mvd_sign_bins,
             )?;
             let mvd_y = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.ibc_abs_mvd_bins,
                 &mut stats.ibc_mvd_sign_bins,
             )?;
@@ -3319,6 +3321,10 @@ fn decode_inter_constrained_intra_ibc_cu(
 ) -> Result<()> {
     stats.coding_units += 1;
     stats.intra_ibc_constrained_cus += 1;
+    let sel = crate::cabac_init::CtxSel::new(
+        inputs.walk.tree_gates.sps_cm_init_flag,
+        crate::cabac::InitType::Pb,
+    );
     let ibc_allowed = crate::ibc::is_ibc_allowed_for_size(
         inputs.decode.sps_ibc_flag,
         inputs.decode.log2_max_ibc_cand_size,
@@ -3326,17 +3332,35 @@ fn decode_inter_constrained_intra_ibc_cu(
         log2_cb_height,
     );
     if ibc_allowed {
-        let ibc_bin = eng.decode_decision(0, 0)?;
+        // Table 66 at the §9.3.4.2.4 eq. 1438 neighbour-ibc_flag sum.
+        let (t, i) = if sel.cm_init {
+            let inc = ctx_inc_neighbour_cells(
+                side_info,
+                &inputs.walk,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                2,
+                |c| c.pred_mode == CuPredMode::Ibc,
+            );
+            sel.ctx(crate::cabac_init::MainCtxTable::IbcFlag, inc)
+        } else {
+            (0, 0)
+        };
+        let ibc_bin = eng.decode_decision(t, i)?;
         stats.ibc_flag_bins += 1;
         if ibc_bin != 0 {
             stats.ibc_cus += 1;
             let mvd_x = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.ibc_abs_mvd_bins,
                 &mut stats.ibc_mvd_sign_bins,
             )?;
             let mvd_y = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.ibc_abs_mvd_bins,
                 &mut stats.ibc_mvd_sign_bins,
             )?;
@@ -4037,7 +4061,10 @@ fn decode_admvp_skip_cu(
     let n_cb_h = 1u32 << log2_cb_height;
     let decision = crate::inter_cu_syntax::read_cu_skip_main(
         eng,
-        EipdCtx::new(false),
+        EipdCtx::for_slice(
+            inputs.walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::Pb,
+        ),
         inputs.inter_tool_gates,
         inputs.slice_is_b,
         log2_cb_width,
@@ -4148,7 +4175,10 @@ fn decode_admvp_nonskip_inter_cu(
     let n_cb_h = 1u32 << log2_cb_height;
     let decision = crate::inter_cu_syntax::read_inter_cu_mode(
         eng,
-        EipdCtx::new(false),
+        EipdCtx::for_slice(
+            inputs.walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::Pb,
+        ),
         inputs.inter_tool_gates,
         log2_cb_width,
         log2_cb_height,
@@ -4205,7 +4235,10 @@ fn decode_admvp_nonskip_inter_cu(
     let mut explicit_stats = crate::inter_cu_syntax::ExplicitAmvpStats::default();
     let amvp = crate::inter_cu_syntax::read_explicit_amvp(
         eng,
-        EipdCtx::new(false),
+        EipdCtx::for_slice(
+            inputs.walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::Pb,
+        ),
         inputs.inter_tool_gates,
         decision.amvr_idx,
         inputs.slice_is_b,
@@ -4297,10 +4330,31 @@ fn decode_inter_coding_unit(
     let walk = inputs.walk;
     let n_cb_w = 1u32 << log2_cb_width;
     let n_cb_h = 1u32 << log2_cb_height;
+    let sel = crate::cabac_init::CtxSel::new(
+        walk.tree_gates.sps_cm_init_flag,
+        crate::cabac::InitType::Pb,
+    );
     // §7.3.8.4 lines 2806-2807: cu_skip_flag is present whenever
     // predModeConstraint != PRED_MODE_CONSTRAINT_INTRA_IBC (both
-    // NO_CONSTRAINT and CONSTRAINT_INTER reach here).
-    let cu_skip = eng.decode_decision(0, 0)? != 0;
+    // NO_CONSTRAINT and CONSTRAINT_INTER reach here). Table 47; under
+    // `sps_cm_init_flag == 1` the ctxInc is the §9.3.4.2.4 eq. 1438
+    // neighbour-cu_skip_flag sum (Table 96, numCtx = 2).
+    let (t, i) = if sel.cm_init {
+        let inc = ctx_inc_neighbour_cells(
+            side_info,
+            &walk,
+            x0,
+            y0,
+            log2_cb_width,
+            log2_cb_height,
+            2,
+            |c| c.cu_skip != 0,
+        );
+        sel.ctx(crate::cabac_init::MainCtxTable::CuSkipFlag, inc)
+    } else {
+        (0, 0)
+    };
+    let cu_skip = eng.decode_decision(t, i)? != 0;
     stats.cu_skip_flag_bins += 1;
     let pred_l0;
     let pred_l1;
@@ -4323,7 +4377,7 @@ fn decode_inter_coding_unit(
             log2_cb_width,
             log2_cb_height,
         )?;
-        return decode_inter_cu_residual_and_reconstruct_motion(
+        decode_inter_cu_residual_and_reconstruct_motion(
             eng,
             pic,
             stats,
@@ -4335,16 +4389,39 @@ fn decode_inter_coding_unit(
             log2_cb_width,
             log2_cb_height,
             motion,
-        );
+        )?;
+        mark_cu_skip_cells(side_info, x0, y0, n_cb_w, n_cb_h);
+        return Ok(());
     } else if cu_skip {
         // sps_admvp_flag = 0 path: mvp_idx_l0 (TR cMax=3, FL prefix bins
         // bypass-friendly under sps_cm_init_flag=0). Round-4 reads up to
         // 3 leading 1-bins as a U binarisation; mvp_idx ∈ 0..=3.
-        let mvp_idx_l0 = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
+        let mvp_table = crate::cabac_init::MainCtxTable::MvpIdx;
+        let (mvp_t, mvp_off) = if sel.cm_init {
+            (
+                mvp_table.as_usize(),
+                mvp_table.ctx_idx_offset(sel.init_type),
+            )
+        } else {
+            (0, 0)
+        };
+        let mvp_idx_l0 = eng.decode_tr_regular(3, 0, mvp_t, |b| {
+            if sel.cm_init {
+                mvp_off + (b as usize).min(2)
+            } else {
+                0
+            }
+        })?;
         stats.mvp_idx_bins += 1;
         let mut mvp_idx_l1 = 0u32;
         if inputs.slice_is_b {
-            mvp_idx_l1 = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
+            mvp_idx_l1 = eng.decode_tr_regular(3, 0, mvp_t, |b| {
+                if sel.cm_init {
+                    mvp_off + (b as usize).min(2)
+                } else {
+                    0
+                }
+            })?;
             stats.mvp_idx_bins += 1;
         }
         // Round-10 §8.5.2.4 spatial-neighbour AMVP. The mvpList[] is
@@ -4388,7 +4465,27 @@ fn decode_inter_coding_unit(
         // CONSTRAINT_INTER subtree infers MODE_INTER without a bin
         // (§7.4.9.4 CuPredMode derivation).
         let pred_mode_flag = if constraint == ModeConstraint::NoConstraint {
-            let bin = eng.decode_decision(0, 0)?;
+            // Table 61; under `sps_cm_init_flag == 1` the ctxInc is the
+            // §9.3.4.2.4 eq. 1438 neighbour-pred_mode_flag sum
+            // (Table 96, numCtx = 3). A neighbour's pred_mode_flag was 1
+            // for MODE_INTRA and MODE_IBC CUs (ibc_flag is only read
+            // after pred_mode_flag == 1 on this path).
+            let (t, i) = if sel.cm_init {
+                let inc = ctx_inc_neighbour_cells(
+                    side_info,
+                    &walk,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    3,
+                    |c| matches!(c.pred_mode, CuPredMode::Intra | CuPredMode::Ibc),
+                );
+                sel.ctx(crate::cabac_init::MainCtxTable::PredModeFlag, inc)
+            } else {
+                (0, 0)
+            };
+            let bin = eng.decode_decision(t, i)?;
             stats.pred_mode_flag_bins += 1;
             bin
         } else {
@@ -4415,7 +4512,23 @@ fn decode_inter_coding_unit(
                 log2_cb_height,
             );
         if ibc_allowed {
-            let ibc_bin = eng.decode_decision(0, 0)?;
+            // Table 66 at the §9.3.4.2.4 eq. 1438 neighbour sum.
+            let (t, i) = if sel.cm_init {
+                let inc = ctx_inc_neighbour_cells(
+                    side_info,
+                    &walk,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    2,
+                    |c| c.pred_mode == CuPredMode::Ibc,
+                );
+                sel.ctx(crate::cabac_init::MainCtxTable::IbcFlag, inc)
+            } else {
+                (0, 0)
+            };
+            let ibc_bin = eng.decode_decision(t, i)?;
             stats.ibc_flag_bins += 1;
             if ibc_bin != 0 {
                 stats.ibc_cus += 1;
@@ -4424,11 +4537,13 @@ fn decode_inter_coding_unit(
                 // an optional `mvd_l0_sign_flag` bypass bit.
                 let mvd_x = decode_signed_mvd(
                     eng,
+                    sel,
                     &mut stats.ibc_abs_mvd_bins,
                     &mut stats.ibc_mvd_sign_bins,
                 )?;
                 let mvd_y = decode_signed_mvd(
                     eng,
+                    sel,
                     &mut stats.ibc_abs_mvd_bins,
                     &mut stats.ibc_mvd_sign_bins,
                 )?;
@@ -4499,8 +4614,21 @@ fn decode_inter_coding_unit(
         // MODE_INTER explicit MV (Baseline sps_admvp_flag == 0).
         let mut inter_pred_idc = 0u32; // PRED_L0 default
         if inputs.slice_is_b {
-            // Baseline + sps_admvp_flag = 0 → cMax = 2 (TR).
-            inter_pred_idc = eng.decode_tr_regular(2, 0, 0, |_| 0)?;
+            // Baseline + sps_admvp_flag = 0 → cMax = 2 (TR). Table 69,
+            // per-bin ctxInc 0,1 under `sps_cm_init_flag == 1`.
+            let table = crate::cabac_init::MainCtxTable::InterPredIdc;
+            let (t, off) = if sel.cm_init {
+                (table.as_usize(), table.ctx_idx_offset(sel.init_type))
+            } else {
+                (0, 0)
+            };
+            inter_pred_idc = eng.decode_tr_regular(2, 0, t, |b| {
+                if sel.cm_init {
+                    off + (b as usize).min(1)
+                } else {
+                    0
+                }
+            })?;
             stats.inter_pred_idc_bins += 1;
         }
         // PRED_L0 = 0, PRED_L1 = 1, PRED_BI = 2 (Table 8 mapping).
@@ -4512,19 +4640,39 @@ fn decode_inter_coding_unit(
         let mut ref_idx_l1 = 0u32;
         if use_l0 {
             if inputs.num_ref_idx_active_minus1_l0 > 0 {
-                ref_idx_l0 =
-                    eng.decode_tr_regular(inputs.num_ref_idx_active_minus1_l0, 0, 0, |_| 0)?;
+                // Table 72: bins 0/1 regular (ctxInc 0,1 + initType
+                // offset) then bypass per Table 95; under the Baseline
+                // collapse every bin is a (0,0) regular bin.
+                ref_idx_l0 = decode_ref_idx_tr(eng, sel, inputs.num_ref_idx_active_minus1_l0)?;
                 stats.ref_idx_bins += 1;
             }
-            let mvp_idx = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
+            // Table 48, per-bin ctxInc 0,1,2.
+            let mvp_table = crate::cabac_init::MainCtxTable::MvpIdx;
+            let (mvp_t, mvp_off) = if sel.cm_init {
+                (
+                    mvp_table.as_usize(),
+                    mvp_table.ctx_idx_offset(sel.init_type),
+                )
+            } else {
+                (0, 0)
+            };
+            let mvp_idx = eng.decode_tr_regular(3, 0, mvp_t, |b| {
+                if sel.cm_init {
+                    mvp_off + (b as usize).min(2)
+                } else {
+                    0
+                }
+            })?;
             stats.mvp_idx_bins += 1;
             let mvd_x = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
             let mvd_y = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
@@ -4543,19 +4691,39 @@ fn decode_inter_coding_unit(
         }
         if use_l1 {
             if inputs.num_ref_idx_active_minus1_l1 > 0 {
-                ref_idx_l1 =
-                    eng.decode_tr_regular(inputs.num_ref_idx_active_minus1_l1, 0, 0, |_| 0)?;
+                // Table 72: bins 0/1 regular (ctxInc 0,1 + initType
+                // offset) then bypass per Table 95; under the Baseline
+                // collapse every bin is a (0,0) regular bin.
+                ref_idx_l1 = decode_ref_idx_tr(eng, sel, inputs.num_ref_idx_active_minus1_l1)?;
                 stats.ref_idx_bins += 1;
             }
-            let mvp_idx = eng.decode_tr_regular(3, 0, 0, |_| 0)?;
+            // Table 48, per-bin ctxInc 0,1,2.
+            let mvp_table = crate::cabac_init::MainCtxTable::MvpIdx;
+            let (mvp_t, mvp_off) = if sel.cm_init {
+                (
+                    mvp_table.as_usize(),
+                    mvp_table.ctx_idx_offset(sel.init_type),
+                )
+            } else {
+                (0, 0)
+            };
+            let mvp_idx = eng.decode_tr_regular(3, 0, mvp_t, |b| {
+                if sel.cm_init {
+                    mvp_off + (b as usize).min(2)
+                } else {
+                    0
+                }
+            })?;
             stats.mvp_idx_bins += 1;
             let mvd_x = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
             let mvd_y = decode_signed_mvd(
                 eng,
+                sel,
                 &mut stats.abs_mvd_egk_bins,
                 &mut stats.mvd_sign_flag_bins,
             )?;
@@ -4596,7 +4764,56 @@ fn decode_inter_coding_unit(
         log2_cb_height,
         pred_l0,
         pred_l1,
-    )
+    )?;
+    if cu_skip {
+        mark_cu_skip_cells(side_info, x0, y0, n_cb_w, n_cb_h);
+    }
+    Ok(())
+}
+
+/// Mark every 4×4 cell covered by a skip-coded CU (`cu_skip_flag == 1`,
+/// §7.4.9.4) so the §9.3.4.2.4 Table 96 `cu_skip_flag` neighbour ctxInc
+/// can consult it. Runs after the CU's motion stamp (which resets the
+/// cell to `cu_skip = 0` via `Default`).
+fn mark_cu_skip_cells(side_info: &mut SideInfoGrid, x0: u32, y0: u32, n_cb_w: u32, n_cb_h: u32) {
+    for yy in (y0..y0 + n_cb_h).step_by(4) {
+        for xx in (x0..x0 + n_cb_w).step_by(4) {
+            let xc = (xx >> 2) as usize;
+            let yc = (yy >> 2) as usize;
+            if xc < side_info.w_cells && yc < side_info.h_cells {
+                side_info.at_mut(xc, yc).cu_skip = 1;
+            }
+        }
+    }
+}
+
+/// §9.3.3.3 TR read for `ref_idx_lX` (Table 72): under
+/// `sps_cm_init_flag == 1` the first two prefix bins are regular-coded
+/// at `ctxIdxOffset + {0, 1}` and every later bin is **bypass**
+/// (Table 95); under `== 0` the historical all-regular `(0, 0)` read.
+fn decode_ref_idx_tr(
+    eng: &mut CabacEngine,
+    sel: crate::cabac_init::CtxSel,
+    c_max: u32,
+) -> Result<u32> {
+    if !sel.cm_init {
+        return eng.decode_tr_regular(c_max, 0, 0, |_| 0);
+    }
+    let table = crate::cabac_init::MainCtxTable::RefIdx;
+    let off = table.ctx_idx_offset(crate::cabac::InitType::Pb);
+    let mut v = 0u32;
+    while v < c_max {
+        let bin = if v < 2 {
+            eng.decode_decision(table.as_usize(), off + v as usize)?
+        } else {
+            eng.decode_bypass()?
+        };
+        if bin == 0 {
+            break;
+        }
+        v += 1;
+    }
+    Ok(v)
 }
 
 /// §7.3.8.5 + §8.5 — the shared inter-CU tail: decode the single-tree
@@ -5736,10 +5953,19 @@ fn admvp_merge_motion_from_grid(
 
 fn decode_signed_mvd(
     eng: &mut CabacEngine,
+    sel: crate::cabac_init::CtxSel,
     abs_count: &mut u32,
     sign_count: &mut u32,
 ) -> Result<i32> {
-    let abs = eng.decode_egk_bypass(0)?;
+    // abs_mvd — EG0; under `sps_cm_init_flag == 1` bin0 is regular on
+    // Table 73 at the initType ctxIdxOffset (Table 95), the rest
+    // bypass; under `== 0` the historical all-bypass read.
+    let abs = if sel.cm_init {
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::AbsMvd, 0);
+        eng.decode_eg0_first_regular(t, i)?
+    } else {
+        eng.decode_egk_bypass(0)?
+    };
     *abs_count += 1;
     if abs == 0 {
         return Ok(0);
@@ -12627,6 +12853,142 @@ mod tests {
             ctx_inc_neighbour_cells(&grid, &walk, 16, 16, 3, 3, 3, is_ibc),
             2,
             "numCtx = 3 admits the full sum"
+        );
+    }
+
+    /// Round 397: `sps_cm_init_flag == 1` on the P/B walker — the
+    /// §9.3.2.2 initType-1 context init plus the §9.3.4.2.1
+    /// `ctxIdx = ctxIdxOffset + ctxInc` routing with the **P/B
+    /// second-half offsets**: `split_cu_flag` (41, 1), `cu_skip_flag`
+    /// (47, 2 + the eq. 1438 neighbour sum), the admvp `merge_idx`
+    /// (49, 5), `cbf_luma`/`cbf_cb`/`cbf_cr` (75/76/77, 1). The test
+    /// encoder starts from the same initType-1 state; the skip CU
+    /// zero-MV-copies the reference picture.
+    #[test]
+    fn round397_cm_init_pb_skip_merge_decodes_with_main_contexts() {
+        use crate::cabac::{CabacEncoder, InitType};
+        use crate::cabac_init::MainCtxTable;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let slice_qp = 22;
+        let off = |t: MainCtxTable| t.ctx_idx_offset(InitType::Pb);
+        let mut enc = CabacEncoder::new();
+        enc.init_main_profile(InitType::Pb, slice_qp);
+        // split_cu_flag = 0 (CB == CTB): Table 41 at the P/B offset.
+        enc.encode_decision(
+            MainCtxTable::SplitCuFlag as usize,
+            off(MainCtxTable::SplitCuFlag),
+            0,
+        );
+        // cu_skip_flag = 1: Table 47, neighbour sum 0 (nothing decoded).
+        enc.encode_decision(
+            MainCtxTable::CuSkipFlag as usize,
+            off(MainCtxTable::CuSkipFlag),
+            1,
+        );
+        // admvp merge tree (mmvd/affine off) → merge_idx = 0: single "0"
+        // bin on Table 49 at the P/B offset.
+        enc.encode_decision(
+            MainCtxTable::MergeIdx as usize,
+            off(MainCtxTable::MergeIdx),
+            0,
+        );
+        // Inter-CU tail: cbf_luma/cb/cr = 0 on Tables 75/76/77.
+        enc.encode_decision(
+            MainCtxTable::CbfLuma as usize,
+            off(MainCtxTable::CbfLuma),
+            0,
+        );
+        enc.encode_decision(MainCtxTable::CbfCb as usize, off(MainCtxTable::CbfCb), 0);
+        enc.encode_decision(MainCtxTable::CbfCr as usize, off(MainCtxTable::CbfCr), 0);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        walk.tree_gates.sps_cm_init_flag = true;
+        let decode = SliceDecodeInputs {
+            slice_qp,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_amvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_affine_flag: false,
+            mmvd_group_enable_flag: false,
+            sps_dmvr_flag: false,
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.admvp_skip_cus, 1, "one admvp cu_skip CU decoded");
+        assert_eq!(stats.cu_skip_flag_bins, 1);
+        assert_eq!(stats.admvp_syntax.gate.merge_idx_bins, 1);
+        assert_eq!(stats.mvp_idx_bins, 0, "no Baseline mvp_idx bins");
+        assert_eq!(stats.coding_units, 1);
+        // Zero-MV merge from the all-200 reference: whole-picture copy.
+        assert!(pic.y.iter().all(|&v| v == 200), "skip CU must copy ref");
+        // The skip CU marked its cells for the §9.3.4.2.4 cu_skip probe.
+        assert_eq!(stats.side_info.at(0, 0).cu_skip, 1);
+        assert_eq!(stats.side_info.at(7, 7).cu_skip, 1);
+    }
+
+    /// Round 397: the §9.3.4.2.1 P/B ctxIdxOffset — `EipdCtx::for_slice`
+    /// and `CtxSel` both select the second half of every Table 39 range
+    /// on P/B slices (e.g. merge_idx 5..9, cu_skip_flag 2..3, amvr_idx
+    /// 4..7) and the first half on I slices.
+    #[test]
+    fn round397_init_type_offsets() {
+        use crate::cabac::InitType;
+        use crate::cabac_init::{CtxSel, MainCtxTable};
+        assert_eq!(MainCtxTable::MergeIdx.ctx_idx_offset(InitType::I), 0);
+        assert_eq!(MainCtxTable::MergeIdx.ctx_idx_offset(InitType::Pb), 5);
+        assert_eq!(MainCtxTable::CuSkipFlag.ctx_idx_offset(InitType::Pb), 2);
+        assert_eq!(MainCtxTable::AmvrIdx.ctx_idx_offset(InitType::Pb), 4);
+        assert_eq!(MainCtxTable::BttSplitFlag.ctx_idx_offset(InitType::Pb), 15);
+        assert_eq!(MainCtxTable::CoeffZeroRun.ctx_idx_offset(InitType::Pb), 24);
+        let sel = CtxSel::new(true, InitType::Pb);
+        assert_eq!(
+            sel.ctx(MainCtxTable::MergeIdx, 2),
+            (MainCtxTable::MergeIdx.as_usize(), 7)
+        );
+        assert_eq!(CtxSel::baseline().ctx(MainCtxTable::MergeIdx, 2), (0, 0));
+        let ctx = crate::eipd_syntax::EipdCtx::for_slice(true, InitType::Pb);
+        assert_eq!(ctx.offset(MainCtxTable::MergeIdx), 5);
+        assert_eq!(
+            crate::eipd_syntax::EipdCtx::new(true).offset(MainCtxTable::MergeIdx),
+            0
         );
     }
 }

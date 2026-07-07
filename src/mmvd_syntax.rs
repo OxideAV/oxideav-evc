@@ -119,6 +119,7 @@ pub fn read_mmvd_group(
     let group_idx = if mmvd_group_idx_present(mmvd_group_enable_flag, log2_cb_width, log2_cb_height)
     {
         let table = MainCtxTable::MmvdGroupIdx.as_usize();
+        let off = ctx.offset(MainCtxTable::MmvdGroupIdx);
         let mut bins = 0u32;
         let v = eng.decode_tr_regular(
             MMVD_GROUP_IDX_MAX,
@@ -127,7 +128,7 @@ pub fn read_mmvd_group(
             |bin_idx| {
                 bins += 1;
                 if cm_init {
-                    mmvd_group_idx_ctx_inc(bin_idx).unwrap_or(0)
+                    off + mmvd_group_idx_ctx_inc(bin_idx).unwrap_or(0)
                 } else {
                     0
                 }
@@ -142,6 +143,7 @@ pub fn read_mmvd_group(
     // mmvd_merge_idx — TR cMax=3, per-bin ctxInc 0,1,2 (Table 52).
     let merge_idx = {
         let table = MainCtxTable::MmvdMergeIdx.as_usize();
+        let off = ctx.offset(MainCtxTable::MmvdMergeIdx);
         let mut bins = 0u32;
         let v = eng.decode_tr_regular(
             MMVD_MERGE_IDX_MAX,
@@ -150,7 +152,7 @@ pub fn read_mmvd_group(
             |bin_idx| {
                 bins += 1;
                 if cm_init {
-                    mmvd_merge_idx_ctx_inc(bin_idx).unwrap_or(0)
+                    off + mmvd_merge_idx_ctx_inc(bin_idx).unwrap_or(0)
                 } else {
                     0
                 }
@@ -163,6 +165,7 @@ pub fn read_mmvd_group(
     // mmvd_distance_idx — TR cMax=7, per-bin ctxInc 0..6 (Table 53).
     let distance_idx = {
         let table = MainCtxTable::MmvdDistanceIdx.as_usize();
+        let off = ctx.offset(MainCtxTable::MmvdDistanceIdx);
         let mut bins = 0u32;
         let v = eng.decode_tr_regular(
             MMVD_DISTANCE_IDX_MAX,
@@ -171,7 +174,7 @@ pub fn read_mmvd_group(
             |bin_idx| {
                 bins += 1;
                 if cm_init {
-                    mmvd_distance_idx_ctx_inc(bin_idx).unwrap_or(0)
+                    off + mmvd_distance_idx_ctx_inc(bin_idx).unwrap_or(0)
                 } else {
                     0
                 }
@@ -184,10 +187,11 @@ pub fn read_mmvd_group(
     // mmvd_direction_idx — FL cMax=3 (2 bins), per-bin ctxInc 0,1 (Table 54).
     let direction_idx = {
         let table = MainCtxTable::MmvdDirectionIdx.as_usize();
+        let off = ctx.offset(MainCtxTable::MmvdDirectionIdx);
         let mut value = 0u32;
         for bin_idx in 0..2u32 {
             let ctx_inc = if cm_init {
-                mmvd_direction_idx_ctx_inc(bin_idx).unwrap_or(0)
+                off + mmvd_direction_idx_ctx_inc(bin_idx).unwrap_or(0)
             } else {
                 0
             };
@@ -212,7 +216,7 @@ pub fn read_mmvd_group(
 /// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
     if ctx.is_cm_init() {
-        (table.as_usize(), ctx_inc)
+        (table.as_usize(), ctx.offset(table) + ctx_inc)
     } else {
         (0, 0)
     }

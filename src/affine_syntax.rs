@@ -124,7 +124,7 @@ pub struct AffineSyntaxStats {
 /// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
     if ctx.is_cm_init() {
-        (table.as_usize(), ctx_inc)
+        (table.as_usize(), ctx.offset(table) + ctx_inc)
     } else {
         (0, 0)
     }
@@ -153,13 +153,14 @@ pub fn read_affine_merge_idx(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::AffineMergeIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::AffineMergeIdx);
     // Count the bins consumed so the stats reflect the actual prefix
     // length; decode_tr_regular's ctxInc closure is invoked once per bin.
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(5, 0, if cm_init { table } else { 0 }, |bin_idx| {
         bins += 1;
         if cm_init {
-            bin_idx as usize
+            off + bin_idx as usize
         } else {
             0
         }

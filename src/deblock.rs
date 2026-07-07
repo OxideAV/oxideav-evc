@@ -97,6 +97,10 @@ pub struct CuSideInfo {
     pub cu_y0: u16,
     pub cu_log2_w: u8,
     pub cu_log2_h: u8,
+    /// `cu_skip_flag[ x ][ y ]` — 1 on cells covered by a skip-coded CU.
+    /// Feeds the §9.3.4.2.4 Table 96 `cu_skip_flag` neighbour ctxInc
+    /// under `sps_cm_init_flag == 1`.
+    pub cu_skip: u8,
 }
 
 impl Default for CuSideInfo {
@@ -119,6 +123,7 @@ impl Default for CuSideInfo {
             cu_y0: 0,
             cu_log2_w: 0,
             cu_log2_h: 0,
+            cu_skip: 0,
         }
     }
 }
@@ -206,6 +211,13 @@ impl SideInfoGrid {
                 cell.ref_mv_delta_l1_y = d_l1.1;
             }
         }
+    }
+
+    /// Mutable access to one 4×4 cell (bounds must hold). Used by the
+    /// walkers for post-stamp annotations (e.g. the `cu_skip` mark).
+    pub fn at_mut(&mut self, x_cell: usize, y_cell: usize) -> &mut CuSideInfo {
+        let idx = y_cell * self.w_cells + x_cell;
+        &mut self.cells[idx]
     }
 
     pub fn at(&self, x_cell: usize, y_cell: usize) -> CuSideInfo {

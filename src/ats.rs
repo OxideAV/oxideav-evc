@@ -408,7 +408,8 @@ impl AtsInterCtx for EipdCtx {
         if self.is_cm_init() {
             // eq. 1472: (Log2(nCbW) + Log2(nCbH)) >= 8 ? 0 : 1.
             let ctx_inc = if log2_w + log2_h >= 8 { 0 } else { 1 };
-            (MainCtxTable::AtsCuInterFlag.as_usize(), ctx_inc)
+            let t = MainCtxTable::AtsCuInterFlag;
+            (t.as_usize(), self.offset(t) + ctx_inc)
         } else {
             (0, 0)
         }
@@ -416,7 +417,8 @@ impl AtsInterCtx for EipdCtx {
 
     fn ats_cu_inter_quad_flag_ctx(self) -> (usize, usize) {
         if self.is_cm_init() {
-            (MainCtxTable::AtsCuInterQuadFlag.as_usize(), 0)
+            let t = MainCtxTable::AtsCuInterQuadFlag;
+            (t.as_usize(), self.offset(t))
         } else {
             (0, 0)
         }
@@ -430,7 +432,8 @@ impl AtsInterCtx for EipdCtx {
                 std::cmp::Ordering::Less => 1,
                 std::cmp::Ordering::Greater => 2,
             };
-            (MainCtxTable::AtsCuInterHorizontalFlag.as_usize(), ctx_inc)
+            let t = MainCtxTable::AtsCuInterHorizontalFlag;
+            (t.as_usize(), self.offset(t) + ctx_inc)
         } else {
             (0, 0)
         }
@@ -438,7 +441,8 @@ impl AtsInterCtx for EipdCtx {
 
     fn ats_cu_inter_pos_flag_ctx(self) -> (usize, usize) {
         if self.is_cm_init() {
-            (MainCtxTable::AtsCuInterPosFlag.as_usize(), 0)
+            let t = MainCtxTable::AtsCuInterPosFlag;
+            (t.as_usize(), self.offset(t))
         } else {
             (0, 0)
         }
@@ -451,7 +455,8 @@ impl AtsModeCtx for EipdCtx {
         // sps_cm_init_flag == 0 every regular bin shares (0, 0); under
         // sps_cm_init_flag == 1 it lands on Table 79 at ctxIdx 0.
         if self.is_cm_init() {
-            (MainCtxTable::AtsMode.as_usize(), 0)
+            let t = MainCtxTable::AtsMode;
+            (t.as_usize(), self.offset(t))
         } else {
             (0, 0)
         }

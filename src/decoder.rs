@@ -611,12 +611,15 @@ impl EvcDecoder {
         // walker decodes the §7.3.8.3 BTT split group, the SUCO order
         // flag and the §7.4.9.3 pred_mode_constraint machinery via the
         // threaded CodingTreeGates.
+        // Round 397: sps_cm_init_flag is lifted — the P/B walker
+        // initialises the §9.3.2.2 Main-profile contexts (initType 1)
+        // and routes every regular bin through the §9.3.4.2.1
+        // ctxIdxOffset + ctxInc selection.
         if sps.sps_eipd_flag
             || sps.sps_addb_flag
             || sps.sps_dquant_flag
             || sps.sps_ats_flag
             || sps.sps_adcc_flag
-            || sps.sps_cm_init_flag
         {
             return Err(Error::unsupported(
                 "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",

@@ -56,7 +56,7 @@ pub struct InterModeGateStats {
 /// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
     if ctx.is_cm_init() {
-        (table.as_usize(), ctx_inc)
+        (table.as_usize(), ctx.offset(table) + ctx_inc)
     } else {
         (0, 0)
     }
@@ -75,6 +75,7 @@ pub fn read_amvr_idx(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::AmvrIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::AmvrIdx);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(
         AMVR_IDX_MAX,
@@ -83,7 +84,7 @@ pub fn read_amvr_idx(
         |bin_idx| {
             bins += 1;
             if cm_init {
-                amvr_idx_ctx_inc(bin_idx).unwrap_or(0)
+                off + amvr_idx_ctx_inc(bin_idx).unwrap_or(0)
             } else {
                 0
             }
@@ -143,12 +144,13 @@ pub fn read_merge_idx(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::MergeIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::MergeIdx);
     let c_max = merge_idx_c_max(n_cb_w, n_cb_h);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
         bins += 1;
         if cm_init {
-            merge_idx_ctx_inc(bin_idx).unwrap_or(0)
+            off + merge_idx_ctx_inc(bin_idx).unwrap_or(0)
         } else {
             0
         }
@@ -174,12 +176,13 @@ pub fn read_inter_pred_idc(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::InterPredIdc.as_usize();
+    let off = ctx.offset(MainCtxTable::InterPredIdc);
     let c_max = inter_pred_idc_c_max(sps_admvp_flag, n_cb_w, n_cb_h);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
         bins += 1;
         if cm_init {
-            inter_pred_idc_ctx_inc(bin_idx).unwrap_or(0)
+            off + inter_pred_idc_ctx_inc(bin_idx).unwrap_or(0)
         } else {
             0
         }
@@ -203,6 +206,7 @@ pub fn read_bi_pred_idx(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::BiPredIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::BiPredIdx);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(
         BI_PRED_IDX_MAX,
@@ -211,7 +215,7 @@ pub fn read_bi_pred_idx(
         |bin_idx| {
             bins += 1;
             if cm_init {
-                bi_pred_idx_ctx_inc(bin_idx).unwrap_or(0)
+                off + bi_pred_idx_ctx_inc(bin_idx).unwrap_or(0)
             } else {
                 0
             }

@@ -373,11 +373,12 @@ fn read_mvp_idx(
 ) -> Result<u32> {
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::MvpIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::MvpIdx);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(3, 0, if cm_init { table } else { 0 }, |bin_idx| {
         bins += 1;
         if cm_init {
-            bin_idx.min(2) as usize
+            off + bin_idx.min(2) as usize
         } else {
             0
         }
@@ -503,6 +504,7 @@ fn read_explicit_list(
     let ref_idx = if num_ref_idx_active_minus1 > 0 && bi_pred_idx == 0 {
         let cm_init = ctx.is_cm_init();
         let table = MainCtxTable::RefIdx.as_usize();
+        let off = ctx.offset(MainCtxTable::RefIdx);
         let mut bins = 0u32;
         let v = eng.decode_tr_regular(
             num_ref_idx_active_minus1,
@@ -514,7 +516,7 @@ fn read_explicit_list(
                 // (Table 9.3.4.2). Under the Baseline collapse all bins are
                 // (0,0); the first two regular ctxIdx are 0 and 1.
                 if cm_init {
-                    bin_idx.min(1) as usize
+                    off + bin_idx.min(1) as usize
                 } else {
                     0
                 }
@@ -594,6 +596,7 @@ fn read_ref_idx(
     }
     let cm_init = ctx.is_cm_init();
     let table = MainCtxTable::RefIdx.as_usize();
+    let off = ctx.offset(MainCtxTable::RefIdx);
     let mut bins = 0u32;
     let v = eng.decode_tr_regular(
         num_ref_idx_active_minus1,
@@ -602,7 +605,7 @@ fn read_ref_idx(
         |bin_idx| {
             bins += 1;
             if cm_init {
-                bin_idx.min(1) as usize
+                off + bin_idx.min(1) as usize
             } else {
                 0
             }

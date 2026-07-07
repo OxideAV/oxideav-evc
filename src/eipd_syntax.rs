@@ -61,13 +61,27 @@ use crate::eipd_mode::{derive_chroma_mode, derive_mode_lists, ModeSelector, Neig
 #[derive(Clone, Copy, Debug)]
 pub struct EipdCtx {
     cm_init: bool,
+    init_type: crate::cabac::InitType,
 }
 
 impl EipdCtx {
-    /// Build the context selector for the slice's `sps_cm_init_flag`.
+    /// Build the context selector for the slice's `sps_cm_init_flag`
+    /// with the I-slice init type (`initType = 0`).
     pub fn new(sps_cm_init_flag: bool) -> Self {
         Self {
             cm_init: sps_cm_init_flag,
+            init_type: crate::cabac::InitType::I,
+        }
+    }
+
+    /// Build the selector for an arbitrary §9.3.2.2 `initType` (P/B
+    /// slices use [`crate::cabac::InitType::Pb`], selecting the second
+    /// half of every Table 39 ctxIdx range as the §9.3.4.2.1
+    /// `ctxIdxOffset`).
+    pub fn for_slice(sps_cm_init_flag: bool, init_type: crate::cabac::InitType) -> Self {
+        Self {
+            cm_init: sps_cm_init_flag,
+            init_type,
         }
     }
 
@@ -79,11 +93,25 @@ impl EipdCtx {
         self.cm_init
     }
 
-    /// `(ctxTable, ctxIdx)` for the named Main-profile context table.
+    /// §9.3.4.2.1 `ctxIdxOffset` for the named table under this slice's
+    /// init type — 0 under `sps_cm_init_flag == 0` (the collapse) and
+    /// for I slices; the second-half start of the Table 39 range on
+    /// P/B slices.
+    #[inline]
+    pub fn offset(self, table: MainCtxTable) -> usize {
+        if self.cm_init {
+            table.ctx_idx_offset(self.init_type)
+        } else {
+            0
+        }
+    }
+
+    /// `(ctxTable, ctxIdx)` for the named Main-profile context table at
+    /// `ctxInc = 0`.
     #[inline]
     fn ctx(self, table: MainCtxTable) -> (usize, usize) {
         if self.cm_init {
-            (table.as_usize(), 0)
+            (table.as_usize(), self.offset(table))
         } else {
             (0, 0)
         }

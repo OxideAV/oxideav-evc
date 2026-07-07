@@ -389,6 +389,44 @@ impl<'a> CabacEngine<'a> {
         }
     }
 
+    /// Decode an EG0 value (§9.3.3.4) whose **first bin is
+    /// regular-coded** and every later bin is bypass — the Table 95
+    /// shape of `abs_mvd_l0` / `abs_mvd_l1` under `sps_cm_init_flag ==
+    /// 1` (bin0 on Table 73 at the initType ctxIdxOffset, the rest of
+    /// the prefix and every suffix bit bypass). The historical
+    /// all-bypass read ([`Self::decode_egk_bypass`] with k = 0) remains
+    /// the `sps_cm_init_flag == 0` path.
+    pub fn decode_eg0_first_regular(&mut self, ctx_table: usize, ctx_idx: usize) -> Result<u32> {
+        let mut k = 0u32;
+        let mut abs_v: u32 = 0;
+        const MAX_PREFIX_BINS: u32 = 32;
+        let mut prefix_count = 0u32;
+        loop {
+            if prefix_count >= MAX_PREFIX_BINS {
+                return Err(Error::invalid("evc cabac EG0: too many prefix bins"));
+            }
+            let bin = if prefix_count == 0 {
+                self.decode_decision(ctx_table, ctx_idx)?
+            } else {
+                self.decode_bypass()?
+            };
+            if bin == 0 {
+                let mut suffix: u32 = 0;
+                let mut kk = k;
+                while kk > 0 {
+                    kk -= 1;
+                    let s = self.decode_bypass()?;
+                    suffix |= (s as u32) << kk;
+                }
+                abs_v = abs_v.wrapping_add(suffix);
+                return Ok(abs_v);
+            }
+            abs_v = abs_v.wrapping_add(1u32 << k);
+            k += 1;
+            prefix_count += 1;
+        }
+    }
+
     /// Decode a TB (truncated binary) value (§9.3.3.6) where every bin is
     /// bypass-coded. `c_max` is the largest possible value of the syntax
     /// element. The §9.3.3.6 construction reads `k = Floor(Log2(cMax+1))`
