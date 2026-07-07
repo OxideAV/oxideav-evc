@@ -73,6 +73,11 @@ pub struct SliceWalkInputs {
     /// `cu_qp_delta_enabled_flag` (PPS). When false, `cu_qp_delta_*` is
     /// not in the bitstream.
     pub cu_qp_delta_enabled: bool,
+    /// `sps_eipd_flag` (§7.4.3.1) — extended intra prediction. When
+    /// true the `coding_unit()` intra syntax switches to the §7.3.8.4
+    /// MPM/PIMS/rem-mode group and reconstruction runs the §8.4.4 EIPD
+    /// kernels over the §8.4.4.1/.2 reference construction.
+    pub sps_eipd_flag: bool,
     /// `sps_dquant_flag` (§7.4.3.1) — the improved delta-QP signalling.
     /// When true (and `cu_qp_delta_enabled`), the §7.3.8.3 `split_unit()`
     /// dquant block derives `cuQpDeltaCode` per subtree and the §7.3.8.5
@@ -130,6 +135,7 @@ impl Default for SliceWalkInputs {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            sps_eipd_flag: false,
             sps_dquant_flag: false,
             cu_qp_delta_area: 6,
             sps_ibc_flag: false,
@@ -1624,6 +1630,8 @@ impl Default for SliceDecodeInputs {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SliceDecodeStats {
     pub ctus: u32,
+    /// §7.3.8.4 `sps_eipd_flag == 1` intra-mode syntax tallies.
+    pub eipd: crate::eipd_syntax::EipdSyntaxStats,
     pub split_cu_flag_bins: u32,
     /// Round 391: §7.3.8.3 BTT/SUCO tree-level syntax tallies
     /// (`btt_split_*`, `split_unit_coding_order_flag`,
@@ -1806,6 +1814,110 @@ pub fn decode_baseline_idr_slice(
         stats.deblock_edges = edges;
     }
     Ok((pic, stats))
+}
+
+/// The per-CU intra prediction mode threaded from `coding_unit()` into
+/// the transform-unit reconstruction: the Baseline 5-mode set
+/// (`sps_eipd_flag == 0`) or a §8.4.2/.3-derived EIPD mode
+/// (`sps_eipd_flag == 1`, Table 15 numbering).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CuIntraMode {
+    Baseline(IntraMode),
+    Eipd(i32),
+}
+
+impl CuIntraMode {
+    /// The value stamped into the side-info grid (`intra_luma_mode`) so
+    /// later CUs can consult this CU as a §8.4.2 neighbour.
+    fn stamp_value(self) -> u8 {
+        match self {
+            CuIntraMode::Baseline(m) => m as u8,
+            CuIntraMode::Eipd(m) => m.clamp(0, 32) as u8,
+        }
+    }
+}
+
+/// §8.4.2 step 1-2 — probe one neighbouring location for a
+/// `candIntraPredModeX`: valid iff the position is inside the picture,
+/// already decoded (grid-stamped) and `LumaPredMode == MODE_INTRA`, in
+/// which case the candidate is the stored `IntraPredModeY`; otherwise
+/// invalid (the derivation substitutes `INTRA_DC`).
+fn eipd_neighbour_mode(
+    side_info: &SideInfoGrid,
+    walk: &SliceWalkInputs,
+    x: i64,
+    y: i64,
+) -> crate::eipd_mode::NeighbourMode {
+    use crate::eipd_mode::NeighbourMode;
+    if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
+        return NeighbourMode::invalid();
+    }
+    let xc = (x as u32 >> 2) as usize;
+    let yc = (y as u32 >> 2) as usize;
+    if xc >= side_info.w_cells || yc >= side_info.h_cells {
+        return NeighbourMode::invalid();
+    }
+    let cell = side_info.at(xc, yc);
+    if cell.cu_log2_w == 0 || cell.pred_mode != CuPredMode::Intra {
+        return NeighbourMode::invalid();
+    }
+    NeighbourMode::valid(cell.intra_luma_mode as i32)
+}
+
+/// §8.4.2 step 1 — the three neighbour candidates at
+/// `(xCb − 1, yCb)`, `(xCb, yCb − 1)` and `(xCb + nCbW, yCb)`.
+fn eipd_neighbours(
+    side_info: &SideInfoGrid,
+    walk: &SliceWalkInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+) -> (
+    crate::eipd_mode::NeighbourMode,
+    crate::eipd_mode::NeighbourMode,
+    crate::eipd_mode::NeighbourMode,
+) {
+    let w = 1i64 << log2_cb_width;
+    (
+        eipd_neighbour_mode(side_info, walk, x0 as i64 - 1, y0 as i64),
+        eipd_neighbour_mode(side_info, walk, x0 as i64, y0 as i64 - 1),
+        eipd_neighbour_mode(side_info, walk, x0 as i64 + w, y0 as i64),
+    )
+}
+
+/// The co-located luma `IntraPredModeY` a chroma coding unit inherits
+/// (§8.4.3): the stored mode of the luma cell at `(x0, y0)`, or
+/// `INTRA_DC` when that cell is `MODE_IBC` (or not intra at all).
+fn colocated_luma_mode(side_info: &SideInfoGrid, x0: u32, y0: u32) -> i32 {
+    let xc = (x0 >> 2) as usize;
+    let yc = (y0 >> 2) as usize;
+    if xc < side_info.w_cells && yc < side_info.h_cells {
+        let cell = side_info.at(xc, yc);
+        if cell.pred_mode == CuPredMode::Intra {
+            return cell.intra_luma_mode as i32;
+        }
+    }
+    crate::eipd::INTRA_DC
+}
+
+/// §6.4.1-shaped probe for the EIPD right reference column: available
+/// iff the cell at `(x0 + nCbW, y0)` is inside the picture and already
+/// decoded (only reachable ahead of the current CU under SUCO's
+/// mirrored orders).
+fn eipd_right_available(
+    side_info: &SideInfoGrid,
+    walk: &SliceWalkInputs,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+) -> bool {
+    let x = x0 as i64 + (1i64 << log2_cb_width);
+    if x >= walk.pic_width as i64 {
+        return false;
+    }
+    let xc = (x as u32 >> 2) as usize;
+    let yc = (y0 >> 2) as usize;
+    xc < side_info.w_cells && yc < side_info.h_cells && side_info.at(xc, yc).cu_log2_w != 0
 }
 
 /// §8.7.1 + §7.3.8.5 per-slice QP state threaded through the coding
@@ -2297,26 +2409,50 @@ fn decode_coding_unit(
     // Binarisation: U with cMax=4 (Table 91) — an unbounded unary prefix
     // capped to 4 leading 1s; the value is the number of leading 1s.
     // sps_cm_init_flag=0 → all bins land on (ctxTable=0, ctxIdx=0).
-    let intra_idx = if is_luma_tree {
-        // Table 62; Table 95 ctxInc: bin0 → 0, every later bin → 1
-        // (under `sps_cm_init_flag == 0` all bins collapse to (0, 0)).
-        let v = if sel.cm_init {
-            let table = crate::cabac_init::MainCtxTable::IntraPredMode;
-            let off = table.ctx_idx_offset(sel.init_type);
-            eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
+    let intra_mode = if walk.sps_eipd_flag {
+        // §7.3.8.4 `sps_eipd_flag == 1` intra syntax: the luma
+        // MPM/PIMS/rem-mode group (resolved through the §8.4.2
+        // three-list derivation over the grid neighbours) on luma
+        // trees; `intra_chroma_pred_mode` (resolved through §8.4.3
+        // against the co-located luma mode) on the chroma tree.
+        let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+            walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::I,
+        );
+        if is_luma_tree {
+            let (a, b, c) = eipd_neighbours(side_info, walk, x0, y0, log2_cb_width);
+            let m = crate::eipd_syntax::resolve_eipd_luma_mode(eng, ctx, &mut stats.eipd, a, b, c)?;
+            CuIntraMode::Eipd(m)
+        } else if walk.chroma_format_idc != 0 {
+            let luma_mode = colocated_luma_mode(side_info, x0, y0);
+            let m =
+                crate::eipd_syntax::resolve_eipd_chroma_mode(eng, ctx, &mut stats.eipd, luma_mode)?;
+            CuIntraMode::Eipd(m)
         } else {
-            eng.decode_u_regular(0, |_| 0)?
-        };
-        stats.intra_pred_mode_bins += 1;
-        v
+            CuIntraMode::Eipd(crate::eipd::INTRA_DC)
+        }
     } else {
-        0
+        let intra_idx = if is_luma_tree {
+            // Table 62; Table 95 ctxInc: bin0 → 0, every later bin → 1
+            // (under `sps_cm_init_flag == 0` all bins collapse to (0, 0)).
+            let v = if sel.cm_init {
+                let table = crate::cabac_init::MainCtxTable::IntraPredMode;
+                let off = table.ctx_idx_offset(sel.init_type);
+                eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
+            } else {
+                eng.decode_u_regular(0, |_| 0)?
+            };
+            stats.intra_pred_mode_bins += 1;
+            v
+        } else {
+            0
+        };
+        CuIntraMode::Baseline(IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc decode: intra_pred_mode {intra_idx} out of Baseline range 0..=4"
+            ))
+        })?)
     };
-    let intra_mode = IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
-        Error::invalid(format!(
-            "evc decode: intra_pred_mode {intra_idx} out of Baseline range 0..=4"
-        ))
-    })?;
 
     decode_transform_unit(
         eng,
@@ -2603,7 +2739,7 @@ fn decode_transform_unit(
     cu_qp_delta_code: u8,
     qp: &mut QpState,
     tree_type: TreeType,
-    intra_mode: IntraMode,
+    intra_mode: CuIntraMode,
     luma_cu_is_ibc: bool,
 ) -> Result<()> {
     let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
@@ -2670,6 +2806,7 @@ fn decode_transform_unit(
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_cb_width as u8,
                 cu_log2_h: log2_cb_height as u8,
+                intra_luma_mode: intra_mode.stamp_value(),
                 ..Default::default()
             },
         );
@@ -2701,16 +2838,33 @@ fn decode_transform_unit(
             }
             // For luma blocks larger than max_tb, the spec splits the CB
             // into multiple TBs. Round-5 fixtures keep CB == TB.
-            intra_reconstruct_cb(
-                pic,
-                x0,
-                y0,
-                log2_tb_width,
-                log2_tb_height,
-                intra_mode,
-                0,
-                &residual,
-            )?;
+            match intra_mode {
+                CuIntraMode::Baseline(m) => intra_reconstruct_cb(
+                    pic,
+                    x0,
+                    y0,
+                    log2_tb_width,
+                    log2_tb_height,
+                    m,
+                    0,
+                    &residual,
+                )?,
+                CuIntraMode::Eipd(m) => {
+                    let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
+                    crate::picture::intra_reconstruct_cb_eipd(
+                        pic,
+                        x0,
+                        y0,
+                        log2_tb_width,
+                        log2_tb_height,
+                        m,
+                        0,
+                        walk.tree_gates.sps_suco_flag,
+                        right,
+                        &residual,
+                    )?
+                }
+            }
         }
         TreeType::DualTreeChroma => {
             if chroma_present {
@@ -2793,26 +2947,58 @@ fn decode_transform_unit(
                         )?;
                     }
                 } else {
-                    intra_reconstruct_cb(
-                        pic,
-                        x0,
-                        y0,
-                        log2_tb_width,
-                        log2_tb_height,
-                        intra_mode,
-                        1,
-                        &res_cb,
-                    )?;
-                    intra_reconstruct_cb(
-                        pic,
-                        x0,
-                        y0,
-                        log2_tb_width,
-                        log2_tb_height,
-                        intra_mode,
-                        2,
-                        &res_cr,
-                    )?;
+                    match intra_mode {
+                        CuIntraMode::Baseline(m) => {
+                            intra_reconstruct_cb(
+                                pic,
+                                x0,
+                                y0,
+                                log2_tb_width,
+                                log2_tb_height,
+                                m,
+                                1,
+                                &res_cb,
+                            )?;
+                            intra_reconstruct_cb(
+                                pic,
+                                x0,
+                                y0,
+                                log2_tb_width,
+                                log2_tb_height,
+                                m,
+                                2,
+                                &res_cr,
+                            )?;
+                        }
+                        CuIntraMode::Eipd(m) => {
+                            let right =
+                                eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
+                            crate::picture::intra_reconstruct_cb_eipd(
+                                pic,
+                                x0,
+                                y0,
+                                log2_tb_width,
+                                log2_tb_height,
+                                m,
+                                1,
+                                walk.tree_gates.sps_suco_flag,
+                                right,
+                                &res_cb,
+                            )?;
+                            crate::picture::intra_reconstruct_cb_eipd(
+                                pic,
+                                x0,
+                                y0,
+                                log2_tb_width,
+                                log2_tb_height,
+                                m,
+                                2,
+                                walk.tree_gates.sps_suco_flag,
+                                right,
+                                &res_cr,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -3007,6 +3193,8 @@ impl<'a, 'b> InterDecodeInputs<'a, 'b> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterDecodeStats {
     pub ctus: u32,
+    /// §7.3.8.4 `sps_eipd_flag == 1` intra-mode syntax tallies.
+    pub eipd: crate::eipd_syntax::EipdSyntaxStats,
     pub split_cu_flag_bins: u32,
     pub coding_units: u32,
     pub cu_skip_flag_bins: u32,
@@ -6223,26 +6411,51 @@ fn decode_inter_intra_cu(
         walk.tree_gates.sps_cm_init_flag,
         crate::cabac::InitType::Pb,
     );
-    let intra_mode = if is_luma_tree {
-        // Table 62; Table 95 ctxInc: bin0 → 0, later bins → 1.
-        let intra_idx = if sel.cm_init {
-            let table = crate::cabac_init::MainCtxTable::IntraPredMode;
-            let off = table.ctx_idx_offset(sel.init_type);
-            eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
-        } else {
-            eng.decode_u_regular(0, |_| 0)?
-        };
-        IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
-            Error::invalid(format!(
-                "evc inter decode: intra_pred_mode {intra_idx} out of range"
-            ))
-        })?
-    } else {
-        IntraMode::Dc
-    };
     let log2_tb_w = log2_cb_width.min(walk.max_tb_log2_size_y);
     let log2_tb_h = log2_cb_height.min(walk.max_tb_log2_size_y);
     let chroma_present = walk.chroma_format_idc != 0 && tree_type != TreeType::DualTreeLuma;
+    // §7.3.8.4 intra syntax: the Baseline single `intra_pred_mode` (luma
+    // trees only, chroma inherits) or — `sps_eipd_flag == 1` — the
+    // MPM/PIMS/rem-mode group plus, on chroma-carrying trees, the
+    // §8.4.3 `intra_chroma_pred_mode`. A SINGLE_TREE EIPD CU reads
+    // both; the chroma mode then drives the chroma reconstruction.
+    let (intra_mode, eipd_chroma_mode) = if walk.sps_eipd_flag {
+        let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+            walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::Pb,
+        );
+        let mode_y = if is_luma_tree {
+            let (a, b, c) = eipd_neighbours(side_info, &walk, x0, y0, log2_cb_width);
+            crate::eipd_syntax::resolve_eipd_luma_mode(eng, ctx, &mut stats.eipd, a, b, c)?
+        } else {
+            colocated_luma_mode(side_info, x0, y0)
+        };
+        let mode_c = if chroma_present {
+            crate::eipd_syntax::resolve_eipd_chroma_mode(eng, ctx, &mut stats.eipd, mode_y)?
+        } else {
+            crate::eipd::INTRA_DC
+        };
+        (CuIntraMode::Eipd(mode_y), mode_c)
+    } else {
+        let m = if is_luma_tree {
+            // Table 62; Table 95 ctxInc: bin0 → 0, later bins → 1.
+            let intra_idx = if sel.cm_init {
+                let table = crate::cabac_init::MainCtxTable::IntraPredMode;
+                let off = table.ctx_idx_offset(sel.init_type);
+                eng.decode_u_regular(table.as_usize(), |bin_idx| off + (bin_idx as usize).min(1))?
+            } else {
+                eng.decode_u_regular(0, |_| 0)?
+            };
+            IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
+                Error::invalid(format!(
+                    "evc inter decode: intra_pred_mode {intra_idx} out of range"
+                ))
+            })?
+        } else {
+            IntraMode::Dc
+        };
+        (CuIntraMode::Baseline(m), crate::eipd::INTRA_DC)
+    };
     let mut cbf_luma = 0u8;
     if is_luma_tree {
         let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
@@ -6292,6 +6505,7 @@ fn decode_inter_intra_cu(
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_cb_width as u8,
                 cu_log2_h: log2_cb_height as u8,
+                intra_luma_mode: intra_mode.stamp_value(),
                 ..Default::default()
             },
         );
@@ -6317,7 +6531,26 @@ fn decode_inter_intra_cu(
                 decode.bit_depth_luma,
             )?;
         }
-        intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, intra_mode, 0, &residual)?;
+        match intra_mode {
+            CuIntraMode::Baseline(m) => {
+                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 0, &residual)?
+            }
+            CuIntraMode::Eipd(m) => {
+                let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
+                crate::picture::intra_reconstruct_cb_eipd(
+                    pic,
+                    x0,
+                    y0,
+                    log2_tb_w,
+                    log2_tb_h,
+                    m,
+                    0,
+                    walk.tree_gates.sps_suco_flag,
+                    right,
+                    &residual,
+                )?
+            }
+        }
     }
     if chroma_present {
         let log2_c_w = log2_tb_w.saturating_sub(1);
@@ -6365,8 +6598,39 @@ fn decode_inter_intra_cu(
                 decode.bit_depth_chroma,
             )?;
         }
-        intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, intra_mode, 1, &res_cb)?;
-        intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, intra_mode, 2, &res_cr)?;
+        match intra_mode {
+            CuIntraMode::Baseline(m) => {
+                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 1, &res_cb)?;
+                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 2, &res_cr)?;
+            }
+            CuIntraMode::Eipd(_) => {
+                let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
+                crate::picture::intra_reconstruct_cb_eipd(
+                    pic,
+                    x0,
+                    y0,
+                    log2_tb_w,
+                    log2_tb_h,
+                    eipd_chroma_mode,
+                    1,
+                    walk.tree_gates.sps_suco_flag,
+                    right,
+                    &res_cb,
+                )?;
+                crate::picture::intra_reconstruct_cb_eipd(
+                    pic,
+                    x0,
+                    y0,
+                    log2_tb_w,
+                    log2_tb_h,
+                    eipd_chroma_mode,
+                    2,
+                    walk.tree_gates.sps_suco_flag,
+                    right,
+                    &res_cr,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -13498,5 +13762,238 @@ mod tests {
         assert_eq!(stats.cu_qp_delta_abs_bins, 1, "one code-2 read per area");
         assert_eq!(stats.admvp_skip_cus, 2);
         assert!(pic.y.iter().all(|&v| v == 200), "both skip CUs copy ref");
+    }
+
+    /// Round 397: EIPD (`sps_eipd_flag == 1`) on the IDR walker — the
+    /// §7.3.8.4 MPM group replaces the Baseline `intra_pred_mode` read.
+    /// One 32×32 CU: `intra_luma_pred_mpm_flag = 1`, `mpm_idx = 0` over
+    /// all-invalid neighbours resolves through the §8.4.2 lists; a DC
+    /// residual reconstructs through the §8.4.4 EIPD kernel; the chroma
+    /// CU reads `intra_chroma_pred_mode = 0` (DM, single bin) and
+    /// inherits the luma mode per §8.4.3.
+    #[test]
+    fn round397_eipd_idr_mpm_group_decodes_to_pixels() {
+        use crate::cabac::CabacEncoder;
+        use crate::eipd_mode::{derive_mode_lists, NeighbourMode};
+        let inv = NeighbourMode::invalid();
+        let expected_mode = derive_mode_lists(inv, inv, inv).cand_mode_list[0];
+        assert_eq!(
+            expected_mode,
+            crate::eipd::INTRA_DC,
+            "all-invalid neighbours resolve candModeList[0] = INTRA_DC"
+        );
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 1); // intra_luma_pred_mpm_flag = 1
+        enc.encode_decision(0, 0, 0); // intra_luma_pred_mpm_idx = 0
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..59 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 59
+        }
+        enc.encode_decision(0, 0, 0);
+        enc.encode_bypass(0); // +60
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Chroma CU: DM + no residual.
+        enc.encode_decision(0, 0, 1); // intra_chroma_pred_mode bin0 = 1 → DM
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_eipd_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 40, // large enough dequant scale for a visible DC shift
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.eipd.mpm_flag_bins, 1);
+        assert_eq!(stats.eipd.mpm_idx_bins, 1);
+        assert_eq!(stats.eipd.pims_flag_bins, 0);
+        assert_eq!(stats.eipd.chroma_pred_mode_bins, 1);
+        assert_eq!(stats.intra_pred_mode_bins, 0, "Baseline read suppressed");
+        assert_eq!(stats.coding_units, 2);
+        // DC over unavailable refs = 128 + the +60 residual: the luma
+        // plane is shifted well above 128; chroma untouched.
+        let mean: i64 = pic.y.iter().map(|&v| v as i64).sum::<i64>() / (32 * 32);
+        assert!(mean >= 131, "luma must carry the DC residual (mean {mean})");
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Round 397: EIPD mode derivation from a real neighbour + the
+    /// §8.4.4.5 INTRA_VER kernel to pixels. Two vertically stacked
+    /// 32×32 CTUs: CTU0 decodes MPM-DC with a DC residual; CTU1 selects
+    /// **INTRA_VER** through whichever §8.4.2 list carries it (against
+    /// candIntraPredModeB = the stamped DC above) and must copy CTU0's
+    /// bottom row column-for-column — pinning the neighbour probe, the
+    /// grid stamp, the list derivation and the directional kernel.
+    #[test]
+    fn round397_eipd_idr_ver_copies_neighbour_row() {
+        use crate::cabac::CabacEncoder;
+        use crate::eipd::{INTRA_DC, INTRA_VER};
+        use crate::eipd_mode::{derive_mode_lists, NeighbourMode};
+        let mut enc = CabacEncoder::new();
+        // CTU0: split=0; MPM-DC luma with a +60 DC residual; chroma DM.
+        enc.encode_decision(0, 0, 0); // split_cu_flag
+        enc.encode_decision(0, 0, 1); // mpm_flag = 1
+        enc.encode_decision(0, 0, 0); // mpm_idx = 0 → DC
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // zero_run 0
+        for _ in 0..59 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0);
+        enc.encode_bypass(0);
+        enc.encode_decision(0, 0, 1); // last
+        enc.encode_decision(0, 0, 1); // chroma DM
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
+                                      // CTU1 at (0, 32): neighbours A invalid (x = −1), B = CTU0 (DC),
+                                      // C invalid → find INTRA_VER in the derived lists and encode the
+                                      // matching selector.
+        let lists = derive_mode_lists(
+            NeighbourMode::invalid(),
+            NeighbourMode::valid(INTRA_DC),
+            NeighbourMode::invalid(),
+        );
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        if let Some(i) = lists.cand_mode_list.iter().position(|&m| m == INTRA_VER) {
+            enc.encode_decision(0, 0, 1); // mpm_flag
+            enc.encode_decision(0, 0, i as u8); // mpm_idx
+        } else if let Some(i) = lists
+            .ext_cand_mode_list
+            .iter()
+            .position(|&m| m == INTRA_VER)
+        {
+            enc.encode_decision(0, 0, 0); // mpm_flag = 0
+            enc.encode_bypass(1); // pims_flag = 1
+            for bit in (0..3).rev() {
+                enc.encode_bypass(((i >> bit) & 1) as u8); // pims_idx FL3
+            }
+        } else {
+            panic!("INTRA_VER must appear in the MPM or PIMS lists for (na, DC, na)");
+        }
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 1); // chroma DM
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 64,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_eipd_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 2);
+        assert_eq!(stats.coding_units, 4);
+        // CTU0 carries the residual.
+        assert_ne!(pic.y[0], 128);
+        // CTU1: INTRA_VER copies CTU0's reconstructed bottom row
+        // (p[x][−1]) into every row — column-exact.
+        for j in 32..64 {
+            for i in 0..32 {
+                assert_eq!(
+                    pic.y[j * 32 + i],
+                    pic.y[31 * 32 + i],
+                    "VER copy mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Round 397: EIPD on the P/B walker — a `pred_mode_flag == 1`
+    /// SINGLE_TREE intra CU reads the luma MPM group **and** the chroma
+    /// mode (spec lines 2852-2866), reconstructing both planes through
+    /// the EIPD kernels.
+    #[test]
+    fn round397_eipd_pb_intra_cu_reads_group() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 1); // pred_mode_flag = 1 (INTRA)
+        enc.encode_decision(0, 0, 1); // mpm_flag = 1
+        enc.encode_decision(0, 0, 0); // mpm_idx = 0 → DC
+        enc.encode_decision(0, 0, 1); // intra_chroma_pred_mode = 0 (DM)
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            sps_eipd_flag: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.eipd.mpm_flag_bins, 1);
+        assert_eq!(stats.eipd.mpm_idx_bins, 1);
+        assert_eq!(stats.eipd.chroma_pred_mode_bins, 1);
+        assert_eq!(stats.coding_units, 1);
+        // DC intra over unavailable refs on a P slice: flat mid-level.
+        assert!(pic.y.iter().all(|&v| v == 128));
+        assert!(pic.cb.iter().all(|&v| v == 128));
     }
 }

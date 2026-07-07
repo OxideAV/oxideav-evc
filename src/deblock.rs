@@ -101,6 +101,12 @@ pub struct CuSideInfo {
     /// Feeds the §9.3.4.2.4 Table 96 `cu_skip_flag` neighbour ctxInc
     /// under `sps_cm_init_flag == 1`.
     pub cu_skip: u8,
+    /// `IntraPredModeY[ x ][ y ]` — the covering intra CU's luma mode
+    /// (Table 15 numbering under `sps_eipd_flag == 1`, the Baseline
+    /// 5-mode index otherwise). Meaningful only on `Intra` cells; feeds
+    /// the §8.4.2 neighbour candidates and the §8.4.3 co-located luma
+    /// mode a chroma CU inherits.
+    pub intra_luma_mode: u8,
 }
 
 impl Default for CuSideInfo {
@@ -124,6 +130,7 @@ impl Default for CuSideInfo {
             cu_log2_w: 0,
             cu_log2_h: 0,
             cu_skip: 0,
+            intra_luma_mode: 0,
         }
     }
 }
