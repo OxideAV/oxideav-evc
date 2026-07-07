@@ -107,6 +107,9 @@ pub struct CuSideInfo {
     /// the §8.4.2 neighbour candidates and the §8.4.3 co-located luma
     /// mode a chroma CU inherits.
     pub intra_luma_mode: u8,
+    /// The covering CU's §8.7.1 `QpY` (the eq. 1042 chain value the
+    /// residual was scaled with). Feeds the §8.8.3.5 per-edge `qPav`.
+    pub qp_y: u8,
 }
 
 impl Default for CuSideInfo {
@@ -131,6 +134,7 @@ impl Default for CuSideInfo {
             cu_log2_h: 0,
             cu_skip: 0,
             intra_luma_mode: 0,
+            qp_y: 0,
         }
     }
 }
@@ -623,6 +627,516 @@ pub fn deblock_chroma(
     Ok(edges)
 }
 
+// =====================================================================
+// §8.8.3 — Advanced deblocking filter (`sps_addb_flag == 1`).
+// =====================================================================
+
+/// Table 34 — α′ per indexA (0..51).
+pub const ADDB_ALPHA_PRIME: [i32; 52] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
+    22, 25, 28, 32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144, 162, 182, 203, 226,
+    255, 255,
+];
+
+/// Table 34 — β′ per indexB (0..51).
+pub const ADDB_BETA_PRIME: [i32; 52] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 7, 8, 8,
+    9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18,
+];
+
+/// Table 35 — t′C0 per (bS − 1) and indexA.
+pub const ADDB_T_C0: [[i32; 52]; 3] = [
+    // bS = 1
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13,
+    ],
+    // bS = 2
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 8, 10, 11, 12, 13, 15, 17,
+    ],
+    // bS = 3
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2,
+        2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 23, 25,
+    ],
+];
+
+/// The slice-level §8.8.3.5 threshold offsets (eqs. 86/87:
+/// `FilterOffsetA = slice_alpha_offset`, `FilterOffsetB =
+/// slice_beta_offset`, both −12..=12, inferred 0 when absent).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AddbOffsets {
+    pub filter_offset_a: i32,
+    pub filter_offset_b: i32,
+}
+
+/// §8.8.3.4 — boundary filtering strength between the CUs covering the
+/// luma positions P and Q (probed from the side-info grid).
+fn addb_bs(grid: &SideInfoGrid, xp: u32, yp: u32, xq: u32, yq: u32, ctb_log2_size_y: u32) -> u32 {
+    let p = grid.at((xp >> 2) as usize, (yp >> 2) as usize);
+    let q = grid.at((xq >> 2) as usize, (yq >> 2) as usize);
+    let p_intra = p.pred_mode == CuPredMode::Intra;
+    let q_intra = q.pred_mode == CuPredMode::Intra;
+    // Intra across a CTU boundary → 4.
+    let different_ctu = (xp >> ctb_log2_size_y) != (xq >> ctb_log2_size_y)
+        || (yp >> ctb_log2_size_y) != (yq >> ctb_log2_size_y);
+    if (p_intra || q_intra) && different_ctu {
+        return 4;
+    }
+    // Intra or IBC on either side → 3.
+    if p_intra || q_intra || p.pred_mode == CuPredMode::Ibc || q.pred_mode == CuPredMode::Ibc {
+        return 3;
+    }
+    // Coded residual on either side → 2. (The `ats_cu_inter_flag == 1`
+    // arm shares this strength; ATS-inter is not yet decoded by the
+    // walkers so no cell carries it.)
+    if p.cbf_luma != 0 || q.cbf_luma != 0 {
+        return 2;
+    }
+    // eqs. 1218-1232: reference/motion comparison at 1/4-pel (>= 4 ==
+    // one integer sample).
+    let (r0l0, r0l1) = (q.ref_idx_l0, q.ref_idx_l1);
+    let (r1l0, r1l1) = (p.ref_idx_l0, p.ref_idx_l1);
+    let mv = |r: i8, x: i32| if r != -1 { x } else { 0 };
+    let (m0l0x, m0l0y) = (mv(r0l0, q.mv_l0_x), mv(r0l0, q.mv_l0_y));
+    let (m0l1x, m0l1y) = (mv(r0l1, q.mv_l1_x), mv(r0l1, q.mv_l1_y));
+    let (m1l0x, m1l0y) = (mv(r1l0, p.mv_l0_x), mv(r1l0, p.mv_l0_y));
+    let (m1l1x, m1l1y) = (mv(r1l1, p.mv_l1_x), mv(r1l1, p.mv_l1_y));
+    let ge4 = |a: i32, b: i32| (a - b).abs() >= 4;
+    if (r0l0 == r1l0 && r0l1 == r1l1) || (r0l0 == r1l1 && r0l1 == r1l0) {
+        if r0l0 == r0l1 {
+            // eq. 1230: all four cross pairings.
+            (ge4(m0l0x, m1l0x)
+                || ge4(m0l0y, m1l0y)
+                || ge4(m0l1x, m1l1x)
+                || ge4(m0l1y, m1l1y)
+                || ge4(m0l0x, m1l1x)
+                || ge4(m0l0y, m1l1y)
+                || ge4(m0l1x, m1l0x)
+                || ge4(m0l1y, m1l0y)) as u32
+        } else if r0l0 == r1l0 && r0l1 == r1l1 {
+            // eq. 1231.
+            (ge4(m0l0x, m1l0x) || ge4(m0l0y, m1l0y) || ge4(m0l1x, m1l1x) || ge4(m0l1y, m1l1y))
+                as u32
+        } else {
+            // eq. 1232 (crossed lists).
+            (ge4(m0l0x, m1l1x) || ge4(m0l0y, m1l1y) || ge4(m0l1x, m1l0x) || ge4(m0l1y, m1l0y))
+                as u32
+        }
+    } else {
+        1
+    }
+}
+
+/// §8.8.3.5 — thresholds for one edge sample set. Returns
+/// `(filter_samples_flag, index_a, alpha, beta)`.
+#[allow(clippy::too_many_arguments)]
+fn addb_thresholds(
+    p0: i32,
+    p1: i32,
+    q0: i32,
+    q1: i32,
+    qp_p: i32,
+    qp_q: i32,
+    bit_depth: u32,
+    offsets: AddbOffsets,
+    bs: u32,
+) -> (bool, usize, i32, i32) {
+    let qp_av = (qp_p + qp_q + 1) >> 1; // eq. 1233
+    let index_a = (qp_av + offsets.filter_offset_a).clamp(0, 51) as usize; // eq. 1234
+    let index_b = (qp_av + offsets.filter_offset_b).clamp(0, 51) as usize; // eq. 1235
+    let scale = 1i32 << (bit_depth - 8);
+    let alpha = ADDB_ALPHA_PRIME[index_a] * scale; // eq. 1236
+    let beta = ADDB_BETA_PRIME[index_b] * scale; // eq. 1237
+                                                 // eq. 1238.
+    let filter =
+        bs != 0 && (p0 - q0).abs() < alpha && (p1 - p0).abs() < beta && (q1 - q0).abs() < beta;
+    (filter, index_a, alpha, beta)
+}
+
+/// §8.8.3.6 — weak filter (bS < 4) over one 4-sample line. `p` and `q`
+/// each hold `p0..p2` / `q0..q2`; filtered in place.
+#[allow(clippy::too_many_arguments)]
+fn addb_filter_weak(
+    p: &mut [i32; 3],
+    q: &mut [i32; 3],
+    chroma_style: bool,
+    bs: u32,
+    beta: i32,
+    index_a: usize,
+    bit_depth: u32,
+    max_val: i32,
+) {
+    let t_c0_prime = ADDB_T_C0[(bs - 1).min(2) as usize][index_a];
+    let shift = bit_depth.saturating_sub(9);
+    let t_c = t_c0_prime * (1 << shift); // eq. 1239
+    let ap = (p[2] - p[0]).abs(); // eq. 1240
+    let aq = (q[2] - q[0]).abs(); // eq. 1241
+    let t_c0 = if !chroma_style {
+        let tc_inc_p = (ap < beta) as i32; // eq. 1242
+        let tc_inc_q = (aq < beta) as i32; // eq. 1243
+        (t_c0_prime + tc_inc_p + tc_inc_q) * (1 << shift) // eq. 1244
+    } else {
+        (t_c0_prime + 1) * (1 << shift) // eq. 1245
+    };
+    // eqs. 1246-1248.
+    let delta = ((((q[0] - p[0]) << 2) + (p[1] - q[1]) + 4) >> 3).clamp(-t_c0, t_c0);
+    let p0_new = p[0] + delta;
+    let q0_new = q[0] - delta;
+    // eqs. 1249-1252.
+    let p1_new = if !chroma_style && ap < beta {
+        p[1] + (((p[2] + p[0] + q[0]) * 3 - (p[1] << 3) - q[1]) >> 4).clamp(-t_c, t_c)
+    } else {
+        p[1]
+    };
+    let q1_new = if !chroma_style && aq < beta {
+        q[1] + (((q[2] + q[0] + p[0]) * 3 - (q[1] << 3) - p[1]) >> 4).clamp(-t_c, t_c)
+    } else {
+        q[1]
+    };
+    // eqs. 1255-1260 (p2/q2 unchanged, eqs. 1253/1254).
+    p[0] = p0_new.clamp(0, max_val);
+    p[1] = p1_new.clamp(0, max_val);
+    q[0] = q0_new.clamp(0, max_val);
+    q[1] = q1_new.clamp(0, max_val);
+}
+
+/// §8.8.3.7 — strong filter (bS == 4) over one 4-sample line. `p` and
+/// `q` hold `p0..p3` / `q0..q3`; the first three of each side are
+/// filtered in place.
+fn addb_filter_strong(
+    p: &mut [i32; 4],
+    q: &mut [i32; 4],
+    chroma_style: bool,
+    alpha: i32,
+    beta: i32,
+    max_val: i32,
+) {
+    let ap = (p[2] - p[0]).abs();
+    let aq = (q[2] - q[0]).abs();
+    let strong_gate = (p[0] - q[0]).abs() < ((alpha >> 2) + 2);
+    let (p0n, p1n, p2n) = if !chroma_style && ap < beta && strong_gate {
+        // eqs. 1262-1264.
+        (
+            (p[2] + 2 * p[1] + 2 * p[0] + 2 * q[0] + q[1] + 4) >> 3,
+            (p[2] + p[1] + p[0] + q[0] + 2) >> 2,
+            (2 * p[3] + 3 * p[2] + p[1] + p[0] + q[0] + 4) >> 3,
+        )
+    } else {
+        // eqs. 1265-1267.
+        ((2 * p[1] + p[0] + q[1] + 2) >> 2, p[1], p[2])
+    };
+    let (q0n, q1n, q2n) = if !chroma_style && aq < beta && strong_gate {
+        // eqs. 1269-1271.
+        (
+            (p[1] + 2 * p[0] + 2 * q[0] + 2 * q[1] + q[2] + 4) >> 3,
+            (p[0] + q[0] + q[1] + q[2] + 2) >> 2,
+            (2 * q[3] + 3 * q[2] + q[1] + q[0] + p[0] + 4) >> 3,
+        )
+    } else {
+        // eqs. 1272-1274.
+        ((2 * q[1] + q[0] + p[1] + 2) >> 2, q[1], q[2])
+    };
+    // eqs. 1275-1280.
+    p[0] = p0n.clamp(0, max_val);
+    p[1] = p1n.clamp(0, max_val);
+    p[2] = p2n.clamp(0, max_val);
+    q[0] = q0n.clamp(0, max_val);
+    q[1] = q1n.clamp(0, max_val);
+    q[2] = q2n.clamp(0, max_val);
+}
+
+/// §8.8.3.3 — filter one coding-block boundary edge (the left edge for
+/// EDGE_VER, the top edge for EDGE_HOR) of the CB at luma `(x_cb,
+/// y_cb)` with the given **luma** log2 dimensions, on plane `c_idx`.
+/// Returns the number of filtered sample lines.
+#[allow(clippy::too_many_arguments)]
+fn addb_filter_cb_edge(
+    pic: &mut crate::picture::YuvPicture,
+    grid: &SideInfoGrid,
+    offsets: AddbOffsets,
+    ctb_log2_size_y: u32,
+    x_cb: u32,
+    y_cb: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    c_idx: u32,
+    vertical: bool,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+) -> u32 {
+    // 4:2:0 only (ChromaArrayType == 1): chroma runs the
+    // chromaStyleFilteringFlag == 1 branch.
+    let chroma_style = c_idx != 0;
+    let sub = if c_idx == 0 { 0u32 } else { 1 };
+    let (width, height) = if c_idx == 0 {
+        (pic.width, pic.height)
+    } else {
+        (pic.width.div_ceil(2), pic.height.div_ceil(2))
+    };
+    let stride = if c_idx == 0 {
+        pic.y_stride()
+    } else {
+        pic.c_stride()
+    };
+    let bit_depth = pic.bit_depth;
+    let max_val = (1i32 << bit_depth) - 1;
+    // Component-domain block geometry (log2CbWidth/Height are the
+    // component dims per §8.8.3.2's cIdx remapping).
+    let log2_w = log2_cb_width - sub;
+    let log2_h = log2_cb_height - sub;
+    let x_cb_c = x_cb >> sub;
+    let y_cb_c = y_cb >> sub;
+    // Picture-boundary edges are never filtered.
+    if (vertical && x_cb_c == 0) || (!vertical && y_cb_c == 0) {
+        return 0;
+    }
+    // Edge-set geometry: luma iterates 4-sample groups with d = 0..3;
+    // 4:2:0 chroma-style iterates 2-sample groups with d = 0..1.
+    let (steps, group, taps) = if !chroma_style {
+        if vertical {
+            (1u32 << (log2_h - 2), 4u32, 4usize)
+        } else {
+            (1u32 << (log2_w - 2), 4u32, 4usize)
+        }
+    } else if vertical {
+        (1u32 << (log2_h.max(1) - 1), 2u32, 2usize)
+    } else {
+        (1u32 << (log2_w.max(1) - 1), 2u32, 2usize)
+    };
+    let mut filtered = 0u32;
+    for step in 0..steps {
+        // bS at luma granularity (§8.8.3.3 step 3: derived from the
+        // luma positions; the chroma-style branch reuses the same
+        // §8.8.3.4 derivation over the covering luma cells).
+        let d_luma = (step * group) << sub;
+        let (xp_l, yp_l, xq_l, yq_l) = if vertical {
+            (x_cb - 1, y_cb + d_luma, x_cb, y_cb + d_luma)
+        } else {
+            (x_cb + d_luma, y_cb - 1, x_cb + d_luma, y_cb)
+        };
+        if xq_l >= pic.width || yq_l >= pic.height {
+            continue;
+        }
+        let bs = addb_bs(grid, xp_l, yp_l, xq_l, yq_l, ctb_log2_size_y);
+        if bs == 0 {
+            continue;
+        }
+        // Per-CU QP (§8.8.3.5): chroma edges take the co-located luma
+        // CU's QpY plus the slice chroma offset (the crate's chroma-QP
+        // simplification, mirroring the §8.8.2 path).
+        let qp_off = match c_idx {
+            1 => cb_qp_offset,
+            2 => cr_qp_offset,
+            _ => 0,
+        };
+        let qp_p =
+            (grid.at((xp_l >> 2) as usize, (yp_l >> 2) as usize).qp_y as i32 + qp_off).clamp(0, 51);
+        let qp_q =
+            (grid.at((xq_l >> 2) as usize, (yq_l >> 2) as usize).qp_y as i32 + qp_off).clamp(0, 51);
+        for d in 0..group {
+            // Component-domain line coordinates.
+            let (line_x, line_y) = if vertical {
+                (x_cb_c, y_cb_c + step * group + d)
+            } else {
+                (x_cb_c + step * group + d, y_cb_c)
+            };
+            if line_x >= width || line_y >= height {
+                continue;
+            }
+            // Gather p0..p3 / q0..q3 across the edge.
+            let plane: &mut Vec<u16> = match c_idx {
+                0 => &mut pic.y,
+                1 => &mut pic.cb,
+                _ => &mut pic.cr,
+            };
+            let fetch = |plane: &Vec<u16>, k: i64| -> Option<i32> {
+                let (x, y) = if vertical {
+                    (line_x as i64 + k, line_y as i64)
+                } else {
+                    (line_x as i64, line_y as i64 + k)
+                };
+                if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
+                    return None;
+                }
+                Some(plane[y as usize * stride + x as usize] as i32)
+            };
+            // p_k at −1−k, q_k at +k relative to the edge.
+            let mut pv = [0i32; 4];
+            let mut qv = [0i32; 4];
+            let mut ok = true;
+            for k in 0..taps {
+                match (fetch(plane, -1 - k as i64), fetch(plane, k as i64)) {
+                    (Some(a), Some(b)) => {
+                        pv[k] = a;
+                        qv[k] = b;
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // For the 2-tap chroma gather, mirror the outermost sample
+            // so the p2/q2 reads of the filter maths stay in bounds
+            // (chroma-style filtering never *writes* p1/p2).
+            if taps == 2 {
+                pv[2] = pv[1];
+                qv[2] = qv[1];
+                pv[3] = pv[2];
+                qv[3] = qv[2];
+            }
+            let (filter, index_a, alpha, beta) = addb_thresholds(
+                pv[0], pv[1], qv[0], qv[1], qp_p, qp_q, bit_depth, offsets, bs,
+            );
+            if !filter {
+                continue;
+            }
+            if bs < 4 {
+                let mut p3 = [pv[0], pv[1], pv[2]];
+                let mut q3 = [qv[0], qv[1], qv[2]];
+                addb_filter_weak(
+                    &mut p3,
+                    &mut q3,
+                    chroma_style,
+                    bs,
+                    beta,
+                    index_a,
+                    bit_depth,
+                    max_val,
+                );
+                pv[0] = p3[0];
+                pv[1] = p3[1];
+                pv[2] = p3[2];
+                qv[0] = q3[0];
+                qv[1] = q3[1];
+                qv[2] = q3[2];
+            } else {
+                let mut p4 = pv;
+                let mut q4 = qv;
+                addb_filter_strong(&mut p4, &mut q4, chroma_style, alpha, beta, max_val);
+                pv = p4;
+                qv = q4;
+            }
+            // Write back p0..p2 / q0..q2 (chroma-style writes p0/q0
+            // only beyond which the maths left p1/p2 untouched — the
+            // mirrored gather guarantees the copies are no-ops).
+            let write_taps = if taps == 2 { 1 } else { 3 };
+            for k in 0..write_taps {
+                let (px, py) = if vertical {
+                    (line_x as i64 - 1 - k as i64, line_y as i64)
+                } else {
+                    (line_x as i64, line_y as i64 - 1 - k as i64)
+                };
+                let (qx, qy) = if vertical {
+                    (line_x as i64 + k as i64, line_y as i64)
+                } else {
+                    (line_x as i64, line_y as i64 + k as i64)
+                };
+                if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
+                    plane[py as usize * stride + px as usize] = pv[k] as u16;
+                }
+                if qx >= 0 && qy >= 0 && (qx as u32) < width && (qy as u32) < height {
+                    plane[qy as usize * stride + qx as usize] = qv[k] as u16;
+                }
+            }
+            filtered += 1;
+        }
+    }
+    filtered
+}
+
+/// §8.8.3.1/.2 — run the advanced deblocking filter over a whole
+/// reconstructed picture: vertical edges first, then horizontal, on a
+/// per-coding-block basis (the CB set is recovered from the side-info
+/// grid's covering-CU geometry), with the §8.8.3.2 `splitTH` split for
+/// blocks wider/taller than the maximum transform size. Only edges on
+/// the 8×8 luma grid are filtered (§8.8.3.1). Returns the number of
+/// filtered sample lines.
+#[allow(clippy::too_many_arguments)]
+pub fn addb_deblock_picture(
+    pic: &mut crate::picture::YuvPicture,
+    grid: &SideInfoGrid,
+    offsets: AddbOffsets,
+    ctb_log2_size_y: u32,
+    max_tb_log2_size_y: u32,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+) -> u32 {
+    let chroma = pic.chroma_format_idc != 0;
+    let mut filtered = 0u32;
+    for vertical in [true, false] {
+        // Enumerate CUs: a cell is a CU origin iff its recorded covering
+        // geometry starts at that cell.
+        for yc in 0..grid.h_cells {
+            for xc in 0..grid.w_cells {
+                let cell = grid.at(xc, yc);
+                if cell.cu_log2_w == 0 {
+                    continue; // never decoded (out-of-picture padding)
+                }
+                let x0 = (xc as u32) << 2;
+                let y0 = (yc as u32) << 2;
+                if cell.cu_x0 as u32 != x0 || cell.cu_y0 as u32 != y0 {
+                    continue; // interior cell
+                }
+                let log2_w = cell.cu_log2_w as u32;
+                let log2_h = cell.cu_log2_h as u32;
+                // §8.8.3.1: only 8×8-luma-grid edges are filtered.
+                let on_grid = if vertical { x0 % 8 == 0 } else { y0 % 8 == 0 };
+                if !on_grid {
+                    continue;
+                }
+                let mut planes: Vec<u32> = vec![0];
+                if chroma {
+                    planes.push(1);
+                    planes.push(2);
+                }
+                for c_idx in planes {
+                    // §8.8.3.2 splitTH: split over-wide/tall blocks into
+                    // two boundary invocations.
+                    let split_th = if c_idx == 0 {
+                        max_tb_log2_size_y
+                    } else {
+                        max_tb_log2_size_y - 1
+                    };
+                    let mut calls: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(2);
+                    if vertical && log2_w > split_th {
+                        calls.push((x0, y0, log2_w >> 1, log2_h));
+                        calls.push((x0 + (1 << split_th), y0, log2_w >> 1, log2_h));
+                    } else if !vertical && log2_h > split_th {
+                        calls.push((x0, y0, log2_w, log2_h >> 1));
+                        calls.push((x0, y0 + (1 << split_th), log2_w, log2_h >> 1));
+                    } else {
+                        calls.push((x0, y0, log2_w, log2_h));
+                    }
+                    for (cx, cy, lw, lh) in calls {
+                        filtered += addb_filter_cb_edge(
+                            pic,
+                            grid,
+                            offsets,
+                            ctb_log2_size_y,
+                            cx,
+                            cy,
+                            lw,
+                            lh,
+                            c_idx,
+                            vertical,
+                            cb_qp_offset,
+                            cr_qp_offset,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    filtered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,5 +1452,142 @@ mod tests {
         // Spot-check sB/sC modified at row 0.
         assert_eq!(pic_b.cb[3], 111);
         assert_eq!(pic_b.cb[4], 119);
+    }
+
+    // =================================================================
+    // Round 397: §8.8.3 advanced deblocking units.
+    // =================================================================
+
+    fn addb_cell(pred: CuPredMode, cbf: u8, mv: (i32, i32), r0: i8, qp: u8) -> CuSideInfo {
+        CuSideInfo {
+            pred_mode: pred,
+            cbf_luma: cbf,
+            mv_l0_x: mv.0,
+            mv_l0_y: mv.1,
+            ref_idx_l0: r0,
+            ref_idx_l1: -1,
+            cu_x0: 0,
+            cu_y0: 0,
+            cu_log2_w: 3,
+            cu_log2_h: 3,
+            qp_y: qp,
+            ..Default::default()
+        }
+    }
+
+    /// §8.8.3.4 — the boundary-strength cascade: intra across a CTU
+    /// boundary → 4; intra or IBC → 3; coded residual → 2; ≥ 1-pel MV
+    /// difference → 1; matching motion → 0.
+    #[test]
+    fn round397_addb_bs_cascade() {
+        let mut g = SideInfoGrid::new(128, 64);
+        // P at (56..64, 0..8) intra; Q at (64..72, 0..8) intra — the
+        // 64-boundary is a CTU boundary at CtbLog2SizeY = 6.
+        g.stamp_block(56, 0, 8, 8, addb_cell(CuPredMode::Intra, 0, (0, 0), -1, 30));
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Intra, 0, (0, 0), -1, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 4, "intra across CTU");
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 7), 3, "same CTU → 3");
+        // IBC neighbour → 3.
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Ibc, 0, (0, 0), -1, 30));
+        g.stamp_block(56, 0, 8, 8, addb_cell(CuPredMode::Inter, 0, (0, 0), 0, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 3);
+        // Coded inter residual → 2.
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Inter, 1, (0, 0), 0, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 2);
+        // Motion difference ≥ 4 quarter-pel → 1 (eq. 1231 shape:
+        // refIdx0L0 == refIdx1L0 = 0, both L1 = −1).
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Inter, 0, (4, 0), 0, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 1);
+        // Matching motion → 0.
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Inter, 0, (0, 0), 0, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 0);
+        // Different reference indices → 1.
+        g.stamp_block(64, 0, 8, 8, addb_cell(CuPredMode::Inter, 0, (0, 0), 1, 30));
+        assert_eq!(addb_bs(&g, 63, 0, 64, 0, 6), 1);
+    }
+
+    /// Table 34/35 spot values + the eq. 1233-1238 threshold math.
+    #[test]
+    fn round397_addb_thresholds_tables() {
+        assert_eq!(ADDB_ALPHA_PRIME[16], 4);
+        assert_eq!(ADDB_ALPHA_PRIME[38], 63);
+        assert_eq!(ADDB_ALPHA_PRIME[51], 255);
+        assert_eq!(ADDB_BETA_PRIME[16], 2);
+        assert_eq!(ADDB_BETA_PRIME[51], 18);
+        assert_eq!(ADDB_T_C0[0][51], 13);
+        assert_eq!(ADDB_T_C0[1][51], 17);
+        assert_eq!(ADDB_T_C0[2][51], 25);
+        // qPav = (40 + 40 + 1) >> 1 = 40 → α = 80, β = 13 at 8-bit.
+        let (filter, index_a, alpha, beta) =
+            addb_thresholds(60, 60, 68, 68, 40, 40, 8, AddbOffsets::default(), 2);
+        assert_eq!(index_a, 40);
+        assert_eq!(alpha, 80);
+        assert_eq!(beta, 13);
+        assert!(filter, "|p0−q0| = 8 < 80, flat sides");
+        // FilterOffsetA shifts indexA (eq. 1234).
+        let (_, index_a2, _, _) = addb_thresholds(
+            60,
+            60,
+            68,
+            68,
+            40,
+            40,
+            8,
+            AddbOffsets {
+                filter_offset_a: -12,
+                filter_offset_b: 0,
+            },
+            2,
+        );
+        assert_eq!(index_a2, 28);
+        // bS = 0 never filters (eq. 1238).
+        let (f0, _, _, _) = addb_thresholds(60, 60, 68, 68, 40, 40, 8, AddbOffsets::default(), 0);
+        assert!(!f0);
+    }
+
+    /// §8.8.3.6 weak filter, hand-traced: flat 60|68 step at
+    /// indexA = 40, bS = 2 → t′C0 = 5, tC0 = 7, Δ = 4;
+    /// p′1 = 61, q′1 = 67 (the eq. 1249/1251 quarter-step).
+    #[test]
+    fn round397_addb_weak_filter_hand_trace() {
+        let mut p = [60, 60, 60];
+        let mut q = [68, 68, 68];
+        addb_filter_weak(&mut p, &mut q, false, 2, 13, 40, 8, 255);
+        assert_eq!(p[0], 63, "Δ = ((8 << 2) + (p1 − q1) + 4) >> 3 = 3");
+        assert_eq!(q[0], 65);
+        assert_eq!(p[1], 61);
+        assert_eq!(q[1], 67);
+        assert_eq!(p[2], 60, "p2 never written");
+        assert_eq!(q[2], 68);
+        // chromaStyle: p1/q1 stay, tC0 = (t′C0 + 1).
+        let mut pc = [60, 60, 60];
+        let mut qc = [68, 68, 68];
+        addb_filter_weak(&mut pc, &mut qc, true, 2, 13, 40, 8, 255);
+        assert_eq!(pc[1], 60);
+        assert_eq!(qc[1], 68);
+        assert_eq!(pc[0], 63);
+    }
+
+    /// §8.8.3.7 strong filter, hand-traced on a flat 100|140 step with
+    /// α = 255, β = 18: the eqs. 1262-1264 / 1269-1271 3-tap smoothing.
+    #[test]
+    fn round397_addb_strong_filter_hand_trace() {
+        let mut p = [100, 100, 100, 100];
+        let mut q = [140, 140, 140, 140];
+        addb_filter_strong(&mut p, &mut q, false, 255, 18, 255);
+        assert_eq!(p[0], (100 + 200 + 200 + 280 + 140 + 4) >> 3); // 115
+        assert_eq!(p[1], (100 + 100 + 100 + 140 + 2) >> 2); // 110
+        assert_eq!(p[2], (200 + 300 + 100 + 100 + 140 + 4) >> 3); // 105
+        assert_eq!(q[0], (100 + 200 + 280 + 280 + 140 + 4) >> 3); // 125
+        assert_eq!(q[1], (100 + 140 + 140 + 140 + 2) >> 2); // 130
+        assert_eq!(q[2], (280 + 420 + 140 + 140 + 100 + 4) >> 3); // 135
+                                                                  // Strong-gate failure (|p0 − q0| ≥ (α >> 2) + 2) falls back to
+                                                                  // the eqs. 1265/1272 1-tap smoothing.
+        let mut p2 = [100, 100, 100, 100];
+        let mut q2 = [200, 200, 200, 200];
+        addb_filter_strong(&mut p2, &mut q2, false, 100, 18, 255);
+        assert_eq!(p2[0], (200 + 100 + 200 + 2) >> 2); // eq. 1265
+        assert_eq!(p2[1], 100);
+        assert_eq!(q2[0], (400 + 200 + 100 + 2) >> 2); // eq. 1272
     }
 }

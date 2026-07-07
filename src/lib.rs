@@ -336,7 +336,9 @@ pub fn decode_idr_slice(
     // and reconstructs through the §8.4.4 EIPD kernels.
     // Round 397: sps_adcc_flag is lifted — residual_coding() routes to
     // the §7.3.8.8 residual_coding_adv() layer.
-    if sps.sps_addb_flag || sps.sps_ats_flag {
+    // Round 397: sps_addb_flag is lifted — deblocking dispatches to the
+    // §8.8.3 advanced filter.
+    if sps.sps_ats_flag {
         return Err(Error::unsupported(
             "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
         ));
@@ -398,6 +400,9 @@ pub fn decode_idr_slice(
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
         enable_deblock: false, // round-3 fixtures keep deblock off
+        sps_addb_flag: sps.sps_addb_flag,
+        filter_offset_a: 0,
+        filter_offset_b: 0,
         slice_cb_qp_offset: 0,
         slice_cr_qp_offset: 0,
         sps_ibc_flag: sps.sps_ibc_flag,

@@ -1643,6 +1643,13 @@ pub struct SliceDecodeInputs {
     /// `slice_deblocking_filter_flag` from the slice header. When true,
     /// the §8.8.2 deblocking pass runs after picture reconstruction.
     pub enable_deblock: bool,
+    /// `sps_addb_flag` (§7.4.3.1): selects the §8.8.3 advanced
+    /// deblocking filter over the §8.8.2 filter when deblocking runs.
+    pub sps_addb_flag: bool,
+    /// eq. 86 `FilterOffsetA = slice_alpha_offset` (−12..=12).
+    pub filter_offset_a: i32,
+    /// eq. 87 `FilterOffsetB = slice_beta_offset` (−12..=12).
+    pub filter_offset_b: i32,
     /// `slice_cb_qp_offset` (range −12..=12) added to the slice QP for
     /// the chroma deblock Table 33 lookup (eq. 1194). Defaults to 0 in
     /// Baseline fixtures.
@@ -1664,6 +1671,9 @@ impl Default for SliceDecodeInputs {
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,
+            sps_addb_flag: false,
+            filter_offset_a: 0,
+            filter_offset_b: 0,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
             sps_ibc_flag: false,
@@ -1844,24 +1854,40 @@ pub fn decode_baseline_idr_slice(
         ));
     }
     if decode.enable_deblock {
-        let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
-        if walk.chroma_format_idc != 0 {
-            edges += crate::deblock::deblock_chroma(
+        if decode.sps_addb_flag {
+            // §8.8.3 advanced deblocking.
+            stats.deblock_edges = crate::deblock::addb_deblock_picture(
                 &mut pic,
                 &side_info,
-                decode.slice_qp,
+                crate::deblock::AddbOffsets {
+                    filter_offset_a: decode.filter_offset_a,
+                    filter_offset_b: decode.filter_offset_b,
+                },
+                walk.ctb_log2_size_y,
+                walk.max_tb_log2_size_y,
                 decode.slice_cb_qp_offset,
-                1,
-            )?;
-            edges += crate::deblock::deblock_chroma(
-                &mut pic,
-                &side_info,
-                decode.slice_qp,
                 decode.slice_cr_qp_offset,
-                2,
-            )?;
+            );
+        } else {
+            let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+            if walk.chroma_format_idc != 0 {
+                edges += crate::deblock::deblock_chroma(
+                    &mut pic,
+                    &side_info,
+                    decode.slice_qp,
+                    decode.slice_cb_qp_offset,
+                    1,
+                )?;
+                edges += crate::deblock::deblock_chroma(
+                    &mut pic,
+                    &side_info,
+                    decode.slice_qp,
+                    decode.slice_cr_qp_offset,
+                    2,
+                )?;
+            }
+            stats.deblock_edges = edges;
         }
-        stats.deblock_edges = edges;
     }
     Ok((pic, stats))
 }
@@ -2769,6 +2795,7 @@ fn apply_ibc_branch_predict_and_reconstruct(
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_cb_width as u8,
                 cu_log2_h: log2_cb_height as u8,
+                qp_y: cu_qp.clamp(0, 51) as u8,
                 ..Default::default()
             },
         );
@@ -2859,6 +2886,7 @@ fn decode_transform_unit(
                 cu_log2_w: log2_cb_width as u8,
                 cu_log2_h: log2_cb_height as u8,
                 intra_luma_mode: intra_mode.stamp_value(),
+                qp_y: cu_qp.clamp(0, 51) as u8,
                 ..Default::default()
             },
         );
@@ -3504,24 +3532,40 @@ pub fn decode_baseline_inter_slice(
     }
     stats.hmvp_cand_count_final = hmvp.len() as u32;
     if decode.enable_deblock {
-        let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
-        if walk.chroma_format_idc != 0 {
-            edges += crate::deblock::deblock_chroma(
+        if decode.sps_addb_flag {
+            // §8.8.3 advanced deblocking.
+            stats.deblock_edges = crate::deblock::addb_deblock_picture(
                 &mut pic,
                 &side_info,
-                decode.slice_qp,
+                crate::deblock::AddbOffsets {
+                    filter_offset_a: decode.filter_offset_a,
+                    filter_offset_b: decode.filter_offset_b,
+                },
+                walk.ctb_log2_size_y,
+                walk.max_tb_log2_size_y,
                 decode.slice_cb_qp_offset,
-                1,
-            )?;
-            edges += crate::deblock::deblock_chroma(
-                &mut pic,
-                &side_info,
-                decode.slice_qp,
                 decode.slice_cr_qp_offset,
-                2,
-            )?;
+            );
+        } else {
+            let mut edges = crate::deblock::deblock_luma(&mut pic, &side_info, decode.slice_qp)?;
+            if walk.chroma_format_idc != 0 {
+                edges += crate::deblock::deblock_chroma(
+                    &mut pic,
+                    &side_info,
+                    decode.slice_qp,
+                    decode.slice_cb_qp_offset,
+                    1,
+                )?;
+                edges += crate::deblock::deblock_chroma(
+                    &mut pic,
+                    &side_info,
+                    decode.slice_qp,
+                    decode.slice_cr_qp_offset,
+                    2,
+                )?;
+            }
+            stats.deblock_edges = edges;
         }
-        stats.deblock_edges = edges;
     }
     // Surface the per-4×4 motion field: a decoded P/B picture retained in
     // the DPB serves as the §8.5.2.3.3 collocated picture (`ColPic`) for
@@ -5425,12 +5469,13 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                     cu_y0: y0 as u16,
                     cu_log2_w: n_cb_w.trailing_zeros() as u8,
                     cu_log2_h: n_cb_h.trailing_zeros() as u8,
+                    qp_y: cu_qp.clamp(0, 51) as u8,
                     ..Default::default()
                 },
             );
         }
         CuMotion::Affine(a) => {
-            stamp_affine_side_info(side_info, a, x0, y0, n_cb_w, n_cb_h, cbf_luma);
+            stamp_affine_side_info(side_info, a, x0, y0, n_cb_w, n_cb_h, cbf_luma, cu_qp);
         }
     }
     // §8.5.2.7 HMVP update: append the just-decoded inter CU's motion
@@ -5876,6 +5921,7 @@ fn apply_dmvr_inter_prediction(
 /// Stamp an affine CU's per-subblock motion into the side-info grid —
 /// each subblock cell carries its own §8.5.3.7 field vector rounded from
 /// 1/16-pel to the grid's 1/4-pel unit.
+#[allow(clippy::too_many_arguments)]
 fn stamp_affine_side_info(
     side_info: &mut SideInfoGrid,
     a: &AffineCuMotion,
@@ -5884,6 +5930,7 @@ fn stamp_affine_side_info(
     n_cb_w: u32,
     n_cb_h: u32,
     cbf_luma: u8,
+    cu_qp: i32,
 ) {
     // Geometry comes from whichever list is active (both lists share the
     // §8.5.3.8 subblock geometry when bi-predicted).
@@ -5938,6 +5985,7 @@ fn stamp_affine_side_info(
                     cu_y0: y0 as u16,
                     cu_log2_w: n_cb_w.trailing_zeros() as u8,
                     cu_log2_h: n_cb_h.trailing_zeros() as u8,
+                    qp_y: cu_qp.clamp(0, 51) as u8,
                     ..Default::default()
                 },
             );
@@ -6572,6 +6620,7 @@ fn decode_inter_intra_cu(
                 cu_log2_w: log2_cb_width as u8,
                 cu_log2_h: log2_cb_height as u8,
                 intra_luma_mode: intra_mode.stamp_value(),
+                qp_y: cu_qp.clamp(0, 51) as u8,
                 ..Default::default()
             },
         );
@@ -7044,6 +7093,7 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
             cu_y0: y0 as u16,
             cu_log2_w: log2_cb_width as u8,
             cu_log2_h: log2_cb_height as u8,
+            qp_y: cu_qp.clamp(0, 51) as u8,
             ..Default::default()
         },
     );
@@ -12072,7 +12122,7 @@ mod tests {
             l1: None,
             motion_model_idc: 1,
         };
-        stamp_affine_side_info(&mut grid, &motion, 0, 0, 16, 16, 0);
+        stamp_affine_side_info(&mut grid, &motion, 0, 0, 16, 16, 0, 22);
         grid
     }
 
@@ -12519,7 +12569,7 @@ mod tests {
             }),
             motion_model_idc: 1,
         };
-        stamp_affine_side_info(&mut grid, &motion0, 0, 0, 16, 16, 0);
+        stamp_affine_side_info(&mut grid, &motion0, 0, 0, 16, 16, 0, 22);
         let mut inputs = cpmv_store_inputs();
         inputs.slice_is_b = true;
         inputs.num_ref_idx_active_minus1_l1 = 1;
@@ -14294,5 +14344,89 @@ mod tests {
         // The +1 DC on top of the all-100 merge copy shifts the luma.
         assert!(pic.y.iter().any(|&v| v != 100), "residual must land");
         assert!(pic.y.iter().all(|&v| v >= 100), "positive DC shift only");
+    }
+
+    /// Round 397: §8.8.3 advanced deblocking end-to-end on the IDR
+    /// walker. A 32×32 CTU quad-splits into four 16×16 CUs; only the
+    /// top-left carries a DC residual, so its right/bottom CU edges are
+    /// steps. With `sps_addb_flag == 1` + `enable_deblock` the §8.8.3.4
+    /// intra strength (3) drives the §8.8.3.6/.7 filters: edge-adjacent
+    /// samples move toward each other while CU cores stay, and the same
+    /// stream with deblocking off keeps the raw step.
+    #[test]
+    fn round397_addb_idr_smooths_cu_edges() {
+        use crate::cabac::CabacEncoder;
+        let encode = || {
+            let mut enc = CabacEncoder::new();
+            enc.encode_decision(0, 0, 1); // split_cu_flag = 1 → 4× 16×16
+                                          // CU (0,0): DC + strong residual (level 60 at qp 40).
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, 1); // cbf_luma = 1
+            enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+            for _ in 0..59 {
+                enc.encode_decision(0, 0, 1);
+            }
+            enc.encode_decision(0, 0, 0);
+            enc.encode_bypass(0); // +60
+            enc.encode_decision(0, 0, 1); // coeff_last_flag
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                          // CU (16,0): INTRA_VER (copies the unavailable-top 128
+                                          // column, keeping a sharp step against the shifted CU 1).
+            enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+            enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+            enc.encode_decision(0, 0, 0);
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            for _ in 0..2 {
+                // CUs (0,16), (16,16): DC, no residual.
+                enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+                enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                enc.encode_decision(0, 0, 0); // cbf_cb = 0
+                enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            }
+            enc.encode_terminate(true);
+            enc.finish()
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let base = SliceDecodeInputs {
+            slice_qp: 40,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        // Reference decode without deblocking.
+        let (raw, _) = decode_baseline_idr_slice(&encode(), walk, base).unwrap();
+        // ADDB decode.
+        let addb = SliceDecodeInputs {
+            enable_deblock: true,
+            sps_addb_flag: true,
+            ..base
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&encode(), walk, addb).unwrap();
+        assert!(stats.deblock_edges > 0, "ADDB must filter CU edges");
+        // The vertical CU edge at x = 16: the raw decode keeps a step;
+        // ADDB pulls the edge-adjacent samples toward each other.
+        let row = 4usize;
+        let p0_raw = raw.y[row * 32 + 15] as i32;
+        let q0_raw = raw.y[row * 32 + 16] as i32;
+        let p0 = pic.y[row * 32 + 15] as i32;
+        let q0 = pic.y[row * 32 + 16] as i32;
+        assert!(
+            (p0 - q0).abs() < (p0_raw - q0_raw).abs(),
+            "edge step must shrink: raw |{p0_raw}−{q0_raw}| vs addb |{p0}−{q0}|"
+        );
+        // Deep CU cores stay untouched (no over-reach).
+        assert_eq!(pic.y[row * 32 + 8], raw.y[row * 32 + 8]);
+        assert_eq!(pic.y[row * 32 + 24], raw.y[row * 32 + 24]);
     }
 }

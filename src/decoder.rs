@@ -620,8 +620,9 @@ impl EvcDecoder {
         // (the §7.3.8.4 EIPD intra group + §8.4.4 kernels on the P/B
         // intra-CU path).
         // Round 397: sps_adcc_flag lifted (§7.3.8.8 advanced residual
-        // coding through the shared residual_coding() dispatch).
-        if sps.sps_addb_flag || sps.sps_ats_flag {
+        // coding through the shared residual_coding() dispatch);
+        // sps_addb_flag lifted (§8.8.3 advanced deblocking).
+        if sps.sps_ats_flag {
             return Err(Error::unsupported(
                 "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",
             ));
@@ -773,6 +774,11 @@ impl EvcDecoder {
             bit_depth_luma: sps.bit_depth_y(),
             bit_depth_chroma: sps.bit_depth_c(),
             enable_deblock: slice_deblocking_filter_flag,
+            // Round 397: §8.8.3 advanced deblocking + the eq. 86/87
+            // slice offsets.
+            sps_addb_flag: sps.sps_addb_flag,
+            filter_offset_a: header.slice_alpha_offset,
+            filter_offset_b: header.slice_beta_offset,
             slice_cb_qp_offset,
             slice_cr_qp_offset,
             sps_ibc_flag: sps.sps_ibc_flag,
