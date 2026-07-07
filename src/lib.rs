@@ -277,6 +277,8 @@ pub fn walk_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_dquant_flag: sps.sps_dquant_flag,
+        cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
         sps_ibc_flag: sps.sps_ibc_flag,
         log2_max_ibc_cand_size,
         // This entry point uses a minimal header parse that doesn't yet
@@ -323,12 +325,10 @@ pub fn decode_idr_slice(
     // §9.3.2.2 Main-profile context tables at the slice QP and route
     // every regular bin through the §9.3.4.2.1
     // `ctxIdx = ctxIdxOffset + ctxInc` selection (`CtxSel`).
-    if sps.sps_eipd_flag
-        || sps.sps_addb_flag
-        || sps.sps_dquant_flag
-        || sps.sps_ats_flag
-        || sps.sps_adcc_flag
-    {
+    // Round 397: sps_dquant_flag is lifted — the walkers thread the
+    // §7.3.8.3 cuQpDeltaCode marks, the §7.3.8.5 code/latch presence
+    // gate and the §8.7.1 eq. 1042 QpY chain.
+    if sps.sps_eipd_flag || sps.sps_addb_flag || sps.sps_ats_flag || sps.sps_adcc_flag {
         return Err(Error::unsupported(
             "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
         ));
@@ -368,6 +368,8 @@ pub fn decode_idr_slice(
         max_tb_log2_size_y,
         chroma_format_idc: sps.chroma_format_idc,
         cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_dquant_flag: sps.sps_dquant_flag,
+        cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
         sps_ibc_flag: sps.sps_ibc_flag,
         log2_max_ibc_cand_size,
         // Minimal-header entry point: ALF map fields default off.

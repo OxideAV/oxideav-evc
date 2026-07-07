@@ -615,12 +615,9 @@ impl EvcDecoder {
         // initialises the §9.3.2.2 Main-profile contexts (initType 1)
         // and routes every regular bin through the §9.3.4.2.1
         // ctxIdxOffset + ctxInc selection.
-        if sps.sps_eipd_flag
-            || sps.sps_addb_flag
-            || sps.sps_dquant_flag
-            || sps.sps_ats_flag
-            || sps.sps_adcc_flag
-        {
+        // Round 397: sps_dquant_flag lifted (cuQpDeltaCode marks + the
+        // eq. 1042 QpY chain in the P/B walker).
+        if sps.sps_eipd_flag || sps.sps_addb_flag || sps.sps_ats_flag || sps.sps_adcc_flag {
             return Err(Error::unsupported(
                 "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",
             ));
@@ -749,6 +746,8 @@ impl EvcDecoder {
             max_tb_log2_size_y,
             chroma_format_idc: sps.chroma_format_idc,
             cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+            sps_dquant_flag: sps.sps_dquant_flag,
+            cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
             sps_ibc_flag: sps.sps_ibc_flag,
             log2_max_ibc_cand_size,
             // §7.3.8.2: thread the slice-header ALF map controls so the

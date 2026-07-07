@@ -73,6 +73,14 @@ pub struct SliceWalkInputs {
     /// `cu_qp_delta_enabled_flag` (PPS). When false, `cu_qp_delta_*` is
     /// not in the bitstream.
     pub cu_qp_delta_enabled: bool,
+    /// `sps_dquant_flag` (§7.4.3.1) — the improved delta-QP signalling.
+    /// When true (and `cu_qp_delta_enabled`), the §7.3.8.3 `split_unit()`
+    /// dquant block derives `cuQpDeltaCode` per subtree and the §7.3.8.5
+    /// presence gate switches to the code/latch form.
+    pub sps_dquant_flag: bool,
+    /// eq. 76 `cuQpDeltaArea = log2_cu_qp_delta_area_minus6 + 6` (PPS).
+    /// Only consulted when `sps_dquant_flag && cu_qp_delta_enabled`.
+    pub cu_qp_delta_area: u32,
     /// `sps_ibc_flag` (§7.4.3.1). When true, the `coding_unit()` walker
     /// evaluates `isIbcAllowed` (§7.4.5) per-CU and conditionally emits
     /// the `ibc_flag` syntax element. When false (Baseline default),
@@ -122,6 +130,8 @@ impl Default for SliceWalkInputs {
             max_tb_log2_size_y: 5,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
+            sps_dquant_flag: false,
+            cu_qp_delta_area: 6,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
             slice_alf_enabled_flag: false,
@@ -250,6 +260,12 @@ struct SplitResolution {
     mode: crate::split::SplitMode,
     suco_order: u32,
     constraint: crate::split::ModeConstraint,
+    /// The `btt_split_flag[ x0 ][ y0 ]` syntax value (inferred 0 when
+    /// absent) — consumed by the §7.3.8.3 dquant `cuQpDeltaCode` block.
+    btt_flag: bool,
+    /// The `btt_split_type[ x0 ][ y0 ]` syntax value (inferred when
+    /// absent) — 1 selects the ternary shapes.
+    btt_split_type: u32,
 }
 
 /// Decode the decision prefix of one §7.3.8.3 `split_unit()` — every
@@ -297,6 +313,8 @@ fn resolve_split_unit(
     let cb_within_picture = x0 + cb_w <= walk.pic_width && y0 + cb_h <= walk.pic_height;
 
     let mut split_cu_flag = false;
+    let mut btt_flag = false;
+    let mut btt_split_type = 0u32;
     let mode;
     if !gates.sps_btt_flag {
         // §7.3.8.3 sps_btt_flag == 0: quad split via split_cu_flag only.
@@ -339,6 +357,8 @@ fn resolve_split_unit(
                 &mut tree_stats.btt,
             )?;
             mode = btt.mode;
+            btt_flag = btt.flag;
+            btt_split_type = btt.split_type;
         } else if !cb_within_picture {
             // btt_split_flag not present (block straddles the picture
             // edge) → inferred 0 → the §7.4.8.3 boundary implicit-split
@@ -429,6 +449,8 @@ fn resolve_split_unit(
         mode,
         suco_order,
         constraint,
+        btt_flag,
+        btt_split_type,
     })
 }
 
@@ -1711,6 +1733,9 @@ pub fn decode_baseline_idr_slice(
         ..Default::default()
     };
     let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
+    // §8.7.1: the eq. 1042 QpY chain starts at slice_qp; the §7.3.8.5
+    // isCuQpDeltaCoded latch starts clear.
+    let mut qp_state = QpState::new(decode.slice_qp);
     let n_ctus = walk
         .pic_width_in_ctus()
         .checked_mul(walk.pic_height_in_ctus())
@@ -1748,6 +1773,8 @@ pub fn decode_baseline_idr_slice(
             walk.ctb_log2_size_y,
             0,
             0,
+            0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
+            &mut qp_state,
             crate::split::ModeConstraint::NoConstraint,
         )?;
         stats.ctus += 1;
@@ -1779,6 +1806,85 @@ pub fn decode_baseline_idr_slice(
         stats.deblock_edges = edges;
     }
     Ok((pic, stats))
+}
+
+/// §8.7.1 + §7.3.8.5 per-slice QP state threaded through the coding
+/// tree: the eq. 1042 `QpY_PREV` chain (each delta-carrying CU derives
+/// `QpY = (QpY_PREV + CuQpDelta + 52) % 52` and becomes the new
+/// predecessor; delta-less CUs keep it unchanged) and the eq. 147
+/// `isCuQpDeltaCoded` latch the §7.3.8.3 dquant marks reset.
+#[derive(Clone, Copy, Debug)]
+struct QpState {
+    /// The running eq. 1042 `QpY` (initialised to `slice_qp` at the
+    /// start of the tile per §8.7.1).
+    qp_y: i32,
+    /// eq. 147 `isCuQpDeltaCoded` — set when `cu_qp_delta_abs` is read,
+    /// reset by the §7.3.8.3 dquant marks.
+    is_cu_qp_delta_coded: bool,
+}
+
+impl QpState {
+    fn new(slice_qp: i32) -> Self {
+        Self {
+            qp_y: slice_qp,
+            is_cu_qp_delta_coded: false,
+        }
+    }
+
+    /// §7.3.8.5 presence gate for `cu_qp_delta_abs` (spec lines
+    /// 3073-3075) given the slice inputs, the subtree's
+    /// `cuQpDeltaCode` and the decoded CBFs.
+    fn cu_qp_delta_present(&self, walk: &SliceWalkInputs, code: u8, cbf_any: bool) -> bool {
+        walk.cu_qp_delta_enabled
+            && (((!walk.sps_dquant_flag || (code == 1 && !self.is_cu_qp_delta_coded)) && cbf_any)
+                || (code == 2 && !self.is_cu_qp_delta_coded))
+    }
+
+    /// eq. 147 + eq. 148 + eq. 1042 — fold a decoded (possibly zero)
+    /// `CuQpDelta` into the chain and return the CU's `QpY`.
+    fn apply_delta(&mut self, cu_qp_delta: i32) -> i32 {
+        self.is_cu_qp_delta_coded = true;
+        self.qp_y = (self.qp_y + cu_qp_delta + 52).rem_euclid(52);
+        self.qp_y
+    }
+}
+
+/// §7.3.8.3 dquant block — derive the subtree's new `cuQpDeltaCode`
+/// (spec lines 2660-2677). Fires only when `cu_qp_delta_enabled_flag &&
+/// sps_dquant_flag` on the `sps_btt_flag == 1` path, inside the same
+/// presence region as the BTT group (`(log2CbWidth > 2 ||
+/// log2CbHeight > 2) && in-picture`). Returns `Some(newCode)` when the
+/// marking fires — the caller then resets the `isCuQpDeltaCoded` latch
+/// for the subtree — or `None` to inherit the current code + latch.
+fn derive_cu_qp_delta_code(
+    walk: &SliceWalkInputs,
+    r: &SplitResolution,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    cb_within_picture: bool,
+    inherited_code: u8,
+) -> Option<u8> {
+    if !(walk.cu_qp_delta_enabled && walk.sps_dquant_flag && walk.tree_gates.sps_btt_flag) {
+        return None;
+    }
+    if !cb_within_picture || (log2_cb_width <= 2 && log2_cb_height <= 2) {
+        return None;
+    }
+    let logsum = log2_cb_width + log2_cb_height;
+    let area = walk.cu_qp_delta_area;
+    if !r.btt_flag && logsum >= area && inherited_code != 2 {
+        if log2_cb_width > walk.max_tb_log2_size_y || log2_cb_height > walk.max_tb_log2_size_y {
+            Some(2)
+        } else {
+            Some(1)
+        }
+    } else if (logsum == area + 1 && r.btt_split_type == 1)
+        || (logsum == area && inherited_code != 2)
+    {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 /// §9.3.4.2.5 eq. 1439 — `numSmaller`: the count of available L/A/R
@@ -1906,6 +2012,8 @@ fn decode_split_unit(
     log2_cb_height: u32,
     ct_depth: u32,
     split_unit_order: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     constraint_current: crate::split::ModeConstraint,
 ) -> Result<()> {
     use crate::split::{self, ModeConstraint, SplitMode};
@@ -1924,6 +2032,24 @@ fn decode_split_unit(
         &mut stats.split_cu_flag_bins,
         &mut stats.tree,
     )?;
+    // §7.3.8.3 dquant block: a firing mark hands the subtree a fresh
+    // `cuQpDeltaCode` and resets the `isCuQpDeltaCoded` latch.
+    let cb_within_picture = x0 + (1u32 << log2_cb_width) <= walk.pic_width
+        && y0 + (1u32 << log2_cb_height) <= walk.pic_height;
+    let cu_qp_delta_code = match derive_cu_qp_delta_code(
+        walk,
+        &r,
+        log2_cb_width,
+        log2_cb_height,
+        cb_within_picture,
+        cu_qp_delta_code,
+    ) {
+        Some(new_code) => {
+            qp.is_cu_qp_delta_coded = false;
+            new_code
+        }
+        None => cu_qp_delta_code,
+    };
 
     if r.split_cu_flag {
         // Quad recursion (spec lines 2690-2716). Children are handed
@@ -1951,6 +2077,8 @@ fn decode_split_unit(
                 ch.log2_cb_height,
                 ch.ct_depth,
                 ch.split_unit_order,
+                cu_qp_delta_code,
+                qp,
                 ModeConstraint::NoConstraint,
             )?;
         }
@@ -1982,6 +2110,8 @@ fn decode_split_unit(
                 ch.log2_cb_height,
                 ch.ct_depth,
                 ch.split_unit_order,
+                cu_qp_delta_code,
+                qp,
                 r.constraint,
             )?;
         }
@@ -2014,6 +2144,8 @@ fn decode_split_unit(
             y0,
             log2_cb_width,
             log2_cb_height,
+            cu_qp_delta_code,
+            qp,
             tree_type,
         )?;
         if split::is_tree_split_point(constraint_current, leaf_constraint) {
@@ -2028,6 +2160,8 @@ fn decode_split_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 TreeType::DualTreeChroma,
             )?;
         }
@@ -2049,6 +2183,8 @@ fn decode_split_unit(
             y0,
             log2_cb_width,
             log2_cb_height,
+            cu_qp_delta_code,
+            qp,
             TreeType::DualTreeChroma,
         )?;
     }
@@ -2067,6 +2203,8 @@ fn decode_coding_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     tree_type: TreeType,
 ) -> Result<()> {
     stats.coding_units += 1;
@@ -2138,6 +2276,8 @@ fn decode_coding_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 tree_type,
                 MotionVector { x: mvd_x, y: mvd_y },
             );
@@ -2189,6 +2329,8 @@ fn decode_coding_unit(
         y0,
         log2_cb_width,
         log2_cb_height,
+        cu_qp_delta_code,
+        qp,
         tree_type,
         intra_mode,
         luma_cu_is_ibc,
@@ -2240,6 +2382,8 @@ fn decode_ibc_branch(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     tree_type: TreeType,
     mvd: MotionVector,
 ) -> Result<()> {
@@ -2281,8 +2425,10 @@ fn decode_ibc_branch(
     // bypass-coded and only present when the magnitude is non-zero. The
     // signed delta is applied to the slice QP per eq. 148, clamped to the
     // legal 8-bit-depth range [0, 51].
+    let cbf_any = cbf_luma != 0;
     let mut qp_delta: i32 = 0;
-    if walk.cu_qp_delta_enabled && cbf_luma != 0 {
+    let read_delta = qp.cu_qp_delta_present(walk, cu_qp_delta_code, cbf_any);
+    if read_delta {
         let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
         let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
@@ -2295,7 +2441,11 @@ fn decode_ibc_branch(
             };
         }
     }
-    let cu_qp = (decode.slice_qp + qp_delta).clamp(0, 51);
+    let cu_qp = if read_delta {
+        qp.apply_delta(qp_delta)
+    } else {
+        qp.qp_y
+    };
     // Decode the luma residual levels (always present per the
     // DUAL_TREE_LUMA inference rule of spec §7.4.9.5 line 6065-6066).
     let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
@@ -2450,6 +2600,8 @@ fn decode_transform_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     tree_type: TreeType,
     intra_mode: IntraMode,
     luma_cu_is_ibc: bool,
@@ -2480,12 +2632,17 @@ fn decode_transform_unit(
         cbf_luma = eng.decode_decision(t, i)? as u32;
         stats.cbf_luma_bins += 1;
     }
-    let mut qp_delta: i32 = 0;
-    if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+    // §7.3.8.5 lines 3073-3078: the cu_qp_delta group under both the
+    // Baseline (`!sps_dquant_flag` → cbf-gated) and dquant (`cuQpDeltaCode`
+    // + `isCuQpDeltaCoded` latch) presence forms; the decoded delta folds
+    // into the §8.7.1 eq. 1042 QpY chain.
+    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+    let cu_qp = if qp.cu_qp_delta_present(walk, cu_qp_delta_code, cbf_any) {
         // Table 78; U binarisation with ctxInc 0 for every bin (Table 95).
         let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
         let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
+        let mut qp_delta = 0i32;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
             qp_delta = if sign != 0 {
@@ -2494,8 +2651,10 @@ fn decode_transform_unit(
                 qp_delta_abs as i32
             };
         }
-    }
-    let cu_qp = (decode.slice_qp + qp_delta).clamp(0, 51);
+        qp.apply_delta(qp_delta)
+    } else {
+        qp.qp_y
+    };
     // Stamp deblocking side-info for this CU (intra prediction in IDR
     // path → CuPredMode::Intra; CBF tracked for BS=1 cases).
     if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
@@ -3045,6 +3204,8 @@ pub fn decode_baseline_inter_slice(
     // §8.5.2.4.4 when an inter CU's neighbour-based AMVP candidates are
     // all unavailable (the round-8 fallback path).
     let mut hmvp = crate::hmvp::HmvpCandList::new();
+    // §8.7.1: the eq. 1042 QpY chain starts at slice_qp.
+    let mut qp_state = QpState::new(inputs.decode.slice_qp);
     let n_ctus = walk
         .pic_width_in_ctus()
         .checked_mul(walk.pic_height_in_ctus())
@@ -3081,6 +3242,8 @@ pub fn decode_baseline_inter_slice(
             walk.ctb_log2_size_y,
             0,
             0,
+            0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
+            &mut qp_state,
             crate::split::ModeConstraint::NoConstraint,
         )?;
         stats.ctus += 1;
@@ -3143,6 +3306,8 @@ fn decode_inter_split_unit(
     log2_cb_height: u32,
     ct_depth: u32,
     split_unit_order: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     constraint_current: crate::split::ModeConstraint,
 ) -> Result<()> {
     use crate::split::{self, ModeConstraint, SplitMode};
@@ -3162,6 +3327,23 @@ fn decode_inter_split_unit(
         &mut stats.split_cu_flag_bins,
         &mut stats.tree,
     )?;
+    // §7.3.8.3 dquant block (see the IDR walker).
+    let cb_within_picture = x0 + (1u32 << log2_cb_width) <= walk.pic_width
+        && y0 + (1u32 << log2_cb_height) <= walk.pic_height;
+    let cu_qp_delta_code = match derive_cu_qp_delta_code(
+        &walk,
+        &r,
+        log2_cb_width,
+        log2_cb_height,
+        cb_within_picture,
+        cu_qp_delta_code,
+    ) {
+        Some(new_code) => {
+            qp.is_cu_qp_delta_coded = false;
+            new_code
+        }
+        None => cu_qp_delta_code,
+    };
 
     if r.split_cu_flag {
         for ch in split::quad_split_children(
@@ -3187,6 +3369,8 @@ fn decode_inter_split_unit(
                 ch.log2_cb_height,
                 ch.ct_depth,
                 ch.split_unit_order,
+                cu_qp_delta_code,
+                qp,
                 ModeConstraint::NoConstraint,
             )?;
         }
@@ -3216,6 +3400,8 @@ fn decode_inter_split_unit(
                 ch.log2_cb_height,
                 ch.ct_depth,
                 ch.split_unit_order,
+                cu_qp_delta_code,
+                qp,
                 r.constraint,
             )?;
         }
@@ -3242,6 +3428,8 @@ fn decode_inter_split_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
             )?;
             if split::is_tree_split_point(constraint_current, leaf_constraint) {
                 stats.coding_units += 1;
@@ -3256,6 +3444,8 @@ fn decode_inter_split_unit(
                     y0,
                     log2_cb_width,
                     log2_cb_height,
+                    cu_qp_delta_code,
+                    qp,
                     TreeType::DualTreeChroma,
                 )?;
             }
@@ -3271,6 +3461,8 @@ fn decode_inter_split_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 leaf_constraint,
             )?;
         }
@@ -3292,6 +3484,8 @@ fn decode_inter_split_unit(
             y0,
             log2_cb_width,
             log2_cb_height,
+            cu_qp_delta_code,
+            qp,
             TreeType::DualTreeChroma,
         )?;
     }
@@ -3318,6 +3512,8 @@ fn decode_inter_constrained_intra_ibc_cu(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
 ) -> Result<()> {
     stats.coding_units += 1;
     stats.intra_ibc_constrained_cus += 1;
@@ -3375,6 +3571,8 @@ fn decode_inter_constrained_intra_ibc_cu(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 MotionVector { x: mvd_x, y: mvd_y },
             );
         }
@@ -3390,6 +3588,8 @@ fn decode_inter_constrained_intra_ibc_cu(
         y0,
         log2_cb_width,
         log2_cb_height,
+        cu_qp_delta_code,
+        qp,
         TreeType::DualTreeLuma,
     )
 }
@@ -4315,6 +4515,8 @@ fn decode_inter_coding_unit(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     constraint: crate::split::ModeConstraint,
 ) -> Result<()> {
     use crate::split::ModeConstraint;
@@ -4388,6 +4590,8 @@ fn decode_inter_coding_unit(
             y0,
             log2_cb_width,
             log2_cb_height,
+            cu_qp_delta_code,
+            qp,
             motion,
         )?;
         mark_cu_skip_cells(side_info, x0, y0, n_cb_w, n_cb_h);
@@ -4558,6 +4762,8 @@ fn decode_inter_coding_unit(
                     y0,
                     log2_cb_width,
                     log2_cb_height,
+                    cu_qp_delta_code,
+                    qp,
                     MotionVector { x: mvd_x, y: mvd_y },
                 );
             }
@@ -4576,6 +4782,8 @@ fn decode_inter_coding_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 TreeType::SingleTree,
             );
         }
@@ -4608,6 +4816,8 @@ fn decode_inter_coding_unit(
                 y0,
                 log2_cb_width,
                 log2_cb_height,
+                cu_qp_delta_code,
+                qp,
                 motion,
             );
         }
@@ -4762,6 +4972,8 @@ fn decode_inter_coding_unit(
         y0,
         log2_cb_width,
         log2_cb_height,
+        cu_qp_delta_code,
+        qp,
         pred_l0,
         pred_l1,
     )?;
@@ -4836,6 +5048,8 @@ fn decode_inter_cu_residual_and_reconstruct(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     pred_l0: Option<(MotionVector, u32)>,
     pred_l1: Option<(MotionVector, u32)>,
 ) -> Result<()> {
@@ -4850,6 +5064,8 @@ fn decode_inter_cu_residual_and_reconstruct(
         y0,
         log2_cb_width,
         log2_cb_height,
+        cu_qp_delta_code,
+        qp,
         CuMotion::Translational((pred_l0, pred_l1)),
     )
 }
@@ -4870,6 +5086,8 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     motion: CuMotion,
 ) -> Result<()> {
     // Project the motion into the (mv, ref) pairs the shared stamping /
@@ -4916,11 +5134,12 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     // magnitude is non-zero. The signed delta is applied to the slice QP
     // per eq. 148: `QpY = slice_qp + cu_qp_delta_abs * (1 - 2 * sign)`,
     // clamped to the legal 8-bit-depth QP range [0, 51].
-    let mut qp_delta: i32 = 0;
-    if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+    let cu_qp = if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
         let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
         let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
+        let mut qp_delta = 0i32;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
             qp_delta = if sign != 0 {
@@ -4929,8 +5148,10 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                 qp_delta_abs as i32
             };
         }
-    }
-    let cu_qp = (inputs.decode.slice_qp + qp_delta).clamp(0, 51);
+        qp.apply_delta(qp_delta)
+    } else {
+        qp.qp_y
+    };
     // Stamp the deblocking side-info for this inter CU. We record the
     // MVs (1/4-pel units) and ref_idx 0 / -1 per slot. An affine CU
     // stamps each subblock with its own §8.5.3.7 field vector (rounded
@@ -5987,6 +6208,8 @@ fn decode_inter_intra_cu(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     tree_type: TreeType,
 ) -> Result<()> {
     use crate::intra::IntraMode;
@@ -6035,7 +6258,26 @@ fn decode_inter_intra_cu(
         cbf_cr = eng.decode_decision(t, i)?;
         stats.cbf_chroma_bins += 2;
     }
-    let cu_qp = decode.slice_qp.clamp(0, 51);
+    // §7.3.8.5 cu_qp_delta (round 397: MODE_INTRA CUs on P/B slices read
+    // the element under the same mode-independent presence gate).
+    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+    let cu_qp = if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
+        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
+        stats.cu_qp_delta_abs_bins += 1;
+        let mut qp_delta = 0i32;
+        if qp_delta_abs > 0 {
+            let sign = eng.decode_bypass()?;
+            qp_delta = if sign != 0 {
+                -(qp_delta_abs as i32)
+            } else {
+                qp_delta_abs as i32
+            };
+        }
+        qp.apply_delta(qp_delta)
+    } else {
+        qp.qp_y
+    };
     if is_luma_tree {
         // Stamp side-info for the deblocking pass.
         side_info.stamp_block(
@@ -6159,6 +6401,8 @@ fn decode_inter_ibc_branch(
     y0: u32,
     log2_cb_width: u32,
     log2_cb_height: u32,
+    cu_qp_delta_code: u8,
+    qp: &mut QpState,
     mvd: MotionVector,
 ) -> Result<()> {
     let walk = inputs.walk;
@@ -6205,11 +6449,12 @@ fn decode_inter_ibc_branch(
     // Table 78 init; `cu_qp_delta_sign_flag` is bypass-coded and only
     // present for a non-zero magnitude. The derived QP follows eq. 148,
     // clamped to [0, 51].
-    let mut qp_delta: i32 = 0;
-    if walk.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+    let cu_qp = if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
         let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
         let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
         stats.cu_qp_delta_abs_bins += 1;
+        let mut qp_delta = 0i32;
         if qp_delta_abs > 0 {
             let sign = eng.decode_bypass()?;
             qp_delta = if sign != 0 {
@@ -6218,8 +6463,10 @@ fn decode_inter_ibc_branch(
                 qp_delta_abs as i32
             };
         }
-    }
-    let cu_qp = (decode.slice_qp + qp_delta).clamp(0, 51);
+        qp.apply_delta(qp_delta)
+    } else {
+        qp.qp_y
+    };
     // Residual decode per component.
     let n_tb_y = (1usize << log2_tb_width) * (1usize << log2_tb_height);
     let mut residual_levels_y = vec![0i32; n_tb_y];
@@ -9585,14 +9832,18 @@ mod tests {
     /// arithmetic avoids the test-only encoder's `encode_bypass` defer
     /// bug on a regular-U-then-bypass stream.
     #[test]
-    fn round100_inter_cu_qp_delta_signed_magnitude_and_clamp() {
-        // Helper replicating the inter walker's eq. 148 + clamp.
+    fn round100_inter_cu_qp_delta_signed_magnitude_and_wrap() {
+        // §8.7.1 eq. 1042: QpY = (QpY_PREV + CuQpDelta + 52) % 52 — the
+        // walkers fold each decoded delta into the QpState chain (round
+        // 397 replaced the historical [0, 51] clamp with the spec's
+        // modular wrap).
         let derive = |slice_qp: i32, abs: u32, sign: u8| -> i32 {
+            let mut qp = QpState::new(slice_qp);
             let mut qp_delta: i32 = 0;
             if abs > 0 {
                 qp_delta = if sign != 0 { -(abs as i32) } else { abs as i32 };
             }
-            (slice_qp + qp_delta).clamp(0, 51)
+            qp.apply_delta(qp_delta)
         };
         // sign = 0 → positive delta.
         assert_eq!(derive(22, 3, 0), 25);
@@ -9600,11 +9851,14 @@ mod tests {
         assert_eq!(derive(22, 3, 1), 19);
         // abs = 0 → delta is 0 regardless of the (absent) sign.
         assert_eq!(derive(22, 0, 0), 22);
-        // Low slice QP + large negative delta saturates at the [0, 51]
-        // floor, never below.
-        assert_eq!(derive(1, 5, 1), 0);
-        // High slice QP + large positive delta saturates at the ceiling.
-        assert_eq!(derive(50, 10, 0), 51);
+        // eq. 1042 wraps modulo 52 (no clamp).
+        assert_eq!(derive(1, 5, 1), 48, "(1 - 5 + 52) % 52");
+        assert_eq!(derive(50, 10, 0), 8, "(50 + 10 + 52) % 52");
+        // The chain: a second CU inherits the previous CU's QpY.
+        let mut qp = QpState::new(22);
+        assert_eq!(qp.apply_delta(5), 27);
+        assert_eq!(qp.apply_delta(-3), 24);
+        assert_eq!(qp.qp_y, 24);
     }
 
     // =================================================================
@@ -12990,5 +13244,259 @@ mod tests {
             crate::eipd_syntax::EipdCtx::new(true).offset(MainCtxTable::MergeIdx),
             0
         );
+    }
+
+    /// Round 397: §7.3.8.3 DQUANT `cuQpDeltaCode = 1` + the §7.3.8.5
+    /// `isCuQpDeltaCoded` latch on the IDR BTT walk. `cuQpDeltaArea = 9`;
+    /// the 32×32 CTU BT_HORs into two 32×16 leaves. Each leaf
+    /// (`btt_split_flag == 0`, `log2W + log2H = 9 ≥ area`, fits MaxTb)
+    /// marks its own `code = 1` area and resets the latch, so the luma
+    /// CU (first cbf-carrying TU of the area) reads `cu_qp_delta_abs`
+    /// and the same leaf's chroma CU — also cbf-carrying — is
+    /// latch-suppressed. Exactly two `cu_qp_delta_abs` reads; the
+    /// eq. 1042 chain applies +5 then −5.
+    #[test]
+    fn round397_dquant_idr_code1_area_latch() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let mut enc = CabacEncoder::new();
+        // A one-coefficient DC residual (level 1) — RLE on the Baseline
+        // (0, 0) contexts.
+        let dc1 = |enc: &mut CabacEncoder| {
+            enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+            enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
+            enc.encode_bypass(0); // +1
+            enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        };
+        // U-binarised cu_qp_delta_abs + bypass sign.
+        let qp_delta = |enc: &mut CabacEncoder, abs: u32, sign: u8| {
+            for _ in 0..abs {
+                enc.encode_decision(0, 0, 1);
+            }
+            enc.encode_decision(0, 0, 0);
+            if abs > 0 {
+                enc.encode_bypass(sign);
+            }
+        };
+        // CTU: BT_HOR (sum 10 > area+1 → no mark at the split node).
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        for sign in [0u8, 1u8] {
+            // 32×16 leaf: flag = 0 → cond-1 mark (code 1, latch reset).
+            enc.encode_decision(t_flag, 0, 0);
+            enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+            enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+            enc.encode_decision(0, 0, 0); //   U terminator
+            enc.encode_decision(0, 0, 1); // cbf_luma = 1
+            qp_delta(&mut enc, 5, sign); // first TU of the area reads
+            dc1(&mut enc);
+            // Chroma CU: cbf_cb = 1 — latch suppresses its delta read.
+            enc.encode_decision(0, 0, 1); // cbf_cb = 1
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            dc1(&mut enc);
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: true,
+            sps_dquant_flag: true,
+            cu_qp_delta_area: 9,
+            tree_gates: btt_tree_gates(),
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (_pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(
+            stats.cu_qp_delta_abs_bins, 2,
+            "one delta per 32×16 area; chroma CUs latch-suppressed"
+        );
+        assert_eq!(stats.coeff_runs, 4, "2 luma + 2 chroma DC coefficients");
+        assert_eq!(stats.coding_units, 4);
+    }
+
+    /// Round 397: §7.3.8.3 DQUANT `cuQpDeltaCode = 2` — with
+    /// `cuQpDeltaArea = 10` the 32×32 CTU itself (btt_split_flag = 1,
+    /// `log2W + log2H == area`) marks code 2 and resets the latch, so
+    /// the **first TU of the CTU reads `cu_qp_delta_abs` even with all
+    /// CBFs zero** (spec line 3075's `cuQpDeltaCode == 2 &&
+    /// !isCuQpDeltaCoded` arm) and every later TU is latch-suppressed.
+    #[test]
+    fn round397_dquant_idr_code2_reads_without_cbf() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let mut enc = CabacEncoder::new();
+        // CTU: BT_HOR; sum == area → code-2 mark.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // First 32×16 leaf: all CBFs zero, but the code-2 arm still
+        // reads cu_qp_delta_abs (value 0 → single U "0", no sign).
+        // INTRA_VER (U bins "110") keeps the rectangular-leaf
+        // reconstruction at the flat 128 top-row copy.
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+        enc.encode_decision(0, 0, 1); //   = 2 (INTRA_VER)
+        enc.encode_decision(0, 0, 0); //   U terminator
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0 (code-2 arm)
+        enc.encode_decision(0, 0, 0); // chroma CU: cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // Second leaf: latch set → no delta read anywhere.
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 1); // intra_pred_mode = 2 again
+        enc.encode_decision(0, 0, 1);
+        enc.encode_decision(0, 0, 0);
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: true,
+            sps_dquant_flag: true,
+            cu_qp_delta_area: 10,
+            tree_gates: btt_tree_gates(),
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(
+            stats.cu_qp_delta_abs_bins, 1,
+            "exactly one code-2 delta read for the CTU area"
+        );
+        assert_eq!(stats.coding_units, 4);
+        assert!(pic.y.iter().all(|&v| v == 128), "no residual anywhere");
+    }
+
+    /// Round 397: DQUANT on the P/B walker — the same code-2 CTU mark
+    /// drives one cbf-less `cu_qp_delta_abs` read on the first admvp
+    /// skip CU and suppresses the second (the latch), proving the
+    /// §7.3.8.3 marks + §7.3.8.5 gate + eq. 1042 chain thread through
+    /// `decode_inter_split_unit`.
+    #[test]
+    fn round397_dquant_pb_code2_latch() {
+        use crate::cabac::CabacEncoder;
+        use crate::cabac_init::MainCtxTable;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let t_flag = MainCtxTable::BttSplitFlag as usize;
+        let t_dir = MainCtxTable::BttSplitDir as usize;
+        let t_type = MainCtxTable::BttSplitType as usize;
+        let mut enc = CabacEncoder::new();
+        // CTU 32×32: BT_HOR; sum == area = 10 → code-2 mark.
+        enc.encode_decision(t_flag, 0, 1);
+        enc.encode_decision(t_dir, 0, 0);
+        enc.encode_decision(t_type, 0, 0);
+        // First 32×16 leaf: admvp skip CU (merge_idx 0), CBFs zero,
+        // code-2 delta read (abs = 3, negative → QpY 22 → 19).
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 1); // cu_qp_delta_abs = 3
+        }
+        enc.encode_decision(0, 0, 0);
+        enc.encode_bypass(1); // negative
+                              // Second leaf: latch suppressed.
+        enc.encode_decision(t_flag, 0, 0);
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: true,
+            sps_dquant_flag: true,
+            cu_qp_delta_area: 10,
+            tree_gates: CodingTreeGates {
+                sps_admvp_flag: true,
+                ..btt_tree_gates()
+            },
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            sps_amvr_flag: false,
+            sps_mmvd_flag: false,
+            sps_affine_flag: false,
+            mmvd_group_enable_flag: false,
+            sps_dmvr_flag: false,
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.cu_qp_delta_abs_bins, 1, "one code-2 read per area");
+        assert_eq!(stats.admvp_skip_cus, 2);
+        assert!(pic.y.iter().all(|&v| v == 200), "both skip CUs copy ref");
     }
 }
