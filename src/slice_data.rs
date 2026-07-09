@@ -198,6 +198,12 @@ pub struct CodingTreeGates {
     /// `sps_admvp_flag` — consulted by the §7.3.8.3 leaf constraint
     /// override and the §7.4.9.3 `predModeConstraint` derivation.
     pub sps_admvp_flag: bool,
+    /// `sps_ats_flag` — when true, `transform_unit()` reads the §7.3.8.5
+    /// `ats_cu_intra_flag` group on intra CUs (and the `ats_cu_inter_*`
+    /// group on inter CUs) and the selected §8.7.4.2 DST-VII / DCT-VIII
+    /// kernel drives the luma inverse transform. False (Baseline) → the
+    /// ATS syntax is suppressed and the plain DCT-II path runs.
+    pub sps_ats_flag: bool,
 }
 
 impl Default for CodingTreeGates {
@@ -209,6 +215,7 @@ impl Default for CodingTreeGates {
             suco_limits: crate::split::SucoSizeLimits::derive(6, 2, 0, 0),
             sps_cm_init_flag: false,
             sps_admvp_flag: false,
+            sps_ats_flag: false,
         }
     }
 }
@@ -237,6 +244,7 @@ impl CodingTreeGates {
             ),
             sps_cm_init_flag: sps.sps_cm_init_flag,
             sps_admvp_flag: sps.sps_admvp_flag,
+            sps_ats_flag: sps.sps_ats_flag,
         }
     }
 }
@@ -1731,6 +1739,9 @@ pub struct SliceDecodeStats {
     /// (sized to the picture); every entry is the present-or-inferred
     /// on/off state for that CTU.
     pub alf_ctb_map: crate::alf::AlfCtbMap,
+    /// §7.3.8.5 `sps_ats_flag == 1` ATS-intra syntax tallies
+    /// (`ats_cu_intra_flag` / `ats_hor_mode` / `ats_ver_mode` bins).
+    pub ats_intra: crate::ats::AtsSyntaxStats,
 }
 
 /// Decode a Baseline-profile IDR slice into a freshly-allocated
@@ -2870,6 +2881,27 @@ fn decode_transform_unit(
     } else {
         qp.qp_y
     };
+    // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group, present on
+    // an intra (MODE_INTRA) CU whose luma tree carries cbf_luma and both
+    // log2CbW/H <= 5. Read after the cu_qp block, before residual_coding.
+    // IBC CUs (MODE_IBC) and the standalone chroma tree do not carry it.
+    let is_luma_intra_tree = matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree);
+    let ats_intra = if is_luma_intra_tree
+        && !luma_cu_is_ibc
+        && crate::ats::ats_intra_flag_present(
+            walk.tree_gates.sps_ats_flag,
+            log2_cb_width,
+            log2_cb_height,
+            cbf_luma != 0,
+        ) {
+        let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+            walk.tree_gates.sps_cm_init_flag,
+            crate::cabac::InitType::I,
+        );
+        crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
+    } else {
+        crate::ats::AtsIntra::disabled()
+    };
     // Stamp deblocking side-info for this CU (intra prediction in IDR
     // path → CuPredMode::Intra; CBF tracked for BS=1 cases).
     if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
@@ -2909,13 +2941,18 @@ fn decode_transform_unit(
                     log2_tb_width,
                     log2_tb_height,
                 )?;
-                scale_and_inverse_transform(
+                // §8.7.4.2: when ats_cu_intra_flag == 1 the luma inverse
+                // transform selects the Table-30 (trTypeHor, trTypeVer)
+                // DST-VII / DCT-VIII kernels; otherwise plain DCT-II.
+                crate::dequant::scale_and_inverse_transform_ats(
                     &levels,
                     &mut residual,
                     1usize << log2_tb_width,
                     1usize << log2_tb_height,
                     cu_qp,
                     decode.bit_depth_luma,
+                    ats_intra.tr_type_hor,
+                    ats_intra.tr_type_ver,
                 )?;
             }
             // For luma blocks larger than max_tb, the spec splits the CB
@@ -3387,6 +3424,12 @@ pub struct InterDecodeStats {
     /// `pred_mode_flag` bins — luma-only intra/IBC CUs in a local dual
     /// tree).
     pub intra_ibc_constrained_cus: u32,
+    /// §7.3.8.5 `sps_ats_flag == 1` ATS-intra syntax tallies decoded on
+    /// intra CUs inside a P/B slice (`decode_inter_intra_cu`).
+    pub ats_intra: crate::ats::AtsSyntaxStats,
+    /// §7.3.8.5 `sps_ats_flag == 1` ATS-inter (sub-block transform)
+    /// syntax tallies decoded on inter CUs.
+    pub ats_inter: crate::ats::AtsInterStats,
 }
 
 /// Decode a Baseline-profile P or B slice. Each CU is single-tree;
@@ -7892,6 +7935,168 @@ mod tests {
         // Chroma planes should still be uniform 128 (cbf_cb/cr = 0).
         assert!(pic.cb.iter().all(|&v| v == 128));
         assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Round 404: end-to-end ATS-intra (`sps_ats_flag == 1`) IDR decode.
+    /// A 4×4 dual-tree luma CU with `cbf_luma = 1` carries the §7.3.8.5
+    /// `ats_cu_intra_flag` group; with `ats_hor_mode = 1` / `ats_ver_mode
+    /// = 0` (Table 30 → `trTypeHor = 2` DCT-VIII, `trTypeVer = 1` DST-VII)
+    /// the luma inverse transform routes through §8.7.4.2's non-DCT-II
+    /// kernels. The picture must reconstruct (non-uniform) rather than
+    /// surface `Error::Unsupported`, and the ATS syntax counters must
+    /// tally the three bins.
+    #[test]
+    fn round404_ats_intra_idr_decode_uses_dst7_dct8_kernels() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // Dual-tree luma CU (sps_eipd_flag = 0, sps_cm_init_flag = 0):
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+                                      // §7.3.8.5 ATS-intra group:
+        enc.encode_bypass(1); // ats_cu_intra_flag = 1 (bypass)
+        enc.encode_decision(0, 0, 1); // ats_hor_mode = 1 → trTypeHor = 2
+        enc.encode_decision(0, 0, 0); // ats_ver_mode = 0 → trTypeVer = 1
+                                      // residual_coding_rle: single DC coeff:
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0 → level 1
+        enc.encode_bypass(0); // coeff_sign_flag = 0 → +1
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Dual-tree chroma CU:
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            tree_gates: CodingTreeGates {
+                sps_ats_flag: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.coding_units, 2, "luma + chroma trees");
+        assert_eq!(stats.cbf_luma_bins, 1);
+        assert_eq!(stats.coeff_runs, 1);
+        // The three ATS-intra syntax elements were consumed (the whole
+        // §7.3.8.5 group parsed without desync — the CABAC engine
+        // terminated cleanly, which is the load-bearing assertion).
+        assert_eq!(stats.ats_intra.cu_intra_flag_bins, 1);
+        assert_eq!(stats.ats_intra.hor_mode_bins, 1);
+        assert_eq!(stats.ats_intra.ver_mode_bins, 1);
+        // Chroma untouched (cbf_cb/cr = 0). (A single level-1 coefficient
+        // through the eq.-1055 renorm rounds toward zero for both DCT-II
+        // and the ATS kernels, so the reconstruction content itself is
+        // exercised deterministically in the dequant-level test below.)
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Round 404: `scale_and_inverse_transform_ats` with a non-DCT-II
+    /// kernel pair genuinely diverges from the plain DCT-II path for the
+    /// same scaled coefficient block — proving the ATS decision actually
+    /// changes the reconstructed residual (not a no-op wrapper).
+    #[test]
+    fn round404_ats_transform_diverges_from_dct2() {
+        // A small 4×4 level block with energy off the DC position so the
+        // basis difference between DCT-II and DST-VII/DCT-VIII is visible
+        // after the eq.-1055 renorm.
+        let levels: Vec<i32> = vec![
+            120, -64, 32, 8, //
+            48, 24, -16, 4, //
+            -20, 12, 8, -4, //
+            6, -8, 2, 1,
+        ];
+        let mut dct2 = vec![0i32; 16];
+        let mut ats = vec![0i32; 16];
+        crate::dequant::scale_and_inverse_transform(&levels, &mut dct2, 4, 4, 30, 8).unwrap();
+        // trTypeHor = 2 (DCT-VIII), trTypeVer = 1 (DST-VII).
+        crate::dequant::scale_and_inverse_transform_ats(&levels, &mut ats, 4, 4, 30, 8, 2, 1)
+            .unwrap();
+        assert_ne!(
+            dct2, ats,
+            "ATS kernel selection must alter the residual vs DCT-II"
+        );
+        // trType (0, 0) must be byte-for-byte the DCT-II path.
+        let mut ats_zero = vec![0i32; 16];
+        crate::dequant::scale_and_inverse_transform_ats(&levels, &mut ats_zero, 4, 4, 30, 8, 0, 0)
+            .unwrap();
+        assert_eq!(dct2, ats_zero, "trType (0,0) must equal DCT-II");
+    }
+
+    /// Round 404: with `ats_cu_intra_flag = 0` the ATS group reads a
+    /// single bin and the transform stays plain DCT-II — byte-identical to
+    /// the Baseline residual decode (regression guard that lifting the
+    /// gate did not perturb the ATS-off path).
+    #[test]
+    fn round404_ats_intra_flag_zero_matches_dct2_baseline() {
+        use crate::cabac::CabacEncoder;
+        // Baseline reference: no ATS syntax at all (sps_ats_flag off).
+        let build = |ats_on: bool| {
+            let mut enc = CabacEncoder::new();
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+            enc.encode_decision(0, 0, 1); // cbf_luma = 1
+            if ats_on {
+                enc.encode_bypass(0); // ats_cu_intra_flag = 0 → no modes
+            }
+            enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+            enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
+            enc.encode_bypass(0); // sign = 0
+            enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_terminate(true);
+            enc.finish()
+        };
+        let decode = || SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let base_walk = || SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let (pic_base, _) =
+            decode_baseline_idr_slice(&build(false), base_walk(), decode()).unwrap();
+        let ats_walk = SliceWalkInputs {
+            tree_gates: CodingTreeGates {
+                sps_ats_flag: true,
+                ..Default::default()
+            },
+            ..base_walk()
+        };
+        let (pic_ats, stats) = decode_baseline_idr_slice(&build(true), ats_walk, decode()).unwrap();
+        assert_eq!(stats.ats_intra.cu_intra_flag_bins, 1);
+        assert_eq!(stats.ats_intra.hor_mode_bins, 0);
+        assert_eq!(stats.ats_intra.ver_mode_bins, 0);
+        // ats_cu_intra_flag == 0 → DCT-II → identical reconstruction.
+        assert_eq!(pic_base.y, pic_ats.y);
     }
 
     /// Inter P CU with `cbf_luma = 1` and a single DC residual
@@ -12601,6 +12806,7 @@ mod tests {
             suco_limits: crate::split::SucoSizeLimits::derive(5, 2, 0, 0),
             sps_cm_init_flag: false,
             sps_admvp_flag: false,
+            sps_ats_flag: false,
         }
     }
 

@@ -9,7 +9,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::transform::inverse_transform;
+use crate::transform::{inverse_transform, inverse_transform_ats};
 
 /// `levelScale` — eq. 1059. Round-3 only ships the `sps_iqt_flag = 0`
 /// list (the `sps_iqt_flag = 1` path swaps the trailing 71 for 72).
@@ -53,6 +53,54 @@ pub fn scale_and_inverse_transform(
     qp: i32,
     bit_depth: u32,
 ) -> Result<()> {
+    // trType 0/0 → the plain §8.7.4.3 DCT-II path.
+    scale_and_inverse_transform_typed(levels, dst, n_tb_w, n_tb_h, qp, bit_depth, 0, 0)
+}
+
+/// §8.7 scaling + **ATS-selected** inverse transform (§7.3.8.5 / Table 30):
+/// like [`scale_and_inverse_transform`] but the step-2 inverse transform
+/// selects the per-direction kernel `(tr_type_hor, tr_type_ver)` per
+/// §8.7.4.2. With `(0, 0)` it is byte-for-byte the DCT-II path;
+/// `(1, ·)`/`(2, ·)` engage DST-VII / DCT-VIII on the luma block an
+/// `ats_cu_intra_flag == 1` (or `ats_cu_inter_flag == 1`) CU selects.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_and_inverse_transform_ats(
+    levels: &[i32],
+    dst: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+    tr_type_hor: u32,
+    tr_type_ver: u32,
+) -> Result<()> {
+    scale_and_inverse_transform_typed(
+        levels,
+        dst,
+        n_tb_w,
+        n_tb_h,
+        qp,
+        bit_depth,
+        tr_type_hor,
+        tr_type_ver,
+    )
+}
+
+/// Shared §8.7 scale (eq. 1059) → inverse transform (eq. 1062) → final
+/// renorm (eq. 1055) core. `tr_type_hor`/`tr_type_ver == 0` routes the
+/// step-2 transform through the plain DCT-II [`inverse_transform`]; any
+/// non-zero type routes through [`inverse_transform_ats`].
+#[allow(clippy::too_many_arguments)]
+fn scale_and_inverse_transform_typed(
+    levels: &[i32],
+    dst: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+    tr_type_hor: u32,
+    tr_type_ver: u32,
+) -> Result<()> {
     if levels.len() != n_tb_w * n_tb_h || dst.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
             "evc dequant: length mismatch (levels={}, dst={}, expected {}*{}={})",
@@ -84,7 +132,11 @@ pub fn scale_and_inverse_transform(
         scaled[idx] = clipped;
     }
     // Step 2: inverse transform (cascaded 1-D matrix mul, eq. 1062).
-    inverse_transform(&mut scaled, n_tb_w, n_tb_h)?;
+    if tr_type_hor == 0 && tr_type_ver == 0 {
+        inverse_transform(&mut scaled, n_tb_w, n_tb_h)?;
+    } else {
+        inverse_transform_ats(&mut scaled, n_tb_w, n_tb_h, tr_type_hor, tr_type_ver)?;
+    }
     // Step 3: final renormalisation per eq. 1055. With sps_iqt_flag = 0:
     //   bdShift_post = (20 - bitDepth) + 7
     let bd_shift_post = (20 - bit_depth) + 7;

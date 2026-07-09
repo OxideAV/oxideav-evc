@@ -338,11 +338,11 @@ pub fn decode_idr_slice(
     // the §7.3.8.8 residual_coding_adv() layer.
     // Round 397: sps_addb_flag is lifted — deblocking dispatches to the
     // §8.8.3 advanced filter.
-    if sps.sps_ats_flag {
-        return Err(Error::unsupported(
-            "evc decode_idr_slice: round-3 only supports Baseline-profile toolset",
-        ));
-    }
+    // Round 404: sps_ats_flag is lifted on the IDR path — the intra
+    // `transform_unit()` reads the §7.3.8.5 `ats_cu_intra_flag` group and
+    // the §8.7.4.2 DST-VII / DCT-VIII kernels drive the luma inverse
+    // transform (an IDR slice has no inter CUs, so ATS-intra fully covers
+    // it). `CodingTreeGates::from_sps` carries `sps_ats_flag` to the walker.
     // sps_alf_flag and sps_dra_flag are handled by the round-11 post-filter
     // pipeline and no longer gate this function.
     if !pps.single_tile_in_pic_flag {
