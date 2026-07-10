@@ -22,7 +22,9 @@ reference-picture-list parsing for non-IDR slices — plus, as of round
 397, the whole **Main-profile** decode toolset (BTT/SUCO,
 ADMVP/affine/AMVR/MMVD/DMVR/HMVP, cm_init CABAC, DQUANT, EIPD, ADCC,
 ADDB, IBC, and — as of round 404 — ATS: no Main-profile decode tool
-remains gated).
+remains gated; round 408 added the §7.3.8.4 transform-unit tiling for
+CBs above MaxTb — the 128-CTU geometry — wired HTDF into decode, and
+reconciled the three §7 errata of in-repo entry #238).
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
@@ -456,9 +458,31 @@ the inverse Hadamard (eqs. 1100-1103), the overlap accumulation
 filter is pure over the reconstructed-sample accessor;
 `picture::apply_htdf_luma` is the data-plane bridge that drives it
 in-place on the `YuvPicture` luma plane (short-circuiting on the
-applicability gates). Invoking that bridge from the §8.4.1 / §8.6
-reconstruction (when `cbf_luma && sps_htdf_flag`) and threading the real
-§6.4.1 border predicate is the next wiring step.
+applicability gates). As of round 408 the bridge is **invoked from
+decode** at both spec invocation points: after every intra luma CB
+reconstruction (§8.4.1 — not gated on `cbf_luma`; the IDR path and the
+P/B intra-CU path both) and after inter CU reconstruction when
+`cbf_luma == 1` (the §8.5 CU-reconstruction step 7, including the DMVR
+arm), at the eq. 1043 `Qp′Y`. §8.6 defines no HTDF step, so IBC CUs are
+excluded. The border predicate is the in-picture-extent rule
+(single-tile slices); threading the full §6.4.1 predicate joins the
+multi-tile work.
+
+As of round 408 the **§7.3.8.4 transform-unit tiling** is decoded on
+every walker path: a CB whose width/height exceeds `MaxTbSizeY` (eq. 51
+fixes `MaxTbLog2SizeY = 6` — a constant, not a CTU-derived cap) reads
+the spec's up-to-four `transform_unit()` invocations, each with its own
+cbf group, `cu_qp_delta` presence check on the eq. 1042 chain, ATS
+group and per-component `residual_coding()`; the TB residuals assemble
+into CB-sized §8.4.5/§8.5.6 resSamples buffers and prediction +
+picture construction run once per CB. The bottom-right invocation sits
+at the errata-#238 (a)-resolved `(x0 + 2^log2TbWidth, y0 +
+2^log2TbHeight)` offset (the printed `logTbWidth` is a dropped-`2` typo
+assigned nowhere). With a 128×128 CTU this is the four-64×64-TB tiling
+a conformant stream produces; errata #238 (b)/(c) (the eq. 148
+`cu_qp_delta_sign_flag` and eq. 74 `startQp` identifier typos) are
+anchored by regression tests against the already-conformant
+implementations.
 
 ### Not yet supported
 
