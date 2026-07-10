@@ -298,16 +298,40 @@ impl<'a> CabacEngine<'a> {
     /// time using the supplied `ctx_idx_for(binIdx)` callback, stopping at
     /// the first `0` bin. Caller-supplied callback lets a syntax element
     /// switch context per bin (e.g. `mvp_idx_l0` uses 0/1/2).
-    pub fn decode_u_regular<F>(&mut self, ctx_table: usize, mut ctx_idx_for: F) -> Result<u32>
+    pub fn decode_u_regular<F>(&mut self, ctx_table: usize, ctx_idx_for: F) -> Result<u32>
+    where
+        F: FnMut(u32) -> usize,
+    {
+        // Historical 64-bin cap, retained for the small-range elements
+        // (intra_pred_mode, cu_qp_delta_abs, ...) as a CPU bound on
+        // hostile fixtures.
+        self.decode_u_regular_capped(63, ctx_table, ctx_idx_for)
+    }
+
+    /// Decode a U-binarised value (§9.3.3.2) whose legal range is bounded
+    /// by the syntax element's Table 91 `cMax`: §9.3.3.2 always appends a
+    /// terminating 0-bin, so a legal bin string is at most `c_max` 1-bins
+    /// followed by a 0 — a stream driving the count past `c_max` is
+    /// invalid. Large-range elements (`coeff_zero_run` with
+    /// `cMax = (1 << (log2W + log2H)) − 1`, `coeff_abs_level_minus1`
+    /// bounded by the ±32768 TransCoeffLevel window) must use this form:
+    /// the historical fixed 64-bin cap mis-rejected conformant runs and
+    /// levels in large TBs.
+    pub fn decode_u_regular_capped<F>(
+        &mut self,
+        c_max: u32,
+        ctx_table: usize,
+        mut ctx_idx_for: F,
+    ) -> Result<u32>
     where
         F: FnMut(u32) -> usize,
     {
         let mut count: u32 = 0;
-        // Cap U at 64 bins to bound CPU on hostile fixtures.
-        const MAX_BINS: u32 = 64;
         loop {
-            if count >= MAX_BINS {
-                return Err(Error::invalid("evc cabac U: too many bins (>64)"));
+            if count > c_max {
+                return Err(Error::invalid(format!(
+                    "evc cabac U: value exceeds cMax {c_max}"
+                )));
             }
             let idx = ctx_idx_for(count);
             let bin = self.decode_decision(ctx_table, idx)?;
@@ -1034,6 +1058,33 @@ mod tests {
     /// bin sequence bit-exactly through [`CabacEngine`], terminate
     /// included. (The pre-384 outstanding-bit encoder failed e.g. the
     /// regular pattern `0 1 1 0 0 0 0`.)
+    /// §9.3.3.2 U with the Table 91 cMax bound: values up to `c_max`
+    /// round-trip (always with the terminating 0-bin) and a bin string
+    /// driving the count past `c_max` is rejected — while values above
+    /// the historical fixed 64-bin cap now decode (large-TB
+    /// `coeff_zero_run` / big `coeff_abs_level_minus1`).
+    #[test]
+    fn u_capped_honours_c_max_not_a_fixed_64() {
+        // 100 one-bins + terminator: legal for cMax >= 100.
+        let mut enc = CabacEncoder::new();
+        for _ in 0..100 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0);
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let v = eng.decode_u_regular_capped(4095, 0, |_| 0).unwrap();
+        assert_eq!(v, 100, "a 100-run must decode under cMax 4095");
+        // The same bin string under cMax 15 is an invalid stream.
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let err = eng.decode_u_regular_capped(15, 0, |_| 0).unwrap_err();
+        assert!(format!("{err}").contains("cMax"), "got: {err}");
+        // The compat wrapper keeps the historical 64-bin bound.
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        assert!(eng.decode_u_regular(0, |_| 0).is_err());
+    }
+
     #[test]
     fn encoder_randomized_roundtrip() {
         // Small deterministic LCG so the test is reproducible.

@@ -1218,9 +1218,13 @@ fn walk_residual_coding_rle(
         )));
     }
     let mut scan_pos: u32 = 0;
+    // Table 91: coeff_zero_run cMax = (1 << (log2W + log2H)) − 1;
+    // coeff_abs_level_minus1 bounded by the ±32768 TransCoeffLevel window.
+    let zero_run_c_max = total_coeffs - 1;
+    const LEVEL_MINUS1_C_MAX: u32 = 32767;
     loop {
-        // coeff_zero_run cMax bound enforces termination.
-        let zr = eng.decode_u_regular(0, |_| 0)?;
+        // coeff_zero_run — the Table 91 cMax bound enforces termination.
+        let zr = eng.decode_u_regular_capped(zero_run_c_max, 0, |_| 0)?;
         scan_pos = scan_pos
             .checked_add(zr)
             .ok_or_else(|| Error::invalid("evc residual_coding_rle: scan_pos overflow"))?;
@@ -1229,9 +1233,7 @@ fn walk_residual_coding_rle(
                 "evc residual_coding_rle: zero-run pushed past block size",
             ));
         }
-        // coeff_abs_level_minus1 — bound for safety; round-3 will replace
-        // this with the real EGk-style fallback for large values.
-        let _level_minus1 = eng.decode_u_regular(0, |_| 0)?;
+        let _level_minus1 = eng.decode_u_regular_capped(LEVEL_MINUS1_C_MAX, 0, |_| 0)?;
         // coeff_sign_flag: bypass (cMax=1, no Table-95 entry).
         let _sign = eng.decode_bypass()?;
         stats.coeff_runs += 1;
@@ -1381,16 +1383,21 @@ fn decode_residual_coding_rle(
     // coefficient's absolute level (feeds the §9.3.4.2.2 ctxInc).
     let mut prev_level: u32 = 6;
     use crate::cabac_init::{ctx_inc_coeff_zero_run, MainCtxTable};
+    // Table 91: coeff_zero_run cMax = (1 << (log2W + log2H)) − 1;
+    // coeff_abs_level_minus1 is unbounded in Table 91 but the
+    // TransCoeffLevel storage window [−32768, 32767] bounds it.
+    let zero_run_c_max = (total as u32) - 1;
+    const LEVEL_MINUS1_C_MAX: u32 = 32767;
     loop {
         // coeff_zero_run U (Table 84).
         let zr = if sel.cm_init {
             let table = MainCtxTable::CoeffZeroRun;
             let off = table.ctx_idx_offset(sel.init_type);
-            eng.decode_u_regular(table.as_usize(), |bin_idx| {
+            eng.decode_u_regular_capped(zero_run_c_max, table.as_usize(), |bin_idx| {
                 off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
             })?
         } else {
-            eng.decode_u_regular(0, |_| 0)?
+            eng.decode_u_regular_capped(zero_run_c_max, 0, |_| 0)?
         };
         scan_pos = scan_pos
             .checked_add(zr)
@@ -1404,11 +1411,11 @@ fn decode_residual_coding_rle(
         let lvl_minus1 = if sel.cm_init {
             let table = MainCtxTable::CoeffAbsLevelMinus1;
             let off = table.ctx_idx_offset(sel.init_type);
-            eng.decode_u_regular(table.as_usize(), |bin_idx| {
+            eng.decode_u_regular_capped(LEVEL_MINUS1_C_MAX, table.as_usize(), |bin_idx| {
                 off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
             })?
         } else {
-            eng.decode_u_regular(0, |_| 0)?
+            eng.decode_u_regular_capped(LEVEL_MINUS1_C_MAX, 0, |_| 0)?
         };
         let abs_lvl = (lvl_minus1 as i32) + 1;
         // coeff_sign_flag bypass.
@@ -9559,6 +9566,52 @@ mod tests {
         assert_eq!(
             stats0.htdf_blocks, 0,
             "inter HTDF is gated on cbf_luma == 1 (§8.5 step 7)"
+        );
+    }
+
+    /// A 64×64 TB (eq. 51) with a `coeff_zero_run` of 100 and a
+    /// coefficient level of 200: both exceed the historical fixed
+    /// 64-bin U cap that mis-rejected conformant large-TB runs/levels
+    /// ("too many bins"); the Table-91-cMax-bounded reads decode them.
+    #[test]
+    fn rle_long_zero_run_and_level_in_64x64_tb() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        for _ in 0..100 {
+            enc.encode_decision(0, 0, 1); // coeff_zero_run prefix
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → run = 100
+        for _ in 0..199 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 prefix
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 200
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 6, // single 64×64 TB
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 40,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.coeff_runs, 1, "one coefficient decoded");
+        assert!(
+            pic.y.iter().any(|&v| v != 128),
+            "the scan-pos-100 coefficient must reach pixels"
         );
     }
 
