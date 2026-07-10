@@ -5608,78 +5608,248 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
         walk.tree_gates.sps_cm_init_flag,
         crate::cabac::InitType::Pb,
     );
-    let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
-    let cbf_luma = eng.decode_decision(t, i)?;
-    stats.cbf_luma_bins += 1;
-    let mut cbf_cb = 0u8;
-    let mut cbf_cr = 0u8;
-    if chroma_present {
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
-        cbf_cb = eng.decode_decision(t, i)?;
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
-        cbf_cr = eng.decode_decision(t, i)?;
-        stats.cbf_chroma_bins += 2;
-    }
-    // §7.3.8.5 transform_unit() cu_qp_delta. The presence condition is
-    // mode-independent — it applies to MODE_INTER CUs identically to the
-    // intra single-tree path. With Baseline's `sps_dquant_flag == 0` the
-    // §7.3.8.5 line 3073 guard collapses to `cu_qp_delta_enabled_flag &&
-    // (cbf_luma || cbf_cb || cbf_cr)`. `cu_qp_delta_abs` is U-binarized
-    // with ctxInc 0 for every bin (Table 95) under Table 78 init;
-    // `cu_qp_delta_sign_flag` is bypass-coded and only present when the
-    // magnitude is non-zero. The signed delta is applied to the slice QP
-    // per eq. 148: `QpY = slice_qp + cu_qp_delta_abs * (1 - 2 * sign)`,
-    // clamped to the legal 8-bit-depth QP range [0, 51].
-    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
-    let cu_qp = if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
-        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
-        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
-        stats.cu_qp_delta_abs_bins += 1;
-        let mut qp_delta = 0i32;
-        if qp_delta_abs > 0 {
-            let sign = eng.decode_bypass()?;
-            qp_delta = if sign != 0 {
-                -(qp_delta_abs as i32)
-            } else {
-                qp_delta_abs as i32
-            };
+    // §7.3.8.4 tiling: a CB exceeding MaxTb decodes up to four
+    // transform_unit() invocations (errata #238 (a) pins the bottom-right
+    // offset — see `transform_unit_offsets`). Each TU carries its own
+    // cbf group, cu_qp_delta presence check (eq. 1042 chain) and
+    // per-component residual_coding(); the inverse-transformed TB
+    // residuals scatter into CB-sized resSamples buffers per
+    // §8.5.6.2/.3.
+    let log2_tb_w = log2_cb_width.min(walk.max_tb_log2_size_y);
+    let log2_tb_h = log2_cb_height.min(walk.max_tb_log2_size_y);
+    let n_cb_l = (1usize << log2_cb_width) * (1usize << log2_cb_height);
+    let log2_cb_c_w = log2_cb_width.saturating_sub(1);
+    let log2_cb_c_h = log2_cb_height.saturating_sub(1);
+    let n_cb_c = (1usize << log2_cb_c_w) * (1usize << log2_cb_c_h);
+    let mut cbf_luma_any = 0u8;
+    let mut cu_qp = qp.qp_y;
+    let mut residual_y_vec: Vec<i32> = Vec::new();
+    let mut residual_cb_vec: Vec<i32> = Vec::new();
+    let mut residual_cr_vec: Vec<i32> = Vec::new();
+    for (tu_x, tu_y) in
+        transform_unit_offsets(log2_cb_width, log2_cb_height, walk.max_tb_log2_size_y)
+    {
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+        let cbf_luma = eng.decode_decision(t, i)?;
+        stats.cbf_luma_bins += 1;
+        let mut cbf_cb = 0u8;
+        let mut cbf_cr = 0u8;
+        if chroma_present {
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+            cbf_cb = eng.decode_decision(t, i)?;
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+            cbf_cr = eng.decode_decision(t, i)?;
+            stats.cbf_chroma_bins += 2;
         }
-        qp.apply_delta(qp_delta)
-    } else {
-        qp.qp_y
-    };
-    // §7.3.8.5 lines 3088-3130: the ATS-inter (sub-block transform) group
-    // on a MODE_INTER CU. Present when `sps_ats_flag`, some cbf, and an
-    // allowed split orientation (`AllowAtsInter::any`, MinTbLog2SizeY = 2 /
-    // eq. 52, MaxTbLog2SizeY from the walker). Resolves the residual
-    // sub-block geometry (TrafoX0/Y0 + reduced TrafoLog2Width/Height) that
-    // the residual_coding() calls below key on.
-    let ats_inter = if walk.tree_gates.sps_ats_flag && cbf_any {
-        let allow = crate::ats::AllowAtsInter::derive(
-            log2_cb_width,
-            log2_cb_height,
-            2,
-            walk.max_tb_log2_size_y,
-        );
-        if allow.any() {
-            let ctx = crate::eipd_syntax::EipdCtx::for_slice(
-                walk.tree_gates.sps_cm_init_flag,
-                crate::cabac::InitType::Pb,
-            );
-            crate::ats::read_ats_inter(
-                eng,
-                ctx,
-                allow,
+        // §7.3.8.5 transform_unit() cu_qp_delta. The presence condition is
+        // mode-independent — it applies to MODE_INTER CUs identically to
+        // the intra single-tree path. With Baseline's `sps_dquant_flag ==
+        // 0` the §7.3.8.5 line 3073 guard collapses to
+        // `cu_qp_delta_enabled_flag && (cbf_luma || cbf_cb || cbf_cr)`.
+        // `cu_qp_delta_abs` is U-binarized with ctxInc 0 for every bin
+        // (Table 95) under Table 78 init; `cu_qp_delta_sign_flag` is
+        // bypass-coded and only present when the magnitude is non-zero.
+        // The signed delta folds into the eq. 148 / eq. 1042 chain
+        // (errata #238 (b): the eq. 148 multiplier is the parsed/inferred
+        // `cu_qp_delta_sign_flag`).
+        let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
+            let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+            let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
+            stats.cu_qp_delta_abs_bins += 1;
+            let mut qp_delta = 0i32;
+            if qp_delta_abs > 0 {
+                let sign = eng.decode_bypass()?;
+                qp_delta = if sign != 0 {
+                    -(qp_delta_abs as i32)
+                } else {
+                    qp_delta_abs as i32
+                };
+            }
+            cu_qp = qp.apply_delta(qp_delta);
+        }
+        // §7.3.8.5 lines 3088-3130: the ATS-inter (sub-block transform)
+        // group on a MODE_INTER CU. Present when `sps_ats_flag`, some cbf,
+        // and an allowed split orientation (`AllowAtsInter::any`,
+        // MinTbLog2SizeY = 2 / eq. 52, MaxTbLog2SizeY from the walker —
+        // an allowed orientation requires log2Cb ≤ MaxTb, so the group is
+        // never present on a TB-split CB). Resolves the residual
+        // sub-block geometry (TrafoX0/Y0 + reduced TrafoLog2Width/Height)
+        // the residual_coding() calls below key on.
+        let ats_inter = if walk.tree_gates.sps_ats_flag && cbf_any {
+            let allow = crate::ats::AllowAtsInter::derive(
                 log2_cb_width,
                 log2_cb_height,
-                &mut stats.ats_inter,
-            )?
+                2,
+                walk.max_tb_log2_size_y,
+            );
+            if allow.any() {
+                let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+                    walk.tree_gates.sps_cm_init_flag,
+                    crate::cabac::InitType::Pb,
+                );
+                crate::ats::read_ats_inter(
+                    eng,
+                    ctx,
+                    allow,
+                    log2_cb_width,
+                    log2_cb_height,
+                    &mut stats.ats_inter,
+                )?
+            } else {
+                crate::ats::AtsInter::disabled(log2_cb_width, log2_cb_height)
+            }
         } else {
             crate::ats::AtsInter::disabled(log2_cb_width, log2_cb_height)
+        };
+        cbf_luma_any |= cbf_luma;
+        // Decode residual blocks per component (into the CB-sized
+        // buffers at the TU offset).
+        if cbf_luma != 0 {
+            // Under ATS-inter the residual occupies only the sub-block at
+            // (TrafoX0, TrafoY0) with the reduced (TrafoLog2Width,
+            // TrafoLog2Height); the §8.7.4.1 Table-31 kernel pair drives
+            // it. Otherwise the residual spans the whole (log2_tb_w,
+            // log2_tb_h) TB with plain DCT-II.
+            let n_y = (1usize << log2_tb_w) * (1usize << log2_tb_h);
+            let (sb_lw, sb_lh) = if ats_inter.used {
+                (ats_inter.trafo_log2_w, ats_inter.trafo_log2_h)
+            } else {
+                (log2_tb_w, log2_tb_h)
+            };
+            let sb_n = (1usize << sb_lw) * (1usize << sb_lh);
+            let mut levels = vec![0i32; sb_n];
+            decode_residual_block(
+                eng,
+                sel,
+                &walk,
+                0,
+                &mut levels,
+                &mut stats.coeff_runs,
+                &mut stats.adcc,
+                sb_lw,
+                sb_lh,
+            )?;
+            let (tr_hor, tr_ver) = ats_inter.tr_types();
+            let mut sb_res = vec![0i32; sb_n];
+            crate::dequant::scale_and_inverse_transform_ats(
+                &levels,
+                &mut sb_res,
+                1usize << sb_lw,
+                1usize << sb_lh,
+                cu_qp,
+                inputs.decode.bit_depth_luma,
+                tr_hor,
+                tr_ver,
+            )?;
+            let tb_res = if ats_inter.used {
+                scatter_subblock(
+                    &sb_res,
+                    1usize << log2_tb_w,
+                    n_y,
+                    ats_inter.trafo_x0 as usize,
+                    ats_inter.trafo_y0 as usize,
+                    1usize << sb_lw,
+                    1usize << sb_lh,
+                )
+            } else {
+                sb_res
+            };
+            if residual_y_vec.is_empty() {
+                residual_y_vec = vec![0i32; n_cb_l];
+            }
+            scatter_tb_residual(
+                &mut residual_y_vec,
+                1usize << log2_cb_width,
+                &tb_res,
+                tu_x as usize,
+                tu_y as usize,
+                1usize << log2_tb_w,
+                1usize << log2_tb_h,
+            );
         }
-    } else {
-        crate::ats::AtsInter::disabled(log2_cb_width, log2_cb_height)
-    };
+        if chroma_present && (cbf_cb != 0 || cbf_cr != 0) {
+            let (log2_c_w, log2_c_h) = (log2_tb_w.saturating_sub(1), log2_tb_h.saturating_sub(1));
+            let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
+            // Under ATS-inter the chroma residual mirrors the luma
+            // sub-block: size (TrafoLog2Width − 1, TrafoLog2Height − 1)
+            // for 4:2:0 at the (TrafoX0 >> 1, TrafoY0 >> 1) offset
+            // (§7.3.8.5 lines 3134-3139, SubWidthC/SubHeightC = 2).
+            // Chroma always uses trType 0 (DCT-II).
+            let (sb_cw, sb_ch, sb_cx0, sb_cy0) = if ats_inter.used {
+                (
+                    ats_inter.trafo_log2_w.saturating_sub(1),
+                    ats_inter.trafo_log2_h.saturating_sub(1),
+                    (ats_inter.trafo_x0 >> 1) as usize,
+                    (ats_inter.trafo_y0 >> 1) as usize,
+                )
+            } else {
+                (log2_c_w, log2_c_h, 0, 0)
+            };
+            let sb_c_n = (1usize << sb_cw) * (1usize << sb_ch);
+            let decode_chroma_residual = |eng: &mut CabacEngine,
+                                          stats: &mut InterDecodeStats,
+                                          c_idx: u32,
+                                          dst: &mut Vec<i32>|
+             -> Result<()> {
+                let mut levels = vec![0i32; sb_c_n];
+                decode_residual_block(
+                    eng,
+                    sel,
+                    &walk,
+                    c_idx,
+                    &mut levels,
+                    &mut stats.coeff_runs,
+                    &mut stats.adcc,
+                    sb_cw,
+                    sb_ch,
+                )?;
+                let mut sb_res = vec![0i32; sb_c_n];
+                scale_and_inverse_transform(
+                    &levels,
+                    &mut sb_res,
+                    1usize << sb_cw,
+                    1usize << sb_ch,
+                    cu_qp,
+                    inputs.decode.bit_depth_chroma,
+                )?;
+                let tb_res = if ats_inter.used {
+                    scatter_subblock(
+                        &sb_res,
+                        1usize << log2_c_w,
+                        n_c,
+                        sb_cx0,
+                        sb_cy0,
+                        1usize << sb_cw,
+                        1usize << sb_ch,
+                    )
+                } else {
+                    sb_res
+                };
+                if dst.is_empty() {
+                    *dst = vec![0i32; n_cb_c];
+                }
+                scatter_tb_residual(
+                    dst,
+                    1usize << log2_cb_c_w,
+                    &tb_res,
+                    (tu_x >> 1) as usize,
+                    (tu_y >> 1) as usize,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                );
+                Ok(())
+            };
+            if cbf_cb != 0 {
+                decode_chroma_residual(eng, stats, 1, &mut residual_cb_vec)?;
+            }
+            if cbf_cr != 0 {
+                decode_chroma_residual(eng, stats, 2, &mut residual_cr_vec)?;
+            }
+        }
+    }
+    // The stamp + deblock consumers read the CB's aggregate cbf.
+    let cbf_luma = cbf_luma_any;
     // Stamp the deblocking side-info for this inter CU. We record the
     // MVs (1/4-pel units) and ref_idx 0 / -1 per slot. An affine CU
     // stamps each subblock with its own §8.5.3.7 field vector (rounded
@@ -5725,127 +5895,6 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
         ref_idx_l1: pred_l1.map(|(_, r)| r as i8).unwrap_or(-1),
     };
     hmvp.update(cand);
-    // Decode residual blocks per component.
-    let log2_tb_w = log2_cb_width.min(walk.max_tb_log2_size_y);
-    let log2_tb_h = log2_cb_height.min(walk.max_tb_log2_size_y);
-    let n_y = (1usize << log2_tb_w) * (1usize << log2_tb_h);
-    let mut residual_y_vec: Vec<i32> = Vec::new();
-    if cbf_luma != 0 {
-        // Under ATS-inter the residual occupies only the sub-block at
-        // (TrafoX0, TrafoY0) with the reduced (TrafoLog2Width,
-        // TrafoLog2Height); the §8.7.4.1 Table-31 kernel pair drives it.
-        // Otherwise the residual spans the whole (log2_tb_w, log2_tb_h) TB
-        // with plain DCT-II.
-        let (sb_lw, sb_lh) = if ats_inter.used {
-            (ats_inter.trafo_log2_w, ats_inter.trafo_log2_h)
-        } else {
-            (log2_tb_w, log2_tb_h)
-        };
-        let sb_n = (1usize << sb_lw) * (1usize << sb_lh);
-        let mut levels = vec![0i32; sb_n];
-        decode_residual_block(
-            eng,
-            sel,
-            &walk,
-            0,
-            &mut levels,
-            &mut stats.coeff_runs,
-            &mut stats.adcc,
-            sb_lw,
-            sb_lh,
-        )?;
-        let (tr_hor, tr_ver) = ats_inter.tr_types();
-        let mut sb_res = vec![0i32; sb_n];
-        crate::dequant::scale_and_inverse_transform_ats(
-            &levels,
-            &mut sb_res,
-            1usize << sb_lw,
-            1usize << sb_lh,
-            cu_qp,
-            inputs.decode.bit_depth_luma,
-            tr_hor,
-            tr_ver,
-        )?;
-        residual_y_vec = if ats_inter.used {
-            scatter_subblock(
-                &sb_res,
-                1usize << log2_tb_w,
-                n_y,
-                ats_inter.trafo_x0 as usize,
-                ats_inter.trafo_y0 as usize,
-                1usize << sb_lw,
-                1usize << sb_lh,
-            )
-        } else {
-            sb_res
-        };
-    }
-    let (log2_c_w, log2_c_h) = if chroma_present {
-        (log2_tb_w.saturating_sub(1), log2_tb_h.saturating_sub(1))
-    } else {
-        (0, 0)
-    };
-    let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
-    // Under ATS-inter the chroma residual mirrors the luma sub-block:
-    // size (TrafoLog2Width − 1, TrafoLog2Height − 1) for 4:2:0 at the
-    // (TrafoX0 >> 1, TrafoY0 >> 1) offset (§7.3.8.5 lines 3134-3139,
-    // SubWidthC/SubHeightC = 2). Chroma always uses trType 0 (DCT-II).
-    let (sb_cw, sb_ch, sb_cx0, sb_cy0) = if ats_inter.used {
-        (
-            ats_inter.trafo_log2_w.saturating_sub(1),
-            ats_inter.trafo_log2_h.saturating_sub(1),
-            (ats_inter.trafo_x0 >> 1) as usize,
-            (ats_inter.trafo_y0 >> 1) as usize,
-        )
-    } else {
-        (log2_c_w, log2_c_h, 0, 0)
-    };
-    let sb_c_n = (1usize << sb_cw) * (1usize << sb_ch);
-    let mut residual_cb_vec: Vec<i32> = Vec::new();
-    let mut residual_cr_vec: Vec<i32> = Vec::new();
-    let decode_chroma_residual =
-        |eng: &mut CabacEngine, stats: &mut InterDecodeStats, c_idx: u32| -> Result<Vec<i32>> {
-            let mut levels = vec![0i32; sb_c_n];
-            decode_residual_block(
-                eng,
-                sel,
-                &walk,
-                c_idx,
-                &mut levels,
-                &mut stats.coeff_runs,
-                &mut stats.adcc,
-                sb_cw,
-                sb_ch,
-            )?;
-            let mut sb_res = vec![0i32; sb_c_n];
-            scale_and_inverse_transform(
-                &levels,
-                &mut sb_res,
-                1usize << sb_cw,
-                1usize << sb_ch,
-                cu_qp,
-                inputs.decode.bit_depth_chroma,
-            )?;
-            Ok(if ats_inter.used {
-                scatter_subblock(
-                    &sb_res,
-                    1usize << log2_c_w,
-                    n_c,
-                    sb_cx0,
-                    sb_cy0,
-                    1usize << sb_cw,
-                    1usize << sb_ch,
-                )
-            } else {
-                sb_res
-            })
-        };
-    if chroma_present && cbf_cb != 0 {
-        residual_cb_vec = decode_chroma_residual(eng, stats, 1)?;
-    }
-    if chroma_present && cbf_cr != 0 {
-        residual_cr_vec = decode_chroma_residual(eng, stats, 2)?;
-    }
     // Motion compensation.
     let bipred = pred_l0.is_some() && pred_l1.is_some();
     if bipred {
@@ -9933,6 +9982,128 @@ mod tests {
         assert_eq!(stats.admvp_syntax.gate.merge_idx_bins, 1);
         // amvr off → no amvr_idx bin.
         assert_eq!(stats.admvp_syntax.gate.amvr_idx_bins, 0);
+    }
+
+    /// §7.3.8.4 TB-split on the **inter** (P-slice) path, errata
+    /// #238 (a) anchored: a 64×64 zero-MV merge CU walked with
+    /// `max_tb_log2_size_y = 5` decodes four `transform_unit()` bodies
+    /// (each with its own cbf_luma/cbf_cb/cbf_cr group). Residual rides
+    /// the top-right and bottom-right TUs only; per §8.5.6.2 the two TB
+    /// residuals must land in exactly those quadrants on top of the
+    /// whole-CB motion compensation — the bottom-right placement is the
+    /// erratum-resolved `(2^log2TbWidth, 2^log2TbHeight)` offset.
+    #[test]
+    fn errata_238a_inter_tb_split_residual_lands_per_quadrant() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 64 * 64];
+        let ref_cb = vec![128u16; 32 * 32];
+        let ref_cr = vec![128u16; 32 * 32];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 64,
+            height: 64,
+            y_stride: 64,
+            c_stride: 32,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → 64×64 leaf
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (MODE_INTER)
+        enc.encode_decision(0, 0, 1); // merge_mode_flag = 1
+        enc.encode_decision(0, 0, 0); // merge_idx = 0 → zero-MV candidate
+                                      // TU 1 (top-left): all quiet.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // TU 2 (top-right): one luma coefficient.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // TU 3 (bottom-left): all quiet.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // TU 4 (bottom-right): one luma coefficient.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..19 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 20
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5, // force the 2×2 TB split
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: gates,
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        // Four TUs → 4 cbf_luma bins + 8 chroma bins.
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        assert_eq!(stats.admvp_merge_cus, 1);
+        // The zero-MV copy puts 200 everywhere; residual lifts only the
+        // top-right and bottom-right 32×32 quadrants.
+        let quadrant_touched = |qx: usize, qy: usize| -> bool {
+            (0..32).any(|y| (0..32).any(|x| pic.y[(qy * 32 + y) * 64 + qx * 32 + x] != 200))
+        };
+        assert!(!quadrant_touched(0, 0), "top-left TU carried no residual");
+        assert!(quadrant_touched(1, 0), "top-right TU residual must land");
+        assert!(
+            !quadrant_touched(0, 1),
+            "bottom-left TU carried no residual"
+        );
+        assert!(
+            quadrant_touched(1, 1),
+            "bottom-right TU residual must land at (2^log2TbWidth, 2^log2TbHeight) — errata #238 (a)"
+        );
+        // Distinct levels (40 vs 20) → distinct anchor lifts.
+        assert_ne!(pic.y[32], 200);
+        assert_ne!(pic.y[32 * 64 + 32], 200);
+        assert_ne!(pic.y[32], pic.y[32 * 64 + 32]);
+        // Chroma untouched.
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
     }
 
     /// Round 381: a non-skip MODE_INTER CU on the admvp path with
