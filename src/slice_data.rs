@@ -1169,8 +1169,7 @@ fn walk_transform_unit(
                 // has no entry for cu_qp_delta_sign_flag → treated as
                 // bypass per 9.3.4.2.1 (entry "bypass" or unlisted defaults
                 // to bypass for ae(v) elements without a Table 95 row, by
-                // inspection). We pessimistically use bypass (matches
-                // reference behaviour).
+                // inspection of the table's conventions). We use bypass.
                 let _sign = eng.decode_bypass()?;
             }
         }
