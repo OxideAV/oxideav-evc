@@ -1743,6 +1743,13 @@ pub struct SliceDecodeInputs {
     /// `log2MaxIbcCandSize` (eq. 70). Only consulted when
     /// `sps_ibc_flag` is true.
     pub log2_max_ibc_cand_size: u32,
+    /// `sps_htdf_flag` (§7.4.3.1): when true the §8.7.6 Hadamard
+    /// Transform Domain Filter runs on each qualifying luma coding
+    /// block right after its reconstruction — unconditionally on intra
+    /// CUs (§8.4.1) and gated on `cbf_luma == 1` for inter CUs (the
+    /// §8.5 CU-reconstruction step 7). §8.6 defines no HTDF step for
+    /// IBC CUs.
+    pub sps_htdf_flag: bool,
 }
 
 impl Default for SliceDecodeInputs {
@@ -1759,6 +1766,7 @@ impl Default for SliceDecodeInputs {
             slice_cr_qp_offset: 0,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            sps_htdf_flag: false,
         }
     }
 }
@@ -1802,6 +1810,10 @@ pub struct SliceDecodeStats {
     pub coeff_runs: u32,
     /// Deblocking edges visited (zero when slice_deblocking_filter_flag = 0).
     pub deblock_edges: u32,
+    /// §8.7.6 HTDF applications: luma coding blocks that passed the
+    /// §8.7.6.1 applicability gates and were filtered (zero unless
+    /// `sps_htdf_flag`).
+    pub htdf_blocks: u32,
     /// Per-CTU `alf_ctb_*` map bins from `coding_tree_unit()`
     /// (§7.3.8.2). Zero unless the slice signals an ALF applicability
     /// map.
@@ -3152,26 +3164,48 @@ fn decode_transform_unit(
     // (§8.4.1 predicts at CB dimensions; the TB split only affects the
     // residual assembly above).
     match tree_type {
-        TreeType::DualTreeLuma | TreeType::SingleTree => match intra_mode {
-            CuIntraMode::Baseline(m) => {
-                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
+        TreeType::DualTreeLuma | TreeType::SingleTree => {
+            match intra_mode {
+                CuIntraMode::Baseline(m) => {
+                    intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
+                }
+                CuIntraMode::Eipd(m) => {
+                    let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
+                    crate::picture::intra_reconstruct_cb_eipd(
+                        pic,
+                        x0,
+                        y0,
+                        log2_cb_width,
+                        log2_cb_height,
+                        m,
+                        0,
+                        walk.tree_gates.sps_suco_flag,
+                        right,
+                        &res_y,
+                    )?
+                }
             }
-            CuIntraMode::Eipd(m) => {
-                let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
-                crate::picture::intra_reconstruct_cb_eipd(
-                    pic,
+            // §8.4.1 (line 6812): when sps_htdf_flag == 1 the §8.7.6
+            // post-reconstruction filter runs on the intra luma CB —
+            // NOT gated on cbf_luma (unlike the inter step 7); the
+            // §8.7.6.1 applicability gates do the rest. Qp′Y per
+            // eq. 1043. §8.6 defines no HTDF step, so an IBC luma
+            // partner is excluded.
+            if decode.sps_htdf_flag && !luma_cu_is_ibc {
+                let qp_prime = cu_qp + 6 * (decode.bit_depth_luma as i32 - 8);
+                if pic.apply_htdf_luma(
                     x0,
                     y0,
-                    log2_cb_width,
-                    log2_cb_height,
-                    m,
-                    0,
-                    walk.tree_gates.sps_suco_flag,
-                    right,
-                    &res_y,
-                )?
+                    1usize << log2_cb_width,
+                    1usize << log2_cb_height,
+                    qp_prime,
+                    true,
+                    false,
+                ) {
+                    stats.htdf_blocks += 1;
+                }
             }
-        },
+        }
         TreeType::DualTreeChroma => {
             if chroma_present {
                 // For sps_eipd_flag=0, intra_chroma_pred_mode is suppressed
@@ -3479,6 +3513,10 @@ pub struct InterDecodeStats {
     /// Number of edges visited by the deblocking pass (luma + chroma
     /// summed). Zero when `slice_deblocking_filter_flag = 0`.
     pub deblock_edges: u32,
+    /// §8.7.6 HTDF applications: luma coding blocks that passed the
+    /// §8.7.6.1 applicability gates and were filtered (zero unless
+    /// `sps_htdf_flag`).
+    pub htdf_blocks: u32,
     /// `NumHmvpCand` at slice end — useful for fixture tests that want
     /// to confirm the §8.5.2.7 update process actually fired. Resets
     /// every CTU row, so on a single-CTU-row slice this equals the
@@ -5936,7 +5974,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
         let (Some((mv0, r0)), Some((mv1, r1))) = (pred_l0, pred_l1) else {
             unreachable!("dmvr_applied requires bi-prediction");
         };
-        return apply_dmvr_inter_prediction(
+        apply_dmvr_inter_prediction(
             pic,
             stats,
             side_info,
@@ -5950,35 +5988,56 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
             &residual_y_vec,
             &residual_cb_vec,
             &residual_cr_vec,
-        );
+        )?;
+    } else {
+        match &motion {
+            CuMotion::Translational(_) | CuMotion::MergeTranslational(_) => apply_inter_prediction(
+                pic,
+                inputs,
+                x0,
+                y0,
+                n_cb_w as usize,
+                n_cb_h as usize,
+                pred_l0,
+                pred_l1,
+                &residual_y_vec,
+                &residual_cb_vec,
+                &residual_cr_vec,
+            )?,
+            CuMotion::Affine(a) => apply_affine_inter_prediction(
+                pic,
+                inputs,
+                x0,
+                y0,
+                n_cb_w as usize,
+                n_cb_h as usize,
+                a,
+                &residual_y_vec,
+                &residual_cb_vec,
+                &residual_cr_vec,
+            )?,
+        }
     }
-    match &motion {
-        CuMotion::Translational(_) | CuMotion::MergeTranslational(_) => apply_inter_prediction(
-            pic,
-            inputs,
+    // §8.5 CU-reconstruction step 7: when cbf_luma == 1 and
+    // sps_htdf_flag == 1 the §8.7.6 post-reconstruction filter runs on
+    // the inter luma CB (Qp′Y per eq. 1043). The eq. 1106 qpIdx branch
+    // predicate is MODE_INTER && square && min(nCbW, nCbH) >= 32.
+    if cbf_luma != 0 && inputs.decode.sps_htdf_flag {
+        let qp_prime = cu_qp + 6 * (inputs.decode.bit_depth_luma as i32 - 8);
+        let square_ge32 = n_cb_w == n_cb_h && n_cb_w.min(n_cb_h) >= 32;
+        if pic.apply_htdf_luma(
             x0,
             y0,
             n_cb_w as usize,
             n_cb_h as usize,
-            pred_l0,
-            pred_l1,
-            &residual_y_vec,
-            &residual_cb_vec,
-            &residual_cr_vec,
-        ),
-        CuMotion::Affine(a) => apply_affine_inter_prediction(
-            pic,
-            inputs,
-            x0,
-            y0,
-            n_cb_w as usize,
-            n_cb_h as usize,
-            a,
-            &residual_y_vec,
-            &residual_cb_vec,
-            &residual_cr_vec,
-        ),
+            qp_prime,
+            false,
+            square_ge32,
+        ) {
+            stats.htdf_blocks += 1;
+        }
     }
+    Ok(())
 }
 
 /// §8.5.1 steps 1)-4) for a `dmvrAppliedFlag == 1` CU: partition into
@@ -7007,6 +7066,23 @@ fn decode_inter_intra_cu(
                     right,
                     &residual,
                 )?
+            }
+        }
+        // §8.4.1 (line 6812): the §8.7.6 HTDF post-reconstruction
+        // filter on an intra luma CB — not gated on cbf_luma; the
+        // §8.7.6.1 applicability gates apply. Qp′Y per eq. 1043.
+        if decode.sps_htdf_flag {
+            let qp_prime = cu_qp + 6 * (decode.bit_depth_luma as i32 - 8);
+            if pic.apply_htdf_luma(
+                x0,
+                y0,
+                1usize << log2_cb_width,
+                1usize << log2_cb_height,
+                qp_prime,
+                true,
+                false,
+            ) {
+                stats.htdf_blocks += 1;
             }
         }
     }
@@ -9156,6 +9232,211 @@ mod tests {
         assert_ne!(
             tr, br,
             "identical levels at chained QPs 30 vs 51 must reconstruct differently (eq. 1042 per-TU chain)"
+        );
+    }
+
+    /// §8.4.1 HTDF wiring (intra): with `sps_htdf_flag` the §8.7.6
+    /// filter runs on the luma CB right after reconstruction. The
+    /// filtered decode must equal the unfiltered decode with
+    /// `apply_htdf_luma` applied to the same block (single-CU picture →
+    /// the per-CU equivalence is exact), and must differ from the
+    /// unfiltered decode (the residual is non-flat, so the filter
+    /// actually moves samples).
+    #[test]
+    fn htdf_intra_applies_after_reconstruct() {
+        use crate::cabac::CabacEncoder;
+        let encode = |cbf: u8| -> Vec<u8> {
+            let mut enc = CabacEncoder::new();
+            enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → 32×32 leaf
+            enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, cbf); // cbf_luma
+            if cbf != 0 {
+                enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+                for _ in 0..39 {
+                    enc.encode_decision(0, 0, 1);
+                }
+                enc.encode_decision(0, 0, 0); // U terminator → level 40
+                enc.encode_bypass(0); // sign = +
+                enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+            }
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_terminate(true);
+            enc.finish()
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let mk_decode = |htdf: bool| SliceDecodeInputs {
+            slice_qp: 30, // > 17 → §8.7.6.1 QP gate passes
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            sps_htdf_flag: htdf,
+            ..Default::default()
+        };
+        let rbsp = encode(1);
+        let (pic_off, stats_off) =
+            decode_baseline_idr_slice(&rbsp, walk, mk_decode(false)).unwrap();
+        assert_eq!(stats_off.htdf_blocks, 0, "flag off → no HTDF");
+        let (pic_on, stats_on) = decode_baseline_idr_slice(&rbsp, walk, mk_decode(true)).unwrap();
+        assert_eq!(stats_on.htdf_blocks, 1, "one qualifying luma CB");
+        assert_ne!(
+            pic_on.y, pic_off.y,
+            "HTDF must move samples on a non-flat reconstruction"
+        );
+        // Reference: the unfiltered picture put through the same bridge.
+        let mut pic_ref = pic_off.clone();
+        assert!(pic_ref.apply_htdf_luma(0, 0, 32, 32, 30, true, false));
+        assert_eq!(
+            pic_on.y, pic_ref.y,
+            "decode-integrated HTDF == direct bridge"
+        );
+        // Chroma is untouched by the luma-only filter.
+        assert_eq!(pic_on.cb, pic_off.cb);
+        assert_eq!(pic_on.cr, pic_off.cr);
+    }
+
+    /// §8.4.1 HTDF on an intra CB is **not** gated on `cbf_luma`
+    /// (unlike the inter step 7): a quiet intra CB still runs the
+    /// filter. On the flat DC reconstruction the filter is an identity,
+    /// so the counter is the observable.
+    #[test]
+    fn htdf_intra_runs_even_with_cbf0() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            sps_htdf_flag: true,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(
+            stats.htdf_blocks, 1,
+            "§8.4.1 invokes HTDF on the intra CB regardless of cbf_luma"
+        );
+        // Flat field → the soft-threshold keeps DC only → identity.
+        assert!(pic.y.iter().all(|&v| v == 128));
+    }
+
+    /// §8.5 CU-reconstruction step 7 HTDF wiring (inter): gated on
+    /// `cbf_luma == 1`. A 16×16 merge CU with residual filters (and
+    /// matches the direct bridge on the unfiltered decode); the same CU
+    /// without residual reads the flag path but never invokes HTDF.
+    #[test]
+    fn htdf_inter_gated_on_cbf_luma() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 16 * 16];
+        let ref_cb = vec![128u16; 8 * 8];
+        let ref_cr = vec![128u16; 8 * 8];
+        let mk_view = || RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let encode = |cbf: u8| -> Vec<u8> {
+            let mut enc = CabacEncoder::new();
+            enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+            enc.encode_decision(0, 0, 0); // pred_mode_flag = 0 (MODE_INTER)
+            enc.encode_decision(0, 0, 1); // merge_mode_flag = 1
+            enc.encode_decision(0, 0, 0); // merge_idx = 0 → zero-MV
+            enc.encode_decision(0, 0, cbf); // cbf_luma
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            if cbf != 0 {
+                enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+                for _ in 0..39 {
+                    enc.encode_decision(0, 0, 1);
+                }
+                enc.encode_decision(0, 0, 0); // U terminator → level 40
+                enc.encode_bypass(0); // sign = +
+                enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+            }
+            enc.encode_terminate(true);
+            enc.finish()
+        };
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let mk_decode = |htdf: bool| SliceDecodeInputs {
+            slice_qp: 30,
+            sps_htdf_flag: htdf,
+            ..Default::default()
+        };
+        let gates = InterToolGates {
+            sps_admvp_flag: true,
+            ..Default::default()
+        };
+        let run = |rbsp: &[u8], htdf: bool| {
+            let ref_list_l0 = [mk_view()];
+            let inputs = InterDecodeInputs {
+                walk,
+                decode: mk_decode(htdf),
+                slice_is_b: false,
+                num_ref_idx_active_minus1_l0: 0,
+                num_ref_idx_active_minus1_l1: 0,
+                ref_list_l0: &ref_list_l0,
+                ref_list_l1: &[],
+                inter_tool_gates: gates,
+                pocs: Default::default(),
+                col_pic: None,
+            };
+            decode_baseline_inter_slice(rbsp, inputs).unwrap()
+        };
+        // cbf_luma = 1: HTDF fires and matches the direct bridge.
+        let rbsp = encode(1);
+        let (pic_off, stats_off) = run(&rbsp, false);
+        assert_eq!(stats_off.htdf_blocks, 0);
+        let (pic_on, stats_on) = run(&rbsp, true);
+        assert_eq!(stats_on.htdf_blocks, 1);
+        assert_ne!(pic_on.y, pic_off.y);
+        let mut pic_ref = pic_off.clone();
+        assert!(pic_ref.apply_htdf_luma(0, 0, 16, 16, 30, false, false));
+        assert_eq!(
+            pic_on.y, pic_ref.y,
+            "decode-integrated HTDF == direct bridge"
+        );
+        // cbf_luma = 0: the §8.5 step-7 gate suppresses the filter.
+        let rbsp0 = encode(0);
+        let (_pic0, stats0) = run(&rbsp0, true);
+        assert_eq!(
+            stats0.htdf_blocks, 0,
+            "inter HTDF is gated on cbf_luma == 1 (§8.5 step 7)"
         );
     }
 

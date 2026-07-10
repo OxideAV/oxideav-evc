@@ -787,6 +787,7 @@ impl EvcDecoder {
             slice_cr_qp_offset,
             sps_ibc_flag: sps.sps_ibc_flag,
             log2_max_ibc_cand_size,
+            sps_htdf_flag: sps.sps_htdf_flag,
         };
         // Resolve POCs to DPB views. This consumes immutable borrows
         // of `self.dpb`, so we collect into an owned Vec<RefPictureView>

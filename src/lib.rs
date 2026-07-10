@@ -407,6 +407,7 @@ pub fn decode_idr_slice(
         slice_cr_qp_offset: 0,
         sps_ibc_flag: sps.sps_ibc_flag,
         log2_max_ibc_cand_size,
+        sps_htdf_flag: sps.sps_htdf_flag,
     };
     slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
 }
