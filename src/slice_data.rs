@@ -8424,6 +8424,178 @@ mod tests {
         assert_eq!(pic.y.len(), 8 * 8);
     }
 
+    /// Round 404: ATS-inter **quad** sub-block transform on a 16×16
+    /// P-slice CU. A 16×16 CU (log2 4) makes all four allow flags true, so
+    /// the `ats_cu_inter_quad_flag` and `ats_cu_inter_horizontal_flag` are
+    /// both present. quad=1 / horizontal=1 / pos=1 → a 4×16 left sub-block
+    /// (§7.3.8.5 line 3113 `TrafoLog2Width = log2 − 2`), Table-31 trTypes
+    /// `(1, 1)`. Exercises the quad branch + the width-split scatter.
+    #[test]
+    fn round404_ats_inter_quad_sub_block_transform_16x16() {
+        use crate::cabac::CabacEncoder;
+        let ref_y = vec![200u16; 16 * 16];
+        let ref_cb = vec![100u16; 8 * 8];
+        let ref_cr = vec![80u16; 8 * 8];
+        let view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 16,
+            height: 16,
+            y_stride: 16,
+            c_stride: 8,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3
+        }
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // ATS-inter group (16×16 → quad flag present):
+        enc.encode_decision(0, 0, 1); // ats_cu_inter_flag = 1
+        enc.encode_decision(0, 0, 1); // ats_cu_inter_quad_flag = 1
+        enc.encode_decision(0, 0, 1); // ats_cu_inter_horizontal_flag = 1
+        enc.encode_decision(0, 0, 1); // ats_cu_inter_pos_flag = 1
+                                      // luma residual at the 4×16 sub-block (single DC coeff):
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
+        enc.encode_bypass(0); // coeff_sign_flag = 0
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 16,
+            pic_height: 16,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4, // 16×16 leaf, no split
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            tree_gates: CodingTreeGates {
+                sps_ats_flag: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let ref_list_l0 = [view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.coding_units, 1);
+        assert_eq!(stats.cbf_luma_bins, 1);
+        assert_eq!(stats.coeff_runs, 1);
+        // All four ATS-inter flags were present and consumed on 16×16.
+        assert_eq!(stats.ats_inter.cu_inter_flag_bins, 1);
+        assert_eq!(stats.ats_inter.quad_flag_bins, 1);
+        assert_eq!(stats.ats_inter.horizontal_flag_bins, 1);
+        assert_eq!(stats.ats_inter.pos_flag_bins, 1);
+        assert!(pic.cb.iter().all(|&v| v == 100));
+        assert!(pic.cr.iter().all(|&v| v == 80));
+        assert_eq!(pic.y.len(), 16 * 16);
+    }
+
+    /// Round 404: ATS-intra on a MODE_INTRA CU **inside a P slice**
+    /// (`decode_inter_intra_cu`) — the intra-in-inter path that milestone 2
+    /// wired. A `pred_mode_flag == 1` 32×32 CU reads the §7.3.8.5
+    /// `ats_cu_intra_flag` group (initType 1) and reconstructs through the
+    /// §8.7.4.2 kernels; exact bin tallies + a clean decode are the guard.
+    #[test]
+    fn round404_ats_intra_on_pb_intra_cu() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 32 * 32];
+        let ref_cb = vec![128u16; 16 * 16];
+        let ref_cr = vec![128u16; 16 * 16];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 32,
+            height: 32,
+            y_stride: 32,
+            c_stride: 16,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → 32×32 CU
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 1); // pred_mode_flag = 1 (INTRA)
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // §7.3.8.5 ATS-intra group:
+        enc.encode_bypass(1); // ats_cu_intra_flag = 1
+        enc.encode_decision(0, 0, 0); // ats_hor_mode = 0 → trTypeHor = 1
+        enc.encode_decision(0, 0, 1); // ats_ver_mode = 1 → trTypeVer = 2
+                                      // luma residual (single DC coeff):
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
+        enc.encode_bypass(0); // coeff_sign_flag = 0
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 32,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            tree_gates: CodingTreeGates {
+                sps_ats_flag: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.coding_units, 1);
+        assert_eq!(stats.cbf_luma_bins, 1);
+        assert_eq!(stats.ats_intra.cu_intra_flag_bins, 1);
+        assert_eq!(stats.ats_intra.hor_mode_bins, 1);
+        assert_eq!(stats.ats_intra.ver_mode_bins, 1);
+        assert_eq!(pic.y.len(), 32 * 32);
+    }
+
     /// IDR with `enable_deblock = true` runs the deblocking pass and
     /// reports `deblock_edges > 0`. With all CUs intra (DC) and
     /// `cbf_luma = 0`, every edge has bS = 0, so the picture is
