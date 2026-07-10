@@ -742,7 +742,10 @@ impl EvcDecoder {
         let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
         let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
         let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
-        let max_tb_log2_size_y = ctb_log2_size_y.min(5);
+        // eq. 51: MaxTbLog2SizeY is the constant 6 — NOT derived from the
+        // CTU size. A 64×64 CB is a single TB; only a 128-CTU stream's
+        // larger CBs tile into multiple TBs (§7.3.8.4 / §8.4.5 / §8.5.6).
+        let max_tb_log2_size_y = 6;
         let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
         let walk = SliceWalkInputs {
             pic_width: sps.pic_width_in_luma_samples,

@@ -268,7 +268,7 @@ pub fn walk_idr_slice(
     // `isIbcAllowed` per-CU.
     let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
     let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
-    let max_tb_log2_size_y = ctb_log2_size_y.min(6);
+    let max_tb_log2_size_y = 6; // eq. 51: MaxTbLog2SizeY = 6 (a constant)
     let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
     let inputs = slice_data::SliceWalkInputs {
         pic_width: sps.pic_width_in_luma_samples,
@@ -368,7 +368,7 @@ pub fn decode_idr_slice(
     let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
     let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
     let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
-    let max_tb_log2_size_y = ctb_log2_size_y.min(5); // round-3: cap at 32x32
+    let max_tb_log2_size_y = 6; // eq. 51: MaxTbLog2SizeY = 6 (a constant)
     let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
     let walk = slice_data::SliceWalkInputs {
         pic_width: sps.pic_width_in_luma_samples,
@@ -986,6 +986,72 @@ mod tests {
             .sum::<f64>()
             / pic.y.len() as f64;
         assert_eq!(mse, 0.0);
+    }
+
+    /// eq. 51 regression: `MaxTbLog2SizeY` is the constant 6, not a
+    /// CTU-derived cap. A Baseline SPS with `sps_btt_flag = 0` infers
+    /// `log2_ctu_size_minus5 = 1` (64×64 CTU); an unsplit 64×64 intra CB
+    /// is then a **single** 64×64 TB, so a lone DC coefficient must lift
+    /// the whole 64×64 luma plane uniformly. (The historical
+    /// `min(CtbLog2SizeY, 5)` cap parsed the same bins for a DC-only
+    /// block but reconstructed only the top-left 32×32 — the bottom-right
+    /// sample is the discriminator.)
+    #[test]
+    fn eq51_max_tb_is_constant_6_single_64x64_tb() {
+        use crate::cabac::CabacEncoder;
+        let sps = sps::parse(&build_baseline_sps_rbsp(64, 64)).unwrap();
+        assert_eq!(sps.log2_ctu_size_minus5, 1, "inferred 64×64 CTU");
+        let pps = pps::parse(&build_baseline_pps_rbsp()).unwrap();
+        let mut hdr = BitEmitter::new();
+        hdr.ue(0);
+        hdr.ue(2); // I slice
+        hdr.u(1, 0);
+        hdr.u(1, 0); // deblocking off
+        hdr.u(6, 51);
+        hdr.ue(0);
+        hdr.ue(0);
+        while hdr.bit_position() % 8 != 0 {
+            hdr.u(1, 0);
+        }
+        let mut slice_rbsp = hdr.into_bytes();
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → unsplit 64×64 CB
+                                      // luma CU: DC mode + one DC coefficient.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..63 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 = 63
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 64
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // chroma CU: no residual.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true);
+        slice_rbsp.extend_from_slice(&enc.finish());
+
+        let (pic, stats) = decode_idr_slice(&sps, &pps, &slice_rbsp).unwrap();
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(stats.cbf_luma_bins, 1, "single TU → one cbf_luma bin");
+        // The inverse transform of the lone coefficient spans the whole
+        // 64×64 TB: samples beyond the 33rd row/column move too. (Under
+        // the historical 32×32 cap the reconstruct only wrote the
+        // top-left 32×32, leaving these at the 128 prefill.)
+        assert_ne!(pic.y[0], 128, "residual must shift the plane");
+        assert_ne!(
+            pic.y[33], 128,
+            "row 0, col 33 lies outside a 32×32 TB — the 64×64 TB must cover it"
+        );
+        assert_ne!(
+            pic.y[33 * 64],
+            128,
+            "row 33, col 0 lies outside a 32×32 TB — the 64×64 TB must cover it"
+        );
+        // Chroma untouched.
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
     }
 
     /// End-to-end pixel decode through `make_decoder` (the registered
