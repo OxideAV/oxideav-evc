@@ -6950,60 +6950,167 @@ fn decode_inter_intra_cu(
         };
         (CuIntraMode::Baseline(m), crate::eipd::INTRA_DC)
     };
-    let mut cbf_luma = 0u8;
-    if is_luma_tree {
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
-        cbf_luma = eng.decode_decision(t, i)?;
-        stats.cbf_luma_bins += 1;
-    }
-    let mut cbf_cb = 0u8;
-    let mut cbf_cr = 0u8;
-    if chroma_present {
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
-        cbf_cb = eng.decode_decision(t, i)?;
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
-        cbf_cr = eng.decode_decision(t, i)?;
-        stats.cbf_chroma_bins += 2;
-    }
-    // §7.3.8.5 cu_qp_delta (round 397: MODE_INTRA CUs on P/B slices read
-    // the element under the same mode-independent presence gate).
-    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
-    let cu_qp = if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
-        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
-        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
-        stats.cu_qp_delta_abs_bins += 1;
-        let mut qp_delta = 0i32;
-        if qp_delta_abs > 0 {
-            let sign = eng.decode_bypass()?;
-            qp_delta = if sign != 0 {
-                -(qp_delta_abs as i32)
-            } else {
-                qp_delta_abs as i32
-            };
+    // §7.3.8.4 tiling: up to four transform_unit() invocations when the
+    // CB exceeds MaxTb (errata #238 (a) pins the bottom-right offset —
+    // see `transform_unit_offsets`). Residuals accumulate into CB-sized
+    // §8.4.5 resSamples buffers; prediction + picture construction run
+    // once over the whole CB.
+    let n_cb = (1usize << log2_cb_width) * (1usize << log2_cb_height);
+    let log2_cb_c_w = log2_cb_width.saturating_sub(1);
+    let log2_cb_c_h = log2_cb_height.saturating_sub(1);
+    let n_cb_c = (1usize << log2_cb_c_w) * (1usize << log2_cb_c_h);
+    let mut res_y = vec![0i32; if is_luma_tree { n_cb } else { 0 }];
+    let mut res_cb = vec![0i32; if chroma_present { n_cb_c } else { 0 }];
+    let mut res_cr = vec![0i32; if chroma_present { n_cb_c } else { 0 }];
+    let mut cbf_luma_any = 0u8;
+    let mut cu_qp = qp.qp_y;
+    for (tu_x, tu_y) in
+        transform_unit_offsets(log2_cb_width, log2_cb_height, walk.max_tb_log2_size_y)
+    {
+        let mut cbf_luma = 0u8;
+        if is_luma_tree {
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+            cbf_luma = eng.decode_decision(t, i)?;
+            stats.cbf_luma_bins += 1;
         }
-        qp.apply_delta(qp_delta)
-    } else {
-        qp.qp_y
-    };
+        let mut cbf_cb = 0u8;
+        let mut cbf_cr = 0u8;
+        if chroma_present {
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+            cbf_cb = eng.decode_decision(t, i)?;
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+            cbf_cr = eng.decode_decision(t, i)?;
+            stats.cbf_chroma_bins += 2;
+        }
+        // §7.3.8.5 cu_qp_delta (round 397: MODE_INTRA CUs on P/B slices
+        // read the element under the same mode-independent presence
+        // gate); the decoded delta folds into the eq. 1042 chain.
+        let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        if qp.cu_qp_delta_present(&walk, cu_qp_delta_code, cbf_any) {
+            let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+            let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
+            stats.cu_qp_delta_abs_bins += 1;
+            let mut qp_delta = 0i32;
+            if qp_delta_abs > 0 {
+                let sign = eng.decode_bypass()?;
+                qp_delta = if sign != 0 {
+                    -(qp_delta_abs as i32)
+                } else {
+                    qp_delta_abs as i32
+                };
+            }
+            cu_qp = qp.apply_delta(qp_delta);
+        }
+        cbf_luma_any |= cbf_luma;
+        if is_luma_tree {
+            // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group on
+            // a MODE_INTRA luma tree with cbf_luma and both log2CbW/H <=
+            // 5 (never on a TB-split CB). Read after the cu_qp block,
+            // before residual_coding (initType 1).
+            let ats_intra = if crate::ats::ats_intra_flag_present(
+                walk.tree_gates.sps_ats_flag,
+                log2_cb_width,
+                log2_cb_height,
+                cbf_luma != 0,
+            ) {
+                let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+                    walk.tree_gates.sps_cm_init_flag,
+                    crate::cabac::InitType::Pb,
+                );
+                crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
+            } else {
+                crate::ats::AtsIntra::disabled()
+            };
+            if cbf_luma != 0 {
+                let n_tb = (1usize << log2_tb_w) * (1usize << log2_tb_h);
+                let mut levels = vec![0i32; n_tb];
+                decode_residual_block(
+                    eng,
+                    sel,
+                    &walk,
+                    0,
+                    &mut levels,
+                    &mut stats.coeff_runs,
+                    &mut stats.adcc,
+                    log2_tb_w,
+                    log2_tb_h,
+                )?;
+                // §8.7.4.2 ATS-intra kernel selection on the luma
+                // transform.
+                let mut tu_res = vec![0i32; n_tb];
+                crate::dequant::scale_and_inverse_transform_ats(
+                    &levels,
+                    &mut tu_res,
+                    1usize << log2_tb_w,
+                    1usize << log2_tb_h,
+                    cu_qp,
+                    decode.bit_depth_luma,
+                    ats_intra.tr_type_hor,
+                    ats_intra.tr_type_ver,
+                )?;
+                scatter_tb_residual(
+                    &mut res_y,
+                    1usize << log2_cb_width,
+                    &tu_res,
+                    tu_x as usize,
+                    tu_y as usize,
+                    1usize << log2_tb_w,
+                    1usize << log2_tb_h,
+                );
+            }
+        }
+        if chroma_present && (cbf_cb != 0 || cbf_cr != 0) {
+            let log2_c_w = log2_tb_w.saturating_sub(1);
+            let log2_c_h = log2_tb_h.saturating_sub(1);
+            let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
+            let decode_one = |eng: &mut CabacEngine,
+                              stats: &mut InterDecodeStats,
+                              c_idx: u32,
+                              dst: &mut [i32]|
+             -> Result<()> {
+                let mut levels = vec![0i32; n_c];
+                decode_residual_block(
+                    eng,
+                    sel,
+                    &walk,
+                    c_idx,
+                    &mut levels,
+                    &mut stats.coeff_runs,
+                    &mut stats.adcc,
+                    log2_c_w,
+                    log2_c_h,
+                )?;
+                let mut tu_res = vec![0i32; n_c];
+                scale_and_inverse_transform(
+                    &levels,
+                    &mut tu_res,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                    cu_qp,
+                    decode.bit_depth_chroma,
+                )?;
+                scatter_tb_residual(
+                    dst,
+                    1usize << log2_cb_c_w,
+                    &tu_res,
+                    (tu_x >> 1) as usize,
+                    (tu_y >> 1) as usize,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                );
+                Ok(())
+            };
+            if cbf_cb != 0 {
+                decode_one(eng, stats, 1, &mut res_cb)?;
+            }
+            if cbf_cr != 0 {
+                decode_one(eng, stats, 2, &mut res_cr)?;
+            }
+        }
+    }
     if is_luma_tree {
-        // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group on a
-        // MODE_INTRA luma tree with cbf_luma and both log2CbW/H <= 5. Read
-        // after the cu_qp block, before residual_coding (initType 1).
-        let ats_intra = if crate::ats::ats_intra_flag_present(
-            walk.tree_gates.sps_ats_flag,
-            log2_cb_width,
-            log2_cb_height,
-            cbf_luma != 0,
-        ) {
-            let ctx = crate::eipd_syntax::EipdCtx::for_slice(
-                walk.tree_gates.sps_cm_init_flag,
-                crate::cabac::InitType::Pb,
-            );
-            crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
-        } else {
-            crate::ats::AtsIntra::disabled()
-        };
-        // Stamp side-info for the deblocking pass.
+        // Stamp side-info for the deblocking pass (aggregate cbf over
+        // the CB's TUs; the eq. 1042 chain value after the last delta).
         side_info.stamp_block(
             x0,
             y0,
@@ -7011,7 +7118,7 @@ fn decode_inter_intra_cu(
             1u32 << log2_cb_height,
             CuSideInfo {
                 pred_mode: CuPredMode::Intra,
-                cbf_luma,
+                cbf_luma: cbf_luma_any,
                 cu_x0: x0 as u16,
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_cb_width as u8,
@@ -7021,36 +7128,9 @@ fn decode_inter_intra_cu(
                 ..Default::default()
             },
         );
-        let n = (1usize << log2_tb_w) * (1usize << log2_tb_h);
-        let mut residual = vec![0i32; n];
-        if cbf_luma != 0 {
-            let mut levels = vec![0i32; n];
-            decode_residual_block(
-                eng,
-                sel,
-                &walk,
-                0,
-                &mut levels,
-                &mut stats.coeff_runs,
-                &mut stats.adcc,
-                log2_tb_w,
-                log2_tb_h,
-            )?;
-            // §8.7.4.2 ATS-intra kernel selection on the luma transform.
-            crate::dequant::scale_and_inverse_transform_ats(
-                &levels,
-                &mut residual,
-                1usize << log2_tb_w,
-                1usize << log2_tb_h,
-                cu_qp,
-                decode.bit_depth_luma,
-                ats_intra.tr_type_hor,
-                ats_intra.tr_type_ver,
-            )?;
-        }
         match intra_mode {
             CuIntraMode::Baseline(m) => {
-                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 0, &residual)?
+                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
             }
             CuIntraMode::Eipd(m) => {
                 let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
@@ -7058,13 +7138,13 @@ fn decode_inter_intra_cu(
                     pic,
                     x0,
                     y0,
-                    log2_tb_w,
-                    log2_tb_h,
+                    log2_cb_width,
+                    log2_cb_height,
                     m,
                     0,
                     walk.tree_gates.sps_suco_flag,
                     right,
-                    &residual,
+                    &res_y,
                 )?
             }
         }
@@ -7087,59 +7167,10 @@ fn decode_inter_intra_cu(
         }
     }
     if chroma_present {
-        let log2_c_w = log2_tb_w.saturating_sub(1);
-        let log2_c_h = log2_tb_h.saturating_sub(1);
-        let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
-        let mut res_cb = vec![0i32; n_c];
-        let mut res_cr = vec![0i32; n_c];
-        if cbf_cb != 0 {
-            let mut levels = vec![0i32; n_c];
-            decode_residual_block(
-                eng,
-                sel,
-                &walk,
-                1,
-                &mut levels,
-                &mut stats.coeff_runs,
-                &mut stats.adcc,
-                log2_c_w,
-                log2_c_h,
-            )?;
-            scale_and_inverse_transform(
-                &levels,
-                &mut res_cb,
-                1usize << log2_c_w,
-                1usize << log2_c_h,
-                cu_qp,
-                decode.bit_depth_chroma,
-            )?;
-        }
-        if cbf_cr != 0 {
-            let mut levels = vec![0i32; n_c];
-            decode_residual_block(
-                eng,
-                sel,
-                &walk,
-                2,
-                &mut levels,
-                &mut stats.coeff_runs,
-                &mut stats.adcc,
-                log2_c_w,
-                log2_c_h,
-            )?;
-            scale_and_inverse_transform(
-                &levels,
-                &mut res_cr,
-                1usize << log2_c_w,
-                1usize << log2_c_h,
-                cu_qp,
-                decode.bit_depth_chroma,
-            )?;
-        }
         match intra_mode {
             CuIntraMode::Baseline(m) => {
-                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 1, &res_cb)?;
-                intra_reconstruct_cb(pic, x0, y0, log2_tb_w, log2_tb_h, m, 2, &res_cr)?;
+                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 1, &res_cb)?;
+                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 2, &res_cr)?;
             }
             CuIntraMode::Eipd(_) => {
                 let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
@@ -7147,8 +7178,8 @@ fn decode_inter_intra_cu(
                     pic,
                     x0,
                     y0,
-                    log2_tb_w,
-                    log2_tb_h,
+                    log2_cb_width,
+                    log2_cb_height,
                     eipd_chroma_mode,
                     1,
                     walk.tree_gates.sps_suco_flag,
@@ -7159,8 +7190,8 @@ fn decode_inter_intra_cu(
                     pic,
                     x0,
                     y0,
-                    log2_tb_w,
-                    log2_tb_h,
+                    log2_cb_width,
+                    log2_cb_height,
                     eipd_chroma_mode,
                     2,
                     walk.tree_gates.sps_suco_flag,
@@ -8857,6 +8888,97 @@ mod tests {
         assert_eq!(stats.ats_intra.hor_mode_bins, 1);
         assert_eq!(stats.ats_intra.ver_mode_bins, 1);
         assert_eq!(pic.y.len(), 32 * 32);
+    }
+
+    /// §7.3.8.4 TB-split on the **P-slice intra** path
+    /// (`decode_inter_intra_cu`): a `pred_mode_flag == 1` 64×64 CU at
+    /// `max_tb_log2_size_y = 5` decodes four single-tree
+    /// `transform_unit()` bodies (cbf_luma + cbf_cb + cbf_cr each); the
+    /// residual in the fourth TU must land in the bottom-right luma
+    /// quadrant — the errata #238 (a) offset on the intra-in-inter path.
+    #[test]
+    fn errata_238a_pb_intra_tb_split() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let ref_y = vec![200u16; 64 * 64];
+        let ref_cb = vec![128u16; 32 * 32];
+        let ref_cr = vec![128u16; 32 * 32];
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 64,
+            height: 64,
+            y_stride: 64,
+            c_stride: 32,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → 64×64 CU
+        enc.encode_decision(0, 0, 0); // cu_skip_flag = 0
+        enc.encode_decision(0, 0, 1); // pred_mode_flag = 1 (INTRA)
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+                                      // TUs 1-3: quiet single-tree bodies.
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        // TU 4 (bottom-right): one luma coefficient.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5, // force the 2×2 TB split
+            chroma_format_idc: 1,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            ..Default::default()
+        };
+        let ref_list_l0 = [ref_view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: InterToolGates::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.coding_units, 1);
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        // Intra DC over an all-unavailable neighbourhood → 128 base;
+        // only the bottom-right quadrant lifts.
+        let quadrant_touched = |qx: usize, qy: usize| -> bool {
+            (0..32).any(|y| (0..32).any(|x| pic.y[(qy * 32 + y) * 64 + qx * 32 + x] != 128))
+        };
+        assert!(!quadrant_touched(0, 0));
+        assert!(!quadrant_touched(1, 0));
+        assert!(!quadrant_touched(0, 1));
+        assert!(
+            quadrant_touched(1, 1),
+            "P-slice intra TB-split bottom-right offset — errata #238 (a)"
+        );
     }
 
     /// IDR with `enable_deblock = true` runs the deblocking pass and
