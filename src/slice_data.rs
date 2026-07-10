@@ -1051,7 +1051,72 @@ fn walk_coding_unit(
     )
 }
 
-/// `transform_unit()` per §7.3.8.5 — Baseline + I-slice subset.
+/// §7.3.8.4 (spec lines 3031–3048) transform-unit tiling: a CB whose
+/// width or height exceeds `MaxTbSizeY` is covered by up to four
+/// `transform_unit()` invocations at max-TB granularity, in the spec's
+/// call order — `(0, 0)` always; `(1 << log2TbWidth, 0)` when the width
+/// splits; `(0, 1 << log2TbHeight)` when the height splits; and
+/// `(1 << log2TbWidth, 1 << log2TbHeight)` when both split.
+///
+/// Errata #238 (a): the fourth call's x-offset is printed as
+/// `1 << logTbWidth` (spec line 3046) — an identifier assigned nowhere
+/// in the document. It resolves to `log2TbWidth`, the spelling of the
+/// three sibling calls (lines 3037/3040/3043), so the bottom-right
+/// transform block sits at `(x0 + 2^log2TbWidth, y0 + 2^log2TbHeight)`
+/// and the 2×2 max-TB tiling closes. The §8.4.5 / §8.5.6.2 residual
+/// recursion walks the same quadrants in the same order.
+///
+/// Offsets are luma samples relative to the CB origin. With eq. 51's
+/// constant `MaxTbLog2SizeY = 6` and CTU ≤ 128 the split is at most one
+/// level per dimension — exactly what the §7.3.8.4 syntax expresses.
+fn transform_unit_offsets(
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    max_tb_log2_size_y: u32,
+) -> impl Iterator<Item = (u32, u32)> {
+    let split_w = log2_cb_width > max_tb_log2_size_y;
+    let split_h = log2_cb_height > max_tb_log2_size_y;
+    let tb_w = 1u32 << log2_cb_width.min(max_tb_log2_size_y);
+    let tb_h = 1u32 << log2_cb_height.min(max_tb_log2_size_y);
+    let mut offsets = [(0u32, 0u32); 4];
+    let mut n = 1;
+    if split_w {
+        offsets[n] = (tb_w, 0);
+        n += 1;
+    }
+    if split_h {
+        offsets[n] = (0, tb_h);
+        n += 1;
+    }
+    if split_w && split_h {
+        // Errata #238 (a): `logTbWidth` → `log2TbWidth`.
+        offsets[n] = (tb_w, tb_h);
+        n += 1;
+    }
+    offsets.into_iter().take(n)
+}
+
+/// Place a TB-sized residual into the CB-sized `resSamples` buffer at
+/// the TB offset — the §8.4.5 eq. 386 (and §8.5.6.2/.3) resSamples
+/// modification step. `full_w` is the CB row stride in the component's
+/// sample units; offsets/dimensions are in the same units.
+fn scatter_tb_residual(
+    full: &mut [i32],
+    full_w: usize,
+    tb: &[i32],
+    x0: usize,
+    y0: usize,
+    tb_w: usize,
+    tb_h: usize,
+) {
+    for yy in 0..tb_h {
+        let dst = (y0 + yy) * full_w + x0;
+        full[dst..dst + tb_w].copy_from_slice(&tb[yy * tb_w..(yy + 1) * tb_w]);
+    }
+}
+
+/// `transform_unit()` per §7.3.8.5 — Baseline + I-slice subset, looped
+/// over the §7.3.8.4 tiling (up to four TUs when the CB exceeds MaxTb).
 #[allow(clippy::too_many_arguments)]
 fn walk_transform_unit(
     eng: &mut CabacEngine,
@@ -1066,59 +1131,67 @@ fn walk_transform_unit(
     let log2_tb_width = log2_cb_width.min(inputs.max_tb_log2_size_y);
     let log2_tb_height = log2_cb_height.min(inputs.max_tb_log2_size_y);
     let chroma_present = inputs.chroma_format_idc != 0;
-    let mut cbf_cb = 0u32;
-    let mut cbf_cr = 0u32;
-    let mut cbf_luma = 0u32;
-    // Line 3066: treeType != DUAL_TREE_LUMA && ChromaArrayType != 0 → cbf_cb,cbf_cr.
-    if tree_type != TreeType::DualTreeLuma && chroma_present {
-        cbf_cb = eng.decode_decision(0, 0)? as u32;
-        cbf_cr = eng.decode_decision(0, 0)? as u32;
-        stats.cbf_chroma_bins += 2;
-    }
     // Line 3070: (isSplit || CuPredMode==INTRA || cbf_cb || cbf_cr) &&
     //            treeType != DUAL_TREE_CHROMA → cbf_luma.
-    // For Baseline + I slice, isSplit derives from CB > MaxTb (we cap above).
     let is_split =
         log2_cb_width > inputs.max_tb_log2_size_y || log2_cb_height > inputs.max_tb_log2_size_y;
     let is_intra = true;
-    if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0) && tree_type != TreeType::DualTreeChroma
+    // §7.3.8.4 tiling — each TU repeats the whole §7.3.8.5 body (the
+    // stats-only walker ignores the offsets).
+    for (_tu_x, _tu_y) in
+        transform_unit_offsets(log2_cb_width, log2_cb_height, inputs.max_tb_log2_size_y)
     {
-        cbf_luma = eng.decode_decision(0, 0)? as u32;
-        stats.cbf_luma_bins += 1;
-    }
-    // Line 3073: cu_qp_delta_abs gated by cu_qp_delta_enabled_flag and a
-    // complex condition. With sps_dquant_flag=0 (Baseline) the inner check
-    // becomes `(cbf_luma || cbf_cb || cbf_cr)`.
-    if inputs.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
-        let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
-        stats.cu_qp_delta_abs_bins += 1;
-        if qp_delta_abs > 0 {
-            // cu_qp_delta_sign_flag: FL with cMax=1 → bypass-coded? The
-            // table descriptor says ae(v) with FL,cMax=1, but Table 95 has
-            // no entry for cu_qp_delta_sign_flag → treated as bypass per
-            // 9.3.4.2.1 (entry "bypass" or unlisted defaults to bypass for
-            // ae(v) elements without a Table 95 row, by inspection). We
-            // pessimistically use bypass (matches reference behaviour).
-            let _sign = eng.decode_bypass()?;
+        let mut cbf_cb = 0u32;
+        let mut cbf_cr = 0u32;
+        let mut cbf_luma = 0u32;
+        // Line 3066: treeType != DUAL_TREE_LUMA && ChromaArrayType != 0 →
+        // cbf_cb, cbf_cr.
+        if tree_type != TreeType::DualTreeLuma && chroma_present {
+            cbf_cb = eng.decode_decision(0, 0)? as u32;
+            cbf_cr = eng.decode_decision(0, 0)? as u32;
+            stats.cbf_chroma_bins += 2;
         }
-    }
-    // ats_*: sps_ats_flag=0 in Baseline → suppressed.
-    // residual_coding for each component if its CBF is set.
-    // sps_adcc_flag=0 in Baseline → run-length residual coding.
-    if cbf_luma != 0 {
-        walk_residual_coding_rle(eng, stats, log2_tb_width, log2_tb_height)?;
-    }
-    if cbf_cb != 0 {
-        // Chroma block dimensions: log2_tb_width - SubWidthC + 1, etc.
-        // For 4:2:0 (SubWidthC=SubHeightC=2): subtract 1 from each log2.
-        let log2_c_w = log2_tb_width.saturating_sub(1);
-        let log2_c_h = log2_tb_height.saturating_sub(1);
-        walk_residual_coding_rle(eng, stats, log2_c_w, log2_c_h)?;
-    }
-    if cbf_cr != 0 {
-        let log2_c_w = log2_tb_width.saturating_sub(1);
-        let log2_c_h = log2_tb_height.saturating_sub(1);
-        walk_residual_coding_rle(eng, stats, log2_c_w, log2_c_h)?;
+        if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0)
+            && tree_type != TreeType::DualTreeChroma
+        {
+            cbf_luma = eng.decode_decision(0, 0)? as u32;
+            stats.cbf_luma_bins += 1;
+        }
+        // Line 3073: cu_qp_delta_abs gated by cu_qp_delta_enabled_flag and
+        // a complex condition. With sps_dquant_flag=0 (Baseline) the inner
+        // check becomes `(cbf_luma || cbf_cb || cbf_cr)`.
+        if inputs.cu_qp_delta_enabled && (cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0) {
+            let qp_delta_abs = eng.decode_u_regular(0, |_| 0)?;
+            stats.cu_qp_delta_abs_bins += 1;
+            if qp_delta_abs > 0 {
+                // cu_qp_delta_sign_flag: FL with cMax=1 → bypass-coded? The
+                // table descriptor says ae(v) with FL,cMax=1, but Table 95
+                // has no entry for cu_qp_delta_sign_flag → treated as
+                // bypass per 9.3.4.2.1 (entry "bypass" or unlisted defaults
+                // to bypass for ae(v) elements without a Table 95 row, by
+                // inspection). We pessimistically use bypass (matches
+                // reference behaviour).
+                let _sign = eng.decode_bypass()?;
+            }
+        }
+        // ats_*: sps_ats_flag=0 in Baseline → suppressed.
+        // residual_coding for each component if its CBF is set.
+        // sps_adcc_flag=0 in Baseline → run-length residual coding.
+        if cbf_luma != 0 {
+            walk_residual_coding_rle(eng, stats, log2_tb_width, log2_tb_height)?;
+        }
+        if cbf_cb != 0 {
+            // Chroma block dimensions: log2_tb_width - SubWidthC + 1, etc.
+            // For 4:2:0 (SubWidthC=SubHeightC=2): subtract 1 from each log2.
+            let log2_c_w = log2_tb_width.saturating_sub(1);
+            let log2_c_h = log2_tb_height.saturating_sub(1);
+            walk_residual_coding_rle(eng, stats, log2_c_w, log2_c_h)?;
+        }
+        if cbf_cr != 0 {
+            let log2_c_w = log2_tb_width.saturating_sub(1);
+            let log2_c_h = log2_tb_height.saturating_sub(1);
+            walk_residual_coding_rle(eng, stats, log2_c_w, log2_c_h)?;
+        }
     }
     Ok(())
 }
@@ -2845,74 +2918,218 @@ fn decode_transform_unit(
     let chroma_present = walk.chroma_format_idc != 0;
     let sel =
         crate::cabac_init::CtxSel::new(walk.tree_gates.sps_cm_init_flag, crate::cabac::InitType::I);
-    let mut cbf_cb = 0u32;
-    let mut cbf_cr = 0u32;
-    let mut cbf_luma = 0u32;
-    if tree_type != TreeType::DualTreeLuma && chroma_present {
-        // Tables 76 / 77, ctxInc 0 (Table 95).
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
-        cbf_cb = eng.decode_decision(t, i)? as u32;
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
-        cbf_cr = eng.decode_decision(t, i)? as u32;
-        stats.cbf_chroma_bins += 2;
-    }
     let is_split =
         log2_cb_width > walk.max_tb_log2_size_y || log2_cb_height > walk.max_tb_log2_size_y;
     let is_intra = true;
-    if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0) && tree_type != TreeType::DualTreeChroma
-    {
-        // Table 75, ctxInc 0 (Table 95).
-        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
-        cbf_luma = eng.decode_decision(t, i)? as u32;
-        stats.cbf_luma_bins += 1;
-    }
-    // §7.3.8.5 lines 3073-3078: the cu_qp_delta group under both the
-    // Baseline (`!sps_dquant_flag` → cbf-gated) and dquant (`cuQpDeltaCode`
-    // + `isCuQpDeltaCoded` latch) presence forms; the decoded delta folds
-    // into the §8.7.1 eq. 1042 QpY chain.
-    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
-    let cu_qp = if qp.cu_qp_delta_present(walk, cu_qp_delta_code, cbf_any) {
-        // Table 78; U binarisation with ctxInc 0 for every bin (Table 95).
-        let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
-        let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
-        stats.cu_qp_delta_abs_bins += 1;
-        let mut qp_delta = 0i32;
-        if qp_delta_abs > 0 {
-            let sign = eng.decode_bypass()?;
-            qp_delta = if sign != 0 {
-                -(qp_delta_abs as i32)
-            } else {
-                qp_delta_abs as i32
-            };
-        }
-        qp.apply_delta(qp_delta)
-    } else {
-        qp.qp_y
-    };
-    // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group, present on
-    // an intra (MODE_INTRA) CU whose luma tree carries cbf_luma and both
-    // log2CbW/H <= 5. Read after the cu_qp block, before residual_coding.
-    // IBC CUs (MODE_IBC) and the standalone chroma tree do not carry it.
     let is_luma_intra_tree = matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree);
-    let ats_intra = if is_luma_intra_tree
-        && !luma_cu_is_ibc
-        && crate::ats::ats_intra_flag_present(
-            walk.tree_gates.sps_ats_flag,
-            log2_cb_width,
-            log2_cb_height,
-            cbf_luma != 0,
-        ) {
-        let ctx = crate::eipd_syntax::EipdCtx::for_slice(
-            walk.tree_gates.sps_cm_init_flag,
-            crate::cabac::InitType::I,
-        );
-        crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
-    } else {
-        crate::ats::AtsIntra::disabled()
-    };
+    // CB-sized residual accumulators. Per §8.4.1/§8.4.5 the residual
+    // process fills an (nCbW)x(nCbH) resSamples array TB by TB (eq. 386);
+    // intra prediction and the §8.7.5 picture construction then run once
+    // over the whole CB.
+    let n_cb = (1usize << log2_cb_width) * (1usize << log2_cb_height);
+    let log2_cb_c_w = log2_cb_width.saturating_sub(1);
+    let log2_cb_c_h = log2_cb_height.saturating_sub(1);
+    let n_cb_c = (1usize << log2_cb_c_w) * (1usize << log2_cb_c_h);
+    let mut res_y = vec![0i32; if is_luma_intra_tree { n_cb } else { 0 }];
+    let chroma_tree = tree_type == TreeType::DualTreeChroma && chroma_present;
+    let mut res_cb = vec![0i32; if chroma_tree { n_cb_c } else { 0 }];
+    let mut res_cr = vec![0i32; if chroma_tree { n_cb_c } else { 0 }];
+    let mut cbf_luma_any = 0u32;
+    let mut cbf_cb_any = 0u32;
+    let mut cbf_cr_any = 0u32;
+    // eq. 1042: each TU consumes the QP chain value current after any
+    // delta the TU itself reads; delta-less TUs inherit the running one.
+    let mut cu_qp = qp.qp_y;
+    // §7.3.8.4 tiling: up to four transform_unit() invocations when the
+    // CB exceeds MaxTb (errata #238 (a) pins the bottom-right offset —
+    // see `transform_unit_offsets`).
+    for (tu_x, tu_y) in
+        transform_unit_offsets(log2_cb_width, log2_cb_height, walk.max_tb_log2_size_y)
+    {
+        let mut cbf_cb = 0u32;
+        let mut cbf_cr = 0u32;
+        let mut cbf_luma = 0u32;
+        if tree_type != TreeType::DualTreeLuma && chroma_present {
+            // Tables 76 / 77, ctxInc 0 (Table 95).
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+            cbf_cb = eng.decode_decision(t, i)? as u32;
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+            cbf_cr = eng.decode_decision(t, i)? as u32;
+            stats.cbf_chroma_bins += 2;
+        }
+        if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0)
+            && tree_type != TreeType::DualTreeChroma
+        {
+            // Table 75, ctxInc 0 (Table 95).
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+            cbf_luma = eng.decode_decision(t, i)? as u32;
+            stats.cbf_luma_bins += 1;
+        }
+        // §7.3.8.5 lines 3073-3078: the cu_qp_delta group under both the
+        // Baseline (`!sps_dquant_flag` → cbf-gated) and dquant
+        // (`cuQpDeltaCode` + `isCuQpDeltaCoded` latch) presence forms; the
+        // decoded delta folds into the §8.7.1 eq. 1042 QpY chain.
+        let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        if qp.cu_qp_delta_present(walk, cu_qp_delta_code, cbf_any) {
+            // Table 78; U binarisation with ctxInc 0 for every bin
+            // (Table 95).
+            let (qt, qi) = sel.ctx(crate::cabac_init::MainCtxTable::CuQpDeltaAbs, 0);
+            let qp_delta_abs = eng.decode_u_regular(qt, |_| qi)?;
+            stats.cu_qp_delta_abs_bins += 1;
+            let mut qp_delta = 0i32;
+            if qp_delta_abs > 0 {
+                let sign = eng.decode_bypass()?;
+                qp_delta = if sign != 0 {
+                    -(qp_delta_abs as i32)
+                } else {
+                    qp_delta_abs as i32
+                };
+            }
+            cu_qp = qp.apply_delta(qp_delta);
+        }
+        // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group, present
+        // on an intra (MODE_INTRA) CU whose luma tree carries cbf_luma and
+        // both log2CbW/H <= 5 (so never on a TB-split CB, whose dimensions
+        // exceed MaxTb ≥ 5). Read after the cu_qp block, before
+        // residual_coding. IBC CUs (MODE_IBC) and the standalone chroma
+        // tree do not carry it.
+        let ats_intra = if is_luma_intra_tree
+            && !luma_cu_is_ibc
+            && crate::ats::ats_intra_flag_present(
+                walk.tree_gates.sps_ats_flag,
+                log2_cb_width,
+                log2_cb_height,
+                cbf_luma != 0,
+            ) {
+            let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+                walk.tree_gates.sps_cm_init_flag,
+                crate::cabac::InitType::I,
+            );
+            crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
+        } else {
+            crate::ats::AtsIntra::disabled()
+        };
+        cbf_luma_any |= cbf_luma;
+        cbf_cb_any |= cbf_cb;
+        cbf_cr_any |= cbf_cr;
+        // residual_coding per component at TB dimensions; each inverse
+        // transform lands in the CB-sized buffer at the TU offset
+        // (§8.4.5 eq. 386).
+        if cbf_luma != 0 {
+            let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
+            let mut levels = vec![0i32; n_tb];
+            decode_residual_block(
+                eng,
+                sel,
+                walk,
+                0,
+                &mut levels,
+                &mut stats.coeff_runs,
+                &mut stats.adcc,
+                log2_tb_width,
+                log2_tb_height,
+            )?;
+            // §8.7.4.2: when ats_cu_intra_flag == 1 the luma inverse
+            // transform selects the Table-30 (trTypeHor, trTypeVer)
+            // DST-VII / DCT-VIII kernels; otherwise plain DCT-II.
+            let mut tu_res = vec![0i32; n_tb];
+            crate::dequant::scale_and_inverse_transform_ats(
+                &levels,
+                &mut tu_res,
+                1usize << log2_tb_width,
+                1usize << log2_tb_height,
+                cu_qp,
+                decode.bit_depth_luma,
+                ats_intra.tr_type_hor,
+                ats_intra.tr_type_ver,
+            )?;
+            scatter_tb_residual(
+                &mut res_y,
+                1usize << log2_cb_width,
+                &tu_res,
+                tu_x as usize,
+                tu_y as usize,
+                1usize << log2_tb_width,
+                1usize << log2_tb_height,
+            );
+        }
+        if chroma_tree {
+            // 4:2:0 chroma TB: (log2Tb − 1) at the (tu_x/2, tu_y/2)
+            // offset within the chroma CB.
+            let log2_c_w = log2_tb_width.saturating_sub(1);
+            let log2_c_h = log2_tb_height.saturating_sub(1);
+            let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
+            if cbf_cb != 0 {
+                let mut levels = vec![0i32; n_c];
+                decode_residual_block(
+                    eng,
+                    sel,
+                    walk,
+                    1,
+                    &mut levels,
+                    &mut stats.coeff_runs,
+                    &mut stats.adcc,
+                    log2_c_w,
+                    log2_c_h,
+                )?;
+                let mut tu_res = vec![0i32; n_c];
+                scale_and_inverse_transform(
+                    &levels,
+                    &mut tu_res,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                    cu_qp,
+                    decode.bit_depth_chroma,
+                )?;
+                scatter_tb_residual(
+                    &mut res_cb,
+                    1usize << log2_cb_c_w,
+                    &tu_res,
+                    (tu_x >> 1) as usize,
+                    (tu_y >> 1) as usize,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                );
+            }
+            if cbf_cr != 0 {
+                let mut levels = vec![0i32; n_c];
+                decode_residual_block(
+                    eng,
+                    sel,
+                    walk,
+                    2,
+                    &mut levels,
+                    &mut stats.coeff_runs,
+                    &mut stats.adcc,
+                    log2_c_w,
+                    log2_c_h,
+                )?;
+                let mut tu_res = vec![0i32; n_c];
+                scale_and_inverse_transform(
+                    &levels,
+                    &mut tu_res,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                    cu_qp,
+                    decode.bit_depth_chroma,
+                )?;
+                scatter_tb_residual(
+                    &mut res_cr,
+                    1usize << log2_cb_c_w,
+                    &tu_res,
+                    (tu_x >> 1) as usize,
+                    (tu_y >> 1) as usize,
+                    1usize << log2_c_w,
+                    1usize << log2_c_h,
+                );
+            }
+        }
+    }
     // Stamp deblocking side-info for this CU (intra prediction in IDR
-    // path → CuPredMode::Intra; CBF tracked for BS=1 cases).
-    if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
+    // path → CuPredMode::Intra; CBF tracked for BS=1 cases — the
+    // aggregate over the CB's TUs — and the eq. 1042 chain value after
+    // the CB's last delta).
+    if is_luma_intra_tree {
         side_info.stamp_block(
             x0,
             y0,
@@ -2920,7 +3137,7 @@ fn decode_transform_unit(
             1u32 << log2_cb_height,
             CuSideInfo {
                 pred_mode: CuPredMode::Intra,
-                cbf_luma: cbf_luma as u8,
+                cbf_luma: cbf_luma_any as u8,
                 cu_x0: x0 as u16,
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_cb_width as u8,
@@ -2931,122 +3148,35 @@ fn decode_transform_unit(
             },
         );
     }
-    // Reconstruct: intra prediction + (optional) residual.
+    // Reconstruct: whole-CB intra prediction + the accumulated residual
+    // (§8.4.1 predicts at CB dimensions; the TB split only affects the
+    // residual assembly above).
     match tree_type {
-        TreeType::DualTreeLuma | TreeType::SingleTree => {
-            let n = (1usize << log2_tb_width) * (1usize << log2_tb_height);
-            let mut residual = vec![0i32; n];
-            if cbf_luma != 0 {
-                let mut levels = vec![0i32; n];
-                decode_residual_block(
-                    eng,
-                    sel,
-                    walk,
-                    0,
-                    &mut levels,
-                    &mut stats.coeff_runs,
-                    &mut stats.adcc,
-                    log2_tb_width,
-                    log2_tb_height,
-                )?;
-                // §8.7.4.2: when ats_cu_intra_flag == 1 the luma inverse
-                // transform selects the Table-30 (trTypeHor, trTypeVer)
-                // DST-VII / DCT-VIII kernels; otherwise plain DCT-II.
-                crate::dequant::scale_and_inverse_transform_ats(
-                    &levels,
-                    &mut residual,
-                    1usize << log2_tb_width,
-                    1usize << log2_tb_height,
-                    cu_qp,
-                    decode.bit_depth_luma,
-                    ats_intra.tr_type_hor,
-                    ats_intra.tr_type_ver,
-                )?;
+        TreeType::DualTreeLuma | TreeType::SingleTree => match intra_mode {
+            CuIntraMode::Baseline(m) => {
+                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
             }
-            // For luma blocks larger than max_tb, the spec splits the CB
-            // into multiple TBs. Round-5 fixtures keep CB == TB.
-            match intra_mode {
-                CuIntraMode::Baseline(m) => intra_reconstruct_cb(
+            CuIntraMode::Eipd(m) => {
+                let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
+                crate::picture::intra_reconstruct_cb_eipd(
                     pic,
                     x0,
                     y0,
-                    log2_tb_width,
-                    log2_tb_height,
+                    log2_cb_width,
+                    log2_cb_height,
                     m,
                     0,
-                    &residual,
-                )?,
-                CuIntraMode::Eipd(m) => {
-                    let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
-                    crate::picture::intra_reconstruct_cb_eipd(
-                        pic,
-                        x0,
-                        y0,
-                        log2_tb_width,
-                        log2_tb_height,
-                        m,
-                        0,
-                        walk.tree_gates.sps_suco_flag,
-                        right,
-                        &residual,
-                    )?
-                }
+                    walk.tree_gates.sps_suco_flag,
+                    right,
+                    &res_y,
+                )?
             }
-        }
+        },
         TreeType::DualTreeChroma => {
             if chroma_present {
                 // For sps_eipd_flag=0, intra_chroma_pred_mode is suppressed
                 // → IntraPredModeC = IntraPredModeY for the same CU. Round-5
                 // fixtures restrict to DC so this inheritance is moot.
-                let log2_c_w = log2_tb_width.saturating_sub(1);
-                let log2_c_h = log2_tb_height.saturating_sub(1);
-                let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
-                let mut res_cb = vec![0i32; n_c];
-                let mut res_cr = vec![0i32; n_c];
-                if cbf_cb != 0 {
-                    let mut levels = vec![0i32; n_c];
-                    decode_residual_block(
-                        eng,
-                        sel,
-                        walk,
-                        1,
-                        &mut levels,
-                        &mut stats.coeff_runs,
-                        &mut stats.adcc,
-                        log2_c_w,
-                        log2_c_h,
-                    )?;
-                    scale_and_inverse_transform(
-                        &levels,
-                        &mut res_cb,
-                        1usize << log2_c_w,
-                        1usize << log2_c_h,
-                        cu_qp,
-                        decode.bit_depth_chroma,
-                    )?;
-                }
-                if cbf_cr != 0 {
-                    let mut levels = vec![0i32; n_c];
-                    decode_residual_block(
-                        eng,
-                        sel,
-                        walk,
-                        2,
-                        &mut levels,
-                        &mut stats.coeff_runs,
-                        &mut stats.adcc,
-                        log2_c_w,
-                        log2_c_h,
-                    )?;
-                    scale_and_inverse_transform(
-                        &levels,
-                        &mut res_cr,
-                        1usize << log2_c_w,
-                        1usize << log2_c_h,
-                        cu_qp,
-                        decode.bit_depth_chroma,
-                    )?;
-                }
                 if luma_cu_is_ibc {
                     // Round 90: the matching luma `coding_unit()` was
                     // IBC and already wrote chroma samples via
@@ -3055,24 +3185,24 @@ fn decode_transform_unit(
                     // just add the chroma residual on top (rare in
                     // round-90 fixtures — `cbf_cb == cbf_cr == 0`
                     // typically).
-                    if cbf_cb != 0 {
+                    if cbf_cb_any != 0 {
                         add_chroma_residual_to_block(
                             pic,
                             x0,
                             y0,
-                            log2_tb_width,
-                            log2_tb_height,
+                            log2_cb_width,
+                            log2_cb_height,
                             1,
                             &res_cb,
                         )?;
                     }
-                    if cbf_cr != 0 {
+                    if cbf_cr_any != 0 {
                         add_chroma_residual_to_block(
                             pic,
                             x0,
                             y0,
-                            log2_tb_width,
-                            log2_tb_height,
+                            log2_cb_width,
+                            log2_cb_height,
                             2,
                             &res_cr,
                         )?;
@@ -3084,8 +3214,8 @@ fn decode_transform_unit(
                                 pic,
                                 x0,
                                 y0,
-                                log2_tb_width,
-                                log2_tb_height,
+                                log2_cb_width,
+                                log2_cb_height,
                                 m,
                                 1,
                                 &res_cb,
@@ -3094,8 +3224,8 @@ fn decode_transform_unit(
                                 pic,
                                 x0,
                                 y0,
-                                log2_tb_width,
-                                log2_tb_height,
+                                log2_cb_width,
+                                log2_cb_height,
                                 m,
                                 2,
                                 &res_cr,
@@ -3108,8 +3238,8 @@ fn decode_transform_unit(
                                 pic,
                                 x0,
                                 y0,
-                                log2_tb_width,
-                                log2_tb_height,
+                                log2_cb_width,
+                                log2_cb_height,
                                 m,
                                 1,
                                 walk.tree_gates.sps_suco_flag,
@@ -3120,8 +3250,8 @@ fn decode_transform_unit(
                                 pic,
                                 x0,
                                 y0,
-                                log2_tb_width,
-                                log2_tb_height,
+                                log2_cb_width,
+                                log2_cb_height,
                                 m,
                                 2,
                                 walk.tree_gates.sps_suco_flag,
@@ -8706,6 +8836,193 @@ mod tests {
         assert!(pic.y.iter().all(|&v| v == 128));
         assert!(pic.cb.iter().all(|&v| v == 128));
         assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// §7.3.8.4 + errata #238 (a): the `transform_unit()` tiling offsets.
+    /// Order and positions follow the four spec calls (lines 3037-3046);
+    /// the bottom-right x-offset is the erratum-resolved
+    /// `1 << log2TbWidth` (the printed `logTbWidth` is a dropped-`2`
+    /// typo, assigned nowhere).
+    #[test]
+    fn errata_238a_transform_unit_offsets() {
+        let v = |cw, ch, mtb| transform_unit_offsets(cw, ch, mtb).collect::<Vec<_>>();
+        // No split: a single TU at the CB origin.
+        assert_eq!(v(6, 6, 6), vec![(0, 0)]);
+        assert_eq!(v(5, 4, 6), vec![(0, 0)]);
+        // Width-only split (e.g. a 128×64 CB at MaxTb 64).
+        assert_eq!(v(7, 6, 6), vec![(0, 0), (64, 0)]);
+        // Height-only split.
+        assert_eq!(v(6, 7, 6), vec![(0, 0), (0, 64)]);
+        // Both split: the erratum-pinned 2×2 tiling — the fourth call at
+        // (1 << log2TbWidth, 1 << log2TbHeight).
+        assert_eq!(v(7, 7, 6), vec![(0, 0), (64, 0), (0, 64), (64, 64)]);
+        // A rectangular CB splits against the same MaxTb per axis.
+        assert_eq!(v(6, 6, 5), vec![(0, 0), (32, 0), (0, 32), (32, 32)]);
+    }
+
+    /// §7.3.8.4 TB-split decode, errata #238 (a) anchored: a 64×64 intra
+    /// CB walked with `max_tb_log2_size_y = 5` tiles into four 32×32
+    /// TUs, each with its own `transform_unit()` body. Residual is
+    /// carried by the second (top-right) and fourth (bottom-right) TUs
+    /// only; the reconstructed lift must land in exactly those two
+    /// quadrants — the bottom-right placement is precisely the
+    /// erratum-resolved `(x0 + 2^log2TbWidth, y0 + 2^log2TbHeight)`
+    /// offset (a decoder following the printed `logTbWidth` literally
+    /// has no defined x-offset for it at all).
+    #[test]
+    fn errata_238a_tb_split_residual_lands_per_quadrant() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
+                                      // Luma CU: DC mode, then four TUs.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+                                      // TU 1 (top-left): no residual.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // TU 2 (top-right): one coefficient.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..19 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 20
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // TU 3 (bottom-left): no residual.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // TU 4 (bottom-right): one coefficient.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Chroma CU: also TB-split → four TUs, all quiet.
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5, // force the 2×2 TB split on the 64×64 CB
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(stats.coding_units, 2);
+        // Four luma TUs → 4 cbf_luma bins; four chroma TUs → 8 chroma bins.
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        // Quadrant placement: (qx, qy) indexes the 32×32 quadrants.
+        let quadrant_touched = |qx: usize, qy: usize| -> bool {
+            (0..32).any(|y| (0..32).any(|x| pic.y[(qy * 32 + y) * 64 + qx * 32 + x] != 128))
+        };
+        assert!(!quadrant_touched(0, 0), "top-left TU carried no residual");
+        assert!(quadrant_touched(1, 0), "top-right TU residual must land");
+        assert!(
+            !quadrant_touched(0, 1),
+            "bottom-left TU carried no residual"
+        );
+        assert!(
+            quadrant_touched(1, 1),
+            "bottom-right TU residual must land at (2^log2TbWidth, 2^log2TbHeight) — errata #238 (a)"
+        );
+        // The two lifted quadrants carry *different* residuals (level 20
+        // vs 40): their anchor samples must differ, proving the TUs were
+        // decoded and placed independently.
+        assert_ne!(pic.y[32], 128, "top-right anchor lifted");
+        assert_ne!(pic.y[32 * 64 + 32], 128, "bottom-right anchor lifted");
+        assert_ne!(
+            pic.y[32],
+            pic.y[32 * 64 + 32],
+            "distinct per-TU levels must produce distinct lifts"
+        );
+        // Chroma untouched.
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// §7.3.8.4 TB-split on the **chroma** dual tree: the same 64×64
+    /// leaf with all luma TUs quiet and a chroma residual in the
+    /// bottom-right chroma TU only. The chroma TB is 16×16 (4:2:0 half
+    /// of the 32×32 luma TB) at the (16, 16) chroma offset.
+    #[test]
+    fn errata_238a_tb_split_chroma_bottom_right() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0 (all four TUs)
+        }
+        // Chroma CU: TUs 1-3 quiet, TU 4 carries a Cb coefficient.
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_decision(0, 0, 1); // cbf_cb = 1 (TU 4)
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        assert!(pic.y.iter().all(|&v| v == 128), "luma untouched");
+        assert!(pic.cr.iter().all(|&v| v == 128), "Cr untouched");
+        // Cb: only the bottom-right 16×16 chroma quadrant may move.
+        let quadrant_touched = |qx: usize, qy: usize| -> bool {
+            (0..16).any(|y| (0..16).any(|x| pic.cb[(qy * 16 + y) * 32 + qx * 16 + x] != 128))
+        };
+        assert!(!quadrant_touched(0, 0));
+        assert!(!quadrant_touched(1, 0));
+        assert!(!quadrant_touched(0, 1));
+        assert!(
+            quadrant_touched(1, 1),
+            "Cb residual must land in the bottom-right chroma TB (errata #238 (a) offset >> 1)"
+        );
     }
 
     /// **Round-9 HMVP-as-AMVP fallback.** When the §8.5.2.4.3 spatial
