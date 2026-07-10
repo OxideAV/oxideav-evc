@@ -9008,6 +9008,157 @@ mod tests {
         assert!(pic.cr.iter().all(|&v| v == 128));
     }
 
+    /// Spec-exact TB-split geometry: a 128×128 CTB (`CtbLog2SizeY = 7`,
+    /// the §7.4.3.1 maximum) at the eq. 51 `MaxTbLog2SizeY = 6` tiles an
+    /// unsplit intra CB into four **64×64** TBs — the only geometry a
+    /// conformant stream can produce for the §7.3.8.4 four-call block.
+    /// The bottom-right 64×64 TB carries the only residual; its lift
+    /// must stay inside the (64, 64)..(127, 127) quadrant (errata
+    /// #238 (a) offset at the real MaxTb).
+    #[test]
+    fn tb_split_128_ctb_at_spec_max_tb_64() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // CTB split = 0 → 128×128 leaf
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0 (TUs 1-3)
+        }
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1 (TU 4, bottom-right)
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..63 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 64
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Chroma CU: four TUs, all quiet.
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 128,
+            pic_height: 128,
+            ctb_log2_size_y: 7, // 128×128 CTU
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 6, // eq. 51 constant
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 51, // keep the 64-point DC lift visible at level 64
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.ctus, 1);
+        assert_eq!(stats.cbf_luma_bins, 4);
+        assert_eq!(stats.cbf_chroma_bins, 8);
+        let quadrant_touched = |qx: usize, qy: usize| -> bool {
+            (0..64).any(|y| (0..64).any(|x| pic.y[(qy * 64 + y) * 128 + qx * 64 + x] != 128))
+        };
+        assert!(!quadrant_touched(0, 0));
+        assert!(!quadrant_touched(1, 0));
+        assert!(!quadrant_touched(0, 1));
+        assert!(
+            quadrant_touched(1, 1),
+            "the 64×64 bottom-right TB must land at (64, 64) — errata #238 (a) at MaxTb 64"
+        );
+        assert_ne!(pic.y[64 * 128 + 64], 128, "bottom-right anchor lifted");
+        assert!(pic.cb.iter().all(|&v| v == 128));
+        assert!(pic.cr.iter().all(|&v| v == 128));
+    }
+
+    /// Per-TU `cu_qp_delta` on a TB-split CB: under the Baseline
+    /// presence form (`!sps_dquant_flag` → cbf-gated) **each**
+    /// cbf-carrying TU reads its own `cu_qp_delta_abs` and folds it into
+    /// the §8.7.1 eq. 1042 chain, so a later TU dequants at the chained
+    /// QP. Identical levels in the top-right (delta 0, QP stays 30) and
+    /// bottom-right (delta +21 → QP 51) TUs must therefore reconstruct
+    /// to *different* lifts, and the quiet TUs read no delta at all.
+    #[test]
+    fn tb_split_per_tu_cu_qp_delta_chain() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+                                      // TU 1 (top-left): quiet → no cu_qp_delta read.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // TU 2 (top-right): cbf → delta_abs = 0 (single U "0").
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // TU 3 (bottom-left): quiet.
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // TU 4 (bottom-right): cbf → delta_abs = 21, sign +.
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        for _ in 0..21 {
+            enc.encode_decision(0, 0, 1); // cu_qp_delta_abs U prefix
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → abs = 21
+        enc.encode_bypass(0); // cu_qp_delta_sign_flag = 0 (+) — eq. 148
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..39 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign = +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Chroma CU: four quiet TUs (cbf-gated → no delta reads).
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: true,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 30,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.cbf_luma_bins, 4);
+        // Exactly the two cbf-carrying TUs read a delta.
+        assert_eq!(stats.cu_qp_delta_abs_bins, 2);
+        // Same level, different chained QP (30 vs 51) → different lifts.
+        let tr = pic.y[32]; // top-right anchor
+        let br = pic.y[32 * 64 + 32]; // bottom-right anchor
+        assert_ne!(tr, 128, "top-right lifted at QP 30");
+        assert_ne!(br, 128, "bottom-right lifted at QP 51");
+        assert_ne!(
+            tr, br,
+            "identical levels at chained QPs 30 vs 51 must reconstruct differently (eq. 1042 per-TU chain)"
+        );
+    }
+
     /// §7.3.8.4 TB-split on the **chroma** dual tree: the same 64×64
     /// leaf with all luma TUs quiet and a chroma residual in the
     /// bottom-right chroma TU only. The chroma TB is 16×16 (4:2:0 half
