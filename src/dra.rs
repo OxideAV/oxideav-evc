@@ -1808,6 +1808,19 @@ pub struct SignalledChromaQpTablePivots {
 /// so the recurrence is
 /// `qpOutVal[i][j] = qpOutVal[i][j−1] + (delta_qp_in_val_minus1[i][j] + 1 − delta_qp_out_val[i][j])`.
 ///
+/// # Errata #238 (c) — `startQP` vs `startQp`
+///
+/// The spec text assigns `startQp` (line 4003) but the two eq. 74 seed
+/// reads (lines 4004–4005) are spelled `startQP` — a single-character
+/// case typo of the just-assigned variable (neither spelling is bound
+/// anywhere else in the document). Per the in-repo errata entry
+/// #238 (c), both reads resolve to the line-4003 `startQp`
+/// (`16` when `global_offset_flag == 1`, else `−QpBdOffsetC`), which is
+/// exactly what the single `start_qp` binding below implements. The
+/// errata entry's secondary observation (the unclosed parenthesis in
+/// the `qpOutVal` recurrence) matches the eq. 74 bracketing note above
+/// and remains resolved the same way.
+///
 /// `qpOutVal[]` is **not** used to fill `ChromaQpTable[]` except at
 /// `qpInVal[0]` (line 4011 of the spec text); the per-segment loop
 /// (lines 4015–4019) uses `delta_qp_out_val[]` directly. So the only
@@ -4194,6 +4207,41 @@ mod tests {
         // Up-fill: table[21] = 24, ..., table[57] = 60 ⇒ clamped to 57.
         assert_eq!(t.lookup(ChromaIdx::Cb, 21), 24);
         assert_eq!(t.lookup(ChromaIdx::Cb, 57), 57);
+    }
+
+    /// Errata #238 (c): the eq. 74 seed reads `startQP` (spec lines
+    /// 4004–4005) resolve to the line-4003 `startQp` assignment — i.e.
+    /// with `global_offset_flag == 0` the first pivot is seeded from
+    /// `−QpBdOffsetC`, not from an undefined (zero) variable. Drive the
+    /// negative-seed case that separates the two readings: at
+    /// `bit_depth_chroma_minus8 = 2` (QpBdOffsetC = 12) a misread
+    /// zero-valued seed would anchor the first pivot at qPi = 3 instead
+    /// of qPi = −9.
+    #[test]
+    fn errata_238c_start_qp_seed_negative_qp_bd_offset() {
+        let params = SignalledChromaQpTableParams {
+            same_qp_table_for_chroma: true,
+            global_offset_flag: false,
+            tables: vec![SignalledChromaQpTablePivots {
+                delta_qp_in_val_minus1: vec![3],
+                delta_qp_out_val: vec![5],
+            }],
+        };
+        // startQp = −QpBdOffsetC = −12:
+        //   qpInVal[0]  = −12 + 3 = −9
+        //   qpOutVal[0] = −12 + 3 + 5 = −4
+        let t = build_signalled_chroma_qp_table(&params, 2).unwrap();
+        assert_eq!(t.lookup(ChromaIdx::Cb, -9), -4, "anchor at qpInVal[0]");
+        // Down-fill −10 → −12 (−1 per step, clip at −12 inert here).
+        assert_eq!(t.lookup(ChromaIdx::Cb, -10), -5);
+        assert_eq!(t.lookup(ChromaIdx::Cb, -12), -7);
+        // Up-fill +1 per step: table[k] = k + 5, clamped at 57.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 0), 5);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 52), 57);
+        assert_eq!(t.lookup(ChromaIdx::Cb, 57), 57);
+        // A zero seed (the misreading) would have anchored at qPi = 3;
+        // under the resolved reading table[3] comes from the up-fill.
+        assert_eq!(t.lookup(ChromaIdx::Cb, 3), 8);
     }
 
     #[test]

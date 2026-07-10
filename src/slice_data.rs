@@ -2012,6 +2012,14 @@ fn eipd_right_available(
 /// `QpY = (QpY_PREV + CuQpDelta + 52) % 52` and becomes the new
 /// predecessor; delta-less CUs keep it unchanged) and the eq. 147
 /// `isCuQpDeltaCoded` latch the §7.3.8.3 dquant marks reset.
+///
+/// Errata #238 (b): eq. 148's sign multiplier reads the bare (undefined)
+/// token `cu_qp_delta_sign`; it resolves to the parsed/inferred
+/// `cu_qp_delta_sign_flag`, so
+/// `CuQpDelta = cu_qp_delta_abs * (1 − 2 * cu_qp_delta_sign_flag)`
+/// (flag 0 → `+abs`, 1 → `−abs`, inferred 0 when absent). Every walker
+/// sign application below implements exactly that form before folding
+/// the delta into this chain.
 #[derive(Clone, Copy, Debug)]
 struct QpState {
     /// The running eq. 1042 `QpY` (initialised to `slice_qp` at the
@@ -10849,6 +10857,28 @@ mod tests {
         assert_eq!(qp.apply_delta(5), 27);
         assert_eq!(qp.apply_delta(-3), 24);
         assert_eq!(qp.qp_y, 24);
+    }
+
+    /// Errata #238 (b): eq. 148 multiplies by the undefined bare token
+    /// `cu_qp_delta_sign`; the resolution reads it as the parsed/
+    /// inferred `cu_qp_delta_sign_flag`, i.e.
+    /// `CuQpDelta = cu_qp_delta_abs * (1 − 2 * cu_qp_delta_sign_flag)`.
+    /// Pin the exact multiplier form the walkers implement across the
+    /// flag values and the §7.4.9.5 inferred-0 case (flag absent when
+    /// `cu_qp_delta_abs == 0`), folded through the eq. 1042 chain.
+    #[test]
+    fn errata_238b_eq148_sign_flag_multiplier() {
+        let eq148 = |abs: i32, sign_flag: i32| abs * (1 - 2 * sign_flag);
+        // Flag 0 → +abs; flag 1 → −abs (§7.4.9.5 lines 6078/6080).
+        assert_eq!(eq148(7, 0), 7);
+        assert_eq!(eq148(7, 1), -7);
+        // Flag absent (abs == 0) → inferred 0 → CuQpDelta = 0.
+        assert_eq!(eq148(0, 0), 0);
+        // The walkers' branch form `sign != 0 ? −abs : abs` is the same
+        // function, folded through eq. 1042:
+        let mut qp = QpState::new(30);
+        assert_eq!(qp.apply_delta(eq148(7, 1)), 23);
+        assert_eq!(qp.apply_delta(eq148(7, 0)), 30);
     }
 
     // =================================================================
