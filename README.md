@@ -19,9 +19,10 @@ candidate construction, default-weighted bipred), deblocking (§8.8.2
 and the §8.8.3 ADDB flavours), a multi-reference DPB with POC
 reordering, spatial-neighbour MV grid AMVP, the HMVP candidate list, and
 reference-picture-list parsing for non-IDR slices — plus, as of round
-397, nearly the whole **Main-profile** decode toolset (BTT/SUCO,
+397, the whole **Main-profile** decode toolset (BTT/SUCO,
 ADMVP/affine/AMVR/MMVD/DMVR/HMVP, cm_init CABAC, DQUANT, EIPD, ADCC,
-ADDB, IBC; ATS remains the one gated tool).
+ADDB, IBC, and — as of round 404 — ATS: no Main-profile decode tool
+remains gated).
 
 The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `sps` / `pps` / `aps`, `slice_header`, `cabac` + `cabac_init`,
@@ -412,9 +413,21 @@ lifted from the decoder gates:
   strong filters, per coding block with the §8.8.3.2 `splitTH` split
   and 4:2:0 chroma-style filtering.
 
-Of the named Main-profile decode tools only **ATS in the walkers**
-(`sps_ats_flag`) still surfaces `Error::Unsupported` at the decoder
-gates (its syntax + transform layers are complete, see above).
+As of round 404 the **ATS toolset is wired to pixels on both walkers**
+and `sps_ats_flag` is lifted from both decoder gates — no Main-profile
+decode tool remains gated. The intra `transform_unit()` (IDR and P/B)
+reads the §7.3.8.5 `ats_cu_intra_flag` group after the cu_qp block and,
+on `ats_cu_intra_flag == 1`, drives the luma inverse transform through
+the §8.7.4.1 Table-30 DST-VII / DCT-VIII kernels
+(`dequant::scale_and_inverse_transform_ats`). Inter CUs read the
+ATS-inter (sub-block transform) group: `AllowAtsInter::derive`
+(MinTbLog2SizeY = 2, the walker's MaxTb) gates `read_ats_inter`, whose
+§7.3.8.5 lines-3103-3130 geometry places the residual in one CB
+sub-block at `(TrafoX0, TrafoY0)` with the reduced
+`TrafoLog2Width/Height`; the luma sub-block transforms through the
+Table-31 `(trTypeHor, trTypeVer)` pair (`AtsInter::tr_types`) and
+scatters into the full-CB residual (`scatter_subblock`), with the 4:2:0
+chroma sub-block mirrored at trType 0.
 
 The DRA (§8.9) post-filter chain is spec-faithful end-to-end: the
 §7.3.6 `dra_data()` parser + §7.4.7 derivation feed the §8.9.3 luma
@@ -449,8 +462,6 @@ reconstruction (when `cbf_luma && sps_htdf_flag`) and threading the real
 
 ### Not yet supported
 
-- ATS in the pixel walkers (`sps_ats_flag == 1` still gates the
-  decoder; the §7.3.8.5 syntax + §8.7.4 transform kernels are done).
 - DRA post-filter application on >8-bit pictures (the §8.9 apply is
   8-bit-code-space; high-bit-depth pictures skip it).
 - Multi-tile pixel reconstruction (single-tile slices only).

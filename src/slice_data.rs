@@ -5405,6 +5405,29 @@ fn decode_inter_cu_residual_and_reconstruct(
     )
 }
 
+/// Place an `sb_w × sb_h` residual sub-block (row-major) into a fresh
+/// `full_len`-length full-CB residual buffer (row stride `full_w`),
+/// zero-filled outside the sub-block, at offset `(x0, y0)`. Used by the
+/// §7.3.8.5 ATS-inter (sub-block transform) path where only one sub-block
+/// of the CB carries residual.
+fn scatter_subblock(
+    sb: &[i32],
+    full_w: usize,
+    full_len: usize,
+    x0: usize,
+    y0: usize,
+    sb_w: usize,
+    sb_h: usize,
+) -> Vec<i32> {
+    let mut full = vec![0i32; full_len];
+    for yy in 0..sb_h {
+        let dst_row = (y0 + yy) * full_w + x0;
+        let src_row = yy * sb_w;
+        full[dst_row..dst_row + sb_w].copy_from_slice(&sb[src_row..src_row + sb_w]);
+    }
+    full
+}
+
 /// The motion-generic reconstruction tail: identical CBF / `cu_qp_delta`
 /// / residual decode for both motion shapes, with the side-info stamp,
 /// HMVP update and motion compensation dispatched per [`CuMotion`]
@@ -5487,6 +5510,38 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     } else {
         qp.qp_y
     };
+    // §7.3.8.5 lines 3088-3130: the ATS-inter (sub-block transform) group
+    // on a MODE_INTER CU. Present when `sps_ats_flag`, some cbf, and an
+    // allowed split orientation (`AllowAtsInter::any`, MinTbLog2SizeY = 2 /
+    // eq. 52, MaxTbLog2SizeY from the walker). Resolves the residual
+    // sub-block geometry (TrafoX0/Y0 + reduced TrafoLog2Width/Height) that
+    // the residual_coding() calls below key on.
+    let ats_inter = if walk.tree_gates.sps_ats_flag && cbf_any {
+        let allow = crate::ats::AllowAtsInter::derive(
+            log2_cb_width,
+            log2_cb_height,
+            2,
+            walk.max_tb_log2_size_y,
+        );
+        if allow.any() {
+            let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+                walk.tree_gates.sps_cm_init_flag,
+                crate::cabac::InitType::Pb,
+            );
+            crate::ats::read_ats_inter(
+                eng,
+                ctx,
+                allow,
+                log2_cb_width,
+                log2_cb_height,
+                &mut stats.ats_inter,
+            )?
+        } else {
+            crate::ats::AtsInter::disabled(log2_cb_width, log2_cb_height)
+        }
+    } else {
+        crate::ats::AtsInter::disabled(log2_cb_width, log2_cb_height)
+    };
     // Stamp the deblocking side-info for this inter CU. We record the
     // MVs (1/4-pel units) and ref_idx 0 / -1 per slot. An affine CU
     // stamps each subblock with its own §8.5.3.7 field vector (rounded
@@ -5538,7 +5593,18 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     let n_y = (1usize << log2_tb_w) * (1usize << log2_tb_h);
     let mut residual_y_vec: Vec<i32> = Vec::new();
     if cbf_luma != 0 {
-        let mut levels = vec![0i32; n_y];
+        // Under ATS-inter the residual occupies only the sub-block at
+        // (TrafoX0, TrafoY0) with the reduced (TrafoLog2Width,
+        // TrafoLog2Height); the §8.7.4.1 Table-31 kernel pair drives it.
+        // Otherwise the residual spans the whole (log2_tb_w, log2_tb_h) TB
+        // with plain DCT-II.
+        let (sb_lw, sb_lh) = if ats_inter.used {
+            (ats_inter.trafo_log2_w, ats_inter.trafo_log2_h)
+        } else {
+            (log2_tb_w, log2_tb_h)
+        };
+        let sb_n = (1usize << sb_lw) * (1usize << sb_lh);
+        let mut levels = vec![0i32; sb_n];
         decode_residual_block(
             eng,
             sel,
@@ -5547,19 +5613,34 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
             &mut levels,
             &mut stats.coeff_runs,
             &mut stats.adcc,
-            log2_tb_w,
-            log2_tb_h,
+            sb_lw,
+            sb_lh,
         )?;
-        let mut res = vec![0i32; n_y];
-        scale_and_inverse_transform(
+        let (tr_hor, tr_ver) = ats_inter.tr_types();
+        let mut sb_res = vec![0i32; sb_n];
+        crate::dequant::scale_and_inverse_transform_ats(
             &levels,
-            &mut res,
-            1usize << log2_tb_w,
-            1usize << log2_tb_h,
+            &mut sb_res,
+            1usize << sb_lw,
+            1usize << sb_lh,
             cu_qp,
             inputs.decode.bit_depth_luma,
+            tr_hor,
+            tr_ver,
         )?;
-        residual_y_vec = res;
+        residual_y_vec = if ats_inter.used {
+            scatter_subblock(
+                &sb_res,
+                1usize << log2_tb_w,
+                n_y,
+                ats_inter.trafo_x0 as usize,
+                ats_inter.trafo_y0 as usize,
+                1usize << sb_lw,
+                1usize << sb_lh,
+            )
+        } else {
+            sb_res
+        };
     }
     let (log2_c_w, log2_c_h) = if chroma_present {
         (log2_tb_w.saturating_sub(1), log2_tb_h.saturating_sub(1))
@@ -5567,55 +5648,65 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
         (0, 0)
     };
     let n_c = (1usize << log2_c_w) * (1usize << log2_c_h);
+    // Under ATS-inter the chroma residual mirrors the luma sub-block:
+    // size (TrafoLog2Width − 1, TrafoLog2Height − 1) for 4:2:0 at the
+    // (TrafoX0 >> 1, TrafoY0 >> 1) offset (§7.3.8.5 lines 3134-3139,
+    // SubWidthC/SubHeightC = 2). Chroma always uses trType 0 (DCT-II).
+    let (sb_cw, sb_ch, sb_cx0, sb_cy0) = if ats_inter.used {
+        (
+            ats_inter.trafo_log2_w.saturating_sub(1),
+            ats_inter.trafo_log2_h.saturating_sub(1),
+            (ats_inter.trafo_x0 >> 1) as usize,
+            (ats_inter.trafo_y0 >> 1) as usize,
+        )
+    } else {
+        (log2_c_w, log2_c_h, 0, 0)
+    };
+    let sb_c_n = (1usize << sb_cw) * (1usize << sb_ch);
     let mut residual_cb_vec: Vec<i32> = Vec::new();
     let mut residual_cr_vec: Vec<i32> = Vec::new();
+    let decode_chroma_residual =
+        |eng: &mut CabacEngine, stats: &mut InterDecodeStats, c_idx: u32| -> Result<Vec<i32>> {
+            let mut levels = vec![0i32; sb_c_n];
+            decode_residual_block(
+                eng,
+                sel,
+                &walk,
+                c_idx,
+                &mut levels,
+                &mut stats.coeff_runs,
+                &mut stats.adcc,
+                sb_cw,
+                sb_ch,
+            )?;
+            let mut sb_res = vec![0i32; sb_c_n];
+            scale_and_inverse_transform(
+                &levels,
+                &mut sb_res,
+                1usize << sb_cw,
+                1usize << sb_ch,
+                cu_qp,
+                inputs.decode.bit_depth_chroma,
+            )?;
+            Ok(if ats_inter.used {
+                scatter_subblock(
+                    &sb_res,
+                    1usize << log2_c_w,
+                    n_c,
+                    sb_cx0,
+                    sb_cy0,
+                    1usize << sb_cw,
+                    1usize << sb_ch,
+                )
+            } else {
+                sb_res
+            })
+        };
     if chroma_present && cbf_cb != 0 {
-        let mut levels = vec![0i32; n_c];
-        decode_residual_block(
-            eng,
-            sel,
-            &walk,
-            1,
-            &mut levels,
-            &mut stats.coeff_runs,
-            &mut stats.adcc,
-            log2_c_w,
-            log2_c_h,
-        )?;
-        let mut res = vec![0i32; n_c];
-        scale_and_inverse_transform(
-            &levels,
-            &mut res,
-            1usize << log2_c_w,
-            1usize << log2_c_h,
-            cu_qp,
-            inputs.decode.bit_depth_chroma,
-        )?;
-        residual_cb_vec = res;
+        residual_cb_vec = decode_chroma_residual(eng, stats, 1)?;
     }
     if chroma_present && cbf_cr != 0 {
-        let mut levels = vec![0i32; n_c];
-        decode_residual_block(
-            eng,
-            sel,
-            &walk,
-            2,
-            &mut levels,
-            &mut stats.coeff_runs,
-            &mut stats.adcc,
-            log2_c_w,
-            log2_c_h,
-        )?;
-        let mut res = vec![0i32; n_c];
-        scale_and_inverse_transform(
-            &levels,
-            &mut res,
-            1usize << log2_c_w,
-            1usize << log2_c_h,
-            cu_qp,
-            inputs.decode.bit_depth_chroma,
-        )?;
-        residual_cr_vec = res;
+        residual_cr_vec = decode_chroma_residual(eng, stats, 2)?;
     }
     // Motion compensation.
     let bipred = pred_l0.is_some() && pred_l1.is_some();
@@ -6649,6 +6740,23 @@ fn decode_inter_intra_cu(
         qp.qp_y
     };
     if is_luma_tree {
+        // §7.3.8.5 lines 3080-3087: the `ats_cu_intra_flag` group on a
+        // MODE_INTRA luma tree with cbf_luma and both log2CbW/H <= 5. Read
+        // after the cu_qp block, before residual_coding (initType 1).
+        let ats_intra = if crate::ats::ats_intra_flag_present(
+            walk.tree_gates.sps_ats_flag,
+            log2_cb_width,
+            log2_cb_height,
+            cbf_luma != 0,
+        ) {
+            let ctx = crate::eipd_syntax::EipdCtx::for_slice(
+                walk.tree_gates.sps_cm_init_flag,
+                crate::cabac::InitType::Pb,
+            );
+            crate::ats::read_ats_intra(eng, ctx, &mut stats.ats_intra)?
+        } else {
+            crate::ats::AtsIntra::disabled()
+        };
         // Stamp side-info for the deblocking pass.
         side_info.stamp_block(
             x0,
@@ -6682,13 +6790,16 @@ fn decode_inter_intra_cu(
                 log2_tb_w,
                 log2_tb_h,
             )?;
-            scale_and_inverse_transform(
+            // §8.7.4.2 ATS-intra kernel selection on the luma transform.
+            crate::dequant::scale_and_inverse_transform_ats(
                 &levels,
                 &mut residual,
                 1usize << log2_tb_w,
                 1usize << log2_tb_h,
                 cu_qp,
                 decode.bit_depth_luma,
+                ats_intra.tr_type_hor,
+                ats_intra.tr_type_ver,
             )?;
         }
         match intra_mode {
@@ -8201,6 +8312,116 @@ mod tests {
                 // decoder is spec-correct.
             }
         }
+    }
+
+    /// Round 404: `scatter_subblock` places an ATS-inter sub-block into a
+    /// zero-filled full-CB residual buffer at the right offset.
+    #[test]
+    fn round404_scatter_subblock_places_at_offset() {
+        // 2×2 sub-block into an 4×4 CB at (2, 0) (a right-half vertical SBT).
+        let sb = vec![1, 2, 3, 4];
+        let full = scatter_subblock(&sb, 4, 16, 2, 0, 2, 2);
+        let expected = vec![
+            0, 0, 1, 2, //
+            0, 0, 3, 4, //
+            0, 0, 0, 0, //
+            0, 0, 0, 0,
+        ];
+        assert_eq!(full, expected);
+    }
+
+    /// Round 404: end-to-end ATS-inter (sub-block transform, `sps_ats_flag
+    /// == 1`) on an 8×8 P-slice CU. The §7.3.8.5 `ats_cu_inter_*` group is
+    /// read (flag=1, no quad on 8×8, horizontal=0, pos=0 → an 8×4 bottom
+    /// sub-block, Table-31 trTypes `(2, 1)`), the residual decodes at the
+    /// sub-block size and reconstructs without desync. The load-bearing
+    /// assertions are the exact syntax tallies + a clean decode.
+    #[test]
+    fn round404_ats_inter_sub_block_transform_p_slice() {
+        use crate::cabac::CabacEncoder;
+        let ref_y = vec![200u16; 8 * 8];
+        let ref_cb = vec![100u16; 4 * 4];
+        let ref_cr = vec![80u16; 4 * 4];
+        let view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 8,
+            height: 8,
+            y_stride: 8,
+            c_stride: 4,
+            chroma_format_idc: 1,
+        };
+        let mut enc = CabacEncoder::new();
+        // 8×8 leaf (log2 == 3). Baseline cu_skip path (walker reads CBFs):
+        enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+        for _ in 0..3 {
+            enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 (TR cMax=3)
+        }
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                                      // §7.3.8.5 ATS-inter group (8×8 → no quad flag):
+        enc.encode_decision(0, 0, 1); // ats_cu_inter_flag = 1
+        enc.encode_decision(0, 0, 0); // ats_cu_inter_horizontal_flag = 0
+        enc.encode_decision(0, 0, 0); // ats_cu_inter_pos_flag = 0
+                                      // luma residual at the 8×4 sub-block (single DC coeff):
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
+        enc.encode_bypass(0); // coeff_sign_flag = 0
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 8,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 3, // 8×8 leaf, no split
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            tree_gates: CodingTreeGates {
+                sps_ats_flag: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 22,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            ..Default::default()
+        };
+        let ref_list_l0 = [view];
+        let inputs = InterDecodeInputs {
+            walk,
+            decode,
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0: &ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        };
+        let (pic, stats) = decode_baseline_inter_slice(&rbsp, inputs).unwrap();
+        assert_eq!(stats.coding_units, 1);
+        assert_eq!(stats.cbf_luma_bins, 1);
+        assert_eq!(stats.coeff_runs, 1);
+        // The ATS-inter syntax group was consumed with the exact presence
+        // gating: flag + horizontal + pos, and NO quad bin on 8×8.
+        assert_eq!(stats.ats_inter.cu_inter_flag_bins, 1);
+        assert_eq!(stats.ats_inter.quad_flag_bins, 0);
+        assert_eq!(stats.ats_inter.horizontal_flag_bins, 1);
+        assert_eq!(stats.ats_inter.pos_flag_bins, 1);
+        // Chroma is pure inter prediction (cbf_cb/cr = 0).
+        assert!(pic.cb.iter().all(|&v| v == 100));
+        assert!(pic.cr.iter().all(|&v| v == 80));
+        assert_eq!(pic.y.len(), 8 * 8);
     }
 
     /// IDR with `enable_deblock = true` runs the deblocking pass and

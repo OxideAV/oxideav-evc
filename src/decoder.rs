@@ -622,11 +622,12 @@ impl EvcDecoder {
         // Round 397: sps_adcc_flag lifted (§7.3.8.8 advanced residual
         // coding through the shared residual_coding() dispatch);
         // sps_addb_flag lifted (§8.8.3 advanced deblocking).
-        if sps.sps_ats_flag {
-            return Err(Error::unsupported(
-                "evc decoder: P/B requires Baseline-profile toolset (round-9 adds DPB + POC)",
-            ));
-        }
+        // Round 404: sps_ats_flag is lifted on the P/B path — intra CUs
+        // read the §7.3.8.5 `ats_cu_intra_flag` group
+        // (`decode_inter_intra_cu`) and inter CUs read the ATS-inter
+        // (sub-block transform) group in the residual reconstruct, both
+        // driving the §8.7.4.2 kernel selection. `CodingTreeGates::from_sps`
+        // carries `sps_ats_flag` to the walker.
         // Round 95: sps_ibc_flag is no longer part of the unsupported gate.
         // The §7.3.8.4 IBC branch is surfaced inside the per-CU inter
         // walker (`decode_inter_coding_unit`) so non-IDR (P/B) slices with

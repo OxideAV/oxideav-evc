@@ -254,6 +254,31 @@ impl AtsInter {
         }
     }
 
+    /// §8.7.4.1 Table 31 — the `(trTypeHor, trTypeVer)` luma kernel pair
+    /// for this ATS-inter sub-block transform, keyed on
+    /// `ats_cu_inter_horizontal_flag` and `ats_cu_inter_pos_flag`:
+    ///
+    /// | horizontal | pos | trTypeHor | trTypeVer |
+    /// |------------|-----|-----------|-----------|
+    /// | 0          | 0   | 2         | 1         |
+    /// | 1          | 0   | 1         | 2         |
+    /// | 0          | 1   | 1         | 1         |
+    /// | 1          | 1   | 1         | 1         |
+    ///
+    /// Returns `(0, 0)` (plain DCT-II) when the sub-block transform is not
+    /// used or when `Max(nTbH, nTbW) >= 64` (the §8.7.4.1 line-15458 guard),
+    /// where `nTbW`/`nTbH` are this decision's sub-block dimensions.
+    pub fn tr_types(self) -> (u32, u32) {
+        if !self.used || self.trafo_log2_w >= 6 || self.trafo_log2_h >= 6 {
+            return (0, 0);
+        }
+        match (self.horizontal, self.pos) {
+            (false, false) => (2, 1),
+            (true, false) => (1, 2),
+            (_, true) => (1, 1),
+        }
+    }
+
     /// Spec lines 3103-3127 — derive the sub-block transform geometry from
     /// the decoded flags + the CB log2 size.
     fn derive_geometry(
@@ -524,6 +549,34 @@ mod tests {
             assert_eq!(ats.tr_type_hor, th);
             assert_eq!(ats.tr_type_ver, tv);
         }
+    }
+
+    /// §8.7.4.1 Table 31 — the ATS-inter `(trTypeHor, trTypeVer)` pair for
+    /// each `(horizontal, pos)` combination, plus the not-used / >=64 guard.
+    #[test]
+    fn ats_inter_tr_types_table31() {
+        let mk = |horizontal, pos| AtsInter {
+            used: true,
+            quad: false,
+            horizontal,
+            pos,
+            trafo_log2_w: 3,
+            trafo_log2_h: 2,
+            trafo_x0: 0,
+            trafo_y0: 4,
+        };
+        assert_eq!(mk(false, false).tr_types(), (2, 1));
+        assert_eq!(mk(true, false).tr_types(), (1, 2));
+        assert_eq!(mk(false, true).tr_types(), (1, 1));
+        assert_eq!(mk(true, true).tr_types(), (1, 1));
+        // Not used → DCT-II.
+        assert_eq!(AtsInter::disabled(3, 3).tr_types(), (0, 0));
+        // Max(nTbW, nTbH) >= 64 (log2 >= 6) → DCT-II guard.
+        let big = AtsInter {
+            trafo_log2_w: 6,
+            ..mk(false, false)
+        };
+        assert_eq!(big.tr_types(), (0, 0));
     }
 
     /// Baseline ATS-mode context routes to (0, 0); Main-profile routes to
