@@ -526,4 +526,67 @@ mod tests {
         assert_eq!(stats.sig_coeff_bins, scan_pos_last as u32);
         assert!(eng.decode_terminate().unwrap());
     }
+
+    /// Errata #213(b): `last_sig_coeff_y_suffix` is sized by
+    /// `last_sig_coeff_y_prefix`, **not** `last_sig_coeff_x_prefix` (the
+    /// Table 91 `cMax` typo copies the x-row). This fixture makes the two
+    /// suffix widths differ — a 16×16 block with `last_x = 12` (x_prefix 7,
+    /// a **2-bin** x_suffix) and `last_y = 5` (y_prefix 4, a **1-bin**
+    /// y_suffix). Had the y_suffix been sized from x_prefix (7 → 2 bins) it
+    /// would over-read one bypass bin and desync the entire sig walk, so a
+    /// clean decode to `(12, 5)` with a terminating flush is the proof the
+    /// crate follows the §7.4 semantics (`y_prefix`) over the printed typo.
+    #[test]
+    fn adcc_last_sig_y_suffix_sized_by_y_prefix_errata_213b() {
+        let mut enc = CabacEncoder::new();
+        // last_x = 12: x_prefix = 7 (TR "1111111", cMax = 7 on log2 4, no
+        // terminator), 2-bin x_suffix "00" → (1 << 2)·(2 + 1) + 0 = 12.
+        for _ in 0..7 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_bypass(0);
+        enc.encode_bypass(0);
+        // last_y = 5: y_prefix = 4 (TR "11110"), 1-bin y_suffix "1" →
+        // (1 << 1)·(2 + 0) + 1 = 5.
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0);
+        enc.encode_bypass(1);
+        // Single non-zero coefficient at (12, 5): the reverse sig walk reads
+        // a 0 for every non-last scan position below scanPosLast.
+        let scan = crate::scan::zig_zag_scan(16, 16);
+        let raster_last = 12 + 5 * 16;
+        let scan_pos_last = scan.iter().position(|&p| p == raster_last).unwrap();
+        for _ in 0..scan_pos_last {
+            enc.encode_decision(0, 0, 0);
+        }
+        enc.encode_decision(0, 0, 0); // greaterA[0] = 0
+        enc.encode_bypass(0); // sign +
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+
+        let mut eng = CabacEngine::new(&rbsp).unwrap();
+        let mut levels = vec![0i32; 256];
+        let mut stats = AdccStats::default();
+        decode_residual_coding_adv(
+            &mut eng,
+            CtxSel::baseline(),
+            0,
+            1,
+            &mut levels,
+            &mut stats,
+            4,
+            4,
+        )
+        .unwrap();
+        // The single coefficient lands at raster (12 + 5·16) = 92.
+        assert_eq!(levels[raster_last as usize], 1);
+        assert_eq!(levels.iter().filter(|&&v| v != 0).count(), 1);
+        // x_suffix (2 bins) + y_suffix (1 bin) = 3 suffix bins total; a
+        // typo-following decoder would have consumed 4 and desynced.
+        assert_eq!(stats.last_sig_suffix_bins, 3);
+        assert_eq!(stats.sig_coeff_bins, scan_pos_last as u32);
+        assert!(eng.decode_terminate().unwrap());
+    }
 }
