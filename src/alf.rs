@@ -1,13 +1,15 @@
-//! EVC Adaptive Loop Filter (ISO/IEC 23094-1 §8.9 / §7.3.5).
+//! EVC Adaptive Loop Filter (ISO/IEC 23094-1 §8.8.4 apply / §7.3.5
+//! `alf_data()` / §8.9.4-numbered coefficient derivation).
 //!
-//! The ALF is a post-deblocking in-loop filter that adaptively selects, for
-//! each CTU, one of up to 25 luma filter sets and up to 4 chroma filter sets
-//! signalled in the ALF APS (`aps_params_type == 0`).  The per-CTU
-//! `alf_ctb_flag` (CABAC-coded in `coding_tree_unit()`) can disable the
-//! filter for individual CTUs; currently the round-11 decoder reads the
-//! `alf_ctb_flag` from the slice header as an enable/disable switch and
-//! applies whichever filter the APS selects uniformly to every luma / chroma
-//! CTU where `alf_ctb_flag` is true.
+//! The ALF is a post-deblocking in-loop filter carrying up to 25 luma
+//! filter classes and up to 4 chroma alternate filters in the ALF APS
+//! (`aps_params_type == 0`). Per CTU the §7.3.8.2 `alf_ctb_flag` /
+//! `alf_ctb_chroma_flag` / `alf_ctb_chroma2_flag` gate the apply, and
+//! **within** a filtered luma CTB the §8.8.4.3 per-sample
+//! transpose/filter-index classification selects which of the 25
+//! per-class `AlfCoeffL` rows filters each sample (EVC signals no
+//! per-CTU filter-set index — the classification is the whole
+//! selection mechanism).
 //!
 //! ## Filter shapes (§8.9.4)
 //!
@@ -45,8 +47,10 @@
 //!   (lines 18059-18074), with the `blkWidth` / `blkHeight` picture-edge
 //!   clamp. The whole-plane [`apply_alf`] entry is retained for the
 //!   minimal-header / no-map path.
-//! * The 25-filter-set `alf_luma_filter_idx` per-CTU selection (§8.9.6) is
-//!   deferred — this round always applies filter set 0.
+//! * (Historical note: an early round listed a per-CTU
+//!   "`alf_luma_filter_idx`" selection as deferred — 23094-1 signals no
+//!   such element; the §8.8.4.3 per-sample classification below is the
+//!   spec's entire filter-selection mechanism.)
 //! * The §8.8.4.3 **ALF transpose + classification filter-index derivation**
 //!   (round 117): [`derive_alf_classification`] computes, per luma sample of
 //!   a coding tree block, the gradient-classification `filtIdx` (0..24, one of
@@ -77,9 +81,13 @@
 //!   position 12 (DC offset) per eq. 104. The decoder now caches the
 //!   derived per-class coefficients and the per-sample
 //!   [`derive_alf_classification`] selects which class's `AlfCoeffL` row
-//!   applies — closing the §8.8.4.2 / §8.9.4 wiring loop. Per-CTU
-//!   ALF filter-set selection (§8.9.6) and the Main-profile toolset
-//!   (BTT/ADMVP/EIPD/ATS/AMVR/affine) remain as documented follow-ups.
+//!   applies — closing the §8.8.4.2 / §8.9.4 wiring loop.
+//! * The §8.8.4.5/.6 **per-CTB padded input derivation** (round 416):
+//!   [`derive_alf_input`] + [`apply_alf_luma_availability`] /
+//!   [`apply_alf_chroma_availability`] mirror-pad each filtered CTB's
+//!   3-sample edge strips per the §6.4.1-vs-§6.4.4 availability
+//!   selector and run the classification over the padded input — the
+//!   decoder's map-driven paths route through these.
 //!
 //! All clause and equation numbers refer to **ISO/IEC 23094-1:2020(E)**.
 
@@ -736,8 +744,9 @@ pub fn apply_alf_chroma(
 /// This is the flat "apply filter globally" entry called by the decoder
 /// pipeline when `sps_alf_flag && slice_alf_enabled_flag`.
 ///
-/// Per-CTU `alf_ctb_flag` selection is deferred (§8.9.6) — all CTUs
-/// receive the same filter for this round.
+/// Per-CTU `alf_ctb_flag` gating and the §8.8.4.3 classification live
+/// on the map-driven paths ([`apply_alf_luma_availability`] etc.);
+/// this legacy entry applies filter set 0 uniformly.
 pub fn apply_alf(pic: &mut YuvPicture, alf: &AlfData, bit_depth_luma: u32, bit_depth_chroma: u32) {
     if alf.luma_filter_signal && alf.num_luma_filters > 0 {
         apply_alf_luma(pic, &alf.luma_filters[0], bit_depth_luma);
