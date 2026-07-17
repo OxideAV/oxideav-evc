@@ -153,6 +153,19 @@ pub struct SideInfoGrid {
     /// Height of the grid in 4×4 cells.
     pub h_cells: usize,
     pub cells: Vec<CuSideInfo>,
+    /// Luma rectangle of the tile currently being decoded (§6.4.1 /
+    /// §6.4.3 first bullet: a neighbouring block in a different tile is
+    /// unavailable). Set by the tiled slice walkers per tile segment and
+    /// cleared once the walk finishes; `None` (the single-tile default)
+    /// disables the tile test — behaviour identical to the historical
+    /// walkers.
+    pub cur_tile: Option<crate::tiles::TileRect>,
+    /// Interior tile boundaries exempt from deblocking (§8.8.2 /
+    /// §8.8.3: "the edges that coincide with tile boundaries when
+    /// loop_filter_across_tiles_enabled_flag is equal to 0"). `None`
+    /// (the default) exempts nothing — single tile, or across-tiles
+    /// filtering enabled.
+    pub tile_bounds: Option<crate::tiles::TileBounds>,
 }
 
 impl Default for SideInfoGrid {
@@ -163,6 +176,8 @@ impl Default for SideInfoGrid {
             w_cells: 0,
             h_cells: 0,
             cells: Vec::new(),
+            cur_tile: None,
+            tile_bounds: None,
         }
     }
 }
@@ -179,6 +194,20 @@ impl SideInfoGrid {
             w_cells,
             h_cells,
             cells,
+            cur_tile: None,
+            tile_bounds: None,
+        }
+    }
+
+    /// §6.4.1 / §6.4.3 first bullet — whether the neighbouring luma
+    /// location `(x, y)` lies in a different tile than the block
+    /// currently being decoded. `false` whenever no current-tile
+    /// rectangle is armed (single-tile decode).
+    #[inline]
+    pub fn neighbour_in_other_tile(&self, x: i64, y: i64) -> bool {
+        match &self.cur_tile {
+            Some(r) => !r.contains(x, y),
+            None => false,
         }
     }
 
@@ -1155,6 +1184,25 @@ mod tests {
         assert_eq!(s_t(51, 3), 10);
         // bS = 0 (intra both sides) is always 0.
         assert_eq!(s_t(40, 0), 0);
+    }
+
+    /// Round 416 — the grid's §6.4.1 tile probe: `None` (single tile)
+    /// never fires; an armed rectangle marks everything outside it as
+    /// other-tile.
+    #[test]
+    fn round416_grid_neighbour_in_other_tile() {
+        let mut grid = SideInfoGrid::new(64, 64);
+        assert!(!grid.neighbour_in_other_tile(-1, 0));
+        assert!(!grid.neighbour_in_other_tile(63, 63));
+        grid.cur_tile = Some(crate::tiles::TileRect {
+            x0: 32,
+            y0: 0,
+            x1: 64,
+            y1: 64,
+        });
+        assert!(grid.neighbour_in_other_tile(31, 0)); // left tile
+        assert!(!grid.neighbour_in_other_tile(32, 0)); // inside
+        assert!(grid.neighbour_in_other_tile(-1, 0)); // out of picture
     }
 
     /// Two adjacent intra CUs always produce bS = 0 → no filtering.

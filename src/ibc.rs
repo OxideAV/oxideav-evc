@@ -201,6 +201,41 @@ pub fn validate_ibc_constraints(
     Ok(())
 }
 
+/// [`validate_ibc_constraints`] plus the §8.6.1 / §6.4.1 tile bullet:
+/// the reference-block corner availability checks invoke §6.4.1, whose
+/// first bullet marks a location in a different tile unavailable — so
+/// under a multi-tile decode the whole reference block must lie inside
+/// the current tile's luma rectangle. The reference block and the tile
+/// are both axis-aligned rectangles, so top-left + bottom-right
+/// containment covers every §8.6.1 corner probe (TL, TR, BL, BR and the
+/// SUCO mid-bottom point). `None` reproduces [`validate_ibc_constraints`].
+#[allow(clippy::too_many_arguments)]
+pub fn validate_ibc_constraints_in_tile(
+    mv_l_sixteenth: MotionVector,
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w: i32,
+    n_cb_h: i32,
+    ctb_log2_size_y: u32,
+    tile_luma: Option<crate::tiles::TileRect>,
+) -> Result<()> {
+    validate_ibc_constraints(mv_l_sixteenth, x_cb, y_cb, n_cb_w, n_cb_h, ctb_log2_size_y)?;
+    if let Some(r) = tile_luma {
+        let mv_x = mv_l_sixteenth.x >> 4;
+        let mv_y = mv_l_sixteenth.y >> 4;
+        let x_ref_tl = (x_cb + mv_x) as i64;
+        let y_ref_tl = (y_cb + mv_y) as i64;
+        let x_ref_br = x_ref_tl + n_cb_w as i64 - 1;
+        let y_ref_br = y_ref_tl + n_cb_h as i64 - 1;
+        if !r.contains(x_ref_tl, y_ref_tl) || !r.contains(x_ref_br, y_ref_br) {
+            return Err(Error::invalid(
+                "evc ibc: BV reference block crosses a tile boundary (§6.4.1)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// §8.6.3 IBC block prediction.  IBC always lands on integer samples
 /// (eq. 1039's `<< 4` is bijective with a zero low-nibble, and the
 /// fractional sample interpolation §8.5.4.3.1 collapses to a sample
@@ -362,18 +397,53 @@ pub fn decode_ibc_cu(
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
 ) -> Result<(MotionVector, MotionVector)> {
+    decode_ibc_cu_in_tile(
+        cur_pic,
+        x_cb,
+        y_cb,
+        n_cb_w_l,
+        n_cb_h_l,
+        mvd,
+        ctb_log2_size_y,
+        chroma_present,
+        pred_y,
+        pred_cb,
+        pred_cr,
+        None,
+    )
+}
+
+/// [`decode_ibc_cu`] with the §6.4.1 tile bullet on the reference-block
+/// conformance checks ([`validate_ibc_constraints_in_tile`]). `None`
+/// reproduces the single-tile behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_ibc_cu_in_tile(
+    cur_pic: &YuvPicture,
+    x_cb: i32,
+    y_cb: i32,
+    n_cb_w_l: usize,
+    n_cb_h_l: usize,
+    mvd: MotionVector,
+    ctb_log2_size_y: u32,
+    chroma_present: bool,
+    pred_y: &mut [i32],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
+    tile_luma: Option<crate::tiles::TileRect>,
+) -> Result<(MotionVector, MotionVector)> {
     // Step 1: derive luma MV (§8.6.2.1).
     let mv_l = derive_ibc_luma_mv(mvd);
     // Inline conformance check before any sample read. The validator's
     // CB-dimension check covers nCbW / nCbH non-positive, so we don't
     // duplicate that guard here.
-    validate_ibc_constraints(
+    validate_ibc_constraints_in_tile(
         mv_l,
         x_cb,
         y_cb,
         n_cb_w_l as i32,
         n_cb_h_l as i32,
         ctb_log2_size_y,
+        tile_luma,
     )?;
     // Step 2: derive chroma MV (§8.6.2.2).
     let mv_c = if chroma_present {
@@ -528,6 +598,29 @@ mod tests {
             x: x << 4,
             y: y << 4,
         }
+    }
+
+    /// Round 416 — §6.4.1 tile bullet on the §8.6.1 reference-corner
+    /// conformance: a BV whose reference block lies in the neighbouring
+    /// tile is rejected under the tile constraint and accepted without
+    /// it (the untiled control).
+    #[test]
+    fn round416_ibc_bv_crossing_tile_boundary_rejected() {
+        // Current tile starts at x = 32; CB at (32, 0) 16×16; BV
+        // (-16, 0) points wholly into the left tile.
+        let mv = mv_sixteenth_from_integer(-16, 0);
+        let tile = crate::tiles::TileRect {
+            x0: 32,
+            y0: 0,
+            x1: 64,
+            y1: 32,
+        };
+        assert!(validate_ibc_constraints_in_tile(mv, 32, 0, 16, 16, 5, None).is_ok());
+        let r = validate_ibc_constraints_in_tile(mv, 32, 0, 16, 16, 5, Some(tile));
+        assert!(r.is_err(), "cross-tile BV must be rejected: {r:?}");
+        // A same-tile above reference stays conformant.
+        let mv_up = mv_sixteenth_from_integer(0, -16);
+        assert!(validate_ibc_constraints_in_tile(mv_up, 32, 16, 16, 16, 5, Some(tile)).is_ok());
     }
 
     #[test]

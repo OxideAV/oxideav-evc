@@ -89,8 +89,8 @@ impl YuvPicture {
     /// * left column available iff `x > 0`
     /// * top-left available iff both
     ///
-    /// Tile/slice boundary handling is omitted (round-3 fixtures are
-    /// single-tile, single-slice).
+    /// Single-tile form of [`Self::fetch_intra_refs_in_tile`] (no tile
+    /// constraint).
     pub fn fetch_intra_refs(
         &self,
         x: u32,
@@ -99,13 +99,37 @@ impl YuvPicture {
         n_cb_h: usize,
         c_idx: u32,
     ) -> RefSamples {
+        self.fetch_intra_refs_in_tile(x, y, n_cb_w, n_cb_h, c_idx, None)
+    }
+
+    /// [`Self::fetch_intra_refs`] with the §6.4.1 first bullet: when a
+    /// component-domain tile rectangle is supplied, any neighbour sample
+    /// outside it is "not available for intra prediction" and keeps the
+    /// §8.4.4.2 `1 << (bitDepth − 1)` substitution value. `tile_c` must
+    /// already be scaled to the component domain of `c_idx`
+    /// ([`crate::tiles::TileRect::component`]).
+    pub fn fetch_intra_refs_in_tile(
+        &self,
+        x: u32,
+        y: u32,
+        n_cb_w: usize,
+        n_cb_h: usize,
+        c_idx: u32,
+        tile_c: Option<crate::tiles::TileRect>,
+    ) -> RefSamples {
         let mut refs = RefSamples::unavailable(n_cb_w, n_cb_h, self.bit_depth);
         let span = n_cb_w + n_cb_h;
         let (plane, stride, w, h) = self.plane_view(c_idx);
+        let in_tile = |ax: usize, ay: usize| -> bool {
+            match &tile_c {
+                Some(r) => r.contains(ax as i64, ay as i64),
+                None => true,
+            }
+        };
         if y > 0 {
             for i in 0..span {
                 let xi = x as usize + i;
-                if xi < w {
+                if xi < w && in_tile(xi, y as usize - 1) {
                     refs.top[i] = plane[(y as usize - 1) * stride + xi] as i32;
                 }
             }
@@ -113,12 +137,12 @@ impl YuvPicture {
         if x > 0 {
             for j in 0..span {
                 let yj = y as usize + j;
-                if yj < h {
+                if yj < h && in_tile(x as usize - 1, yj) {
                     refs.left[j] = plane[yj * stride + (x as usize - 1)] as i32;
                 }
             }
         }
-        if x > 0 && y > 0 {
+        if x > 0 && y > 0 && in_tile(x as usize - 1, y as usize - 1) {
             refs.top_left = plane[(y as usize - 1) * stride + (x as usize - 1)] as i32;
         }
         refs
@@ -156,6 +180,37 @@ impl YuvPicture {
         sps_suco_flag: bool,
         right_available: bool,
     ) -> crate::eipd::EipdRefSamples {
+        self.fetch_eipd_refs_in_tile(
+            x,
+            y,
+            n_cb_w,
+            n_cb_h,
+            c_idx,
+            sps_suco_flag,
+            right_available,
+            None,
+        )
+    }
+
+    /// [`Self::fetch_eipd_refs`] with the §6.4.1 first bullet: when a
+    /// component-domain tile rectangle is supplied, any neighbour
+    /// location outside it is unavailable and the §8.4.4.2
+    /// `sps_eipd_flag == 1` substitution (scan-predecessor copy /
+    /// mid-level corner) fills the hole. `tile_c` must already be
+    /// scaled to the component domain of `c_idx`
+    /// ([`crate::tiles::TileRect::component`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_eipd_refs_in_tile(
+        &self,
+        x: u32,
+        y: u32,
+        n_cb_w: usize,
+        n_cb_h: usize,
+        c_idx: u32,
+        sps_suco_flag: bool,
+        right_available: bool,
+        tile_c: Option<crate::tiles::TileRect>,
+    ) -> crate::eipd::EipdRefSamples {
         let (plane, stride, w, h) = self.plane_view(c_idx);
         let xb = x as i64;
         let yb = y as i64;
@@ -164,12 +219,17 @@ impl YuvPicture {
 
         // Availability: a component-domain offset (ox, oy) relative to the
         // block's top-left. `available` returns true only for causal,
-        // in-picture neighbour locations.
+        // in-picture, same-tile neighbour locations.
         let available = |ox: i64, oy: i64| -> bool {
             let ax = xb + ox;
             let ay = yb + oy;
             if ax < 0 || ay < 0 || ax >= wi || ay >= hi {
                 return false;
+            }
+            if let Some(r) = &tile_c {
+                if !r.contains(ax, ay) {
+                    return false;
+                }
             }
             if oy < 0 {
                 // Top row / corner: must be above the block (y > 0), and the
@@ -232,6 +292,35 @@ impl YuvPicture {
         is_intra: bool,
         is_inter_square_ge32: bool,
     ) -> bool {
+        self.apply_htdf_luma_in_tile(
+            x,
+            y,
+            n_cb_w,
+            n_cb_h,
+            qp_y,
+            is_intra,
+            is_inter_square_ge32,
+            None,
+        )
+    }
+
+    /// [`Self::apply_htdf_luma`] with the §6.4.1 tile constraint: the
+    /// §8.7.6.2 border availability treats samples outside the supplied
+    /// luma tile rectangle as unavailable, so the `dx`/`dy` replicate
+    /// clamp folds tile edges exactly like picture edges. `None`
+    /// reproduces the in-picture-extent rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_htdf_luma_in_tile(
+        &mut self,
+        x: u32,
+        y: u32,
+        n_cb_w: usize,
+        n_cb_h: usize,
+        qp_y: i32,
+        is_intra: bool,
+        is_inter_square_ge32: bool,
+        tile_luma: Option<crate::tiles::TileRect>,
+    ) -> bool {
         use crate::htdf::{
             derive_htdf_lut, filter_block, htdf_applies, pad_rec_samples, InPictureBorder,
         };
@@ -243,11 +332,17 @@ impl YuvPicture {
         let h = self.height as i32;
         let stride = self.y_stride();
         let lut = derive_htdf_lut(qp_y, is_inter_square_ge32);
+        // The available window is the tile rectangle (already clamped
+        // to the picture extent); the whole picture when untiled.
+        let (bx0, by0, bx1, by1) = match tile_luma {
+            Some(r) => (r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32),
+            None => (0, 0, w, h),
+        };
         let border = InPictureBorder {
-            x_cb: x as i32,
-            y_cb: y as i32,
-            width: w,
-            height: h,
+            x_cb: x as i32 - bx0,
+            y_cb: y as i32 - by0,
+            width: bx1 - bx0,
+            height: by1 - by0,
         };
         let pad = pad_rec_samples(
             x as i32,
@@ -380,6 +475,35 @@ pub fn intra_reconstruct_cb(
     c_idx: u32,
     residual: &[i32],
 ) -> Result<()> {
+    intra_reconstruct_cb_in_tile(
+        pic,
+        x_luma,
+        y_luma,
+        log2_cb_w_luma,
+        log2_cb_h_luma,
+        pred_mode,
+        c_idx,
+        residual,
+        None,
+    )
+}
+
+/// [`intra_reconstruct_cb`] with the §6.4.1 tile constraint: reference
+/// samples outside the supplied *luma-domain* tile rectangle are
+/// unavailable (mid-level substitution). `None` reproduces the
+/// single-tile behaviour exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn intra_reconstruct_cb_in_tile(
+    pic: &mut YuvPicture,
+    x_luma: u32,
+    y_luma: u32,
+    log2_cb_w_luma: u32,
+    log2_cb_h_luma: u32,
+    pred_mode: IntraMode,
+    c_idx: u32,
+    residual: &[i32],
+    tile_luma: Option<crate::tiles::TileRect>,
+) -> Result<()> {
     // Compute component-space coordinates and dimensions.
     let (sub_w, sub_h) = sub_sampling(pic.chroma_format_idc, c_idx)?;
     let x = x_luma / sub_w;
@@ -395,7 +519,8 @@ pub fn intra_reconstruct_cb(
             n_cb_w * n_cb_h
         )));
     }
-    let refs = pic.fetch_intra_refs(x, y, n_cb_w, n_cb_h, c_idx);
+    let tile_c = tile_luma.map(|r| r.component(sub_w, sub_h));
+    let refs = pic.fetch_intra_refs_in_tile(x, y, n_cb_w, n_cb_h, c_idx, tile_c);
     let mut pred = vec![0i32; n_cb_w * n_cb_h];
     predict(pred_mode, &refs, n_cb_w, n_cb_h, pic.bit_depth, &mut pred);
     // Picture construction: rec = clip(pred + res) — eq. 1091.
@@ -430,6 +555,41 @@ pub fn intra_reconstruct_cb_eipd(
     right_available: bool,
     residual: &[i32],
 ) -> Result<()> {
+    intra_reconstruct_cb_eipd_in_tile(
+        pic,
+        x_luma,
+        y_luma,
+        log2_cb_w_luma,
+        log2_cb_h_luma,
+        pred_mode_intra,
+        c_idx,
+        sps_suco_flag,
+        right_available,
+        residual,
+        None,
+    )
+}
+
+/// [`intra_reconstruct_cb_eipd`] with the §6.4.1 tile constraint:
+/// reference locations outside the supplied *luma-domain* tile
+/// rectangle are unavailable (§8.4.4.2 substitution), and the §6.4.2
+/// `availableL` folds the tile test so a CU at a tile's left edge
+/// derives `LR_00`/`LR_01`. `None` reproduces the single-tile
+/// behaviour exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn intra_reconstruct_cb_eipd_in_tile(
+    pic: &mut YuvPicture,
+    x_luma: u32,
+    y_luma: u32,
+    log2_cb_w_luma: u32,
+    log2_cb_h_luma: u32,
+    pred_mode_intra: i32,
+    c_idx: u32,
+    sps_suco_flag: bool,
+    right_available: bool,
+    residual: &[i32],
+    tile_luma: Option<crate::tiles::TileRect>,
+) -> Result<()> {
     use crate::eipd::{predict_eipd, AvailLr};
 
     let (sub_w, sub_h) = sub_sampling(pic.chroma_format_idc, c_idx)?;
@@ -446,9 +606,14 @@ pub fn intra_reconstruct_cb_eipd(
             n_cb_w * n_cb_h
         )));
     }
+    let tile_c = tile_luma.map(|r| r.component(sub_w, sub_h));
 
-    // §6.4.2 availLR from the simplified causal rule.
-    let left_avail = x > 0;
+    // §6.4.2 availLR from the simplified causal rule, folded with the
+    // §6.4.1 tile bullet at the (x − 1, y) left location.
+    let left_avail = x > 0
+        && tile_c
+            .map(|r| r.contains(x as i64 - 1, y as i64))
+            .unwrap_or(true);
     let avail_lr = match (left_avail, sps_suco_flag && right_available) {
         (false, false) => AvailLr::Lr00,
         (true, false) => AvailLr::Lr10,
@@ -456,7 +621,16 @@ pub fn intra_reconstruct_cb_eipd(
         (true, true) => AvailLr::Lr11,
     };
 
-    let refs = pic.fetch_eipd_refs(x, y, n_cb_w, n_cb_h, c_idx, sps_suco_flag, right_available);
+    let refs = pic.fetch_eipd_refs_in_tile(
+        x,
+        y,
+        n_cb_w,
+        n_cb_h,
+        c_idx,
+        sps_suco_flag,
+        right_available,
+        tile_c,
+    );
     let mut pred = vec![0i32; n_cb_w * n_cb_h];
     predict_eipd(
         pred_mode_intra,
@@ -500,6 +674,63 @@ fn sub_h_log2(s: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 416 — §6.4.1 tile bullet on the Baseline intra reference
+    /// fetch: a left column that lies in the neighbouring tile keeps
+    /// the mid-level substitution even though the samples exist in the
+    /// reconstructed plane.
+    #[test]
+    fn round416_fetch_intra_refs_tile_gates_left_column() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        // Seed the whole left half with 200s and the right tile's top
+        // rows with 90s.
+        pic.store_block(0, 0, 8, 16, 0, &[200i32; 128]);
+        pic.store_block(8, 0, 8, 4, 0, &[90i32; 32]);
+        let tile_right = crate::tiles::TileRect {
+            x0: 8,
+            y0: 0,
+            x1: 16,
+            y1: 16,
+        };
+        // Untiled: the left refs at x=8 read the stored 200s.
+        let refs = pic.fetch_intra_refs_in_tile(8, 4, 4, 4, 0, None);
+        assert_eq!(refs.left[0], 200);
+        // Tiled (current tile starts at x=8): the same probe is in the
+        // other tile → §8.4.4.2 mid-level 128 — while the top row above
+        // the block stays inside the tile and is still read (90s).
+        let refs = pic.fetch_intra_refs_in_tile(8, 4, 4, 4, 0, Some(tile_right));
+        assert_eq!(refs.left[0], 128);
+        assert_eq!(refs.top_left, 128);
+        assert_eq!(refs.top[0], 90);
+    }
+
+    /// Round 416 — §6.4.1 tile bullet on the EIPD reference fetch: with
+    /// the current tile starting at the block's column, the left column
+    /// is a hole and the §8.4.4.2 `sps_eipd_flag == 1` substitution
+    /// copies scan predecessors instead of the neighbouring tile's
+    /// reconstructed samples.
+    #[test]
+    fn round416_fetch_eipd_refs_tile_gates_left_column() {
+        let mut pic = YuvPicture::new(16, 16, 1, 8).unwrap();
+        pic.store_block(0, 0, 8, 16, 0, &[200i32; 128]);
+        // Top neighbour row inside the right tile: 90s.
+        pic.store_block(8, 0, 8, 4, 0, &[90i32; 32]);
+        let tile_right = crate::tiles::TileRect {
+            x0: 8,
+            y0: 0,
+            x1: 16,
+            y1: 16,
+        };
+        let refs = pic.fetch_eipd_refs_in_tile(8, 4, 4, 4, 0, false, false, Some(tile_right));
+        // Left column p[-1][y]: unavailable (other tile) → substituted
+        // from the corner/top chain, never the 200s.
+        for j in 0..8i32 {
+            assert_ne!(refs.left(j), 200, "left[{j}] leaked across the tile");
+        }
+        // Untiled control: the 200s are read directly.
+        let refs = pic.fetch_eipd_refs_in_tile(8, 4, 4, 4, 0, false, false, None);
+        assert_eq!(refs.left(0), 200);
+    }
 
     /// Newly-constructed buffer is initialised to 128 (8-bit half-range).
     #[test]

@@ -1021,7 +1021,9 @@ pub fn parse(rbsp: &[u8]) -> Result<Pps> {
     let mut uniform_tile_spacing_flag = true;
     let mut tile_column_width_minus1 = Vec::new();
     let mut tile_row_height_minus1 = Vec::new();
-    let mut loop_filter_across_tiles_enabled_flag = false;
+    // §7.4.4.2: when not present (single_tile_in_pic_flag == 1),
+    // loop_filter_across_tiles_enabled_flag is inferred equal to 1.
+    let mut loop_filter_across_tiles_enabled_flag = true;
     let mut tile_offset_len_minus1 = 0;
     if !single_tile_in_pic_flag {
         num_tile_columns_minus1 = br.ue()?;

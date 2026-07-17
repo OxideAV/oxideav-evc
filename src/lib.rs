@@ -159,6 +159,8 @@ pub mod split;
 #[doc(hidden)]
 pub mod sps;
 #[doc(hidden)]
+pub mod tiles;
+#[doc(hidden)]
 pub mod tmvp;
 #[doc(hidden)]
 pub mod transform;

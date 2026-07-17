@@ -46,7 +46,7 @@ use crate::cabac::CabacEngine;
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
 use crate::intra::IntraMode;
-use crate::picture::{intra_reconstruct_cb, YuvPicture};
+use crate::picture::YuvPicture;
 
 /// Static SPS/PPS state that the walker needs to make
 /// per-syntax-element decisions. Only the fields actually consulted by
@@ -2030,6 +2030,10 @@ fn eipd_neighbour_mode(
     if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
         return NeighbourMode::invalid();
     }
+    // §6.4.1 first bullet: a neighbour in a different tile is invalid.
+    if side_info.neighbour_in_other_tile(x, y) {
+        return NeighbourMode::invalid();
+    }
     let xc = (x as u32 >> 2) as usize;
     let yc = (y as u32 >> 2) as usize;
     if xc >= side_info.w_cells || yc >= side_info.h_cells {
@@ -2091,6 +2095,12 @@ fn eipd_right_available(
 ) -> bool {
     let x = x0 as i64 + (1i64 << log2_cb_width);
     if x >= walk.pic_width as i64 {
+        return false;
+    }
+    // §6.4.1 first bullet: a right neighbour in a different tile is
+    // unavailable (SUCO orders never cross a tile boundary, but the
+    // guard keeps the probe spec-shaped).
+    if side_info.neighbour_in_other_tile(x, y0 as i64) {
         return false;
     }
     let xc = (x as u32 >> 2) as usize;
@@ -2214,6 +2224,11 @@ fn btt_num_smaller(
         if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
             return None;
         }
+        // §6.4.1 first bullet: a neighbour in a different tile is
+        // unavailable.
+        if side_info.neighbour_in_other_tile(x, y) {
+            return None;
+        }
         let xc = (x as u32 >> 2) as usize;
         let yc = (y as u32 >> 2) as usize;
         if xc >= side_info.w_cells || yc >= side_info.h_cells {
@@ -2266,6 +2281,11 @@ fn ctx_inc_neighbour_cells(
     let n_cb_h = 1i64 << log2_cb_height;
     let probe = |x: i64, y: i64| -> u32 {
         if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
+            return 0;
+        }
+        // §6.4.1 first bullet: a neighbour in a different tile is
+        // unavailable.
+        if side_info.neighbour_in_other_tile(x, y) {
             return 0;
         }
         let xc = (x as u32 >> 2) as usize;
@@ -2849,7 +2869,7 @@ fn apply_ibc_branch_predict_and_reconstruct(
     let mut pred_y = vec![0i32; n_l];
     let mut pred_cb = vec![0i32; n_c];
     let mut pred_cr = vec![0i32; n_c];
-    let (mv_l, _mv_c) = crate::ibc::decode_ibc_cu(
+    let (mv_l, _mv_c) = crate::ibc::decode_ibc_cu_in_tile(
         pic,
         x0 as i32,
         y0 as i32,
@@ -2861,6 +2881,7 @@ fn apply_ibc_branch_predict_and_reconstruct(
         &mut pred_y,
         &mut pred_cb,
         &mut pred_cr,
+        side_info.cur_tile,
     )?;
     // Scale + IDCT the residual levels at the per-CU QP (the round-103
     // `cu_qp_delta`-derived value resolved by `decode_ibc_branch`; the
@@ -3172,12 +3193,20 @@ fn decode_transform_unit(
     match tree_type {
         TreeType::DualTreeLuma | TreeType::SingleTree => {
             match intra_mode {
-                CuIntraMode::Baseline(m) => {
-                    intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
-                }
+                CuIntraMode::Baseline(m) => crate::picture::intra_reconstruct_cb_in_tile(
+                    pic,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    m,
+                    0,
+                    &res_y,
+                    side_info.cur_tile,
+                )?,
                 CuIntraMode::Eipd(m) => {
                     let right = eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
-                    crate::picture::intra_reconstruct_cb_eipd(
+                    crate::picture::intra_reconstruct_cb_eipd_in_tile(
                         pic,
                         x0,
                         y0,
@@ -3188,6 +3217,7 @@ fn decode_transform_unit(
                         walk.tree_gates.sps_suco_flag,
                         right,
                         &res_y,
+                        side_info.cur_tile,
                     )?
                 }
             }
@@ -3199,7 +3229,7 @@ fn decode_transform_unit(
             // partner is excluded.
             if decode.sps_htdf_flag && !luma_cu_is_ibc {
                 let qp_prime = cu_qp + 6 * (decode.bit_depth_luma as i32 - 8);
-                if pic.apply_htdf_luma(
+                if pic.apply_htdf_luma_in_tile(
                     x0,
                     y0,
                     1usize << log2_cb_width,
@@ -3207,6 +3237,7 @@ fn decode_transform_unit(
                     qp_prime,
                     true,
                     false,
+                    side_info.cur_tile,
                 ) {
                     stats.htdf_blocks += 1;
                 }
@@ -3250,7 +3281,7 @@ fn decode_transform_unit(
                 } else {
                     match intra_mode {
                         CuIntraMode::Baseline(m) => {
-                            intra_reconstruct_cb(
+                            crate::picture::intra_reconstruct_cb_in_tile(
                                 pic,
                                 x0,
                                 y0,
@@ -3259,8 +3290,9 @@ fn decode_transform_unit(
                                 m,
                                 1,
                                 &res_cb,
+                                side_info.cur_tile,
                             )?;
-                            intra_reconstruct_cb(
+                            crate::picture::intra_reconstruct_cb_in_tile(
                                 pic,
                                 x0,
                                 y0,
@@ -3269,12 +3301,13 @@ fn decode_transform_unit(
                                 m,
                                 2,
                                 &res_cr,
+                                side_info.cur_tile,
                             )?;
                         }
                         CuIntraMode::Eipd(m) => {
                             let right =
                                 eipd_right_available(side_info, walk, x0, y0, log2_cb_width);
-                            crate::picture::intra_reconstruct_cb_eipd(
+                            crate::picture::intra_reconstruct_cb_eipd_in_tile(
                                 pic,
                                 x0,
                                 y0,
@@ -3285,8 +3318,9 @@ fn decode_transform_unit(
                                 walk.tree_gates.sps_suco_flag,
                                 right,
                                 &res_cb,
+                                side_info.cur_tile,
                             )?;
-                            crate::picture::intra_reconstruct_cb_eipd(
+                            crate::picture::intra_reconstruct_cb_eipd_in_tile(
                                 pic,
                                 x0,
                                 y0,
@@ -3297,6 +3331,7 @@ fn decode_transform_unit(
                                 walk.tree_gates.sps_suco_flag,
                                 right,
                                 &res_cr,
+                                side_info.cur_tile,
                             )?;
                         }
                     }
@@ -6031,7 +6066,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
     if cbf_luma != 0 && inputs.decode.sps_htdf_flag {
         let qp_prime = cu_qp + 6 * (inputs.decode.bit_depth_luma as i32 - 8);
         let square_ge32 = n_cb_w == n_cb_h && n_cb_w.min(n_cb_h) >= 32;
-        if pic.apply_htdf_luma(
+        if pic.apply_htdf_luma_in_tile(
             x0,
             y0,
             n_cb_w as usize,
@@ -6039,6 +6074,7 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
             qp_prime,
             false,
             square_ge32,
+            side_info.cur_tile,
         ) {
             stats.htdf_blocks += 1;
         }
@@ -6397,6 +6433,11 @@ fn affine_neighbour_from_grid(
     if x < 0 || y < 0 {
         return Default::default();
     }
+    // §6.4.3 first bullet: an affine neighbour in a different tile is
+    // unavailable (its corner-cell MVs may not be consulted either).
+    if grid.neighbour_in_other_tile(x as i64, y as i64) {
+        return Default::default();
+    }
     let cell = grid.at((x >> 2) as usize, (y >> 2) as usize);
     if cell.pred_mode != CuPredMode::Inter || cell.motion_model_idc == 0 {
         return Default::default();
@@ -6687,6 +6728,11 @@ fn spatial_neighbour_mv(
     if x < 0 || y < 0 {
         return None;
     }
+    // §6.4.3 first bullet: a neighbour in a different tile is
+    // unavailable as an MV candidate.
+    if side_info.neighbour_in_other_tile(x as i64, y as i64) {
+        return None;
+    }
     let x_cell = (x as u32) >> 2;
     let y_cell = (y as u32) >> 2;
     if (x_cell as usize) >= side_info.w_cells || (y_cell as usize) >= side_info.h_cells {
@@ -6783,6 +6829,11 @@ fn baseline_amvp_select_with_grid_and_hmvp(
 /// contract the §8.5.2.3.1 assembly consumes.
 fn merge_neighbour_mv_from_grid(grid: &SideInfoGrid, x: i32, y: i32) -> crate::merge::NeighbourMv {
     if x < 0 || y < 0 {
+        return crate::merge::NeighbourMv::default();
+    }
+    // §6.4.3 first bullet: a neighbour in a different tile is
+    // unavailable as an MV candidate.
+    if grid.neighbour_in_other_tile(x as i64, y as i64) {
         return crate::merge::NeighbourMv::default();
     }
     let info = grid.at((x >> 2) as usize, (y >> 2) as usize);
@@ -6901,7 +6952,6 @@ fn decode_inter_intra_cu(
     tree_type: TreeType,
 ) -> Result<()> {
     use crate::intra::IntraMode;
-    use crate::picture::intra_reconstruct_cb;
     // §7.3.8.4: intra_pred_mode is read only when
     // `treeType != DUAL_TREE_CHROMA`. A standalone DUAL_TREE_CHROMA CU
     // (the local-dual-tree chroma at a §7.4.9.3 tree-split point) uses
@@ -7135,12 +7185,20 @@ fn decode_inter_intra_cu(
             },
         );
         match intra_mode {
-            CuIntraMode::Baseline(m) => {
-                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 0, &res_y)?
-            }
+            CuIntraMode::Baseline(m) => crate::picture::intra_reconstruct_cb_in_tile(
+                pic,
+                x0,
+                y0,
+                log2_cb_width,
+                log2_cb_height,
+                m,
+                0,
+                &res_y,
+                side_info.cur_tile,
+            )?,
             CuIntraMode::Eipd(m) => {
                 let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
-                crate::picture::intra_reconstruct_cb_eipd(
+                crate::picture::intra_reconstruct_cb_eipd_in_tile(
                     pic,
                     x0,
                     y0,
@@ -7151,6 +7209,7 @@ fn decode_inter_intra_cu(
                     walk.tree_gates.sps_suco_flag,
                     right,
                     &res_y,
+                    side_info.cur_tile,
                 )?
             }
         }
@@ -7159,7 +7218,7 @@ fn decode_inter_intra_cu(
         // §8.7.6.1 applicability gates apply. Qp′Y per eq. 1043.
         if decode.sps_htdf_flag {
             let qp_prime = cu_qp + 6 * (decode.bit_depth_luma as i32 - 8);
-            if pic.apply_htdf_luma(
+            if pic.apply_htdf_luma_in_tile(
                 x0,
                 y0,
                 1usize << log2_cb_width,
@@ -7167,6 +7226,7 @@ fn decode_inter_intra_cu(
                 qp_prime,
                 true,
                 false,
+                side_info.cur_tile,
             ) {
                 stats.htdf_blocks += 1;
             }
@@ -7175,12 +7235,32 @@ fn decode_inter_intra_cu(
     if chroma_present {
         match intra_mode {
             CuIntraMode::Baseline(m) => {
-                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 1, &res_cb)?;
-                intra_reconstruct_cb(pic, x0, y0, log2_cb_width, log2_cb_height, m, 2, &res_cr)?;
+                crate::picture::intra_reconstruct_cb_in_tile(
+                    pic,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    m,
+                    1,
+                    &res_cb,
+                    side_info.cur_tile,
+                )?;
+                crate::picture::intra_reconstruct_cb_in_tile(
+                    pic,
+                    x0,
+                    y0,
+                    log2_cb_width,
+                    log2_cb_height,
+                    m,
+                    2,
+                    &res_cr,
+                    side_info.cur_tile,
+                )?;
             }
             CuIntraMode::Eipd(_) => {
                 let right = eipd_right_available(side_info, &walk, x0, y0, log2_cb_width);
-                crate::picture::intra_reconstruct_cb_eipd(
+                crate::picture::intra_reconstruct_cb_eipd_in_tile(
                     pic,
                     x0,
                     y0,
@@ -7191,8 +7271,9 @@ fn decode_inter_intra_cu(
                     walk.tree_gates.sps_suco_flag,
                     right,
                     &res_cb,
+                    side_info.cur_tile,
                 )?;
-                crate::picture::intra_reconstruct_cb_eipd(
+                crate::picture::intra_reconstruct_cb_eipd_in_tile(
                     pic,
                     x0,
                     y0,
@@ -7203,6 +7284,7 @@ fn decode_inter_intra_cu(
                     walk.tree_gates.sps_suco_flag,
                     right,
                     &res_cr,
+                    side_info.cur_tile,
                 )?;
             }
         }
@@ -7435,7 +7517,7 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
     let mut pred_y = vec![0i32; n_l];
     let mut pred_cb = vec![0i32; n_c];
     let mut pred_cr = vec![0i32; n_c];
-    let (mv_l, _mv_c) = crate::ibc::decode_ibc_cu(
+    let (mv_l, _mv_c) = crate::ibc::decode_ibc_cu_in_tile(
         pic,
         x0 as i32,
         y0 as i32,
@@ -7447,6 +7529,7 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
         &mut pred_y,
         &mut pred_cb,
         &mut pred_cr,
+        side_info.cur_tile,
     )?;
     // Luma scale + IDCT + add at the per-CU QP (round-103 `cu_qp_delta`
     // value resolved by `decode_inter_ibc_branch`; direct-call tests pass
