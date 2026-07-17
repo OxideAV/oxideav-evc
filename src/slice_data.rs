@@ -8388,6 +8388,63 @@ mod tests {
         assert_eq!(pic_single.y, ref_y, "single-tile control is a full copy");
     }
 
+    /// Round 416 — 2×2 tile grid: a 64×64 picture, CTB 32, four tiles
+    /// of one CTU each with distinct DC levels. The tiled decode must
+    /// stitch the four standalone 32×32 decodes bit-exactly — the
+    /// bottom-right tile in particular gets neither left nor top
+    /// references from its decoded neighbours.
+    #[test]
+    fn round416_four_tile_idr_decode_stitches_standalone_tiles() {
+        let levels = [149u32, 99, 49, 9];
+        let subsets: Vec<Vec<u8>> = levels.iter().map(|&l| encode_dc_ctu_subset(l)).collect();
+        let mut rbsp = Vec::new();
+        let mut ranges = Vec::new();
+        for s in &subsets {
+            let start = rbsp.len();
+            rbsp.extend_from_slice(s);
+            ranges.push(start..rbsp.len());
+        }
+        let order = SliceTileWalkOrder {
+            segments: (0..4)
+                .map(|i| SliceTileWalkSegment {
+                    tile_idx: i,
+                    first_ctb_addr_ts: i,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![i],
+                    byte_align_after: i < 3,
+                })
+                .collect(),
+        };
+        let layout =
+            crate::tiles::PicTileLayout::from_ctb_bounds(&[0, 1, 2], &[0, 1, 2], 5, 64, 64, false)
+                .unwrap();
+        let (pic, stats) = decode_baseline_idr_slice_tiled(
+            &rbsp,
+            tile_walk_inputs(64, 64),
+            tile_decode_inputs(),
+            &order,
+            &ranges,
+            &layout,
+        )
+        .unwrap();
+        assert_eq!(stats.ctus, 4);
+        for (t, s) in subsets.iter().enumerate() {
+            let (tile_pic, _) =
+                decode_baseline_idr_slice(s, tile_walk_inputs(32, 32), tile_decode_inputs())
+                    .unwrap();
+            let (tx, ty) = ((t % 2) * 32, (t / 2) * 32);
+            for j in 0..32usize {
+                for i in 0..32usize {
+                    assert_eq!(
+                        pic.y[(ty + j) * 64 + tx + i],
+                        tile_pic.y[j * 32 + i],
+                        "tile {t} luma mismatch at ({i}, {j})"
+                    );
+                }
+            }
+        }
+    }
+
     /// Round 416 — the single-tile wrapper contract: decoding through
     /// `decode_baseline_idr_slice` equals an explicit one-segment
     /// `decode_baseline_idr_slice_tiled` call over the whole RBSP.

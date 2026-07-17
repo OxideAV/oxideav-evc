@@ -2251,17 +2251,11 @@ mod tests {
         enc.finish()
     }
 
-    /// Round 416 — end-to-end **multi-tile** decode through the
-    /// registered decoder: SPS + a 2×1-tile PPS + an IDR slice spanning
-    /// both tiles (tile fields + a 16-bit entry point in the header,
-    /// two CABAC subsets) + a P slice of per-tile zero-MV skip CUs.
-    /// The IDR frame must stitch the two standalone single-tile decodes
-    /// bit-exactly (§6.4.1 keeps tile 1's intra refs off tile 0), and
-    /// the P frame must equal the IDR frame.
-    #[test]
-    fn round416_make_decoder_decodes_two_tile_idr_plus_p() {
+    /// Round 416 — the full two-tile NAL bitstream (SPS, a 2×1-tile
+    /// PPS, a both-tiles IDR and a both-tiles skip-P) plus the two IDR
+    /// tile subsets for stitch controls.
+    fn build_two_tile_bitstream() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use crate::cabac::CabacEncoder;
-        use oxideav_core::{CodecParameters, Packet, TimeBase};
         let sps_rbsp = build_baseline_sps_rbsp(128, 64);
         let pps_rbsp = build_two_tile_pps_rbsp();
 
@@ -2340,7 +2334,20 @@ mod tests {
         bs.extend_from_slice(&nal_envelope(25, &pps_rbsp)); // PPS
         bs.extend_from_slice(&nal_envelope(1, &idr_rbsp)); // IDR
         bs.extend_from_slice(&nal_envelope(0, &p_rbsp)); // NonIDR
+        (bs, subset_a, subset_b)
+    }
 
+    /// Round 416 — end-to-end **multi-tile** decode through the
+    /// registered decoder: SPS + a 2×1-tile PPS + an IDR slice spanning
+    /// both tiles (tile fields + a 16-bit entry point in the header,
+    /// two CABAC subsets) + a P slice of per-tile zero-MV skip CUs.
+    /// The IDR frame must stitch the two standalone single-tile decodes
+    /// bit-exactly (§6.4.1 keeps tile 1's intra refs off tile 0), and
+    /// the P frame must equal the IDR frame.
+    #[test]
+    fn round416_make_decoder_decodes_two_tile_idr_plus_p() {
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let (bs, subset_a, subset_b) = build_two_tile_bitstream();
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let mut dec = decoder::make_decoder(&params).unwrap();
         let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
@@ -2396,6 +2403,34 @@ mod tests {
         assert_eq!(v0.planes[0].data, v1.planes[0].data);
         assert_eq!(v0.planes[1].data, v1.planes[1].data);
         assert_eq!(v0.planes[2].data, v1.planes[2].data);
+    }
+
+    /// Round 416 — mutation gate over the multi-tile stream: every
+    /// single-byte corruption of the two-tile IDR+P bitstream (two XOR
+    /// patterns per position — a low-bit flip and a full invert) must
+    /// come back as a clean `Err` or a decoded frame, never a panic,
+    /// out-of-bounds access or runaway allocation. Exercises the tile
+    /// plumbing's error paths: PPS tile geometry, slice-header tile
+    /// ids, the entry-point subsets and the per-tile CABAC terminates.
+    #[test]
+    fn round416_two_tile_stream_mutation_never_panics() {
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let (bs, _, _) = build_two_tile_bitstream();
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        for pos in 0..bs.len() {
+            for pat in [0x01u8, 0xFF] {
+                let mut mutated = bs.clone();
+                mutated[pos] ^= pat;
+                let mut dec = decoder::make_decoder(&params).unwrap();
+                let pkt = Packet::new(0, TimeBase::new(1, 90_000), mutated).with_pts(0);
+                // Every outcome except a panic is acceptable: a clean
+                // parse error from send_packet, an empty frame queue,
+                // or a (differently-)decoded picture.
+                if dec.send_packet(&pkt).is_ok() {
+                    while dec.receive_frame().is_ok() {}
+                }
+            }
+        }
     }
 
     /// Round 391: full NAL-stream 10-bit decode through the registered
