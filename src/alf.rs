@@ -1122,6 +1122,27 @@ pub fn derive_alf_classification(
     blk_height: usize,
     bit_depth: u32,
 ) -> AlfClassification {
+    derive_alf_classification_with(
+        |gx, gy| rec_sample_clamped(src, stride, w, h, x_ctb as i32 + gx, y_ctb as i32 + gy),
+        blk_width,
+        blk_height,
+        bit_depth,
+    )
+}
+
+/// §8.8.4.3 classification core over an arbitrary CTB-local sample
+/// accessor — `sample(gx, gy)` must be valid for `gx ∈ −3..blkWidth+2`,
+/// `gy ∈ −3..blkHeight+2` (the eq. 1289-1292 gradient halo reads one
+/// sample beyond the [−2, blk+1] window). [`derive_alf_classification`]
+/// wraps it with the picture-clamped plane read;
+/// [`derive_alf_classification_padded`] wraps the §8.8.4.5 padded
+/// input, which is exactly that extent.
+pub fn derive_alf_classification_with(
+    sample: impl Fn(i32, i32) -> i32,
+    blk_width: usize,
+    blk_height: usize,
+    bit_depth: u32,
+) -> AlfClassification {
     // --- Step 1: gradients over the [−2, blk+1] halo (eq. 1289-1292). ---
     //
     // We index gradient arrays by an offset so x, y can run from −2.
@@ -1136,17 +1157,15 @@ pub fn derive_alf_classification(
 
     for gy in -2..(blk_height as i32 + 2) {
         for gx in -2..(blk_width as i32 + 2) {
-            let px = x_ctb as i32 + gx;
-            let py = y_ctb as i32 + gy;
-            let c = rec_sample_clamped(src, stride, w, h, px, py) << 1;
-            let l = rec_sample_clamped(src, stride, w, h, px - 1, py);
-            let r = rec_sample_clamped(src, stride, w, h, px + 1, py);
-            let u = rec_sample_clamped(src, stride, w, h, px, py - 1);
-            let d = rec_sample_clamped(src, stride, w, h, px, py + 1);
-            let ul = rec_sample_clamped(src, stride, w, h, px - 1, py - 1);
-            let dr = rec_sample_clamped(src, stride, w, h, px + 1, py + 1);
-            let ur = rec_sample_clamped(src, stride, w, h, px + 1, py - 1);
-            let dl = rec_sample_clamped(src, stride, w, h, px - 1, py + 1);
+            let c = sample(gx, gy) << 1;
+            let l = sample(gx - 1, gy);
+            let r = sample(gx + 1, gy);
+            let u = sample(gx, gy - 1);
+            let d = sample(gx, gy + 1);
+            let ul = sample(gx - 1, gy - 1);
+            let dr = sample(gx + 1, gy + 1);
+            let ur = sample(gx + 1, gy - 1);
+            let dl = sample(gx - 1, gy + 1);
             let idx = g_index(gx, gy);
             filt_h[idx] = (c - l - r).abs();
             filt_v[idx] = (c - u - d).abs();
@@ -1375,6 +1394,355 @@ pub fn apply_alf_luma_classified_masked(
     }
 }
 
+// =====================================================================
+// §8.8.4.5 / §8.8.4.6 — per-CTB ALF input-sample derivation.
+// =====================================================================
+
+/// Availability context for the §8.8.4.5/.6 per-CTB edge derivation.
+///
+/// The spec switches the CTB-edge availability derivation on
+/// `loop_filter_across_tiles_enabled_flag`:
+///
+/// * `== 0` → §6.4.1 (in-picture, coded, **same tile** — the tile
+///   bullet resolved against `layout`);
+/// * `== 1` → §6.4.4 (in-picture, coded, and the covering block **not
+///   intra / IBC** — probed from the side-info `grid`; with no grid the
+///   picture is all-intra (an IDR minimal path) and every edge
+///   neighbour is unavailable).
+///
+/// `IsCoded` is identically true at ALF time (the whole picture has
+/// reconstructed), so it never fires here.
+#[derive(Clone, Copy)]
+pub struct AlfInputAvailability<'a> {
+    /// `pic_width_in_luma_samples`.
+    pub pic_width: u32,
+    /// `pic_height_in_luma_samples`.
+    pub pic_height: u32,
+    /// §7.4.4.2 `loop_filter_across_tiles_enabled_flag`.
+    pub loop_filter_across_tiles_enabled: bool,
+    /// The picture tile layout (consulted only when the flag is 0).
+    pub layout: Option<&'a crate::tiles::PicTileLayout>,
+    /// The decoded picture's side-info grid (consulted only when the
+    /// flag is 1, for the §6.4.4 intra/IBC bullet).
+    pub grid: Option<&'a crate::deblock::SideInfoGrid>,
+}
+
+impl AlfInputAvailability<'_> {
+    /// A whole-picture single-tile context with no motion grid — the
+    /// §6.4.4 path with every in-picture neighbour treated as intra
+    /// (the all-intra / minimal-header shape).
+    pub fn all_intra(pic_width: u32, pic_height: u32) -> Self {
+        Self {
+            pic_width,
+            pic_height,
+            loop_filter_across_tiles_enabled: true,
+            layout: None,
+            grid: None,
+        }
+    }
+
+    /// §8.8.4.5/.6 edge availability at the neighbouring **luma**
+    /// location `(nb_x, nb_y)` for the CTB anchored at luma
+    /// `(x_ctb, y_ctb)`.
+    pub fn edge_available(&self, x_ctb: u32, y_ctb: u32, nb_x: i64, nb_y: i64) -> bool {
+        if nb_x < 0 || nb_y < 0 || nb_x >= self.pic_width as i64 || nb_y >= self.pic_height as i64 {
+            return false;
+        }
+        if !self.loop_filter_across_tiles_enabled {
+            // §6.4.1: the different-tile bullet.
+            if let Some(layout) = self.layout {
+                let cur = layout.tile_rect_at(x_ctb, y_ctb);
+                if !cur.contains(nb_x, nb_y) {
+                    return false;
+                }
+            }
+            true
+        } else {
+            // §6.4.4: the intra/IBC bullet over the covering block.
+            match self.grid {
+                Some(grid) => {
+                    let cell = grid.at((nb_x as u32 >> 2) as usize, (nb_y as u32 >> 2) as usize);
+                    cell.cu_log2_w != 0
+                        && matches!(cell.pred_mode, crate::deblock::CuPredMode::Inter)
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// The §8.8.4.5/.6 padded per-CTB ALF input: `recPictureOut[x][y]` for
+/// `x ∈ −3..blkWidth+2`, `y ∈ −3..blkHeight+2`, row-major with a
+/// `blkWidth + 6` stride and the origin at `(−3, −3)`.
+pub struct AlfPaddedInput {
+    data: Vec<i32>,
+    stride: usize,
+}
+
+impl AlfPaddedInput {
+    /// `recPictureOut[x][y]` at CTB-local coordinates.
+    #[inline]
+    pub fn at(&self, x: i32, y: i32) -> i32 {
+        self.data[((y + 3) as usize) * self.stride + ((x + 3) as usize)]
+    }
+}
+
+/// §8.8.4.5 (luma, `c_idx == 0`) / §8.8.4.6 (chroma) input-sample
+/// derivation for one CTB: copy the block interior (eq. 1324/1349),
+/// then fill each 3-sample edge strip either straight from the plane
+/// (edge available) or **mirrored across the block boundary**
+/// (eqs. 1325-1348 / 1350-1373 — e.g. `out[−1] = rec[+1]`,
+/// `out[blk] = rec[blk−2]`).
+///
+/// * `(x_blk, y_blk)` / `blk_w` / `blk_h` are in the *component*
+///   domain of the supplied plane; `sub_w`/`sub_h` scale the §8.8.4.6
+///   availability probes back to luma locations (1/1 for luma).
+/// * Every plane read is defensively clamped to the plane extent — the
+///   printed strip equations index `recPicture` beyond the picture at
+///   outer corners, where only the clamped column/row is ever
+///   consumed by the eq. 1286/1321 diamond taps.
+/// * The chroma top strip (eq. 1362) prints an extra
+///   "`loop_filter_across_tiles_enabled_flag` is equal to FALSE"
+///   conjunct that would leave the `(availableT == FALSE, flag == 1)`
+///   case unassigned; the coherent reading — mirror whenever the edge
+///   is unavailable, exactly like §8.8.4.5 and the other three chroma
+///   strips — is implemented.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_alf_input(
+    plane: &[u16],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    x_blk: usize,
+    y_blk: usize,
+    blk_w: usize,
+    blk_h: usize,
+    sub_w: usize,
+    sub_h: usize,
+    avail: &AlfInputAvailability<'_>,
+) -> AlfPaddedInput {
+    let rec = |px: i64, py: i64| -> i32 {
+        let cx = px.clamp(0, plane_w as i64 - 1) as usize;
+        let cy = py.clamp(0, plane_h as i64 - 1) as usize;
+        plane[cy * stride + cx] as i32
+    };
+    let pad_stride = blk_w + 6;
+    let mut out = AlfPaddedInput {
+        data: vec![0i32; pad_stride * (blk_h + 6)],
+        stride: pad_stride,
+    };
+    let xb = x_blk as i64;
+    let yb = y_blk as i64;
+    // The §8.8.4.5/.6 availability probes are issued at luma locations.
+    let x_luma = (x_blk * sub_w) as u32;
+    let y_luma = (y_blk * sub_h) as u32;
+    let avail_at = |nb_x: i64, nb_y: i64| -> bool {
+        avail.edge_available(x_luma, y_luma, nb_x * sub_w as i64, nb_y * sub_h as i64)
+    };
+    let available_l = avail_at(xb - 1, yb);
+    let available_t = avail_at(xb, yb - 1);
+    let available_r = avail_at(xb + blk_w as i64, yb);
+    let available_b = avail_at(xb, yb + blk_h as i64);
+
+    // Interior (eq. 1324/1349).
+    for y in 0..blk_h as i32 {
+        for x in 0..blk_w as i32 {
+            let v = rec(xb + x as i64, yb + y as i64);
+            out.data[((y + 3) as usize) * pad_stride + ((x + 3) as usize)] = v;
+        }
+    }
+    let set = |data: &mut [i32], x: i32, y: i32, v: i32| {
+        data[((y + 3) as usize) * pad_stride + ((x + 3) as usize)] = v;
+    };
+    // Left strip (eqs. 1325-1330 / 1350-1355): out[−k] over the block
+    // rows.
+    for y in 0..blk_h as i32 {
+        for k in 1..=3i32 {
+            let v = if available_l {
+                rec(xb - k as i64, yb + y as i64)
+            } else {
+                rec(xb + k as i64, yb + y as i64)
+            };
+            set(&mut out.data, -k, y, v);
+        }
+    }
+    // Right strip (eqs. 1331-1336 / 1356-1361): out[blk−1+k] mirrors
+    // around the block's last column.
+    for y in 0..blk_h as i32 {
+        for k in 1..=3i32 {
+            let x_out = blk_w as i32 - 1 + k;
+            let v = if available_r {
+                rec(xb + x_out as i64, yb + y as i64)
+            } else {
+                rec(xb + (blk_w as i32 - 1 - k) as i64, yb + y as i64)
+            };
+            set(&mut out.data, x_out, y, v);
+        }
+    }
+    // Top strip (eqs. 1337-1342 / 1362-1367): full −3..blk+2 width.
+    for x in -3..(blk_w as i32 + 3) {
+        for k in 1..=3i32 {
+            let v = if available_t {
+                rec(xb + x as i64, yb - k as i64)
+            } else {
+                rec(xb + x as i64, yb + k as i64)
+            };
+            set(&mut out.data, x, -k, v);
+        }
+    }
+    // Bottom strip (eqs. 1343-1348 / 1368-1373).
+    for x in -3..(blk_w as i32 + 3) {
+        for k in 1..=3i32 {
+            let y_out = blk_h as i32 - 1 + k;
+            let v = if available_b {
+                rec(xb + x as i64, yb + y_out as i64)
+            } else {
+                rec(xb + x as i64, yb + (blk_h as i32 - 1 - k) as i64)
+            };
+            set(&mut out.data, x, y_out, v);
+        }
+    }
+    out
+}
+
+/// §8.8.4.3 classification over the §8.8.4.5 padded input (the spec
+/// invokes the derivation on `recPicture`, i.e. the *padded* per-CTB
+/// array — CTB-edge gradients read mirrored samples, not the
+/// neighbouring CTB).
+pub fn derive_alf_classification_padded(
+    pad: &AlfPaddedInput,
+    blk_w: usize,
+    blk_h: usize,
+    bit_depth: u32,
+) -> AlfClassification {
+    derive_alf_classification_with(|gx, gy| pad.at(gx, gy), blk_w, blk_h, bit_depth)
+}
+
+/// §8.8.4.1/.2 luma ALF over the per-CTB §8.8.4.5 padded inputs: for
+/// every CTB whose `alf_ctb_flag` is 1, derive the padded input from
+/// the **pre-ALF snapshot**, run the §8.8.4.3 classification over it,
+/// filter per eqs. 1281-1288, and write into the picture. All pads are
+/// built from one up-front snapshot, so a filtered CTB never feeds a
+/// later CTB's taps (the spec's `recPictureRec` is the picture prior
+/// to ALF for every CTB).
+pub fn apply_alf_luma_availability(
+    pic: &mut YuvPicture,
+    alf: &AlfData,
+    map: &AlfCtbMap,
+    avail: &AlfInputAvailability<'_>,
+    bit_depth: u32,
+) {
+    let w = pic.width as usize;
+    let h = pic.height as usize;
+    let stride = pic.y_stride();
+    let snapshot = pic.y.clone();
+    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let ctb_size = 1usize << map.ctb_log2_size_y;
+    for ry in 0..map.ctbs_high as usize {
+        for rx in 0..map.ctbs_wide as usize {
+            let idx = ry * map.ctbs_wide as usize + rx;
+            if !map.luma.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let x_ctb = rx * ctb_size;
+            let y_ctb = ry * ctb_size;
+            let blk_w = (x_ctb + ctb_size).min(w) - x_ctb;
+            let blk_h = (y_ctb + ctb_size).min(h) - y_ctb;
+            let pad = derive_alf_input(
+                &snapshot, stride, w, h, x_ctb, y_ctb, blk_w, blk_h, 1, 1, avail,
+            );
+            let cls = derive_alf_classification_padded(&pad, blk_w, blk_h, bit_depth);
+            for y in 0..blk_h {
+                for x in 0..blk_w {
+                    let filt_idx = cls.filt_idx_at(x, y) as usize;
+                    let transpose_idx = cls.transpose_idx_at(x, y);
+                    let f = alf.luma_filters[filt_idx].coef;
+                    let coef = transpose_luma_coeffs(&f, transpose_idx);
+                    let mut sum: i32 = 0;
+                    for k in 0..12 {
+                        let (dy0, dx0) = LUMA_TAPS[k];
+                        let (dy1, dx1) = LUMA_TAPS_SYM[k];
+                        let s0 = pad.at(x as i32 + dx0, y as i32 + dy0);
+                        let s1 = pad.at(x as i32 + dx1, y as i32 + dy1);
+                        sum += coef[k] as i32 * (s0 + s1);
+                    }
+                    sum += coef[12] as i32 * pad.at(x as i32, y as i32);
+                    let out = ((sum + 256) >> 9).clamp(0, max_val);
+                    pic.y[(y_ctb + y) * stride + (x_ctb + x)] = out as u16;
+                }
+            }
+        }
+    }
+}
+
+/// §8.8.4.1/.4 chroma ALF over the per-CTB §8.8.4.6 padded inputs —
+/// the availability-driven counterpart of [`apply_alf_chroma_masked`].
+/// `c_idx` selects Cb (1) or Cr (2); the per-CTB gate reads the
+/// matching plane of `map`.
+pub fn apply_alf_chroma_availability(
+    pic: &mut YuvPicture,
+    filter: &AlfChromaFilter,
+    map: &AlfCtbMap,
+    avail: &AlfInputAvailability<'_>,
+    c_idx: usize,
+    bit_depth: u32,
+) {
+    debug_assert!(c_idx == 1 || c_idx == 2, "c_idx must be 1 (Cb) or 2 (Cr)");
+    if pic.chroma_format_idc == 0 {
+        return;
+    }
+    let (sub_w, sub_h) = chroma_sub_sampling(pic.chroma_format_idc);
+    let (cw, ch) = chroma_plane_dims(pic.width, pic.height, pic.chroma_format_idc);
+    let stride = pic.c_stride();
+    let snapshot = if c_idx == 1 {
+        pic.cb.clone()
+    } else {
+        pic.cr.clone()
+    };
+    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let ctb_size = 1usize << map.ctb_log2_size_y;
+    let coef = &filter.coef;
+    let plane_flags = if c_idx == 1 {
+        &map.chroma_cb
+    } else {
+        &map.chroma_cr
+    };
+    for ry in 0..map.ctbs_high as usize {
+        for rx in 0..map.ctbs_wide as usize {
+            let idx = ry * map.ctbs_wide as usize + rx;
+            if !plane_flags.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let x_ctb_c = (rx * ctb_size) / sub_w;
+            let y_ctb_c = (ry * ctb_size) / sub_h;
+            if x_ctb_c >= cw || y_ctb_c >= ch {
+                continue;
+            }
+            let blk_w_c = (ctb_size / sub_w).min(cw - x_ctb_c);
+            let blk_h_c = (ctb_size / sub_h).min(ch - y_ctb_c);
+            let pad = derive_alf_input(
+                &snapshot, stride, cw, ch, x_ctb_c, y_ctb_c, blk_w_c, blk_h_c, sub_w, sub_h, avail,
+            );
+            let dst = if c_idx == 1 { &mut pic.cb } else { &mut pic.cr };
+            for y in 0..blk_h_c {
+                for x in 0..blk_w_c {
+                    let mut sum: i32 = 0;
+                    for k in 0..6 {
+                        let (dy0, dx0) = CHROMA_TAPS[k];
+                        let (dy1, dx1) = CHROMA_TAPS_SYM[k];
+                        let s0 = pad.at(x as i32 + dx0, y as i32 + dy0);
+                        let s1 = pad.at(x as i32 + dx1, y as i32 + dy1);
+                        sum += coef[k] as i32 * (s0 + s1);
+                    }
+                    sum += coef[6] as i32 * pad.at(x as i32, y as i32);
+                    let out = ((sum + 256) >> 9).clamp(0, max_val);
+                    dst[(y_ctb_c + y) * stride + (x_ctb_c + x)] = out as u16;
+                }
+            }
+        }
+    }
+}
+
 /// Apply the §8.8.4.2 transpose permutation (eq. 1282-1285) to a 13-tap luma
 /// filter `f[0..12]`, selecting the arrangement that the sample's
 /// `transposeIdx` requests. `transpose_idx == 0` returns `f` unchanged
@@ -1409,6 +1777,187 @@ pub fn transpose_luma_coeffs(
 mod tests {
     use super::*;
     use crate::sps::tests::BitEmitter;
+
+    /// Round 416 — §8.8.4.5 input derivation: an unavailable edge takes
+    /// the 3-sample mirror (`out[−k] = rec[+k]`, `out[blk−1+k] =
+    /// rec[blk−1−k]`), an available edge copies the plane straight.
+    #[test]
+    fn round416_derive_alf_input_mirrors_unavailable_edges() {
+        // 16×8 plane, value = x + 16*y (unique per position).
+        let stride = 16usize;
+        let plane: Vec<u16> = (0..16 * 8).map(|i| i as u16).collect();
+        let rec = |x: usize, y: usize| plane[y * stride + x] as i32;
+        // Two-tile layout with the boundary at x = 8, across-tiles
+        // filtering disabled → §6.4.1 (tile bullet).
+        let layout =
+            crate::tiles::PicTileLayout::from_ctb_bounds(&[0, 1, 2], &[0, 1], 3, 16, 8, false)
+                .unwrap();
+        let avail = AlfInputAvailability {
+            pic_width: 16,
+            pic_height: 8,
+            loop_filter_across_tiles_enabled: false,
+            layout: Some(&layout),
+            grid: None,
+        };
+        // Block = the right tile (8..16, 0..8).
+        let pad = derive_alf_input(&plane, stride, 16, 8, 8, 0, 8, 8, 1, 1, &avail);
+        // Interior copies.
+        assert_eq!(pad.at(0, 0), rec(8, 0));
+        assert_eq!(pad.at(7, 7), rec(15, 7));
+        // Left edge: other tile → mirror (eq. 1325-1327).
+        for y in 0..8 {
+            assert_eq!(pad.at(-1, y), rec(8 + 1, y as usize));
+            assert_eq!(pad.at(-2, y), rec(8 + 2, y as usize));
+            assert_eq!(pad.at(-3, y), rec(8 + 3, y as usize));
+        }
+        // Right edge: picture edge → mirror around the last column
+        // (eq. 1331-1333: out[blk] = rec[blk−2] …).
+        for y in 0..8 {
+            assert_eq!(pad.at(8, y), rec(8 + 6, y as usize));
+            assert_eq!(pad.at(9, y), rec(8 + 5, y as usize));
+            assert_eq!(pad.at(10, y), rec(8 + 4, y as usize));
+        }
+        // Top: picture edge → mirror (eq. 1337-1339), full width.
+        for x in -3..11 {
+            let px = (8 + x).clamp(0, 15) as usize;
+            assert_eq!(pad.at(x, -1), rec(px, 1));
+            assert_eq!(pad.at(x, -2), rec(px, 2));
+        }
+
+        // Same block with the tile boundary removed (single tile):
+        // the left edge is now available and copies straight.
+        let single = crate::tiles::PicTileLayout::single_tile(16, 8);
+        let avail_open = AlfInputAvailability {
+            pic_width: 16,
+            pic_height: 8,
+            loop_filter_across_tiles_enabled: false,
+            layout: Some(&single),
+            grid: None,
+        };
+        let pad_open = derive_alf_input(&plane, stride, 16, 8, 8, 0, 8, 8, 1, 1, &avail_open);
+        for y in 0..8 {
+            assert_eq!(pad_open.at(-1, y), rec(7, y as usize));
+            assert_eq!(pad_open.at(-3, y), rec(5, y as usize));
+        }
+    }
+
+    /// Round 416 — the §8.8.4.5 availability selector: across-tiles
+    /// enabled routes through §6.4.4, where an inter-coded neighbour
+    /// keeps the edge available and an intra neighbour mirrors.
+    #[test]
+    fn round416_alf_availability_6_4_4_intra_bullet() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        let mut grid = SideInfoGrid::new(16, 8);
+        let inter = CuSideInfo {
+            pred_mode: CuPredMode::Inter,
+            cu_log2_w: 3,
+            cu_log2_h: 3,
+            ref_idx_l0: 0,
+            ..Default::default()
+        };
+        grid.stamp_block(0, 0, 8, 8, inter);
+        let mut intra = inter;
+        intra.pred_mode = CuPredMode::Intra;
+        grid.stamp_block(8, 0, 8, 8, intra);
+        let avail = AlfInputAvailability {
+            pic_width: 16,
+            pic_height: 8,
+            loop_filter_across_tiles_enabled: true,
+            layout: None,
+            grid: Some(&grid),
+        };
+        // Block at (8, 0): its left neighbour (7, 0) is inter → edge
+        // available.
+        assert!(avail.edge_available(8, 0, 7, 0));
+        // Block at (0, 0): its right neighbour (8, 0) is intra → edge
+        // unavailable per the §6.4.4 bullet.
+        assert!(!avail.edge_available(0, 0, 8, 0));
+        // Out of picture is always unavailable.
+        assert!(!avail.edge_available(0, 0, -1, 0));
+        // With no grid, every in-picture neighbour counts as intra.
+        let all_intra = AlfInputAvailability::all_intra(16, 8);
+        assert!(!all_intra.edge_available(8, 0, 7, 0));
+    }
+
+    /// Round 416 — §8.8.4.5 drives the §8.8.4.2 filter: across an armed
+    /// tile boundary the right CTB filters over its own mirrored
+    /// samples (edge column == interior output on per-CTB-uniform
+    /// content), while §6.4.4 with an all-inter grid lets the left
+    /// CTB's differing samples leak into the taps (edge column
+    /// differs).
+    #[test]
+    fn round416_alf_luma_availability_tile_isolation() {
+        use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
+        // 64×32, CTB 32: left CTB = 100s, right CTB = 200s.
+        let mk_pic = || {
+            let mut pic = YuvPicture::new(64, 32, 1, 8).unwrap();
+            for j in 0..32usize {
+                for i in 0..64usize {
+                    pic.y[j * 64 + i] = if i < 32 { 100 } else { 200 };
+                }
+            }
+            pic
+        };
+        // One shared filter for every class: a horizontal tap pair plus
+        // the DC term, unity gain (2*100 + 312 = 512).
+        let mut alf = AlfData::default();
+        let f = AlfLumaFilter {
+            coef: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 312],
+        };
+        alf.luma_filters = [f; ALF_MAX_LUMA_FILTERS];
+        let mut map = AlfCtbMap::new(64, 32, 5);
+        for i in 0..2 {
+            map.set(i, true, false, false);
+        }
+
+        // Case 1: tile boundary at x = 32, across-tiles off → the right
+        // CTB's left column filters over mirrored 200s: every output in
+        // the right CTB equals the uniform-field response.
+        let layout =
+            crate::tiles::PicTileLayout::from_ctb_bounds(&[0, 1, 2], &[0, 1], 5, 64, 32, false)
+                .unwrap();
+        let avail_tiled = AlfInputAvailability {
+            pic_width: 64,
+            pic_height: 32,
+            loop_filter_across_tiles_enabled: false,
+            layout: Some(&layout),
+            grid: None,
+        };
+        let mut pic = mk_pic();
+        apply_alf_luma_availability(&mut pic, &alf, &map, &avail_tiled, 8);
+        for j in 0..32usize {
+            assert_eq!(
+                pic.y[j * 64 + 32],
+                pic.y[j * 64 + 40],
+                "tile-isolated right CTB must filter uniformly at row {j}"
+            );
+        }
+
+        // Case 2: single tile, across-tiles on, all-inter grid → the
+        // left CTB's 100s reach the right CTB's left-column taps.
+        let mut grid = SideInfoGrid::new(64, 32);
+        let inter = CuSideInfo {
+            pred_mode: CuPredMode::Inter,
+            cu_log2_w: 5,
+            cu_log2_h: 5,
+            ref_idx_l0: 0,
+            ..Default::default()
+        };
+        grid.stamp_block(0, 0, 64, 32, inter);
+        let avail_open = AlfInputAvailability {
+            pic_width: 64,
+            pic_height: 32,
+            loop_filter_across_tiles_enabled: true,
+            layout: None,
+            grid: Some(&grid),
+        };
+        let mut pic_open = mk_pic();
+        apply_alf_luma_availability(&mut pic_open, &alf, &map, &avail_open, 8);
+        assert_ne!(
+            pic_open.y[32], pic_open.y[40],
+            "available edge must leak the neighbouring CTB's samples"
+        );
+    }
 
     /// Emit a spec-faithful §7.3.5 ALF APS payload for `num_signalled` luma
     /// filter classes. Each per-tap value is encoded as uek(v) with the

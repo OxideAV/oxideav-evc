@@ -181,6 +181,10 @@ struct PostFilterInputs<'a> {
     /// PPS-resident DRA APS id (round 126). `None` when
     /// `pic_dra_enabled_flag == 0`.
     dra_aps_id: Option<u8>,
+    /// Round 416: the §8.8.4.5/.6 per-CTB edge-availability context —
+    /// selects §6.4.1 (across-tiles filtering off) vs §6.4.4
+    /// (intra/IBC neighbours over the decoded motion grid).
+    alf_avail: alf::AlfInputAvailability<'a>,
 }
 
 impl EvcDecoder {
@@ -399,6 +403,13 @@ impl Decoder for EvcDecoder {
                             alf_chroma_aps_id: None,
                             alf_chroma2_aps_id: None,
                             dra_aps_id,
+                            // §8.8.4.5: an IDR picture is all-intra, so
+                            // under §6.4.4 every CTB-edge neighbour is
+                            // unavailable (mirror pad).
+                            alf_avail: alf::AlfInputAvailability::all_intra(
+                                sps.pic_width_in_luma_samples,
+                                sps.pic_height_in_luma_samples,
+                            ),
                         },
                     );
                     let entry = DpbEntry {
@@ -461,6 +472,18 @@ impl Decoder for EvcDecoder {
                             alf_chroma_aps_id,
                             alf_chroma2_aps_id,
                             dra_aps_id,
+                            // §8.8.4.5/.6: single-tile P/B picture —
+                            // §6.4.4 edge availability over the decoded
+                            // motion grid (an inter neighbour keeps the
+                            // CTB edge available; intra/IBC mirrors).
+                            alf_avail: alf::AlfInputAvailability {
+                                pic_width: sps.pic_width_in_luma_samples,
+                                pic_height: sps.pic_height_in_luma_samples,
+                                loop_filter_across_tiles_enabled: pps
+                                    .loop_filter_across_tiles_enabled_flag,
+                                layout: None,
+                                grid: Some(&side_info),
+                            },
                         },
                     );
                     let entry = DpbEntry {
@@ -1003,8 +1026,9 @@ impl EvcDecoder {
                     // Round-120: classified per-sample luma apply (§8.8.4.2
                     // + §8.8.4.3 + §8.9.4) drives the filter selection from
                     // the per-CTB classification rather than always using
-                    // filter set 0.
-                    alf::apply_alf_luma_classified_masked(pic, alf_data, alf_map, bd_y);
+                    // filter set 0. Round 416: over the §8.8.4.5 per-CTB
+                    // padded inputs with the edge-availability derivation.
+                    alf::apply_alf_luma_availability(pic, alf_data, alf_map, &in_.alf_avail, bd_y);
                     apply_chroma_alf_masked_or_whole_plane(
                         pic,
                         alf_map,
@@ -1012,6 +1036,7 @@ impl EvcDecoder {
                         cr_alf,
                         chroma_cb_enabled,
                         chroma_cr_enabled,
+                        &in_.alf_avail,
                         bd_c,
                     );
                 } else if chroma_cb_enabled || chroma_cr_enabled {
@@ -1027,6 +1052,7 @@ impl EvcDecoder {
                         cr_alf,
                         chroma_cb_enabled,
                         chroma_cr_enabled,
+                        &in_.alf_avail,
                         bd_c,
                     );
                 } else {
@@ -1130,6 +1156,7 @@ fn apply_chroma_alf_masked_or_whole_plane(
     cr_alf: Option<&alf::AlfData>,
     chroma_cb_enabled: bool,
     chroma_cr_enabled: bool,
+    avail: &alf::AlfInputAvailability<'_>,
     bd_c: u32,
 ) {
     if pic.chroma_format_idc == 0 {
@@ -1140,8 +1167,16 @@ fn apply_chroma_alf_masked_or_whole_plane(
     if chroma_cb_enabled {
         if let Some(cb_data) = cb_alf {
             if cb_map_on {
-                // §8.8.4.4 per-CTB Cb apply, gated by alf_ctb_chroma_flag.
-                alf::apply_alf_chroma_masked(pic, &cb_data.chroma_filters[0], alf_map, 1, bd_c);
+                // §8.8.4.4 per-CTB Cb apply, gated by alf_ctb_chroma_flag,
+                // over the §8.8.4.6 padded inputs (round 416).
+                alf::apply_alf_chroma_availability(
+                    pic,
+                    &cb_data.chroma_filters[0],
+                    alf_map,
+                    avail,
+                    1,
+                    bd_c,
+                );
             } else {
                 alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
             }
@@ -1150,8 +1185,16 @@ fn apply_chroma_alf_masked_or_whole_plane(
     if chroma_cr_enabled {
         if let Some(cr_data) = cr_alf {
             if cr_map_on {
-                // §8.8.4.4 per-CTB Cr apply, gated by alf_ctb_chroma2_flag.
-                alf::apply_alf_chroma_masked(pic, &cr_data.chroma_filters[0], alf_map, 2, bd_c);
+                // §8.8.4.4 per-CTB Cr apply, gated by alf_ctb_chroma2_flag,
+                // over the §8.8.4.6 padded inputs (round 416).
+                alf::apply_alf_chroma_availability(
+                    pic,
+                    &cr_data.chroma_filters[0],
+                    alf_map,
+                    avail,
+                    2,
+                    bd_c,
+                );
             } else {
                 alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
             }
