@@ -3849,21 +3849,73 @@ pub fn decode_baseline_inter_slice(
             )));
         }
     }
+    // The single-tile raster walk is exactly the §7.3.8.1 order with
+    // one segment covering the picture and one §7.4.5 subset spanning
+    // the whole RBSP.
+    let n_ctus = walk
+        .pic_width_in_ctus()
+        .checked_mul(walk.pic_height_in_ctus())
+        .ok_or_else(|| Error::invalid("evc inter decode: ctu count overflow"))?;
+    if n_ctus == 0 {
+        return Err(Error::invalid("evc inter decode: no CTUs"));
+    }
+    let order = SliceTileWalkOrder {
+        segments: vec![SliceTileWalkSegment {
+            tile_idx: 0,
+            first_ctb_addr_ts: 0,
+            num_ctus: n_ctus,
+            ctb_addr_in_rs: (0..n_ctus).collect(),
+            byte_align_after: false,
+        }],
+    };
+    let layout = crate::tiles::PicTileLayout::single_tile(walk.pic_width, walk.pic_height);
+    let whole = 0..rbsp.len();
+    decode_baseline_inter_slice_tiled(rbsp, inputs, &order, core::slice::from_ref(&whole), &layout)
+}
+
+/// [`decode_baseline_inter_slice`] over the §7.3.8.1 **multi-tile**
+/// CTU-iteration order — the P/B counterpart of
+/// [`decode_baseline_idr_slice_tiled`].
+///
+/// Per tile: a fresh [`CabacEngine`] over the tile's §7.4.5 eq. 88/89
+/// byte subset with the §9.3.2.2 context re-init (§9.3.1 item 2,
+/// initType 1), a `QpY_PREV = slice_qp` restart (§8.7.1), the §7.3.8.2
+/// `NumHmvpCand = 0` reset keyed on the tile's own `xFirstCtb` (line
+/// 2623 — the history list never crosses a CTB row *or* a tile), the
+/// §6.4.1/§6.4.3 `cur_tile` rectangle armed for every availability
+/// probe, and a terminating `end_of_tile_one_bit`. Inter *sample*
+/// prediction is deliberately not tile-constrained: §8.5.4 motion
+/// compensation reads the reference pictures across tile boundaries
+/// (only the current-picture neighbour derivations carry the §6.4
+/// tile bullet).
+pub fn decode_baseline_inter_slice_tiled(
+    rbsp: &[u8],
+    inputs: InterDecodeInputs<'_, '_>,
+    order: &SliceTileWalkOrder,
+    subset_ranges: &[core::ops::Range<usize>],
+    layout: &crate::tiles::PicTileLayout,
+) -> Result<(YuvPicture, InterDecodeStats)> {
+    let walk = inputs.walk;
+    let decode = inputs.decode;
+    if order.segments.is_empty() {
+        return Err(Error::invalid(
+            "evc inter decode: empty tile walk order (no tiles in slice)",
+        ));
+    }
+    if subset_ranges.len() != order.segments.len() {
+        return Err(Error::invalid(format!(
+            "evc inter decode: {} tile subset ranges for {} walk segments \
+             (§7.4.5 eq. 88/89 must yield one subset per tile)",
+            subset_ranges.len(),
+            order.segments.len()
+        )));
+    }
     let mut pic = YuvPicture::new(
         walk.pic_width,
         walk.pic_height,
         walk.chroma_format_idc,
         decode.bit_depth_luma,
     )?;
-    let mut eng = CabacEngine::new(rbsp)?;
-    // §9.3.2.2: Main-profile context init (initType 1 — P/B slice).
-    if walk.tree_gates.sps_cm_init_flag {
-        crate::cabac_init::init_main_profile_contexts(
-            &mut eng,
-            crate::cabac::InitType::Pb,
-            decode.slice_qp,
-        )?;
-    }
     let mut stats = InterDecodeStats {
         alf_ctb_map: crate::alf::AlfCtbMap::new(
             walk.pic_width,
@@ -3873,62 +3925,119 @@ pub fn decode_baseline_inter_slice(
         ..Default::default()
     };
     let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
-    // §8.5.2.7 / §7.3.8.2: HMVP candidate list lives per-CTU-row and
-    // resets at the left boundary of each row. The list is consulted by
-    // §8.5.2.4.4 when an inter CU's neighbour-based AMVP candidates are
-    // all unavailable (the round-8 fallback path).
-    let mut hmvp = crate::hmvp::HmvpCandList::new();
-    // §8.7.1: the eq. 1042 QpY chain starts at slice_qp.
-    let mut qp_state = QpState::new(inputs.decode.slice_qp);
-    let n_ctus = walk
+    // §8.8.2/§8.8.3: tile-boundary edges are exempt from deblocking
+    // when loop_filter_across_tiles_enabled_flag == 0.
+    side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(layout);
+    let n_pic_ctus = walk
         .pic_width_in_ctus()
         .checked_mul(walk.pic_height_in_ctus())
         .ok_or_else(|| Error::invalid("evc inter decode: ctu count overflow"))?;
-    if n_ctus == 0 {
+    if n_pic_ctus == 0 {
         return Err(Error::invalid("evc inter decode: no CTUs"));
     }
-    for ctu_idx in 0..n_ctus {
-        let x_ctb = (ctu_idx % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
-        let y_ctb = (ctu_idx / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
-        // §7.3.8.2: `if (xCtb == xFirstCtb) NumHmvpCand = 0`. With the
-        // round-8 single-tile constraint xFirstCtb == 0.
-        if x_ctb == 0 {
-            hmvp.reset();
+    // §8.5.2.7 / §7.3.8.2: HMVP candidate list lives per-CTU-row (and
+    // per-tile) and resets at the left boundary of each row within the
+    // tile. Consulted by §8.5.2.4.4 when an inter CU's neighbour-based
+    // AMVP candidates are all unavailable.
+    let mut hmvp = crate::hmvp::HmvpCandList::new();
+    let mut hmvp_final = 0u32;
+    for (seg, range) in order.segments.iter().zip(subset_ranges.iter()) {
+        let subset = rbsp.get(range.clone()).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc inter decode: tile {} subset range {}..{} outside slice data (len {})",
+                seg.tile_idx,
+                range.start,
+                range.end,
+                rbsp.len()
+            ))
+        })?;
+        // §9.3.1 item 2: full CABAC (re)initialisation at the first CTU
+        // of every tile (initType 1 — P/B slice).
+        let mut eng = CabacEngine::new(subset)?;
+        if walk.tree_gates.sps_cm_init_flag {
+            crate::cabac_init::init_main_profile_contexts(
+                &mut eng,
+                crate::cabac::InitType::Pb,
+                decode.slice_qp,
+            )?;
         }
-        // §7.3.8.2: per-CTU ALF applicability map before split_unit().
-        // §8.9: record the resolved flags for per-CTB ALF apply-masking.
-        let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
-        stats
-            .alf_ctb_map
-            .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
-        // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
-        // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
-        decode_inter_split_unit(
-            &mut eng,
-            &mut pic,
-            &mut stats,
-            &mut side_info,
-            &mut hmvp,
-            &inputs,
-            x_ctb,
-            y_ctb,
-            walk.ctb_log2_size_y,
-            walk.ctb_log2_size_y,
-            0,
-            0,
-            0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
-            &mut qp_state,
-            crate::split::ModeConstraint::NoConstraint,
-        )?;
-        stats.ctus += 1;
+        // §8.7.1: QpY_PREV restarts at slice_qp for the first coding
+        // unit of the tile.
+        let mut qp_state = QpState::new(decode.slice_qp);
+        let first_rs = *seg.ctb_addr_in_rs.first().ok_or_else(|| {
+            Error::invalid(format!(
+                "evc inter decode: tile {} has no CTUs (empty CtbAddrInRs)",
+                seg.tile_idx
+            ))
+        })?;
+        if first_rs >= n_pic_ctus {
+            return Err(Error::invalid(format!(
+                "evc inter decode: tile {} CtbAddrInRs {first_rs} >= picture CTU count \
+                 {n_pic_ctus}",
+                seg.tile_idx
+            )));
+        }
+        // §7.3.8.2 lines 2622-2623: xFirstCtb is the tile's first-CTB
+        // luma column — the NumHmvpCand reset fires on the leftmost CTB
+        // of every CTB row within the tile.
+        let x_first_ctb = (first_rs % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        let y_first = (first_rs / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        side_info.cur_tile = Some(layout.tile_rect_at(x_first_ctb, y_first));
+        for &rs in &seg.ctb_addr_in_rs {
+            if rs >= n_pic_ctus {
+                return Err(Error::invalid(format!(
+                    "evc inter decode: tile {} CtbAddrInRs {rs} >= picture CTU count \
+                     {n_pic_ctus}",
+                    seg.tile_idx
+                )));
+            }
+            let x_ctb = (rs % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+            let y_ctb = (rs / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+            // §7.3.8.2 lines 2624-2625: `if (xCtb == xFirstCtb)
+            // NumHmvpCand = 0`.
+            if x_ctb == x_first_ctb {
+                hmvp.reset();
+            }
+            // §7.3.8.2: per-CTU ALF applicability map before
+            // split_unit(); flags recorded per raster CTB address.
+            let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+            stats
+                .alf_ctb_map
+                .set(rs as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
+            // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
+            // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
+            decode_inter_split_unit(
+                &mut eng,
+                &mut pic,
+                &mut stats,
+                &mut side_info,
+                &mut hmvp,
+                &inputs,
+                x_ctb,
+                y_ctb,
+                walk.ctb_log2_size_y,
+                walk.ctb_log2_size_y,
+                0,
+                0,
+                0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
+                &mut qp_state,
+                crate::split::ModeConstraint::NoConstraint,
+            )?;
+            stats.ctus += 1;
+        }
+        // §7.3.8.1: end_of_tile_one_bit terminates this tile's engine.
+        let term = eng.decode_terminate()?;
+        if !term {
+            return Err(Error::invalid(
+                "evc inter decode: end_of_tile_one_bit must terminate",
+            ));
+        }
+        hmvp_final = hmvp.len() as u32;
     }
-    let term = eng.decode_terminate()?;
-    if !term {
-        return Err(Error::invalid(
-            "evc inter decode: end_of_tile_one_bit must terminate",
-        ));
-    }
-    stats.hmvp_cand_count_final = hmvp.len() as u32;
+    // The walk is over — the retained grid serves whole-picture
+    // consumers (deblock below, ALF/ColPic later).
+    side_info.cur_tile = None;
+    stats.hmvp_cand_count_final = hmvp_final;
     if decode.enable_deblock {
         if decode.sps_addb_flag {
             // §8.8.3 advanced deblocking.
@@ -8093,6 +8202,190 @@ mod tests {
                 assert_eq!(pic.cb[y * 32 + 16 + x], pic_b.cb[y * 16 + x]);
             }
         }
+    }
+
+    /// Round 416 — encode one P-slice CTU (§7.3.8.2 split into four
+    /// 16×16 cu_skip CUs, each selecting `mvp_idx`) into its own
+    /// §7.4.5 subset. `mvp_idx = 3` is the zero temporal slot;
+    /// `mvp_idx = 0` is the left spatial slot (TR cMax 3).
+    fn encode_skip_ctu_subset(mvp_idx: u32, terminate: bool) -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        encode_skip_ctu_bins(&mut enc, mvp_idx);
+        enc.encode_terminate(terminate);
+        enc.finish()
+    }
+
+    fn encode_skip_ctu_bins(enc: &mut crate::cabac::CabacEncoder, mvp_idx: u32) {
+        enc.encode_decision(0, 0, 1); // CTB split → four 16×16 leaves
+        for _ in 0..4 {
+            enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+            for _ in 0..mvp_idx.min(3) {
+                enc.encode_decision(0, 0, 1); // mvp_idx TR ones
+            }
+            if mvp_idx < 3 {
+                enc.encode_decision(0, 0, 0); // TR terminator
+            }
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        }
+    }
+
+    /// A 64×32 reference picture with a horizontal-and-vertical luma
+    /// gradient (so any sub-pel MV visibly changes the prediction).
+    fn gradient_ref() -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let mut ref_y = vec![0u16; 64 * 32];
+        for j in 0..32 {
+            for i in 0..64 {
+                ref_y[j * 64 + i] = ((i * 3 + j * 2) & 0xFF) as u16;
+            }
+        }
+        let mut ref_cb = vec![0u16; 32 * 16];
+        let mut ref_cr = vec![0u16; 32 * 16];
+        for j in 0..16 {
+            for i in 0..32 {
+                ref_cb[j * 32 + i] = (60 + i + j) as u16;
+                ref_cr[j * 32 + i] = (220 - i - j) as u16;
+            }
+        }
+        (ref_y, ref_cb, ref_cr)
+    }
+
+    fn p_slice_inputs<'a, 'b>(
+        walk: SliceWalkInputs,
+        ref_list_l0: &'a [crate::inter::RefPictureView<'b>],
+    ) -> InterDecodeInputs<'a, 'b> {
+        InterDecodeInputs {
+            walk,
+            decode: SliceDecodeInputs {
+                slice_qp: 22,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
+                enable_deblock: false,
+                ..Default::default()
+            },
+            slice_is_b: false,
+            num_ref_idx_active_minus1_l0: 0,
+            num_ref_idx_active_minus1_l1: 0,
+            ref_list_l0,
+            ref_list_l1: &[],
+            inter_tool_gates: Default::default(),
+            pocs: Default::default(),
+            col_pic: None,
+        }
+    }
+
+    /// Round 416 — §7.3.8.1/§9.3.1 multi-tile P-slice pixel decode with
+    /// the §6.4.3 cross-tile MV isolation: a 64×32 picture in two 32×32
+    /// tiles. Tile 0's CUs skip with the zero slot (`mvp_idx = 3`) and
+    /// copy the reference's left half; tile 1's CUs select the **left
+    /// spatial slot** (`mvp_idx = 0`) — whose A-position lands in tile 0
+    /// for the tile's first column of CUs. Under the tile bullet that
+    /// neighbour is unavailable, so the slot takes the §8.5.2.4
+    /// `(1, 1)` quarter-pel substitution (HMVP is tile-reset and empty)
+    /// and tile 1 motion-compensates at (0.25, 0.25) — whereas the same
+    /// CU syntax in a single-tile 64×32 stream would inherit tile 0's
+    /// zero MV and plain-copy. The retained motion field pins both.
+    #[test]
+    fn round416_two_tile_p_slice_gates_cross_tile_mv() {
+        use crate::cabac::CabacEncoder;
+        use crate::inter::RefPictureView;
+        let (ref_y, ref_cb, ref_cr) = gradient_ref();
+        let ref_view = RefPictureView {
+            y: &ref_y,
+            cb: &ref_cb,
+            cr: &ref_cr,
+            width: 64,
+            height: 32,
+            y_stride: 64,
+            c_stride: 32,
+            chroma_format_idc: 1,
+        };
+        let ref_list_l0 = [ref_view];
+        let walk = SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 32,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 4,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+
+        // Tiled stream: tile 0 = zero-slot skips, tile 1 = left-slot
+        // skips, one subset per tile.
+        let subset_a = encode_skip_ctu_subset(3, true);
+        let subset_b = encode_skip_ctu_subset(0, true);
+        let mut rbsp = subset_a.clone();
+        rbsp.extend_from_slice(&subset_b);
+        let ranges = [0..subset_a.len(), subset_a.len()..rbsp.len()];
+        let order = SliceTileWalkOrder {
+            segments: vec![
+                SliceTileWalkSegment {
+                    tile_idx: 0,
+                    first_ctb_addr_ts: 0,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![0],
+                    byte_align_after: true,
+                },
+                SliceTileWalkSegment {
+                    tile_idx: 1,
+                    first_ctb_addr_ts: 1,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![1],
+                    byte_align_after: false,
+                },
+            ],
+        };
+        let layout =
+            crate::tiles::PicTileLayout::from_ctb_bounds(&[0, 1, 2], &[0, 1], 5, 64, 32, false)
+                .unwrap();
+        let (pic, stats) = decode_baseline_inter_slice_tiled(
+            &rbsp,
+            p_slice_inputs(walk, &ref_list_l0),
+            &order,
+            &ranges,
+            &layout,
+        )
+        .unwrap();
+        assert_eq!(stats.ctus, 2);
+        assert_eq!(stats.cu_skip_flag_bins, 8);
+        // Tile 0: zero-MV copy of the reference's left half.
+        for j in 0..32usize {
+            for i in 0..32usize {
+                assert_eq!(pic.y[j * 64 + i], ref_y[j * 64 + i], "tile 0 at ({i}, {j})");
+            }
+        }
+        // Tile 1: the retained motion field must carry the §8.5.2.4
+        // (1, 1) quarter-pel substitution — NOT tile 0's zero MV.
+        let cell = stats.side_info.at(32 >> 2, 0);
+        assert_eq!(cell.pred_mode, CuPredMode::Inter);
+        assert_eq!(
+            (cell.mv_l0_x, cell.mv_l0_y),
+            (1, 1),
+            "tile 1 must take the unavailable-neighbour substitution"
+        );
+        // And the (0.25, 0.25)-pel interpolated output differs from a
+        // plain copy of the reference's right half.
+        assert!(
+            (0..32usize).any(|j| (32..64usize).any(|i| pic.y[j * 64 + i] != ref_y[j * 64 + i])),
+            "tile 1 must be sub-pel interpolated, not copied"
+        );
+
+        // Single-tile control: identical CU syntax in one engine — the
+        // left probe now sees tile 0's zero MV and plain-copies.
+        let mut enc = CabacEncoder::new();
+        encode_skip_ctu_bins(&mut enc, 3);
+        encode_skip_ctu_bins(&mut enc, 0);
+        enc.encode_terminate(true);
+        let single_rbsp = enc.finish();
+        let (pic_single, stats_single) =
+            decode_baseline_inter_slice(&single_rbsp, p_slice_inputs(walk, &ref_list_l0)).unwrap();
+        let cell = stats_single.side_info.at(32 >> 2, 0);
+        assert_eq!((cell.mv_l0_x, cell.mv_l0_y), (0, 0));
+        assert_eq!(pic_single.y, ref_y, "single-tile control is a full copy");
     }
 
     /// Round 416 — the single-tile wrapper contract: decoding through
