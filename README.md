@@ -441,7 +441,11 @@ to eqs. 1403-1409 — not a constant-identity short-circuit). The chroma
 *apply* now uses the §8.9.4 eqs. 1377-1382 magnitude scale
 (`map_one_chroma_sample` / `apply_chroma_inverse_mapping_u8`) driven
 by the per-luma-sample `chromaScale`, superseding the round-11
-per-segment QP-offset approximation.
+per-segment QP-offset approximation. As of round 416 the apply is
+**full-code-space**: the luma LUT carries one entry per sample value
+at the picture's bit depth (the §7.3.6 10-bit `dra_range_l`
+boundaries scale by `1 << (BitDepthY − 10)` into the code space), so
+>8-bit pictures map through DRA instead of skipping it.
 
 The **§8.7.6 Hadamard Transform Domain Filter** (HTDF, `sps_htdf_flag
 == 1`) post-reconstruction luma filter is implemented (`htdf` module).
@@ -509,8 +513,9 @@ implementations.
 
 ### Not yet supported
 
-- DRA post-filter application on >8-bit pictures (the §8.9 apply is
-  8-bit-code-space; high-bit-depth pictures skip it).
+Nothing is currently gated: every Main-profile decode tool, multi-tile
+pixel reconstruction, and the post-filter chain (ALF / DRA / HTDF)
+run at every supported bit depth (8..=16, §7.4.3.1).
 
 ## Usage
 

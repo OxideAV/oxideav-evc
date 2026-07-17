@@ -1087,11 +1087,11 @@ impl EvcDecoder {
                 }
             }
         }
-        if sps.sps_dra_flag && pic.bit_depth == 8 {
-            // The DRA apply path is 8-bit-code-space (256-entry LUTs);
-            // >8-bit DRA application is a documented follow-up, so
-            // high-bit-depth pictures skip the mapping rather than
-            // clamp through an 8-bit LUT.
+        if sps.sps_dra_flag {
+            // Round 416: the DRA apply is full-code-space (one LUT entry
+            // per sample value at the picture's bit depth, boundaries
+            // scaled from the §7.3.6 10-bit domain), so high-bit-depth
+            // pictures map instead of skipping.
             if let Some(dra_data) = self.dra_aps_for_pps(in_.dra_aps_id) {
                 dra::apply_dra(pic, dra_data, bd_y, bd_c);
             }

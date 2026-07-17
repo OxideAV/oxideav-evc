@@ -179,49 +179,68 @@ pub fn parse_dra_data(payload: &[u8]) -> Result<DraData> {
 /// The `scale` field stores `scale × 8` (Q8.3), so division by 8 uses
 /// integer arithmetic with rounding.
 pub fn build_luma_lut(dra: &DraData, bit_depth: u32) -> [u8; 256] {
-    let max_val = ((1u32 << bit_depth) - 1) as i32;
+    let full = build_luma_lut_vec(dra, bit_depth.min(8));
     let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = full.get(i).copied().unwrap_or(i as u16).min(255) as u8;
+    }
+    lut
+}
+
+/// Full-bit-depth generalisation of [`build_luma_lut`]: one entry per
+/// code-space value (`1 << bit_depth` entries, `bit_depth ∈ 8..=16`).
+///
+/// The signalled `dra_range_l[ ]` boundaries live in the §7.3.6 10-bit
+/// domain; for `BitDepthY > 10` they scale by `1 << (BitDepthY − 10)`
+/// — the same eq. 122-style shift the §7.4.7 derivation applies — so
+/// the piecewise segments cover the full code space. For
+/// `BitDepthY <= 10` the shift is zero and the boundaries apply
+/// directly (byte-identical to the historical 8-bit table over the
+/// shared domain).
+pub fn build_luma_lut_vec(dra: &DraData, bit_depth: u32) -> Vec<u16> {
+    let bit_depth = bit_depth.clamp(8, 16);
+    let n = 1usize << bit_depth;
+    let max_val = (n - 1) as i32;
+    let shift = bit_depth.saturating_sub(10);
 
     if !dra.descriptor_present || dra.num_ranges == 0 {
         // Identity mapping.
-        for (i, v) in lut.iter_mut().enumerate() {
-            *v = i.min(255) as u8;
-        }
-        return lut;
+        return (0..n as u32).map(|v| v as u16).collect();
     }
+    let range_at = |i: usize| -> i32 { (dra.range_l[i] as i32) << shift };
 
     // Build output bases for each segment.
     let mut base_out = [0i32; DRA_MAX_RANGES];
-    base_out[0] = dra.range_l[0] as i32;
+    base_out[0] = range_at(0);
     for i in 0..dra.num_ranges.saturating_sub(1) {
-        let width = (dra.range_l[i + 1] as i32) - (dra.range_l[i] as i32);
+        let width = range_at(i + 1) - range_at(i);
         // Accumulated output: base + scale/8 * width. Round to nearest.
         let delta = (dra.scale[i] as i32 * width + 4) >> 3;
         base_out[i + 1] = base_out[i] + delta;
     }
 
     // Fill the LUT.
-    for v in 0u32..256 {
+    let mut lut = Vec::with_capacity(n);
+    for v in 0..n as u32 {
         let vin = v as i32;
         // Find which segment v belongs to.
-        let seg = find_segment(dra, vin);
-        let seg_start = dra.range_l[seg] as i32;
+        let seg = find_segment(dra, vin, shift);
+        let seg_start = range_at(seg);
         let base = base_out[seg];
         let scale_q3 = dra.scale[seg] as i32;
         // round(scale/8 * (v - seg_start)) = (scale * (v-seg_start) + 4) >> 3.
         let mapped = base + ((scale_q3 * (vin - seg_start) + 4) >> 3);
-        let clipped = mapped.clamp(0, max_val) as u8;
-        lut[v as usize] = clipped;
+        lut.push(mapped.clamp(0, max_val) as u16);
     }
-
     lut
 }
 
-/// Find the segment index for luma value `v` in the DRA range table.
-/// The last segment absorbs all values ≥ `range_l[num_ranges-1]`.
-fn find_segment(dra: &DraData, v: i32) -> usize {
+/// Find the segment index for luma value `v` in the DRA range table
+/// (boundaries scaled into the code space by `shift`). The last segment
+/// absorbs all values ≥ the scaled `range_l[num_ranges-1]`.
+fn find_segment(dra: &DraData, v: i32, shift: u32) -> usize {
     for i in (0..dra.num_ranges).rev() {
-        if v >= dra.range_l[i] as i32 {
+        if v >= (dra.range_l[i] as i32) << shift {
             return i;
         }
     }
@@ -281,9 +300,13 @@ pub fn find_range_idx(input_sample: i32, ranges_array: &[i32], num_ranges: usize
 /// is `1 << bit_depth` (sample space upper bound) so the last segment
 /// absorbs every value ≥ `range_l[num_ranges − 1]`.
 pub fn build_ranges_array(dra: &DraData, bit_depth: u32) -> Vec<i32> {
+    // The signalled boundaries are 10-bit-domain values; scale into the
+    // code space for BitDepth > 10 (zero shift at <= 10 — the
+    // historical behaviour).
+    let shift = bit_depth.saturating_sub(10);
     let mut out = Vec::with_capacity(dra.num_ranges + 1);
     for i in 0..dra.num_ranges {
-        out.push(dra.range_l[i] as i32);
+        out.push((dra.range_l[i] as i32) << shift);
     }
     out.push(1i32 << bit_depth);
     out
@@ -337,11 +360,12 @@ pub fn apply_dra(pic: &mut YuvPicture, dra: &DraData, bit_depth_luma: u32, bit_d
         None
     };
 
-    let lut = build_luma_lut(dra, bit_depth_luma);
+    // Full-code-space LUT (round 416: one entry per sample value at the
+    // picture's bit depth — >8-bit pictures no longer skip DRA).
+    let lut = build_luma_lut_vec(dra, bit_depth_luma);
+    let top = lut.len() - 1;
     for v in pic.y.iter_mut() {
-        // 8-bit code-space LUT; >8-bit samples clamp defensively (the
-        // decoder gates DRA application on bit_depth == 8).
-        *v = lut[(*v).min(255) as usize] as u16;
+        *v = lut[(*v as usize).min(top)];
     }
 
     if pic.chroma_format_idc != 0 {
@@ -2488,6 +2512,88 @@ mod tests {
         assert!(parse_dra_data(&[]).is_err());
     }
 
+    /// Round 416 — the full-code-space LUT at 8 bits reproduces the
+    /// historical 256-entry table exactly, and at 10 bits it covers all
+    /// 1024 code values with the 10-bit clip.
+    #[test]
+    fn round416_luma_lut_vec_full_code_space() {
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 1,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.scale[0] = 16; // Q8.3 → 2.0
+        let lut8 = build_luma_lut(&dra, 8);
+        let vec8 = build_luma_lut_vec(&dra, 8);
+        assert_eq!(vec8.len(), 256);
+        for (i, &v) in vec8.iter().enumerate() {
+            assert_eq!(v, lut8[i] as u16, "8-bit vec/array divergence at {i}");
+        }
+        let vec10 = build_luma_lut_vec(&dra, 10);
+        assert_eq!(vec10.len(), 1024);
+        assert_eq!(vec10[100], 200);
+        assert_eq!(vec10[300], 600);
+        assert_eq!(vec10[600], 1023, "10-bit clip at 1023");
+    }
+
+    /// Round 416 — >10-bit code space scales the §7.3.6 10-bit
+    /// `dra_range_l` boundaries by `1 << (BitDepthY − 10)`: a segment
+    /// boundary at 512 sits at 2048 in 12-bit space, and the ranges
+    /// array used by the chroma segment lookup scales identically.
+    #[test]
+    fn round416_luma_lut_vec_scales_boundaries_above_10bit() {
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 2,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 512;
+        dra.scale[0] = 8; // 1.0 below the boundary
+        dra.scale[1] = 16; // 2.0 above it
+        let lut12 = build_luma_lut_vec(&dra, 12);
+        assert_eq!(lut12.len(), 4096);
+        // Below the scaled boundary (512 << 2 = 2048): identity.
+        assert_eq!(lut12[2047], 2047);
+        // Above it: base 2048 + 2 * (v − 2048).
+        assert_eq!(lut12[2049], 2050);
+        assert_eq!(lut12[2148], 2248);
+        assert_eq!(build_ranges_array(&dra, 12), vec![0, 2048, 4096]);
+        // At <= 10 bits the shift is zero (historical behaviour).
+        assert_eq!(build_ranges_array(&dra, 10), vec![0, 512, 1024]);
+    }
+
+    /// Round 416 — `apply_dra` maps a 10-bit picture end-to-end (the
+    /// decoder's 8-bit-only gate is lifted): luma maps through the
+    /// full-code-space LUT and chroma takes the co-located segment's
+    /// offset with the 10-bit clip.
+    #[test]
+    fn round416_apply_dra_maps_10bit_picture() {
+        let mut dra = DraData {
+            descriptor_present: true,
+            num_ranges: 2,
+            ..DraData::default()
+        };
+        dra.range_l[0] = 0;
+        dra.range_l[1] = 512;
+        dra.scale[0] = 16; // 2.0
+        dra.scale[1] = 8; // 1.0
+        dra.chroma_qp_offset[0] = 5;
+        dra.chroma_qp_offset[1] = 5;
+        let mut pic = YuvPicture::new(8, 8, 1, 10).unwrap();
+        // Luma plane at 300 (segment 0), chroma at the 10-bit mid 512.
+        for v in pic.y.iter_mut() {
+            *v = 300;
+        }
+        apply_dra(&mut pic, &dra, 10, 10);
+        // Luma: 2 * 300 = 600 — a value only expressible above 8 bits.
+        assert!(pic.y.iter().all(|&v| v == 600));
+        // Chroma: pre-DRA luma 300 → segment 0 → offset +5 on 512.
+        assert!(pic.cb.iter().all(|&v| v == 517));
+        assert!(pic.cr.iter().all(|&v| v == 517));
+    }
+
     #[test]
     fn lut_identity_single_range() {
         // Scale = 1.0 (Q8.3 = 8), range starting at 0.
@@ -2608,12 +2714,12 @@ mod tests {
         dra.range_l[0] = 0;
         dra.range_l[1] = 64;
         dra.range_l[2] = 192;
-        assert_eq!(find_segment(&dra, 0), 0);
-        assert_eq!(find_segment(&dra, 63), 0);
-        assert_eq!(find_segment(&dra, 64), 1);
-        assert_eq!(find_segment(&dra, 191), 1);
-        assert_eq!(find_segment(&dra, 192), 2);
-        assert_eq!(find_segment(&dra, 255), 2);
+        assert_eq!(find_segment(&dra, 0, 0), 0);
+        assert_eq!(find_segment(&dra, 63, 0), 0);
+        assert_eq!(find_segment(&dra, 64, 0), 1);
+        assert_eq!(find_segment(&dra, 191, 0), 1);
+        assert_eq!(find_segment(&dra, 192, 0), 2);
+        assert_eq!(find_segment(&dra, 255, 0), 2);
     }
 
     // -----------------------------------------------------------------
