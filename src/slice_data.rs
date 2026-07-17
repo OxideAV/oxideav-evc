@@ -1876,36 +1876,9 @@ pub fn decode_baseline_idr_slice(
             decode.bit_depth_luma, decode.bit_depth_chroma
         )));
     }
-    let mut pic = YuvPicture::new(
-        walk.pic_width,
-        walk.pic_height,
-        walk.chroma_format_idc,
-        decode.bit_depth_luma,
-    )?;
-    let mut eng = CabacEngine::new(rbsp)?;
-    // §9.3.2.2: under `sps_cm_init_flag == 1` initialise every
-    // Main-profile context table from the Tables 40-90 initValues at the
-    // slice QP (initType 0 — I slice). Under `== 0` all contexts keep
-    // the case-1 default `(256, 0)`.
-    if walk.tree_gates.sps_cm_init_flag {
-        crate::cabac_init::init_main_profile_contexts(
-            &mut eng,
-            crate::cabac::InitType::I,
-            decode.slice_qp,
-        )?;
-    }
-    let mut stats = SliceDecodeStats {
-        alf_ctb_map: crate::alf::AlfCtbMap::new(
-            walk.pic_width,
-            walk.pic_height,
-            walk.ctb_log2_size_y,
-        ),
-        ..Default::default()
-    };
-    let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
-    // §8.7.1: the eq. 1042 QpY chain starts at slice_qp; the §7.3.8.5
-    // isCuQpDeltaCoded latch starts clear.
-    let mut qp_state = QpState::new(decode.slice_qp);
+    // The single-tile raster walk is exactly the §7.3.8.1 order with
+    // one segment covering the picture and one §7.4.5 subset spanning
+    // the whole RBSP.
     let n_ctus = walk
         .pic_width_in_ctus()
         .checked_mul(walk.pic_height_in_ctus())
@@ -1918,43 +1891,208 @@ pub fn decode_baseline_idr_slice(
             "evc decode: ctu count {n_ctus} > sanity bound"
         )));
     }
-    for ctu_idx in 0..n_ctus {
-        let x_ctb = (ctu_idx % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
-        let y_ctb = (ctu_idx / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
-        // §7.3.8.2: per-CTU ALF applicability map before split_unit().
-        // §8.9: record the resolved flags so the post-filter pass can mask
-        // the ALF apply per coding tree block.
-        let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
-        stats
-            .alf_ctb_map
-            .set(ctu_idx as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
-        // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
-        // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
-        decode_split_unit(
-            &mut eng,
-            &mut pic,
-            &mut stats,
-            &mut side_info,
-            &walk,
-            &decode,
-            x_ctb,
-            y_ctb,
-            walk.ctb_log2_size_y,
-            walk.ctb_log2_size_y,
-            0,
-            0,
-            0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
-            &mut qp_state,
-            crate::split::ModeConstraint::NoConstraint,
-        )?;
-        stats.ctus += 1;
+    let order = SliceTileWalkOrder {
+        segments: vec![SliceTileWalkSegment {
+            tile_idx: 0,
+            first_ctb_addr_ts: 0,
+            num_ctus: n_ctus,
+            ctb_addr_in_rs: (0..n_ctus).collect(),
+            byte_align_after: false,
+        }],
+    };
+    let layout = crate::tiles::PicTileLayout::single_tile(walk.pic_width, walk.pic_height);
+    let whole = 0..rbsp.len();
+    decode_baseline_idr_slice_tiled(
+        rbsp,
+        walk,
+        decode,
+        &order,
+        core::slice::from_ref(&whole),
+        &layout,
+    )
+}
+
+/// [`decode_baseline_idr_slice`] over the §7.3.8.1 **multi-tile**
+/// CTU-iteration order — the pixel-emission counterpart of
+/// [`walk_baseline_idr_slice_tiled`].
+///
+/// Per §7.3.8.1 the outer loop runs once per tile in `SliceTileIdx[ ]`
+/// order, each tile walking its CTUs in tile-scan order
+/// (`CtbAddrInRs = CtbAddrTsToRs[ ctbAddrInTs ]`, materialised in the
+/// [`SliceTileWalkOrder`] segments) and terminating with an
+/// `end_of_tile_one_bit`. Per §9.3.1 the CABAC engine **and** the
+/// context variables re-initialise at the first CTU of every tile, so a
+/// fresh [`CabacEngine`] is constructed over each tile's §7.4.5
+/// eq. 88/89 byte subset (`subset_ranges`, one half-open range per
+/// tile) and — under `sps_cm_init_flag == 1` — the §9.3.2.2 init runs
+/// again per tile. Per §8.7.1 the eq. 1042 `QpY_PREV` chain restarts at
+/// `slice_qp` for the first coding unit of each tile.
+///
+/// The `layout` supplies each tile's luma rectangle: it arms the
+/// side-info grid's `cur_tile` for the §6.4.1/§6.4.3 availability
+/// probes while the tile decodes, and its [`crate::tiles::TileBounds`]
+/// exemption set (armed when `loop_filter_across_tiles_enabled_flag ==
+/// 0`) gates the post-reconstruction deblocking pass.
+pub fn decode_baseline_idr_slice_tiled(
+    rbsp: &[u8],
+    walk: SliceWalkInputs,
+    decode: SliceDecodeInputs,
+    order: &SliceTileWalkOrder,
+    subset_ranges: &[core::ops::Range<usize>],
+    layout: &crate::tiles::PicTileLayout,
+) -> Result<(YuvPicture, SliceDecodeStats)> {
+    if walk.ctb_log2_size_y < 5 || walk.ctb_log2_size_y > 7 {
+        return Err(Error::invalid(format!(
+            "evc decode: CtbLog2SizeY {} out of Baseline range [5, 7]",
+            walk.ctb_log2_size_y
+        )));
     }
-    let term = eng.decode_terminate()?;
-    if !term {
+    if walk.min_cb_log2_size_y < 2 || walk.min_cb_log2_size_y > walk.ctb_log2_size_y {
+        return Err(Error::invalid(format!(
+            "evc decode: MinCbLog2SizeY {} invalid",
+            walk.min_cb_log2_size_y
+        )));
+    }
+    if decode.bit_depth_luma != decode.bit_depth_chroma {
+        return Err(Error::unsupported(format!(
+            "evc decode: BitDepthY {} != BitDepthC {} unsupported",
+            decode.bit_depth_luma, decode.bit_depth_chroma
+        )));
+    }
+    if order.segments.is_empty() {
         return Err(Error::invalid(
-            "evc decode: end_of_tile_one_bit must terminate engine",
+            "evc decode: empty tile walk order (no tiles in slice)",
         ));
     }
+    if subset_ranges.len() != order.segments.len() {
+        return Err(Error::invalid(format!(
+            "evc decode: {} tile subset ranges for {} walk segments \
+             (§7.4.5 eq. 88/89 must yield one subset per tile)",
+            subset_ranges.len(),
+            order.segments.len()
+        )));
+    }
+    let mut pic = YuvPicture::new(
+        walk.pic_width,
+        walk.pic_height,
+        walk.chroma_format_idc,
+        decode.bit_depth_luma,
+    )?;
+    let mut stats = SliceDecodeStats {
+        alf_ctb_map: crate::alf::AlfCtbMap::new(
+            walk.pic_width,
+            walk.pic_height,
+            walk.ctb_log2_size_y,
+        ),
+        ..Default::default()
+    };
+    let mut side_info = SideInfoGrid::new(walk.pic_width, walk.pic_height);
+    // §8.8.2/§8.8.3: tile-boundary edges are exempt from deblocking
+    // when loop_filter_across_tiles_enabled_flag == 0.
+    side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(layout);
+    let n_pic_ctus = walk
+        .pic_width_in_ctus()
+        .checked_mul(walk.pic_height_in_ctus())
+        .ok_or_else(|| Error::invalid("evc decode: ctu count overflow"))?;
+    if n_pic_ctus == 0 || n_pic_ctus > 1_048_576 {
+        return Err(Error::invalid(format!(
+            "evc decode: ctu count {n_pic_ctus} outside sanity bounds"
+        )));
+    }
+    for (seg, range) in order.segments.iter().zip(subset_ranges.iter()) {
+        // §7.4.5 eq. 88/89: this tile's coded bits are exactly
+        // rbsp[range].
+        let subset = rbsp.get(range.clone()).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc decode: tile {} subset range {}..{} outside slice data (len {})",
+                seg.tile_idx,
+                range.start,
+                range.end,
+                rbsp.len()
+            ))
+        })?;
+        // §9.3.1 item 2: full CABAC (re)initialisation at the first CTU
+        // of every tile — a fresh engine over the tile's subset plus,
+        // under sps_cm_init_flag, the §9.3.2.2 context init (initType 0
+        // — I slice).
+        let mut eng = CabacEngine::new(subset)?;
+        if walk.tree_gates.sps_cm_init_flag {
+            crate::cabac_init::init_main_profile_contexts(
+                &mut eng,
+                crate::cabac::InitType::I,
+                decode.slice_qp,
+            )?;
+        }
+        // §8.7.1: QpY_PREV restarts at slice_qp for the first coding
+        // unit of the tile.
+        let mut qp_state = QpState::new(decode.slice_qp);
+        // Arm the §6.4.1/§6.4.3 tile rectangle for every availability
+        // probe issued while this tile decodes.
+        let first_rs = *seg.ctb_addr_in_rs.first().ok_or_else(|| {
+            Error::invalid(format!(
+                "evc decode: tile {} has no CTUs (empty CtbAddrInRs)",
+                seg.tile_idx
+            ))
+        })?;
+        if first_rs >= n_pic_ctus {
+            return Err(Error::invalid(format!(
+                "evc decode: tile {} CtbAddrInRs {first_rs} >= picture CTU count {n_pic_ctus}",
+                seg.tile_idx
+            )));
+        }
+        let x_first = (first_rs % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        let y_first = (first_rs / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+        side_info.cur_tile = Some(layout.tile_rect_at(x_first, y_first));
+        for &rs in &seg.ctb_addr_in_rs {
+            if rs >= n_pic_ctus {
+                return Err(Error::invalid(format!(
+                    "evc decode: tile {} CtbAddrInRs {rs} >= picture CTU count {n_pic_ctus}",
+                    seg.tile_idx
+                )));
+            }
+            let x_ctb = (rs % walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+            let y_ctb = (rs / walk.pic_width_in_ctus()) << walk.ctb_log2_size_y;
+            // §7.3.8.2: per-CTU ALF applicability map before
+            // split_unit(). §8.9: record the resolved flags so the
+            // post-filter pass can mask the ALF apply per coding tree
+            // block (indexed by raster CTB address).
+            let alf = decode_coding_tree_unit_alf(&mut eng, &walk, &mut stats.alf_ctb)?;
+            stats
+                .alf_ctb_map
+                .set(rs as usize, alf.luma, alf.chroma_cb, alf.chroma_cr);
+            // §7.3.8.2 line 2632: split_unit( xCtb, yCtb, CtbLog2SizeY,
+            // CtbLog2SizeY, 0, 0, 0, PRED_MODE_NO_CONSTRAINT ).
+            decode_split_unit(
+                &mut eng,
+                &mut pic,
+                &mut stats,
+                &mut side_info,
+                &walk,
+                &decode,
+                x_ctb,
+                y_ctb,
+                walk.ctb_log2_size_y,
+                walk.ctb_log2_size_y,
+                0,
+                0,
+                0, // §7.3.8.2: split_unit(…, cuQpDeltaCode = 0, …)
+                &mut qp_state,
+                crate::split::ModeConstraint::NoConstraint,
+            )?;
+            stats.ctus += 1;
+        }
+        // §7.3.8.1: end_of_tile_one_bit terminates this tile's engine.
+        let term = eng.decode_terminate()?;
+        if !term {
+            return Err(Error::invalid(
+                "evc decode: end_of_tile_one_bit must terminate engine",
+            ));
+        }
+    }
+    // The walk is over — the retained grid serves whole-picture
+    // consumers (deblock below, ALF/ColPic later), none of which are
+    // scoped to one tile.
+    side_info.cur_tile = None;
     if decode.enable_deblock {
         if decode.sps_addb_flag {
             // §8.8.3 advanced deblocking.
@@ -7824,6 +7962,239 @@ fn apply_inter_prediction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 416 — encode one Baseline 32×32 intra CTU (no split, DC
+    /// mode, one luma DC coefficient of `level = abs_minus1 + 1`, quiet
+    /// chroma) into its own §7.4.5 subset with a fresh in-test encoder,
+    /// exactly the §9.3.1 per-tile engine restart shape.
+    fn encode_dc_ctu_subset(abs_minus1: u32) -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (32×32 leaf)
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..abs_minus1 {
+            enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 (U ones)
+        }
+        enc.encode_decision(0, 0, 0); // U terminator → level = abs_minus1 + 1
+        enc.encode_bypass(0); // coeff_sign_flag = 0 → positive
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+        enc.encode_decision(0, 0, 0); // chroma tree: cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // chroma tree: cbf_cr = 0
+        enc.encode_terminate(true); // end_of_tile_one_bit
+        enc.finish()
+    }
+
+    fn tile_walk_inputs(pic_width: u32, pic_height: u32) -> SliceWalkInputs {
+        SliceWalkInputs {
+            pic_width,
+            pic_height,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    fn tile_decode_inputs() -> SliceDecodeInputs {
+        SliceDecodeInputs {
+            // QP 51 so the single DC level dequantizes into a clearly
+            // visible whole-block shift.
+            slice_qp: 51,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            ..Default::default()
+        }
+    }
+
+    /// Round 416 — §7.3.8.1/§9.3.1 multi-tile IDR pixel decode: a 64×32
+    /// picture split into two 32×32 tiles, each tile a separate §7.4.5
+    /// byte subset with its own CABAC engine. The §6.4.1 tile bullet
+    /// makes each tile decode exactly as if it were an independent
+    /// picture of the tile's dimensions, so the tiled decode must
+    /// stitch the two standalone decodes bit-exactly — including at the
+    /// tile-1 left column, whose intra references may NOT leak tile 0's
+    /// reconstructed samples.
+    #[test]
+    fn round416_two_tile_idr_decode_stitches_standalone_tiles() {
+        let subset_a = encode_dc_ctu_subset(149); // level 150 → bright shift
+        let subset_b = encode_dc_ctu_subset(49); // level 50 → small shift
+        let mut rbsp = subset_a.clone();
+        rbsp.extend_from_slice(&subset_b);
+        let ranges = [0..subset_a.len(), subset_a.len()..rbsp.len()];
+        let order = SliceTileWalkOrder {
+            segments: vec![
+                SliceTileWalkSegment {
+                    tile_idx: 0,
+                    first_ctb_addr_ts: 0,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![0],
+                    byte_align_after: true,
+                },
+                SliceTileWalkSegment {
+                    tile_idx: 1,
+                    first_ctb_addr_ts: 1,
+                    num_ctus: 1,
+                    ctb_addr_in_rs: vec![1],
+                    byte_align_after: false,
+                },
+            ],
+        };
+        let layout =
+            crate::tiles::PicTileLayout::from_ctb_bounds(&[0, 1, 2], &[0, 1], 5, 64, 32, false)
+                .unwrap();
+        let (pic, stats) = decode_baseline_idr_slice_tiled(
+            &rbsp,
+            tile_walk_inputs(64, 32),
+            tile_decode_inputs(),
+            &order,
+            &ranges,
+            &layout,
+        )
+        .unwrap();
+        assert_eq!(stats.ctus, 2);
+        assert_eq!(stats.coding_units, 4, "2 tiles × (luma + chroma trees)");
+
+        // Standalone controls: each subset decoded as its own 32×32
+        // picture.
+        let (pic_a, stats_a) =
+            decode_baseline_idr_slice(&subset_a, tile_walk_inputs(32, 32), tile_decode_inputs())
+                .unwrap();
+        assert_eq!(stats_a.coding_units, 2);
+        assert_eq!(stats_a.coeff_runs, 1);
+        let (pic_b, _) =
+            decode_baseline_idr_slice(&subset_b, tile_walk_inputs(32, 32), tile_decode_inputs())
+                .unwrap();
+        // The two tiles carry different levels → different content, so
+        // the stitch equality below is non-vacuous.
+        assert_ne!(pic_a.y[0], pic_b.y[0], "tiles must differ");
+        assert_ne!(pic_a.y[31], 128, "tile 0's right column must be non-mid");
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(
+                    pic.y[y * 64 + x],
+                    pic_a.y[y * 32 + x],
+                    "tile 0 luma mismatch at ({x}, {y})"
+                );
+                assert_eq!(
+                    pic.y[y * 64 + 32 + x],
+                    pic_b.y[y * 32 + x],
+                    "tile 1 luma mismatch at ({x}, {y})"
+                );
+            }
+        }
+        for y in 0..16usize {
+            for x in 0..16usize {
+                assert_eq!(pic.cb[y * 32 + x], pic_a.cb[y * 16 + x]);
+                assert_eq!(pic.cb[y * 32 + 16 + x], pic_b.cb[y * 16 + x]);
+            }
+        }
+    }
+
+    /// Round 416 — the single-tile wrapper contract: decoding through
+    /// `decode_baseline_idr_slice` equals an explicit one-segment
+    /// `decode_baseline_idr_slice_tiled` call over the whole RBSP.
+    #[test]
+    fn round416_single_tile_wrapper_matches_explicit_tiled_call() {
+        let rbsp = encode_dc_ctu_subset(7);
+        let walk = tile_walk_inputs(32, 32);
+        let decode = tile_decode_inputs();
+        let (pic_wrapped, stats_wrapped) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        let order = SliceTileWalkOrder {
+            segments: vec![SliceTileWalkSegment {
+                tile_idx: 0,
+                first_ctb_addr_ts: 0,
+                num_ctus: 1,
+                ctb_addr_in_rs: vec![0],
+                byte_align_after: false,
+            }],
+        };
+        let layout = crate::tiles::PicTileLayout::single_tile(32, 32);
+        let whole = 0..rbsp.len();
+        let (pic_tiled, stats_tiled) = decode_baseline_idr_slice_tiled(
+            &rbsp,
+            walk,
+            decode,
+            &order,
+            core::slice::from_ref(&whole),
+            &layout,
+        )
+        .unwrap();
+        assert_eq!(pic_wrapped.y, pic_tiled.y);
+        assert_eq!(pic_wrapped.cb, pic_tiled.cb);
+        assert_eq!(pic_wrapped.cr, pic_tiled.cr);
+        assert_eq!(stats_wrapped.ctus, stats_tiled.ctus);
+        assert_eq!(stats_wrapped.coeff_runs, stats_tiled.coeff_runs);
+    }
+
+    /// Round 416 — malformed tile plumbing surfaces clean errors, never
+    /// a panic: subset/segment count mismatch, empty order, and a
+    /// subset range past the RBSP end.
+    #[test]
+    fn round416_tiled_decode_rejects_malformed_plumbing() {
+        let rbsp = encode_dc_ctu_subset(0);
+        let walk = tile_walk_inputs(32, 32);
+        let decode = tile_decode_inputs();
+        let layout = crate::tiles::PicTileLayout::single_tile(32, 32);
+        let seg = SliceTileWalkSegment {
+            tile_idx: 0,
+            first_ctb_addr_ts: 0,
+            num_ctus: 1,
+            ctb_addr_in_rs: vec![0],
+            byte_align_after: false,
+        };
+        // Segment/subset count mismatch.
+        let order = SliceTileWalkOrder {
+            segments: vec![seg.clone()],
+        };
+        assert!(decode_baseline_idr_slice_tiled(
+            &rbsp,
+            walk,
+            decode,
+            &order,
+            &[0..rbsp.len(), 0..rbsp.len()],
+            &layout
+        )
+        .is_err());
+        // Empty order.
+        let empty = SliceTileWalkOrder { segments: vec![] };
+        assert!(
+            decode_baseline_idr_slice_tiled(&rbsp, walk, decode, &empty, &[], &layout).is_err()
+        );
+        // Subset range outside the RBSP.
+        let past_end = 0..rbsp.len() + 4;
+        assert!(decode_baseline_idr_slice_tiled(
+            &rbsp,
+            walk,
+            decode,
+            &order,
+            core::slice::from_ref(&past_end),
+            &layout
+        )
+        .is_err());
+        // CTB address outside the picture grid.
+        let bad_seg = SliceTileWalkSegment {
+            ctb_addr_in_rs: vec![9],
+            ..seg
+        };
+        let bad_order = SliceTileWalkOrder {
+            segments: vec![bad_seg],
+        };
+        let whole = 0..rbsp.len();
+        assert!(decode_baseline_idr_slice_tiled(
+            &rbsp,
+            walk,
+            decode,
+            &bad_order,
+            core::slice::from_ref(&whole),
+            &layout
+        )
+        .is_err());
+    }
 
     /// Verify the walker reaches the terminate decision on a tiny hand
     /// fixture: a 16×16 picture (one 16×16 CTU with min_cb=4), no CBFs
