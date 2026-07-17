@@ -464,9 +464,32 @@ reconstruction (§8.4.1 — not gated on `cbf_luma`; the IDR path and the
 P/B intra-CU path both) and after inter CU reconstruction when
 `cbf_luma == 1` (the §8.5 CU-reconstruction step 7, including the DMVR
 arm), at the eq. 1043 `Qp′Y`. §8.6 defines no HTDF step, so IBC CUs are
-excluded. The border predicate is the in-picture-extent rule
-(single-tile slices); threading the full §6.4.1 predicate joins the
-multi-tile work.
+excluded. The §8.7.6.2 border availability folds the §6.4.1 tile
+bullet: on a multi-tile picture the pad's replicate clamp treats tile
+edges exactly like picture edges.
+
+As of round 416 **multi-tile pixel reconstruction** is in: the
+§7.3.8.1 tiled pixel walkers (IDR and P/B) drive per-tile §7.4.5
+eq. 88/89 byte subsets with the §9.3.1 per-tile CABAC engine + context
+re-init, the §8.7.1 per-tile `QpY_PREV` restart and the §7.3.8.2
+`xFirstCtb`-keyed HMVP reset; every §6.4.1/§6.4.3 availability probe
+(intra references, EIPD neighbour modes, AMVP/merge/affine grid
+lookups, ctxInc neighbour sums, IBC reference-corner conformance, HTDF
+borders) folds the "different tile" bullet via the tile rectangle the
+walkers arm on the side-info grid; the §8.8.2/§8.8.3 deblocking flavours
+exempt tile-boundary edges when
+`loop_filter_across_tiles_enabled_flag == 0`; and the §8.8.4.5/.6 ALF
+input derivation builds each CTB's mirror-padded `recPictureOut` with
+the §6.4.1-vs-§6.4.4 availability selector (classification runs over
+the padded input per §8.8.4.2). The registered decoder resolves the
+§6.5.1 tile geometry + §7.3.4 entry points from the PPS/slice header
+on both paths — the IDR path now runs the **full §7.3.4 header parse**
+(tile fields, the ALF slice block + APS ids, and
+`slice_deblocking_filter_flag` + the §8.8.3 alpha/beta offsets, all
+previously ignored by the minimal round-3 parse). Inter *sample*
+prediction deliberately reads reference pictures across tile
+boundaries per §8.5.4; only current-picture derivations are
+tile-constrained.
 
 As of round 408 the **§7.3.8.4 transform-unit tiling** is decoded on
 every walker path: a CB whose width/height exceeds `MaxTbSizeY` (eq. 51
@@ -488,7 +511,6 @@ implementations.
 
 - DRA post-filter application on >8-bit pictures (the §8.9 apply is
   8-bit-code-space; high-bit-depth pictures skip it).
-- Multi-tile pixel reconstruction (single-tile slices only).
 
 ## Usage
 

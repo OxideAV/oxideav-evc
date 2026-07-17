@@ -92,6 +92,9 @@ struct NonIdrDecodeResult {
     side_info: crate::deblock::SideInfoGrid,
     ref_pocs_l0: Vec<i32>,
     ref_pocs_l1: Vec<i32>,
+    /// Round 416: the resolved picture tile layout — feeds the
+    /// §8.8.4.5/.6 post-filter availability.
+    tile_layout: crate::tiles::PicTileLayout,
 }
 
 /// Build the round-3 decoder for the registry.
@@ -374,19 +377,24 @@ impl Decoder for EvcDecoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("evc decoder: IDR slice before PPS"))?
                         .clone();
-                    let (mut pic, stats) = crate::decode_idr_slice(&sps, &pps, nal.rbsp())?;
+                    // Round 416: the IDR path runs the full §7.3.4 header
+                    // parse — tile fields + entry points (multi-tile
+                    // pictures decode through the §7.3.8.1 tiled walker),
+                    // the ALF slice block (per-CTU map + APS ids now
+                    // route on IDR pictures too) and the deblocking
+                    // controls (`slice_deblocking_filter_flag` honoured).
+                    let crate::IdrDecodeResult {
+                        mut pic,
+                        stats,
+                        chroma_cb_enabled,
+                        chroma_cr_enabled,
+                        alf_luma_aps_id,
+                        alf_chroma_aps_id,
+                        alf_chroma2_aps_id,
+                        layout,
+                    } = crate::decode_idr_slice_full(&sps, &pps, nal.rbsp())?;
                     // §8.3.1: IDR resets POC to 0, flushes the DPB.
                     self.dpb_flush();
-                    // Round-11: ALF + DRA post-filter pass. Round 113: the
-                    // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply. The
-                    // minimal-header IDR path produces an all-off map, so this
-                    // falls back to the whole-plane apply (unchanged behaviour).
-                    // Round 126: the minimal-header path does not consume a
-                    // slice header, so no `slice_alf_*_aps_id` is available
-                    // here; `apply_post_filters` falls back to the most-
-                    // recently-stored APS id (back-compat). The PPS-resident
-                    // `pic_dra_aps_id` IS available, though, so we route DRA
-                    // through it.
                     let dra_aps_id = if pps.pic_dra_enabled_flag {
                         Some(pps.pic_dra_aps_id)
                     } else {
@@ -397,19 +405,26 @@ impl Decoder for EvcDecoder {
                         &sps,
                         PostFilterInputs {
                             alf_ctb_map: &stats.alf_ctb_map,
-                            chroma_cb_enabled: false,
-                            chroma_cr_enabled: false,
-                            alf_luma_aps_id: None,
-                            alf_chroma_aps_id: None,
-                            alf_chroma2_aps_id: None,
+                            chroma_cb_enabled,
+                            chroma_cr_enabled,
+                            alf_luma_aps_id,
+                            alf_chroma_aps_id,
+                            alf_chroma2_aps_id,
                             dra_aps_id,
                             // §8.8.4.5: an IDR picture is all-intra, so
-                            // under §6.4.4 every CTB-edge neighbour is
-                            // unavailable (mirror pad).
-                            alf_avail: alf::AlfInputAvailability::all_intra(
-                                sps.pic_width_in_luma_samples,
-                                sps.pic_height_in_luma_samples,
-                            ),
+                            // under §6.4.4 (across-tiles filtering on)
+                            // every CTB-edge neighbour is unavailable
+                            // (mirror pad); with across-tiles filtering
+                            // off the §6.4.1 tile bullet applies over
+                            // the resolved layout.
+                            alf_avail: alf::AlfInputAvailability {
+                                pic_width: sps.pic_width_in_luma_samples,
+                                pic_height: sps.pic_height_in_luma_samples,
+                                loop_filter_across_tiles_enabled: pps
+                                    .loop_filter_across_tiles_enabled_flag,
+                                layout: Some(&layout),
+                                grid: None,
+                            },
                         },
                     );
                     let entry = DpbEntry {
@@ -450,6 +465,7 @@ impl Decoder for EvcDecoder {
                         side_info,
                         ref_pocs_l0,
                         ref_pocs_l1,
+                        tile_layout,
                     } = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
                     // Round-11: ALF + DRA post-filter pass. Round 113: the
                     // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply.
@@ -472,16 +488,17 @@ impl Decoder for EvcDecoder {
                             alf_chroma_aps_id,
                             alf_chroma2_aps_id,
                             dra_aps_id,
-                            // §8.8.4.5/.6: single-tile P/B picture —
-                            // §6.4.4 edge availability over the decoded
-                            // motion grid (an inter neighbour keeps the
-                            // CTB edge available; intra/IBC mirrors).
+                            // §8.8.4.5/.6 edge availability: §6.4.4 over
+                            // the decoded motion grid when across-tiles
+                            // filtering is on (an inter neighbour keeps
+                            // the CTB edge available; intra/IBC mirrors),
+                            // §6.4.1 over the tile layout when off.
                             alf_avail: alf::AlfInputAvailability {
                                 pic_width: sps.pic_width_in_luma_samples,
                                 pic_height: sps.pic_height_in_luma_samples,
                                 loop_filter_across_tiles_enabled: pps
                                     .loop_filter_across_tiles_enabled_flag,
-                                layout: None,
+                                layout: Some(&tile_layout),
                                 grid: Some(&side_info),
                             },
                         },
@@ -661,11 +678,8 @@ impl EvcDecoder {
         // round 90.
         // sps_alf_flag and sps_dra_flag are handled by the round-11 post-filter
         // pipeline — they no longer gate the Unsupported path.
-        if !pps.single_tile_in_pic_flag {
-            return Err(Error::unsupported(
-                "evc decoder: P/B requires single_tile_in_pic_flag == 1",
-            ));
-        }
+        // Round 416: single_tile_in_pic_flag is lifted — multi-tile P/B
+        // pictures decode through the §7.3.8.1 tiled walker below.
         let ctx = crate::slice_header::SliceParseContext {
             single_tile_in_pic_flag: pps.single_tile_in_pic_flag,
             arbitrary_slice_present_flag: pps.arbitrary_slice_present_flag,
@@ -751,8 +765,11 @@ impl EvcDecoder {
 
         // Re-run the parse on a counting BitReader to discover where the
         // slice header ends so slice_data can pick up at the next byte.
+        // Round 416: the §7.4.5 tile plumbing resolves in between —
+        // the entry-point loop sits before the byte alignment.
         let mut br = crate::bitreader::BitReader::new(slice_nal_rbsp);
         crate::slice_header::parse_consume(&mut br, NalUnitType::NonIdr, &ctx)?;
+        let plumbing = crate::resolve_slice_tiles(sps, pps, &header, &mut br)?;
         br.align_to_byte();
         let consumed_bits = br.bit_position();
         if consumed_bits % 8 != 0 {
@@ -765,6 +782,7 @@ impl EvcDecoder {
             ));
         }
         let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
+        let subset_ranges = plumbing.subset_ranges(slice_data_bytes.len())?;
         let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
         let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
         // eq. 51: MaxTbLog2SizeY is the constant 6 — NOT derived from the
@@ -876,8 +894,13 @@ impl EvcDecoder {
             },
             col_pic,
         };
-        let (pic, stats) =
-            crate::slice_data::decode_baseline_inter_slice(slice_data_bytes, inputs)?;
+        let (pic, stats) = crate::slice_data::decode_baseline_inter_slice_tiled(
+            slice_data_bytes,
+            inputs,
+            &plumbing.order,
+            &subset_ranges,
+            &plumbing.layout,
+        )?;
 
         // Update §8.3.1 prev-LSB tracker for the next non-IDR slice.
         if sps.sps_pocs_flag {
@@ -904,6 +927,7 @@ impl EvcDecoder {
             alf_luma_aps_id: header.slice_alf_luma_aps_id,
             alf_chroma_aps_id: header.slice_alf_chroma_aps_id,
             alf_chroma2_aps_id: header.slice_alf_chroma2_aps_id,
+            tile_layout: plumbing.layout,
         })
     }
 

@@ -463,6 +463,219 @@ pub fn decode_idr_slice(
     slice_data::decode_baseline_idr_slice(slice_data_bytes, walk, decode)
 }
 
+/// The resolved tile plumbing of one slice: the §7.3.8.1 CTU walk
+/// order, the picture tile layout, and the parsed §7.3.4 entry-point
+/// offsets ([`slice_header::compute_tile_subset_byte_ranges`] turns
+/// them into §7.4.5 eq. 88/89 byte subsets once the slice-data length
+/// is known).
+#[doc(hidden)]
+pub struct SliceTilePlumbing {
+    pub order: slice_data::SliceTileWalkOrder,
+    pub layout: tiles::PicTileLayout,
+    pub entry_point_offsets: Vec<u32>,
+}
+
+impl SliceTilePlumbing {
+    /// The §7.4.5 eq. 88/89 per-tile byte subsets over a slice-data
+    /// buffer of `slice_data_len` bytes: one whole-buffer range for a
+    /// single-tile slice, the entry-point-derived split otherwise.
+    pub fn subset_ranges(
+        &self,
+        slice_data_len: usize,
+    ) -> oxideav_core::Result<Vec<core::ops::Range<usize>>> {
+        if self.order.segments.len() <= 1 {
+            return Ok(core::iter::once(0..slice_data_len).collect());
+        }
+        slice_header::compute_tile_subset_byte_ranges(&self.entry_point_offsets, slice_data_len)
+    }
+}
+
+/// Resolve a parsed slice header's tile plumbing against the active
+/// SPS/PPS: the §6.5.1 eq. 24-32 derivations feed
+/// [`slice_data::resolve_slice_tile_walk_order`] and the luma-domain
+/// [`tiles::PicTileLayout`], and — for a multi-tile slice — the §7.3.4
+/// `entry_point_offset_minus1[ ]` loop is consumed off `br` (which must
+/// sit just past `slice_cr_qp_offset`, i.e. right after
+/// [`slice_header::parse_consume`]).
+#[doc(hidden)]
+pub fn resolve_slice_tiles(
+    sps: &sps::Sps,
+    pps: &pps::Pps,
+    header: &slice_header::SliceHeader,
+    br: &mut bitreader::BitReader,
+) -> oxideav_core::Result<SliceTilePlumbing> {
+    let ctb_log2 = sps.log2_ctu_size_minus5 + 5;
+    let ctb = 1u32 << ctb_log2;
+    let pw = sps.pic_width_in_luma_samples;
+    let ph = sps.pic_height_in_luma_samples;
+    let pw_ctbs = pw.div_ceil(ctb);
+    let ph_ctbs = ph.div_ceil(ctb);
+    let col_bd = pps.col_bd(pw_ctbs);
+    let row_bd = pps.row_bd(ph_ctbs);
+    let layout = tiles::PicTileLayout::from_ctb_bounds(
+        &col_bd,
+        &row_bd,
+        ctb_log2,
+        pw,
+        ph,
+        pps.loop_filter_across_tiles_enabled_flag,
+    )?;
+    let maps = pps.tile_index_maps(pw_ctbs, ph_ctbs);
+    let num_tiles_in_pic = pps.num_tiles_in_pic();
+    let slice_tile_idx =
+        header.slice_tile_indices(&maps, pps.num_tile_columns_minus1, num_tiles_in_pic)?;
+    let num_ctus_in_tile = pps.num_ctus_in_tile(pw_ctbs, ph_ctbs);
+    let ts_to_rs = pps.ctb_addr_ts_to_rs(pw_ctbs, ph_ctbs);
+    let order = slice_data::resolve_slice_tile_walk_order(
+        &slice_tile_idx,
+        &maps.first_ctb_addr_ts,
+        &num_ctus_in_tile,
+        &ts_to_rs,
+    )?;
+    let entry_point_offsets = header.parse_entry_points(
+        br,
+        &maps,
+        pps.num_tile_columns_minus1,
+        num_tiles_in_pic,
+        pps.tile_offset_len_minus1,
+    )?;
+    Ok(SliceTilePlumbing {
+        order,
+        layout,
+        entry_point_offsets,
+    })
+}
+
+/// Everything the registered decoder needs from a fully-parsed IDR
+/// slice: the reconstructed picture + stats, the slice-header ALF
+/// routing (per-CTU map enables + APS ids) and the resolved tile
+/// layout for the §8.8.4.5/.6 post-filter availability.
+#[doc(hidden)]
+pub struct IdrDecodeResult {
+    pub pic: picture::YuvPicture,
+    pub stats: slice_data::SliceDecodeStats,
+    pub chroma_cb_enabled: bool,
+    pub chroma_cr_enabled: bool,
+    pub alf_luma_aps_id: Option<u8>,
+    pub alf_chroma_aps_id: Option<u8>,
+    pub alf_chroma2_aps_id: Option<u8>,
+    pub layout: tiles::PicTileLayout,
+}
+
+/// Full-header IDR decode: the §7.3.4 slice-header parse (tile fields,
+/// ALF block, deblocking controls — superseding the round-3 minimal
+/// parse that ignored them), the §7.4.5 tile plumbing, and the
+/// §7.3.8.1 (possibly multi-tile) pixel walk. `slice_deblocking_filter_flag`
+/// and the §8.8.3 alpha/beta offsets are honoured on the IDR path.
+#[doc(hidden)]
+pub fn decode_idr_slice_full(
+    sps: &sps::Sps,
+    pps: &pps::Pps,
+    slice_nal_rbsp: &[u8],
+) -> oxideav_core::Result<IdrDecodeResult> {
+    use oxideav_core::Error;
+    let ctx = slice_header::SliceParseContext {
+        single_tile_in_pic_flag: pps.single_tile_in_pic_flag,
+        arbitrary_slice_present_flag: pps.arbitrary_slice_present_flag,
+        tile_id_len_minus1: pps.tile_id_len_minus1,
+        num_tile_columns_minus1: pps.num_tile_columns_minus1,
+        num_tile_rows_minus1: pps.num_tile_rows_minus1,
+        sps_pocs_flag: sps.sps_pocs_flag,
+        sps_rpl_flag: sps.sps_rpl_flag,
+        sps_alf_flag: sps.sps_alf_flag,
+        sps_mmvd_flag: sps.sps_mmvd_flag,
+        sps_admvp_flag: sps.sps_admvp_flag,
+        sps_addb_flag: sps.sps_addb_flag,
+        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
+        chroma_array_type: sps.chroma_array_type(),
+        num_ref_pic_lists_in_sps_l0: sps.num_ref_pic_lists_in_sps_l0,
+        num_ref_pic_lists_in_sps_l1: sps.num_ref_pic_lists_in_sps_l1,
+        rpl1_idx_present_flag: pps.rpl1_idx_present_flag,
+        long_term_ref_pics_flag: sps.long_term_ref_pics_flag,
+        additional_lt_poc_lsb_len: pps.additional_lt_poc_lsb_len,
+    };
+    let mut br = bitreader::BitReader::new(slice_nal_rbsp);
+    let header = slice_header::parse_consume(&mut br, nal::NalUnitType::Idr, &ctx)?;
+    let plumbing = resolve_slice_tiles(sps, pps, &header, &mut br)?;
+    br.align_to_byte();
+    let consumed_bits = br.bit_position();
+    if consumed_bits % 8 != 0 {
+        return Err(Error::invalid(
+            "evc decode_idr_slice_full: slice header not byte-aligned after parse",
+        ));
+    }
+    let consumed_bytes = (consumed_bits / 8) as usize;
+    if consumed_bytes >= slice_nal_rbsp.len() {
+        return Err(Error::invalid(
+            "evc decode_idr_slice_full: no slice_data bytes after header",
+        ));
+    }
+    let slice_data_bytes = &slice_nal_rbsp[consumed_bytes..];
+    let subset_ranges = plumbing.subset_ranges(slice_data_bytes.len())?;
+
+    let ctb_log2_size_y = sps.log2_ctu_size_minus5 + 5;
+    let min_cb_log2_size_y = sps.log2_min_cb_size_minus2 + 2;
+    let max_tb_log2_size_y = 6; // eq. 51: MaxTbLog2SizeY = 6 (a constant)
+    let log2_max_ibc_cand_size = sps.log2_max_ibc_cand_size().unwrap_or(0);
+    let walk = slice_data::SliceWalkInputs {
+        pic_width: sps.pic_width_in_luma_samples,
+        pic_height: sps.pic_height_in_luma_samples,
+        ctb_log2_size_y,
+        min_cb_log2_size_y,
+        max_tb_log2_size_y,
+        chroma_format_idc: sps.chroma_format_idc,
+        cu_qp_delta_enabled: pps.cu_qp_delta_enabled_flag,
+        sps_adcc_flag: sps.sps_adcc_flag,
+        sps_eipd_flag: sps.sps_eipd_flag,
+        sps_dquant_flag: sps.sps_dquant_flag,
+        cu_qp_delta_area: pps.log2_cu_qp_delta_area_minus6 + 6,
+        sps_ibc_flag: sps.sps_ibc_flag,
+        log2_max_ibc_cand_size,
+        // §7.3.8.2: the slice-header ALF map controls thread through so
+        // the CTU walker decodes the per-CTU `alf_ctb_*` map (the
+        // round-3 minimal parse defaulted these off on IDR).
+        slice_alf_enabled_flag: header.slice_alf_enabled_flag,
+        slice_alf_map_flag: header.slice_alf_map_flag,
+        slice_chroma_alf_enabled_flag: header.slice_chroma_alf_enabled_flag,
+        slice_alf_chroma_map_flag: header.slice_alf_chroma_map_flag,
+        slice_chroma2_alf_enabled_flag: header.slice_chroma2_alf_enabled_flag,
+        slice_alf_chroma2_map_flag: header.slice_alf_chroma2_map_flag,
+        tree_gates: slice_data::CodingTreeGates::from_sps(sps),
+    };
+    let decode = slice_data::SliceDecodeInputs {
+        slice_qp: header.slice_qp as i32,
+        bit_depth_luma: sps.bit_depth_y(),
+        bit_depth_chroma: sps.bit_depth_c(),
+        enable_deblock: header.slice_deblocking_filter_flag,
+        sps_addb_flag: sps.sps_addb_flag,
+        filter_offset_a: header.slice_alpha_offset,
+        filter_offset_b: header.slice_beta_offset,
+        slice_cb_qp_offset: header.slice_cb_qp_offset,
+        slice_cr_qp_offset: header.slice_cr_qp_offset,
+        sps_ibc_flag: sps.sps_ibc_flag,
+        log2_max_ibc_cand_size,
+        sps_htdf_flag: sps.sps_htdf_flag,
+    };
+    let (pic, stats) = slice_data::decode_baseline_idr_slice_tiled(
+        slice_data_bytes,
+        walk,
+        decode,
+        &plumbing.order,
+        &subset_ranges,
+        &plumbing.layout,
+    )?;
+    Ok(IdrDecodeResult {
+        pic,
+        stats,
+        chroma_cb_enabled: header.slice_chroma_alf_enabled_flag,
+        chroma_cr_enabled: header.slice_chroma2_alf_enabled_flag,
+        alf_luma_aps_id: header.slice_alf_luma_aps_id,
+        alf_chroma_aps_id: header.slice_alf_chroma_aps_id,
+        alf_chroma2_aps_id: header.slice_alf_chroma2_aps_id,
+        layout: plumbing.layout,
+    })
+}
+
 /// Helper for [`decode_idr_slice`]: parse the Baseline IDR slice header
 /// and recover `slice_qp` for downstream dequant. Round-3 supports the
 /// minimal set: `slice_pps_id`, `slice_type` (must be 2), trailing
@@ -1987,6 +2200,202 @@ mod tests {
         assert!((0..16).all(|j| (16..32).all(|i| pic.y[j * 32 + i] == 512)));
         assert!(pic.cb.iter().all(|&v| v == 512));
         assert!(pic.cr.iter().all(|&v| v == 512));
+    }
+
+    /// Round 416 — a 2×1-tile PPS: 128×64 picture, CTU 64, two 64×64
+    /// tiles, `loop_filter_across_tiles_enabled_flag = 0`,
+    /// `tile_offset_len_minus1 = 15` (16-bit entry points),
+    /// `tile_id_len_minus1 = 0`.
+    fn build_two_tile_pps_rbsp() -> Vec<u8> {
+        let mut pps_body = BitEmitter::new();
+        pps_body.ue(0); // pps_id
+        pps_body.ue(0); // sps_id
+        pps_body.ue(0); // num_ref_idx_default_active_minus1[0]
+        pps_body.ue(0); // num_ref_idx_default_active_minus1[1]
+        pps_body.ue(0); // additional_lt_poc_lsb_len
+        pps_body.u(1, 0); // rpl1_idx_present_flag
+        pps_body.u(1, 0); // single_tile_in_pic_flag = 0
+        pps_body.ue(1); // num_tile_columns_minus1 = 1
+        pps_body.ue(0); // num_tile_rows_minus1 = 0
+        pps_body.u(1, 1); // uniform_tile_spacing_flag
+        pps_body.u(1, 0); // loop_filter_across_tiles_enabled_flag = 0
+        pps_body.ue(15); // tile_offset_len_minus1 (16-bit entry points)
+        pps_body.ue(0); // tile_id_len_minus1
+        pps_body.u(1, 0); // explicit_tile_id_flag
+        pps_body.u(1, 0); // pic_dra_enabled_flag
+        pps_body.u(1, 0); // arbitrary_slice_present_flag
+        pps_body.u(1, 0); // constrained_intra_pred_flag
+        pps_body.u(1, 0); // cu_qp_delta_enabled_flag
+        pps_body.finish_with_trailing_bits();
+        pps_body.into_bytes()
+    }
+
+    /// Round 416 — one Baseline 64×64 intra CTU as its own §7.4.5 tile
+    /// subset: unsplit DC CU, a single luma DC level, quiet chroma.
+    fn encode_tile_ctu_subset(abs_minus1: u32) -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (64×64 leaf)
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        for _ in 0..abs_minus1 {
+            enc.encode_decision(0, 0, 1);
+        }
+        enc.encode_decision(0, 0, 0); // U terminator
+        enc.encode_bypass(0); // sign +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_terminate(true); // end_of_tile_one_bit
+        enc.finish()
+    }
+
+    /// Round 416 — end-to-end **multi-tile** decode through the
+    /// registered decoder: SPS + a 2×1-tile PPS + an IDR slice spanning
+    /// both tiles (tile fields + a 16-bit entry point in the header,
+    /// two CABAC subsets) + a P slice of per-tile zero-MV skip CUs.
+    /// The IDR frame must stitch the two standalone single-tile decodes
+    /// bit-exactly (§6.4.1 keeps tile 1's intra refs off tile 0), and
+    /// the P frame must equal the IDR frame.
+    #[test]
+    fn round416_make_decoder_decodes_two_tile_idr_plus_p() {
+        use crate::cabac::CabacEncoder;
+        use oxideav_core::{CodecParameters, Packet, TimeBase};
+        let sps_rbsp = build_baseline_sps_rbsp(128, 64);
+        let pps_rbsp = build_two_tile_pps_rbsp();
+
+        // --- IDR slice: both tiles, distinct DC levels per tile. ---
+        let subset_a = encode_tile_ctu_subset(149);
+        let subset_b = encode_tile_ctu_subset(49);
+        let mut idr_hdr = BitEmitter::new();
+        idr_hdr.ue(0); // slice_pps_id
+        idr_hdr.u(1, 0); // single_tile_in_slice_flag = 0
+        idr_hdr.u(1, 0); // first_tile_id (1 bit)
+        idr_hdr.u(1, 1); // last_tile_id (1 bit) — arbitrary flag absent
+        idr_hdr.ue(2); // slice_type = I
+        idr_hdr.u(1, 0); // no_output_of_prior_pics_flag
+        idr_hdr.u(1, 0); // slice_deblocking_filter_flag
+        idr_hdr.u(6, 51); // slice_qp (51 → visible DC shift)
+        idr_hdr.ue(0); // slice_cb_qp_offset
+        idr_hdr.ue(0); // slice_cr_qp_offset
+                       // §7.3.4 entry point: NumTilesInSlice − 1 = 1 offset, 16 bits.
+        idr_hdr.u(16, subset_a.len() as u32 - 1); // entry_point_offset_minus1[0]
+        while idr_hdr.bit_position() % 8 != 0 {
+            idr_hdr.u(1, 0);
+        }
+        let mut idr_rbsp = idr_hdr.into_bytes();
+        idr_rbsp.extend_from_slice(&subset_a);
+        idr_rbsp.extend_from_slice(&subset_b);
+
+        // --- P slice: both tiles, one 64×64 zero-slot skip CU each. ---
+        let encode_skip_tile = || -> Vec<u8> {
+            let mut enc = CabacEncoder::new();
+            enc.encode_decision(0, 0, 0); // split_cu_flag = 0
+            enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
+            for _ in 0..3 {
+                enc.encode_decision(0, 0, 1); // mvp_idx = 3 (zero slot)
+            }
+            enc.encode_decision(0, 0, 0); // cbf_luma
+            enc.encode_decision(0, 0, 0); // cbf_cb
+            enc.encode_decision(0, 0, 0); // cbf_cr
+            enc.encode_terminate(true);
+            enc.finish()
+        };
+        let p_subset_a = encode_skip_tile();
+        let p_subset_b = encode_skip_tile();
+        let mut p_hdr = BitEmitter::new();
+        p_hdr.ue(0); // slice_pps_id
+        p_hdr.u(1, 0); // single_tile_in_slice_flag = 0
+        p_hdr.u(1, 0); // first_tile_id
+        p_hdr.u(1, 1); // last_tile_id
+        p_hdr.ue(1); // slice_type = P
+        p_hdr.u(1, 0); // num_ref_idx_active_override_flag
+        p_hdr.u(1, 0); // slice_deblocking_filter_flag
+        p_hdr.u(6, 51); // slice_qp
+        p_hdr.ue(0); // cb offset
+        p_hdr.ue(0); // cr offset
+        p_hdr.u(16, p_subset_a.len() as u32 - 1); // entry point
+        while p_hdr.bit_position() % 8 != 0 {
+            p_hdr.u(1, 0);
+        }
+        let mut p_rbsp = p_hdr.into_bytes();
+        p_rbsp.extend_from_slice(&p_subset_a);
+        p_rbsp.extend_from_slice(&p_subset_b);
+
+        fn nal_envelope(nut: u8, rbsp: &[u8]) -> Vec<u8> {
+            let nut_plus1: u16 = (nut as u16) + 1;
+            let mut hdr_word: u16 = 0;
+            hdr_word |= (nut_plus1 & 0x3F) << 9;
+            let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
+            let nal_len = (hdr.len() + rbsp.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&nal_len.to_be_bytes());
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(rbsp);
+            out
+        }
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&nal_envelope(24, &sps_rbsp)); // SPS
+        bs.extend_from_slice(&nal_envelope(25, &pps_rbsp)); // PPS
+        bs.extend_from_slice(&nal_envelope(1, &idr_rbsp)); // IDR
+        bs.extend_from_slice(&nal_envelope(0, &p_rbsp)); // NonIDR
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bs).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let f0 = dec.receive_frame().unwrap();
+        let f1 = dec.receive_frame().unwrap();
+        let v0 = match f0 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        let v1 = match f1 {
+            oxideav_core::Frame::Video(v) => v,
+            _ => panic!("not video"),
+        };
+        // Standalone controls: each tile subset decoded as its own
+        // 64×64 single-tile picture must stitch the IDR frame exactly.
+        let walk = slice_data::SliceWalkInputs {
+            pic_width: 64,
+            pic_height: 64,
+            ctb_log2_size_y: 6,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 6,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let decode_in = slice_data::SliceDecodeInputs {
+            slice_qp: 51,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            enable_deblock: false,
+            ..Default::default()
+        };
+        let (pic_a, _) = slice_data::decode_baseline_idr_slice(&subset_a, walk, decode_in).unwrap();
+        let (pic_b, _) = slice_data::decode_baseline_idr_slice(&subset_b, walk, decode_in).unwrap();
+        assert_ne!(pic_a.y[0], pic_b.y[0], "tiles must differ");
+        let y0 = &v0.planes[0].data;
+        for j in 0..64usize {
+            for i in 0..64usize {
+                assert_eq!(
+                    y0[j * 128 + i] as u16,
+                    pic_a.y[j * 64 + i],
+                    "tile 0 mismatch at ({i}, {j})"
+                );
+                assert_eq!(
+                    y0[j * 128 + 64 + i] as u16,
+                    pic_b.y[j * 64 + i],
+                    "tile 1 mismatch at ({i}, {j})"
+                );
+            }
+        }
+        // The P frame zero-MV-copies the IDR per tile.
+        assert_eq!(v0.planes[0].data, v1.planes[0].data);
+        assert_eq!(v0.planes[1].data, v1.planes[1].data);
+        assert_eq!(v0.planes[2].data, v1.planes[2].data);
     }
 
     /// Round 391: full NAL-stream 10-bit decode through the registered
