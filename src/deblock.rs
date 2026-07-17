@@ -419,6 +419,14 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
     // boundary). For each 4-sample run vertical at fixed x.
     let mut x = 4usize;
     while x < pic_w {
+        // §8.8.2.1: edges that coincide with tile boundaries are exempt
+        // when loop_filter_across_tiles_enabled_flag == 0.
+        if let Some(tb) = &side_info.tile_bounds {
+            if tb.is_col_boundary(x as u32) {
+                x += 4;
+                continue;
+            }
+        }
         let mut y = 0usize;
         while y + 4 <= pic_h {
             let p = side_info.at(x.saturating_sub(1) >> 2, y >> 2);
@@ -451,6 +459,13 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
     // Pass 2: horizontal edges (filter vertically, y-direction).
     let mut y = 4usize;
     while y < pic_h {
+        // §8.8.2.1 tile-boundary edge exemption (horizontal edges).
+        if let Some(tb) = &side_info.tile_bounds {
+            if tb.is_row_boundary(y as u32) {
+                y += 4;
+                continue;
+            }
+        }
         let mut x = 0usize;
         while x + 4 <= pic_w {
             let p = side_info.at(x >> 2, y.saturating_sub(1) >> 2);
@@ -562,6 +577,15 @@ pub fn deblock_chroma(
     let mut xc = chroma_step_x;
     while xc < plane_w {
         let x_luma = xc * sub_w;
+        // §8.8.2.1: tile-boundary edges (compared in the luma domain —
+        // tile boundaries are CTB-aligned) are exempt when
+        // loop_filter_across_tiles_enabled_flag == 0.
+        if let Some(tb) = &side_info.tile_bounds {
+            if tb.is_col_boundary(x_luma as u32) {
+                xc += chroma_step_x;
+                continue;
+            }
+        }
         let mut yc = 0usize;
         while yc + 4 <= plane_h {
             // The chroma 4-sample run covers 4*sub_h luma rows. We sample
@@ -614,6 +638,13 @@ pub fn deblock_chroma(
     let mut yc = chroma_step_y;
     while yc < plane_h {
         let y_luma = yc * sub_h;
+        // §8.8.2.1 tile-boundary edge exemption (horizontal edges).
+        if let Some(tb) = &side_info.tile_bounds {
+            if tb.is_row_boundary(y_luma as u32) {
+                yc += chroma_step_y;
+                continue;
+            }
+        }
         let mut xc = 0usize;
         while xc + 4 <= plane_w {
             let x_luma = xc * sub_w;
@@ -1144,6 +1175,17 @@ pub fn addb_deblock_picture(
                         calls.push((x0, y0, log2_w, log2_h));
                     }
                     for (cx, cy, lw, lh) in calls {
+                        // §8.8.3.1: edges that correspond to tile
+                        // boundaries are exempt when
+                        // loop_filter_across_tiles_enabled_flag == 0
+                        // (coordinates are luma-domain CB positions).
+                        if let Some(tb) = &grid.tile_bounds {
+                            if (vertical && tb.is_col_boundary(cx))
+                                || (!vertical && tb.is_row_boundary(cy))
+                            {
+                                continue;
+                            }
+                        }
                         filtered += addb_filter_cb_edge(
                             pic,
                             grid,
@@ -1184,6 +1226,143 @@ mod tests {
         assert_eq!(s_t(51, 3), 10);
         // bS = 0 (intra both sides) is always 0.
         assert_eq!(s_t(40, 0), 0);
+    }
+
+    /// Round 416 — §8.8.2.1 tile-boundary edge exemption: with
+    /// `tile_bounds` armed at the luma column x = 8, the vertical edge
+    /// between two residual-carrying inter CUs is NOT filtered, while
+    /// the same picture without the exemption smooths it. Non-boundary
+    /// edges behave identically in both runs.
+    #[test]
+    fn round416_deblock_luma_skips_tile_boundary_edges() {
+        let mk_pic = || {
+            let mut pic = YuvPicture::new(16, 8, 1, 8).unwrap();
+            for j in 0..8usize {
+                for i in 0..16usize {
+                    pic.y[j * 16 + i] = if i < 8 { 100 } else { 106 };
+                }
+            }
+            for j in 0..4usize {
+                for i in 0..8usize {
+                    pic.cb[j * 8 + i] = if i < 4 { 90 } else { 96 };
+                }
+            }
+            pic
+        };
+        let cu = |x0: u16| CuSideInfo {
+            pred_mode: CuPredMode::Inter,
+            cbf_luma: 1,
+            cu_x0: x0,
+            cu_y0: 0,
+            cu_log2_w: 3,
+            cu_log2_h: 3,
+            ref_idx_l0: 0,
+            qp_y: 32,
+            ..Default::default()
+        };
+        let mut grid = SideInfoGrid::new(16, 8);
+        grid.stamp_block(0, 0, 8, 8, cu(0));
+        grid.stamp_block(8, 0, 8, 8, cu(8));
+
+        // Unexempt control: the x = 8 step is smoothed.
+        let mut pic_open = mk_pic();
+        deblock_luma(&mut pic_open, &grid, 32).unwrap();
+        assert_ne!(
+            pic_open.y[7], 100,
+            "control must filter the x = 8 luma edge"
+        );
+
+        // Tile boundary at x = 8 with across-tiles filtering off.
+        grid.tile_bounds = Some(crate::tiles::TileBounds {
+            col_bd: vec![8],
+            row_bd: vec![],
+        });
+        let mut pic_tiled = mk_pic();
+        deblock_luma(&mut pic_tiled, &grid, 32).unwrap();
+        for j in 0..8usize {
+            for i in 6..10usize {
+                let want = if i < 8 { 100 } else { 106 };
+                assert_eq!(
+                    pic_tiled.y[j * 16 + i],
+                    want,
+                    "tile-boundary luma edge must stay unfiltered at ({i}, {j})"
+                );
+            }
+        }
+        // Chroma: the boundary maps to chroma x = 4; it too stays
+        // unfiltered under the exemption.
+        let mut pic_c = mk_pic();
+        deblock_chroma(&mut pic_c, &grid, 32, 0, 1).unwrap();
+        for j in 0..4usize {
+            for i in 3..5usize {
+                let want = if i < 4 { 90 } else { 96 };
+                assert_eq!(
+                    pic_c.cb[j * 8 + i],
+                    want,
+                    "tile-boundary chroma edge must stay unfiltered at ({i}, {j})"
+                );
+            }
+        }
+    }
+
+    /// Round 416 — §8.8.3.1 (ADDB) tile-boundary edge exemption: the
+    /// left edge of a CB whose x0 coincides with an armed tile-column
+    /// boundary is skipped; without the exemption the same edge
+    /// filters.
+    #[test]
+    fn round416_addb_skips_tile_boundary_edges() {
+        let mk_pic = || {
+            let mut pic = YuvPicture::new(16, 8, 1, 8).unwrap();
+            for j in 0..8usize {
+                for i in 0..16usize {
+                    pic.y[j * 16 + i] = if i < 8 { 100 } else { 106 };
+                }
+            }
+            pic
+        };
+        let cu = |x0: u16| CuSideInfo {
+            pred_mode: CuPredMode::Inter,
+            cbf_luma: 1,
+            cu_x0: x0,
+            cu_y0: 0,
+            cu_log2_w: 3,
+            cu_log2_h: 3,
+            ref_idx_l0: 0,
+            qp_y: 40,
+            ..Default::default()
+        };
+        let mut grid = SideInfoGrid::new(16, 8);
+        grid.stamp_block(0, 0, 8, 8, cu(0));
+        grid.stamp_block(8, 0, 8, 8, cu(8));
+        let offsets = AddbOffsets {
+            filter_offset_a: 0,
+            filter_offset_b: 0,
+        };
+
+        let mut pic_open = mk_pic();
+        let filtered_open = addb_deblock_picture(&mut pic_open, &grid, offsets, 5, 5, 0, 0);
+        assert!(filtered_open > 0);
+        assert_ne!(
+            pic_open.y[7], 100,
+            "control must filter the x = 8 ADDB edge"
+        );
+
+        grid.tile_bounds = Some(crate::tiles::TileBounds {
+            col_bd: vec![8],
+            row_bd: vec![],
+        });
+        let mut pic_tiled = mk_pic();
+        addb_deblock_picture(&mut pic_tiled, &grid, offsets, 5, 5, 0, 0);
+        for j in 0..8usize {
+            for i in 5..11usize {
+                let want = if i < 8 { 100 } else { 106 };
+                assert_eq!(
+                    pic_tiled.y[j * 16 + i],
+                    want,
+                    "ADDB tile-boundary edge must stay unfiltered at ({i}, {j})"
+                );
+            }
+        }
     }
 
     /// Round 416 — the grid's §6.4.1 tile probe: `None` (single tile)
