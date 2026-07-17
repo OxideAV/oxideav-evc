@@ -102,6 +102,8 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// Public-but-internal type that callers normally see via the `Decoder`
 /// trait. Wraps the per-stream parameter-set cache, the round-9 DPB and
 /// the POC-ordered output queue.
+// Internal: reach it through [`make_decoder`] / the registry instead.
+#[doc(hidden)]
 pub struct EvcDecoder {
     codec_id: CodecId,
     sps: Option<Sps>,

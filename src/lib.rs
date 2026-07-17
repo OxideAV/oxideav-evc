@@ -75,47 +75,92 @@
 //! spec-only — clauses, equations, and table numbers cite the
 //! Recommendation directly.
 
+// Internal syntax/recon plumbing — kept `pub` so tests and fixture tooling
+// can drive each stage directly, but `#[doc(hidden)]` so the documented API
+// (and cargo-semver-checks) tracks only the stable surface: `probe` +
+// `EvcFileInfo` + `CODEC_ID_STR`, `register`, and `decoder::make_decoder`.
+#[doc(hidden)]
 pub mod adcc;
+#[doc(hidden)]
 pub mod affine;
+#[doc(hidden)]
 pub mod affine_cand;
+#[doc(hidden)]
 pub mod affine_syntax;
+#[doc(hidden)]
 pub mod alf;
+#[doc(hidden)]
 pub mod alf_tables;
+#[doc(hidden)]
 pub mod amvr_syntax;
+#[doc(hidden)]
 pub mod aps;
+#[doc(hidden)]
 pub mod ats;
+#[doc(hidden)]
 pub mod bitreader;
+#[doc(hidden)]
 pub mod cabac;
+#[doc(hidden)]
 pub mod cabac_init;
+#[doc(hidden)]
 pub mod deblock;
 pub mod decoder;
+#[doc(hidden)]
 pub mod dequant;
+#[doc(hidden)]
 pub mod dmvr;
+#[doc(hidden)]
 pub mod dra;
+#[doc(hidden)]
 pub mod eipd;
+#[doc(hidden)]
 pub mod eipd_mode;
+#[doc(hidden)]
 pub mod eipd_ref;
+#[doc(hidden)]
 pub mod eipd_syntax;
+#[doc(hidden)]
 pub mod hmvp;
+#[doc(hidden)]
 pub mod htdf;
+#[doc(hidden)]
 pub mod ibc;
+#[doc(hidden)]
 pub mod inter;
+#[doc(hidden)]
 pub mod inter_cu_syntax;
+#[doc(hidden)]
 pub mod intra;
+#[doc(hidden)]
 pub mod merge;
+#[doc(hidden)]
 pub mod mmvd;
+#[doc(hidden)]
 pub mod mmvd_syntax;
+#[doc(hidden)]
 pub mod nal;
+#[doc(hidden)]
 pub mod neighbour;
+#[doc(hidden)]
 pub mod picture;
+#[doc(hidden)]
 pub mod pps;
+#[doc(hidden)]
 pub mod rpl;
+#[doc(hidden)]
 pub mod scan;
+#[doc(hidden)]
 pub mod slice_data;
+#[doc(hidden)]
 pub mod slice_header;
+#[doc(hidden)]
 pub mod split;
+#[doc(hidden)]
 pub mod sps;
+#[doc(hidden)]
 pub mod tmvp;
+#[doc(hidden)]
 pub mod transform;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
@@ -188,6 +233,8 @@ fn info_from_nal(nal_ref: &nal::NalRef<'_>) -> Option<EvcFileInfo> {
 /// **Round-2 scope**: Baseline-profile IDR slices only. Errors out on any
 /// SPS toolset combination not yet supported by the walker (see
 /// [`slice_data::walk_baseline_idr_slice`] for the constraint set).
+// Internal round-2 harness over hidden parser types — not a stable API.
+#[doc(hidden)]
 pub fn walk_idr_slice(
     sps: &sps::Sps,
     pps: &pps::Pps,
@@ -310,6 +357,8 @@ pub fn walk_idr_slice(
 /// (§8.7.5). Round-3 fixtures must use `cbf_luma == cbf_cb == cbf_cr ==
 /// 0` for every CU; non-zero CBFs trigger `Error::Unsupported` (round-4
 /// scope).
+// Internal round-3 harness over hidden parser types — not a stable API.
+#[doc(hidden)]
 pub fn decode_idr_slice(
     sps: &sps::Sps,
     pps: &pps::Pps,
