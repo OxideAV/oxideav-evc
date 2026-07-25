@@ -38,8 +38,9 @@ use crate::CODEC_ID_STR;
 /// Default slice QP when the caller doesn't pass the `qp` option.
 pub const DEFAULT_QP: i32 = 30;
 
-/// Encode one 8-bit 4:2:0 source picture into a complete key access
-/// unit (`[SPS][PPS][IDR]`, length-prefixed). Returns the bitstream,
+/// Encode one 4:2:0 source picture (any 8..=16 bit depth the recon
+/// chain supports) into a complete key access unit
+/// (`[SPS][PPS][IDR]`, length-prefixed). Returns the bitstream,
 /// the reconstruction the decoder will reproduce byte-exactly, and the
 /// slice-encoder statistics. This is the whole-frame entry point the
 /// registry encoder wraps; tests and fixture tooling can call it
@@ -48,11 +49,6 @@ pub fn encode_idr_access_unit(
     src: &YuvPicture,
     slice_qp: i32,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
-    if src.bit_depth != 8 {
-        return Err(Error::unsupported(
-            "evc encoder: 8-bit sources only in this round (recon chain is depth-ready)",
-        ));
-    }
     let (payload, recon, stats) = encode_idr_slice_data(src, slice_qp)?;
     let mut slice_rbsp = write_idr_slice_header(slice_qp as u32)?;
     slice_rbsp.extend_from_slice(&payload);
@@ -61,6 +57,7 @@ pub fn encode_idr_access_unit(
         width: src.width,
         height: src.height,
         level_idc: 51, // generous cap; no external constraint checking yet
+        bit_depth: src.bit_depth,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -84,13 +81,17 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "evc encoder: dimensions {width}x{height} must be non-zero multiples of 4"
         )));
     }
-    if let Some(pf) = params.pixel_format {
-        if pf != PixelFormat::Yuv420P {
+    let bit_depth = match params.pixel_format {
+        None | Some(PixelFormat::Yuv420P) => 8,
+        Some(PixelFormat::Yuv420P10Le) => 10,
+        Some(PixelFormat::Yuv420P12Le) => 12,
+        Some(pf) => {
             return Err(Error::unsupported(format!(
-                "evc encoder: pixel format {pf:?} unsupported (Yuv420P only)"
-            )));
+                "evc encoder: pixel format {pf:?} unsupported \
+                 (Yuv420P / Yuv420P10Le / Yuv420P12Le)"
+            )))
         }
-    }
+    };
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -102,12 +103,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     out_params.width = Some(width);
     out_params.height = Some(height);
-    out_params.pixel_format = Some(PixelFormat::Yuv420P);
+    out_params.pixel_format = Some(params.pixel_format.unwrap_or(PixelFormat::Yuv420P));
     Ok(Box::new(EvcEncoder {
         codec_id: CodecId::new(CODEC_ID_STR),
         out_params,
         width,
         height,
+        bit_depth,
         qp,
         queue: VecDeque::new(),
     }))
@@ -123,6 +125,7 @@ pub struct EvcEncoder {
     out_params: CodecParameters,
     width: u32,
     height: u32,
+    bit_depth: u32,
     qp: i32,
     queue: VecDeque<Packet>,
 }
@@ -141,7 +144,7 @@ impl Encoder for EvcEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
-        let src = video_frame_to_picture(v, self.width, self.height)?;
+        let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
         let (data, _recon, _stats) = encode_idr_access_unit(&src, self.qp)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
@@ -161,39 +164,56 @@ impl Encoder for EvcEncoder {
     }
 }
 
-/// Convert an 8-bit `Yuv420P` [`oxideav_core::VideoFrame`] into the
-/// crate's u16 picture buffer, honouring per-plane strides.
+/// Convert a planar 4:2:0 [`oxideav_core::VideoFrame`] into the
+/// crate's u16 picture buffer, honouring per-plane strides. 8-bit
+/// frames carry one byte per sample; deeper frames two little-endian
+/// bytes per sample (the `Yuv420P10Le`-family layout, strides in
+/// bytes) — the same conventions the decoder emits.
 fn video_frame_to_picture(
     v: &oxideav_core::VideoFrame,
     width: u32,
     height: u32,
+    bit_depth: u32,
 ) -> Result<YuvPicture> {
     let planes = v.image_planes();
     if planes.len() < 3 {
         return Err(Error::invalid(format!(
-            "evc encoder: expected 3 image planes (Yuv420P), got {}",
+            "evc encoder: expected 3 image planes (4:2:0 planar), got {}",
             planes.len()
         )));
     }
-    let mut pic = YuvPicture::new(width, height, 1, 8)?;
+    let mut pic = YuvPicture::new(width, height, 1, bit_depth)?;
     let cw = width.div_ceil(2) as usize;
     let ch = height.div_ceil(2) as usize;
+    let bytes_per = if bit_depth > 8 { 2usize } else { 1 };
+    let max_val = ((1u32 << bit_depth) - 1) as u16;
     let copy = |dst: &mut [u16],
                 dst_w: usize,
                 dst_h: usize,
                 plane: &oxideav_core::VideoPlane|
      -> Result<()> {
-        if plane.stride < dst_w || plane.data.len() < plane.stride * dst_h {
+        let row_bytes = dst_w * bytes_per;
+        if plane.stride < row_bytes || plane.data.len() < plane.stride * dst_h {
             return Err(Error::invalid(format!(
-                "evc encoder: plane too small (stride {}, len {}, need {dst_w}x{dst_h})",
+                "evc encoder: plane too small (stride {}, len {}, need {dst_w}x{dst_h}x{bytes_per})",
                 plane.stride,
                 plane.data.len()
             )));
         }
         for y in 0..dst_h {
-            let row = &plane.data[y * plane.stride..y * plane.stride + dst_w];
-            for (d, &s) in dst[y * dst_w..(y + 1) * dst_w].iter_mut().zip(row.iter()) {
-                *d = s as u16;
+            let row = &plane.data[y * plane.stride..y * plane.stride + row_bytes];
+            for (x, d) in dst[y * dst_w..(y + 1) * dst_w].iter_mut().enumerate() {
+                let s = if bytes_per == 2 {
+                    u16::from_le_bytes([row[2 * x], row[2 * x + 1]])
+                } else {
+                    row[x] as u16
+                };
+                if s > max_val {
+                    return Err(Error::invalid(format!(
+                        "evc encoder: sample {s} exceeds {bit_depth}-bit range"
+                    )));
+                }
+                *d = s;
             }
         }
         Ok(())
@@ -257,7 +277,7 @@ mod tests {
         assert_eq!(pkt.pts, Some(42));
 
         // Reference recon from the direct entry point.
-        let src = video_frame_to_picture(&frame, w, h).unwrap();
+        let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
         let (stream, recon, _stats) = encode_idr_access_unit(&src, DEFAULT_QP).unwrap();
         assert_eq!(pkt.data, stream, "registry and direct paths must agree");
 
@@ -282,7 +302,7 @@ mod tests {
     /// parse to the encoder's declared configuration.
     #[test]
     fn access_unit_reparses_exactly() {
-        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48).unwrap();
+        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 8).unwrap();
         let (stream, _recon, _stats) = encode_idr_access_unit(&src, 22).unwrap();
         let nals = crate::nal::iter_length_prefixed(&stream).unwrap();
         assert_eq!(nals.len(), 3);
@@ -356,6 +376,90 @@ mod tests {
         assert!(make_encoder(&params(66, 64)).is_err());
     }
 
+    /// 10-bit input (`Yuv420P10Le`, two LE bytes per sample): the whole
+    /// registry loop must round-trip recon-exact, with the decoder
+    /// emitting the matching 16-bit-LE planes.
+    #[test]
+    fn ten_bit_round_trip_exact() {
+        let (w, h) = (64u32, 48u32);
+        let (cw, chh) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        let pack16 = |vals: &[u16]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(vals.len() * 2);
+            for &v in vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        };
+        let y: Vec<u16> = (0..(w * h) as usize)
+            .map(|i| (((i % w as usize) * 9 + (i / w as usize) * 5) % 1024) as u16)
+            .collect();
+        let cb: Vec<u16> = (0..cw * chh).map(|i| (300 + (i % 400)) as u16).collect();
+        let cr: Vec<u16> = (0..cw * chh).map(|i| (600 + (i % 300)) as u16).collect();
+        let frame = VideoFrame {
+            pts: Some(7),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize * 2,
+                    data: pack16(&y),
+                },
+                VideoPlane {
+                    stride: cw * 2,
+                    data: pack16(&cb),
+                },
+                VideoPlane {
+                    stride: cw * 2,
+                    data: pack16(&cr),
+                },
+            ],
+        };
+        let mut p = params(w, h);
+        p.pixel_format = Some(PixelFormat::Yuv420P10Le);
+        p.options.insert("qp", "20");
+        let mut enc = make_encoder(&p).unwrap();
+        enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let info = crate::probe(&pkt.data).unwrap();
+        assert_eq!(info.bit_depth_luma, 10);
+
+        let src = video_frame_to_picture(&frame, w, h, 10).unwrap();
+        let (stream, recon, _stats) = encode_idr_access_unit(&src, 20).unwrap();
+        assert_eq!(pkt.data, stream);
+
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let vf = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video frame, got {other:?}"),
+        };
+        assert_eq!(vf.planes[0].data, pack16(&recon.y), "10-bit luma");
+        assert_eq!(vf.planes[1].data, pack16(&recon.cb), "10-bit cb");
+        assert_eq!(vf.planes[2].data, pack16(&recon.cr), "10-bit cr");
+        // And the recon is a faithful 10-bit picture, not an 8-bit one.
+        assert!(recon.y.iter().any(|&v| v > 255));
+    }
+
+    /// Single-byte mutation gate over the encoder's own access unit:
+    /// every low-bit flip and full inversion of every stream byte must
+    /// decode to either a clean error or a frame — never a panic.
+    #[test]
+    fn mutation_gate_over_encoded_stream() {
+        let src = video_frame_to_picture(&synth_frame(48, 48), 48, 48, 8).unwrap();
+        let (stream, _recon, _stats) = encode_idr_access_unit(&src, 42).unwrap();
+        for i in 0..stream.len() {
+            for mask in [0x01u8, 0xFF] {
+                let mut mutated = stream.clone();
+                mutated[i] ^= mask;
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                let pkt = Packet::new(0, TimeBase::new(1, 90_000), mutated);
+                if dec.send_packet(&pkt).is_ok() {
+                    let _ = dec.receive_frame();
+                }
+            }
+        }
+    }
+
     /// Output params advertise the stream a muxer needs.
     #[test]
     fn output_params_shape() {
@@ -372,7 +476,7 @@ mod tests {
     /// state, no non-deterministic RD tie-breaks.
     #[test]
     fn encode_is_deterministic() {
-        let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60).unwrap();
+        let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60, 8).unwrap();
         let (a, _, _) = encode_idr_access_unit(&src, 33).unwrap();
         let (b, _, _) = encode_idr_access_unit(&src, 33).unwrap();
         assert_eq!(a, b);
@@ -399,7 +503,7 @@ mod tests {
                 }
             }
         }
-        let src = video_frame_to_picture(&f, w, h).unwrap();
+        let src = video_frame_to_picture(&f, w, h, 8).unwrap();
         let pixels = (w * h) as f64;
         let mut prev_psnr = f64::INFINITY;
         let mut prev_len = usize::MAX;

@@ -23,6 +23,9 @@ pub struct EncSequenceConfig {
     /// `level_idc` to declare (30 = level 3.0 covers the CIF-class
     /// fixture sizes; callers with bigger frames should raise it).
     pub level_idc: u8,
+    /// `BitDepthY == BitDepthC` (§7.4.3.1) — 8..=16; the writer emits
+    /// `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` from it.
+    pub bit_depth: u32,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the Baseline intra configuration:
@@ -38,6 +41,12 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     if cfg.width > crate::sps::MAX_DIMENSION || cfg.height > crate::sps::MAX_DIMENSION {
         return Err(Error::invalid("evc enc sps: dimensions exceed bound"));
     }
+    if !(8..=16).contains(&cfg.bit_depth) {
+        return Err(Error::invalid(format!(
+            "evc enc sps: bit depth {} outside 8..=16",
+            cfg.bit_depth
+        )));
+    }
     let mut w = BitWriter::new();
     w.ue(0); // sps_seq_parameter_set_id
     w.u(8, 0); // profile_idc = 0 (Baseline)
@@ -47,8 +56,8 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.ue(1); // chroma_format_idc = 1 (4:2:0)
     w.ue(cfg.width); // pic_width_in_luma_samples
     w.ue(cfg.height); // pic_height_in_luma_samples
-    w.ue(0); // bit_depth_luma_minus8
-    w.ue(0); // bit_depth_chroma_minus8
+    w.ue(cfg.bit_depth - 8); // bit_depth_luma_minus8
+    w.ue(cfg.bit_depth - 8); // bit_depth_chroma_minus8 (decoder requires ==)
     w.u1(false); // sps_btt_flag → CtbLog2SizeY=6, MinCbLog2SizeY=2 defaults
     w.u1(false); // sps_suco_flag
     w.u1(false); // sps_admvp_flag
@@ -145,6 +154,7 @@ mod tests {
             width: 176,
             height: 144,
             level_idc: 30,
+            bit_depth: 8,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -181,6 +191,26 @@ mod tests {
         assert!(!sps.vui_parameters_present_flag);
     }
 
+    /// 10-bit SPS parse-back: the bit-depth fields land where the
+    /// encoder put them; out-of-range depths are refused.
+    #[test]
+    fn sps_parse_back_10bit() {
+        let cfg = EncSequenceConfig {
+            width: 64,
+            height: 64,
+            level_idc: 30,
+            bit_depth: 10,
+        };
+        let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
+        assert_eq!(sps.bit_depth_y(), 10);
+        assert_eq!(sps.bit_depth_c(), 10);
+        let bad = EncSequenceConfig {
+            bit_depth: 17,
+            ..cfg
+        };
+        assert!(write_sps_rbsp(&bad).is_err());
+    }
+
     /// PPS writer → PPS parser.
     #[test]
     fn pps_parse_back() {
@@ -205,6 +235,7 @@ mod tests {
             width: 64,
             height: 64,
             level_idc: 30,
+            bit_depth: 8,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -258,6 +289,7 @@ mod tests {
             width: 320,
             height: 240,
             level_idc: 30,
+            bit_depth: 8,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

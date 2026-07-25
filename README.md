@@ -528,8 +528,10 @@ API: `register(&mut codecs)` wires both factories;
 `encoder::make_encoder` stays directly callable). Scope: Baseline
 profile, all-intra — every input frame becomes a self-contained
 `[SPS][PPS][IDR]` key access unit in the Annex B length-prefixed
-framing. 8-bit 4:2:0 input, dimensions multiples of 4, `qp` option
-0..=51 (default 30).
+framing. 4:2:0 input at 8 bits (`Yuv420P`), 10 bits (`Yuv420P10Le`)
+or 12 bits (`Yuv420P12Le`) — the whole recon chain is bit-depth
+parameterized — dimensions multiples of 4, `qp` option 0..=51
+(default 30).
 
 Pipeline: §7.3 header **writers** that are field-for-field duals of
 the crate's parsers (`bitwriter` + `headers_enc`, parse-back pinned);
@@ -550,9 +552,11 @@ binary is staged under `docs/video/evc/`, so the encoder's gates are
 (b) **byte-exact encode→decode == encoder-reconstruction** through the
 crate's registered decoder (itself the conformance-validated side),
 pinned across a size × QP matrix (64×64 / 32×32 / 128×96 / 100×60
-boundary-split / 176×144 × QP 4/22/37/51) plus determinism and
-multi-frame session tests. Cross-implementation decode remains open
-until a validator lands in docs.
+boundary-split / 176×144 × QP 4/22/37/51, plus a 10-bit loop) plus
+determinism, multi-frame-session and a single-byte mutation gate over
+the encoder's own access unit (every flip/invert decodes to a clean
+error or a frame, never a panic). Cross-implementation decode remains
+open until a validator lands in docs.
 
 Measured on the in-tree busy synthetic QCIF frame (176×144):
 
@@ -569,8 +573,8 @@ bin shares a single CABAC context. Encoder follow-ups, in priority
 order: `sps_cm_init_flag == 1` per-element context modelling (the
 big rate win), low-delay P (inter search + the §7.3.8.4 inter CU
 write side), deblocking-on encode (`slice_deblocking_filter_flag = 1`
-with filtered-recon tracking), 10-bit input, arbitrary (non-multiple-
-of-4) dimensions via cropping.
+with filtered-recon tracking), arbitrary (non-multiple-of-4)
+dimensions via cropping.
 
 ## Usage
 
