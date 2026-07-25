@@ -366,4 +366,93 @@ mod tests {
         assert_eq!(p.height, Some(96));
         assert_eq!(p.pixel_format, Some(PixelFormat::Yuv420P));
     }
+
+    /// Determinism: encoding the same frame twice (fresh encoder each
+    /// time) must produce byte-identical access units — no hidden
+    /// state, no non-deterministic RD tie-breaks.
+    #[test]
+    fn encode_is_deterministic() {
+        let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60).unwrap();
+        let (a, _, _) = encode_idr_access_unit(&src, 33).unwrap();
+        let (b, _, _) = encode_idr_access_unit(&src, 33).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// QCIF-class rate/PSNR characterization across the QP grid: every
+    /// point must round-trip recon-exact through the registered
+    /// decoder, PSNR must be monotone non-increasing and rate monotone
+    /// non-increasing in QP, with sane absolute envelopes at the ends
+    /// (≥ 46 dB at QP 4; ≤ 4 bpp at QP 51 on this deliberately busy
+    /// synthetic frame — the Baseline `sps_cm_init_flag == 0` entropy
+    /// layer shares a single context across every regular bin, so
+    /// absolute rates run high; context modelling is the follow-up).
+    /// Run with `--nocapture` to read the measured curve.
+    #[test]
+    fn rate_psnr_curve_qcif() {
+        let (w, h) = (176u32, 144u32);
+        let mut f = synth_frame(w as usize, h as usize);
+        // Add a diagonal feature field so the frame isn't trivially flat.
+        for yy in 0..h as usize {
+            for xx in 0..w as usize {
+                if (xx + yy) % 23 == 0 {
+                    f.planes[0].data[yy * w as usize + xx] = 235;
+                }
+            }
+        }
+        let src = video_frame_to_picture(&f, w, h).unwrap();
+        let pixels = (w * h) as f64;
+        let mut prev_psnr = f64::INFINITY;
+        let mut prev_len = usize::MAX;
+        for &qp in &[4i32, 10, 16, 22, 28, 34, 40, 46, 51] {
+            let (stream, recon, _stats) = encode_idr_access_unit(&src, qp).unwrap();
+            // Recon-exactness through the registered decoder.
+            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 90_000), stream.clone());
+            dec.send_packet(&pkt).unwrap();
+            let vf = match dec.receive_frame().unwrap() {
+                Frame::Video(vf) => vf,
+                other => panic!("expected video frame, got {other:?}"),
+            };
+            let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
+            assert_eq!(vf.planes[0].data, y8, "qp {qp}: decode != recon");
+            // Curve shape.
+            let mse: f64 = src
+                .y
+                .iter()
+                .zip(recon.y.iter())
+                .map(|(&a, &b)| {
+                    let d = a as f64 - b as f64;
+                    d * d
+                })
+                .sum::<f64>()
+                / pixels;
+            let psnr = if mse == 0.0 {
+                99.0
+            } else {
+                10.0 * (255.0f64 * 255.0 / mse).log10()
+            };
+            let bpp = stream.len() as f64 * 8.0 / pixels;
+            eprintln!(
+                "qcif qp {qp:2}: {:6} bytes  {bpp:5.3} bpp  {psnr:5.2} dB",
+                stream.len()
+            );
+            // Monotone in the meaningful range — above ~60 dB the
+            // points are all effectively lossless (sub-1-LSB noise) and
+            // their ordering is quantization-rounding luck.
+            assert!(
+                psnr.min(60.0) <= prev_psnr.min(60.0) + 0.01,
+                "qp {qp}: PSNR rose ({psnr:.2} after {prev_psnr:.2})"
+            );
+            assert!(stream.len() <= prev_len, "qp {qp}: rate rose");
+            if qp == 4 {
+                assert!(psnr >= 46.0, "qp 4 PSNR {psnr:.2}");
+            }
+            if qp == 51 {
+                assert!(bpp <= 4.0, "qp 51 bpp {bpp:.3}");
+            }
+            prev_psnr = psnr;
+            prev_len = stream.len();
+        }
+    }
 }
