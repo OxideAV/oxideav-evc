@@ -100,6 +100,8 @@ pub mod ats;
 #[doc(hidden)]
 pub mod bitreader;
 #[doc(hidden)]
+pub mod bitwriter;
+#[doc(hidden)]
 pub mod cabac;
 #[doc(hidden)]
 pub mod cabac_init;

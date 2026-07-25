@@ -524,11 +524,11 @@ fn ceil_log2_plus_one(c_max: u32) -> u32 {
     32 - (n - 1).leading_zeros()
 }
 
-/// In-test CABAC encoder — symmetric inverse of [`CabacEngine`]. Emits a
+/// CABAC **encoder** — symmetric inverse of [`CabacEngine`]. Emits a
 /// raw bit stream that the decoder consumes byte-aligned via
-/// [`BitReader`]. Used by the round-trip fixture tests below; **not**
-/// exposed publicly because the round-2 deliverable is the decoder side
-/// only.
+/// [`BitReader`]. Originally an in-test fixture tool; round 429
+/// promotes it to real code as the entropy-coding back end of the
+/// Baseline intra encoder (`crate::slice_enc` / `crate::encoder`).
 ///
 /// Round 384: rewritten as an **exact carry-propagation arithmetic
 /// coder**. The previous outstanding-bit M-coder emitted an
@@ -552,9 +552,8 @@ fn ceil_log2_plus_one(c_max: u32) -> u32 {
 ///
 /// Every regular/bypass bin therefore round-trips exactly (the historic
 /// "bypass-tail defer" caveat is gone).
-#[cfg(test)]
 #[derive(Debug)]
-pub(crate) struct CabacEncoder {
+pub struct CabacEncoder {
     /// Committed codeword bits (one per element, MSB-first).
     bits: Vec<u8>,
     /// The 14-bit sliding codeword window (`< 0x4000` between calls).
@@ -564,11 +563,16 @@ pub(crate) struct CabacEncoder {
     ctx: Vec<Vec<ContextVar>>,
 }
 
-#[cfg(test)]
+impl Default for CabacEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CabacEncoder {
     const WINDOW_MASK: u32 = (1 << 14) - 1;
 
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             bits: Vec::new(),
             low: 0,
@@ -609,7 +613,7 @@ impl CabacEncoder {
         }
     }
 
-    pub(crate) fn encode_decision(&mut self, ctx_table: usize, ctx_idx: usize, bin: u8) {
+    pub fn encode_decision(&mut self, ctx_table: usize, ctx_idx: usize, bin: u8) {
         let var = self.ctx[ctx_table][ctx_idx];
         let mut ivl_lps_range = ((var.val_state as u32) * self.range) >> 9;
         if ivl_lps_range < 437 {
@@ -625,8 +629,7 @@ impl CabacEncoder {
         self.renorm();
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn encode_bypass(&mut self, bin: u8) {
+    pub fn encode_bypass(&mut self, bin: u8) {
         // Decoder bypass: offset <<= 1 | bit, compare against range,
         // subtract on 1. Dual: double the window, add `range` for a 1,
         // then commit exactly one bit (the decoder consumed exactly one).
@@ -642,7 +645,29 @@ impl CabacEncoder {
         self.low &= Self::WINDOW_MASK;
     }
 
-    pub(crate) fn encode_terminate(&mut self, terminate: bool) {
+    /// Encode a U-binarised value (§9.3.3.2) the way
+    /// [`CabacEngine::decode_u_regular_capped`] reads it back: `value`
+    /// 1-bins followed by one terminating 0-bin (the decoder's capped
+    /// loop always consumes the terminator, including at `value ==
+    /// c_max`). `ctx_idx_for(binIdx)` mirrors the decode-side context
+    /// switch; under `sps_cm_init_flag == 0` callers pass `|_| 0`.
+    pub fn encode_u_regular_capped<F>(
+        &mut self,
+        value: u32,
+        c_max: u32,
+        ctx_table: usize,
+        mut ctx_idx_for: F,
+    ) where
+        F: FnMut(u32) -> usize,
+    {
+        debug_assert!(value <= c_max, "U value {value} exceeds cMax {c_max}");
+        for bin_idx in 0..value {
+            self.encode_decision(ctx_table, ctx_idx_for(bin_idx), 1);
+        }
+        self.encode_decision(ctx_table, ctx_idx_for(value), 0);
+    }
+
+    pub fn encode_terminate(&mut self, terminate: bool) {
         // EVC §9.3.4.3.5: the decoder does ivlCurrRange -= 1, then the
         // bin is 1 iff ivl_offset >= ivl_curr_range (no renormalisation
         // on 1). Select the terminate point and flush the window.
@@ -658,10 +683,9 @@ impl CabacEncoder {
         }
     }
 
-    /// Install a context variable (test fixtures that encode against
-    /// Main-profile-initialised contexts — the encoder dual of
-    /// [`CabacEngine::set_context`]).
-    pub(crate) fn set_context(&mut self, ctx_table: usize, ctx_idx: usize, var: ContextVar) {
+    /// Install a context variable — the encoder dual of
+    /// [`CabacEngine::set_context`].
+    pub fn set_context(&mut self, ctx_table: usize, ctx_idx: usize, var: ContextVar) {
         self.ctx[ctx_table][ctx_idx] = var;
     }
 
@@ -669,7 +693,7 @@ impl CabacEncoder {
     /// from the Tables 40-90 initValues at `slice_qp`, mirroring
     /// [`crate::cabac_init::init_main_profile_contexts`] so a test
     /// encoder and the decoder start from identical context state.
-    pub(crate) fn init_main_profile(&mut self, init_type: InitType, slice_qp: i32) {
+    pub fn init_main_profile(&mut self, init_type: InitType, slice_qp: i32) {
         use crate::cabac_init::MainCtxTable;
         for &table in MainCtxTable::ALL {
             let (start, end) = table.init_type_range(init_type);
@@ -681,7 +705,7 @@ impl CabacEncoder {
         }
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         // Pack MSB-first, padding the final byte with 1-bits (any
         // decoder over-read during a trailing renormalisation stays in
         // the upper region, mirroring the historical convention).
@@ -1083,6 +1107,28 @@ mod tests {
         // The compat wrapper keeps the historical 64-bin bound.
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         assert!(eng.decode_u_regular(0, |_| 0).is_err());
+    }
+
+    /// The write-side U helper is the exact dual of
+    /// `decode_u_regular_capped` for every value in range, terminator
+    /// included at `value == c_max`.
+    #[test]
+    fn u_capped_write_read_duality() {
+        for c_max in [4u32, 15, 63, 255] {
+            let mut enc = CabacEncoder::new();
+            let vals: Vec<u32> = (0..=c_max.min(40)).chain([c_max]).collect();
+            for &v in &vals {
+                enc.encode_u_regular_capped(v, c_max, 0, |_| 0);
+            }
+            enc.encode_terminate(true);
+            let bs = enc.finish();
+            let mut dec = CabacEngine::new(&bs).unwrap();
+            for &v in &vals {
+                let got = dec.decode_u_regular_capped(c_max, 0, |_| 0).unwrap();
+                assert_eq!(got, v, "cMax {c_max}");
+            }
+            assert!(dec.decode_terminate().unwrap());
+        }
     }
 
     #[test]
