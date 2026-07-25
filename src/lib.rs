@@ -122,6 +122,7 @@ pub mod eipd_mode;
 pub mod eipd_ref;
 #[doc(hidden)]
 pub mod eipd_syntax;
+pub mod encoder;
 #[doc(hidden)]
 pub mod headers_enc;
 #[doc(hidden)]
@@ -751,9 +752,11 @@ fn parse_slice_header_consume(
     Ok(())
 }
 
-/// Register the EVC implementation (currently parser-only) with a codec
-/// registry. The registered decoder factory returns an unsupported-error
-/// decoder per the round-1 deliverable.
+/// Register the EVC implementation with a codec registry: the working
+/// Baseline/Main decoder plus (round 429) the Baseline intra encoder.
+/// The dual-API convention holds — [`decoder::make_decoder`] and
+/// [`encoder::make_encoder`] stay directly callable alongside the
+/// registry factories.
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("evc_sw")
         .with_lossy(true)
@@ -768,6 +771,7 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tags([
                 CodecTag::fourcc(b"evc1"),
                 CodecTag::fourcc(b"evcC"),
@@ -876,9 +880,10 @@ mod tests {
     fn register_creates_factory() {
         let mut reg = CodecRegistry::default();
         register(&mut reg);
-        // The registry must know the "evc" codec id and have a decoder
-        // implementation registered.
+        // The registry must know the "evc" codec id and have both a
+        // decoder and (round 429) an encoder implementation registered.
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
+        assert!(reg.has_encoder(&CodecId::new(CODEC_ID_STR)));
     }
 
     #[test]
