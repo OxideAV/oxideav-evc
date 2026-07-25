@@ -490,6 +490,68 @@ mod tests {
         }
     }
 
+    /// 12-bit input (`Yuv420P12Le`) closes the depth matrix: registry
+    /// loop recon-exact, probe reports depth 12.
+    #[test]
+    fn twelve_bit_round_trip_exact() {
+        let (w, h) = (32u32, 32u32);
+        let (cw, chh) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        let pack16 = |vals: &[u16]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(vals.len() * 2);
+            for &v in vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        };
+        let y: Vec<u16> = (0..(w * h) as usize)
+            .map(|i| ((i * 37) % 4096) as u16)
+            .collect();
+        let cb: Vec<u16> = (0..cw * chh)
+            .map(|i| (1000 + i * 3 % 2000) as u16)
+            .collect();
+        let cr: Vec<u16> = (0..cw * chh).map(|i| (2500 + i % 1500) as u16).collect();
+        let frame = VideoFrame {
+            pts: Some(1),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize * 2,
+                    data: pack16(&y),
+                },
+                VideoPlane {
+                    stride: cw * 2,
+                    data: pack16(&cb),
+                },
+                VideoPlane {
+                    stride: cw * 2,
+                    data: pack16(&cr),
+                },
+            ],
+        };
+        let mut p = params(w, h);
+        p.pixel_format = Some(PixelFormat::Yuv420P12Le);
+        let mut enc = make_encoder(&p).unwrap();
+        enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        assert_eq!(crate::probe(&pkt.data).unwrap().bit_depth_luma, 12);
+        let src = video_frame_to_picture(&frame, w, h, 12).unwrap();
+        let (stream, recon, _stats) = encode_idr_access_unit(&src, DEFAULT_QP).unwrap();
+        assert_eq!(pkt.data, stream);
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let vf = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video frame, got {other:?}"),
+        };
+        assert_eq!(vf.planes[0].data, pack16(&recon.y), "12-bit luma");
+        assert_eq!(vf.planes[1].data, pack16(&recon.cb), "12-bit cb");
+        assert_eq!(vf.planes[2].data, pack16(&recon.cr), "12-bit cr");
+        assert!(
+            recon.y.iter().any(|&v| v > 1023),
+            "true 12-bit range in play"
+        );
+    }
+
     /// Deblocking-on encode: with the `deblock` option the slice signals
     /// `slice_deblocking_filter_flag = 1` and the decoder runs the
     /// §8.8.2 post-pass. On an **all-intra** picture that pass is
