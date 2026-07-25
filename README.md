@@ -3,7 +3,8 @@
 [![CI](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-evc.svg)](https://crates.io/crates/oxideav-evc) [![docs.rs](https://docs.rs/oxideav-evc/badge.svg)](https://docs.rs/oxideav-evc) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1)
-video decoder. Zero C dependencies, zero FFI, zero `*-sys`.
+video decoder plus a Baseline-profile intra **encoder**. Zero C
+dependencies, zero FFI, zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -34,6 +35,8 @@ The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `eipd` / `eipd_mode` / `eipd_ref` / `eipd_syntax`,
 `ats`, `adcc`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
 `neighbour`, `picture`, and the registered `decoder`
+factory — plus, since round 429, the encode side: `bitwriter`,
+`headers_enc`, `quant_enc`, `slice_enc` and the registered `encoder`
 factory. All clause / equation / table numbers cite ISO/IEC
 23094-1:2020(E) directly.
 
@@ -513,9 +516,61 @@ implementations.
 
 ### Not yet supported
 
-Nothing is currently gated: every Main-profile decode tool, multi-tile
-pixel reconstruction, and the post-filter chain (ALF / DRA / HTDF)
-run at every supported bit depth (8..=16, §7.4.3.1).
+Nothing is currently gated on the decode side: every Main-profile
+decode tool, multi-tile pixel reconstruction, and the post-filter
+chain (ALF / DRA / HTDF) run at every supported bit depth (8..=16,
+§7.4.3.1).
+
+## Encoder (round 429 — Baseline intra bootstrap)
+
+The crate now registers an **encoder** alongside the decoder (dual
+API: `register(&mut codecs)` wires both factories;
+`encoder::make_encoder` stays directly callable). Scope: Baseline
+profile, all-intra — every input frame becomes a self-contained
+`[SPS][PPS][IDR]` key access unit in the Annex B length-prefixed
+framing. 8-bit 4:2:0 input, dimensions multiples of 4, `qp` option
+0..=51 (default 30).
+
+Pipeline: §7.3 header **writers** that are field-for-field duals of
+the crate's parsers (`bitwriter` + `headers_enc`, parse-back pinned);
+the exact carry-propagation **CABAC encoder** (promoted from the
+round-384 test fixture) driving the §7.3.8 IDR `slice_data()` bin
+stream — quad `split_unit()` recursion with implicit boundary splits,
+dual-tree leaf `coding_unit()` pairs, `intra_pred_mode` U codes,
+§7.3.8.7 RLE residual writing; a **forward transform + quantizer**
+(`quant_enc`) built by linear inversion of the §8.7 decode chain (with
+one refinement iteration against the exact inverse, near-lossless at
+QP 0); and true **RD decisions** — the 5-mode Table-13 search and the
+bottom-up leaf-vs-split tree choice both run the decoder's own
+reconstruction pipeline under `SSE + λ·bits`.
+
+**Validation posture (stated plainly):** no external EVC validator
+binary is staged under `docs/video/evc/`, so the encoder's gates are
+(a) re-parse-exactness through this crate's own §7.3 parsers and
+(b) **byte-exact encode→decode == encoder-reconstruction** through the
+crate's registered decoder (itself the conformance-validated side),
+pinned across a size × QP matrix (64×64 / 32×32 / 128×96 / 100×60
+boundary-split / 176×144 × QP 4/22/37/51) plus determinism and
+multi-frame session tests. Cross-implementation decode remains open
+until a validator lands in docs.
+
+Measured on the in-tree busy synthetic QCIF frame (176×144):
+
+| QP | bytes | bpp | luma PSNR |
+|----|-------|-----|-----------|
+| 4  | 98 193 | 31.00 | 85.2 dB |
+| 22 | 46 835 | 14.78 | 79.6 dB |
+| 34 | 25 651 |  8.10 | 52.2 dB |
+| 51 |  9 905 |  3.13 | 38.1 dB |
+
+Absolute rates run high by design of the Baseline entropy layer the
+encoder currently drives: with `sps_cm_init_flag == 0` every regular
+bin shares a single CABAC context. Encoder follow-ups, in priority
+order: `sps_cm_init_flag == 1` per-element context modelling (the
+big rate win), low-delay P (inter search + the §7.3.8.4 inter CU
+write side), deblocking-on encode (`slice_deblocking_filter_flag = 1`
+with filtered-recon tracking), 10-bit input, arbitrary (non-multiple-
+of-4) dimensions via cropping.
 
 ## Usage
 
@@ -528,8 +583,9 @@ if let Some(info) = probe(bytes) {
 }
 ```
 
-The decoder also registers with the framework via
-`oxideav_evc::register(&mut codecs)`.
+Both the decoder and the encoder register with the framework via
+`oxideav_evc::register(&mut codecs)`; `decoder::make_decoder` and
+`encoder::make_encoder` remain directly callable.
 
 ## Clean-room provenance
 
