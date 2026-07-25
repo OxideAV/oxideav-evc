@@ -108,7 +108,9 @@ pub fn write_pps_rbsp() -> Result<Vec<u8>> {
 /// no ALF/ADDB/RPL fields under the all-zero SPS toolset), then pad to
 /// the byte boundary — `slice_data()` starts byte-aligned (§7.4.5).
 /// Returns the header bytes; the caller appends the CABAC payload.
-pub fn write_idr_slice_header(slice_qp: u32) -> Result<Vec<u8>> {
+/// `deblock` sets `slice_deblocking_filter_flag` (with the Baseline
+/// `sps_addb_flag == 0` no alpha/beta offsets follow).
+pub fn write_idr_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
     if slice_qp > 51 {
         return Err(Error::invalid(format!(
             "evc enc slice header: slice_qp {slice_qp} > 51"
@@ -118,7 +120,7 @@ pub fn write_idr_slice_header(slice_qp: u32) -> Result<Vec<u8>> {
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(2); // slice_type = I (§7.4.5: IDR must be 2)
     w.u1(false); // no_output_of_prior_pics_flag
-    w.u1(false); // slice_deblocking_filter_flag (encoder recon == output)
+    w.u1(deblock); // slice_deblocking_filter_flag
     w.u(6, slice_qp); // slice_qp
     w.se(0); // slice_cb_qp_offset
     w.se(0); // slice_cr_qp_offset
@@ -259,7 +261,7 @@ mod tests {
             long_term_ref_pics_flag: sps.long_term_ref_pics_flag,
             additional_lt_poc_lsb_len: pps.additional_lt_poc_lsb_len,
         };
-        let hdr_bytes = write_idr_slice_header(27).unwrap();
+        let hdr_bytes = write_idr_slice_header(27, false).unwrap();
         let mut br = crate::bitreader::BitReader::new(&hdr_bytes);
         let hdr = crate::slice_header::parse_consume(&mut br, nal::NalUnitType::Idr, &ctx).unwrap();
         assert_eq!(hdr.slice_pic_parameter_set_id, 0);
@@ -278,7 +280,12 @@ mod tests {
     /// Out-of-range slice QP is refused.
     #[test]
     fn slice_header_rejects_bad_qp() {
-        assert!(write_idr_slice_header(52).is_err());
+        assert!(write_idr_slice_header(52, false).is_err());
+        // The deblock flag round-trips (its parse is covered by the
+        // registered-decoder e2e; here just shape-check the bit).
+        let with = write_idr_slice_header(20, true).unwrap();
+        let without = write_idr_slice_header(20, false).unwrap();
+        assert_ne!(with, without);
     }
 
     /// NAL wrapping matches the crate's own length-prefixed iterator and

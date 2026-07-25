@@ -20,6 +20,9 @@
 //! Options (via [`CodecParameters::options`]):
 //!
 //! * `qp` — Baseline slice QP, `0..=51` (default 30).
+//! * `deblock` — `1`/`true` signals `slice_deblocking_filter_flag = 1`
+//!   and the decoder runs the §8.8.2 filter; the encoder tracks the
+//!   filtered reconstruction so output stays byte-exact (default off).
 
 use std::collections::VecDeque;
 
@@ -32,7 +35,7 @@ use crate::headers_enc::{
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
-use crate::slice_enc::{encode_idr_slice_data, EncStats};
+use crate::slice_enc::EncStats;
 use crate::CODEC_ID_STR;
 
 /// Default slice QP when the caller doesn't pass the `qp` option.
@@ -49,8 +52,21 @@ pub fn encode_idr_access_unit(
     src: &YuvPicture,
     slice_qp: i32,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
-    let (payload, recon, stats) = encode_idr_slice_data(src, slice_qp)?;
-    let mut slice_rbsp = write_idr_slice_header(slice_qp as u32)?;
+    encode_idr_access_unit_with(src, slice_qp, false)
+}
+
+/// [`encode_idr_access_unit`] with `slice_deblocking_filter_flag`
+/// control: with `deblock` the returned recon is the §8.8.2-filtered
+/// picture the decoder emits (see
+/// [`crate::slice_enc::encode_idr_slice_data_with`]).
+pub fn encode_idr_access_unit_with(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    let (payload, recon, stats) =
+        crate::slice_enc::encode_idr_slice_data_with(src, slice_qp, deblock)?;
+    let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
     slice_rbsp.extend_from_slice(&payload);
 
     let cfg = EncSequenceConfig {
@@ -92,6 +108,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )))
         }
     };
+    let deblock = match params.options.get("deblock") {
+        None => false,
+        Some(s) => match s {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            other => {
+                return Err(Error::invalid(format!(
+                    "evc encoder: deblock option {other:?} not a boolean"
+                )))
+            }
+        },
+    };
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -111,6 +139,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         height,
         bit_depth,
         qp,
+        deblock,
         queue: VecDeque::new(),
     }))
 }
@@ -127,6 +156,7 @@ pub struct EvcEncoder {
     height: u32,
     bit_depth: u32,
     qp: i32,
+    deblock: bool,
     queue: VecDeque<Packet>,
 }
 
@@ -145,7 +175,7 @@ impl Encoder for EvcEncoder {
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
         let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
-        let (data, _recon, _stats) = encode_idr_access_unit(&src, self.qp)?;
+        let (data, _recon, _stats) = encode_idr_access_unit_with(&src, self.qp, self.deblock)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
         pkt.dts = v.pts; // intra-only: decode order == display order
@@ -458,6 +488,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Deblocking-on encode: with the `deblock` option the slice signals
+    /// `slice_deblocking_filter_flag = 1` and the decoder runs the
+    /// §8.8.2 post-pass. On an **all-intra** picture that pass is
+    /// normatively a no-op: §8.8.2.3 step 2 sets `bS = 0` whenever p0
+    /// or q0 lies in an intra-coded CU, and Table 33 defines `sT` only
+    /// for `bS ∈ {1, 2, 3}` (step 5 filters only when `sT′ > 0`) — the
+    /// Baseline filter touches inter/IBC/cbf edges exclusively. So the
+    /// pin is: flag round-trips, the decoder's filtered output still
+    /// equals the encoder recon byte-exactly, and that recon equals the
+    /// unfiltered encode (the intra no-op made explicit). The plumbing
+    /// becomes load-bearing the moment the P encoder lands.
+    #[test]
+    fn deblock_on_round_trip_exact() {
+        let (w, h) = (64u32, 64u32);
+        let frame = synth_frame(w as usize, h as usize);
+        let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
+        let qp = 45;
+        let (stream_db, recon_db, _) = encode_idr_access_unit_with(&src, qp, true).unwrap();
+        let (stream_no, recon_no, _) = encode_idr_access_unit_with(&src, qp, false).unwrap();
+        assert_eq!(
+            recon_db.y, recon_no.y,
+            "§8.8.2.3: intra edges are bS 0 — the pass must be a no-op on I pictures"
+        );
+        assert_ne!(stream_db, stream_no, "the header flag bit must differ");
+        assert_eq!(stream_db.len(), stream_no.len());
+
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), stream_db);
+        dec.send_packet(&pkt).unwrap();
+        let vf = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video frame, got {other:?}"),
+        };
+        let y8: Vec<u8> = recon_db.y.iter().map(|&v| v as u8).collect();
+        let cb8: Vec<u8> = recon_db.cb.iter().map(|&v| v as u8).collect();
+        let cr8: Vec<u8> = recon_db.cr.iter().map(|&v| v as u8).collect();
+        assert_eq!(vf.planes[0].data, y8, "deblocked luma mismatch");
+        assert_eq!(vf.planes[1].data, cb8, "deblocked cb mismatch");
+        assert_eq!(vf.planes[2].data, cr8, "deblocked cr mismatch");
+
+        // And through the registry option surface.
+        let mut p = params(w, h);
+        p.options.insert("deblock", "1");
+        p.options.insert("qp", "45");
+        let mut enc = make_encoder(&p).unwrap();
+        enc.send_frame(&Frame::Video(frame)).unwrap();
+        let pkt2 = enc.receive_packet().unwrap();
+        assert_eq!(pkt2.data, pkt.data);
+        let mut bad = params(w, h);
+        bad.options.insert("deblock", "maybe");
+        assert!(make_encoder(&bad).is_err());
     }
 
     /// Output params advertise the stream a muxer needs.

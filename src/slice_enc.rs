@@ -36,6 +36,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::cabac::CabacEncoder;
+use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
 use crate::intra::{predict, IntraMode, RefSamples};
 use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
@@ -101,16 +102,39 @@ struct EncCtx<'a> {
     pic_h: u32,
 }
 
+/// [`encode_idr_slice_data_with`] with deblocking off — the historical
+/// entry point.
+pub fn encode_idr_slice_data(
+    src: &YuvPicture,
+    slice_qp: i32,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_slice_data_with(src, slice_qp, false)
+}
+
 /// Encode one Baseline IDR picture's `slice_data()` payload. Returns
 /// the CABAC payload bytes (byte-aligned, ready to append after the
 /// byte-aligned slice header), the reconstruction the decoder must
 /// reproduce exactly, and the encode statistics.
 ///
+/// With `deblock` set the caller signals
+/// `slice_deblocking_filter_flag = 1` in the slice header and the
+/// returned recon is the §8.8.2-filtered picture: the encoder stamps
+/// the same per-CU side info the decoder builds (pred mode, cbf,
+/// geometry, QpY) and runs the decoder's own `deblock_luma` /
+/// `deblock_chroma` post-pass, so the output stays byte-exact.
+/// (Prediction during the encode uses un-deblocked samples, exactly
+/// like the decoder — deblocking is a whole-picture post-pass.)
+/// Note the §8.8.2.3 semantics: intra edges derive `bS = 0` and
+/// Table 33 defines `sT` only for `bS ∈ {1, 2, 3}`, so on an all-intra
+/// picture the pass is normatively a no-op — this wiring becomes
+/// pixel-effective once the P encoder lands.
+///
 /// Requirements: 4:2:0 source, dimensions multiples of 4 (the §7.4.3.1
 /// minimum CB), any bit depth the recon chain supports (8..=16).
-pub fn encode_idr_slice_data(
+pub fn encode_idr_slice_data_with(
     src: &YuvPicture,
     slice_qp: i32,
+    deblock: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
@@ -169,7 +193,61 @@ pub fn encode_idr_slice_data(
         );
     }
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
+
+    if deblock {
+        // Mirror the decoder's post-reconstruction §8.8.2 pass: stamp
+        // the side-info grid exactly as `decode_transform_unit` does
+        // for intra luma CUs, arm the single-tile loop-filter bounds,
+        // and run the decoder's own deblock kernels on the recon.
+        let mut side_info = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
+        let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
+        side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
+        for (x0, y0, node) in &roots {
+            stamp_decided(&mut side_info, slice_qp, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
+        }
+        crate::deblock::deblock_luma(&mut ctx.recon, &side_info, slice_qp)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, 0, 1)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, 0, 2)?;
+    }
     Ok((enc.finish(), ctx.recon, stats))
+}
+
+/// Stamp the decided tree's leaves into a [`SideInfoGrid`] with the
+/// exact `CuSideInfo` the decoder's intra path records — the inputs of
+/// the §8.8.2 boundary-strength derivation.
+fn stamp_decided(
+    side_info: &mut SideInfoGrid,
+    slice_qp: i32,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+    node: &Node,
+) {
+    match node {
+        Node::Split(children) => {
+            for (cx, cy, clw, clh, child) in children {
+                stamp_decided(side_info, slice_qp, *cx, *cy, *clw, *clh, child);
+            }
+        }
+        Node::Leaf(plan) => side_info.stamp_block(
+            x0,
+            y0,
+            1u32 << log2_w,
+            1u32 << log2_h,
+            CuSideInfo {
+                pred_mode: CuPredMode::Intra,
+                cbf_luma: u8::from(plan.cbf_y),
+                cu_x0: x0 as u16,
+                cu_y0: y0 as u16,
+                cu_log2_w: log2_w as u8,
+                cu_log2_h: log2_h as u8,
+                intra_luma_mode: plan.mode_idx as u8,
+                qp_y: slice_qp.clamp(0, 51) as u8,
+                ..Default::default()
+            },
+        ),
+    }
 }
 
 /// Mirror of the decoder's Baseline `resolve_split_unit` presence rules
