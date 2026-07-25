@@ -123,6 +123,8 @@ pub mod eipd_ref;
 #[doc(hidden)]
 pub mod eipd_syntax;
 #[doc(hidden)]
+pub mod headers_enc;
+#[doc(hidden)]
 pub mod hmvp;
 #[doc(hidden)]
 pub mod htdf;
@@ -148,6 +150,8 @@ pub mod neighbour;
 pub mod picture;
 #[doc(hidden)]
 pub mod pps;
+#[doc(hidden)]
+pub mod quant_enc;
 #[doc(hidden)]
 pub mod rpl;
 #[doc(hidden)]
