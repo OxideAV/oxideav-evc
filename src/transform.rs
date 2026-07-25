@@ -188,8 +188,10 @@ fn transform_1d(x: &[i32], y: &mut [i32], mat: &[i16], n_tb_s: usize) {
 }
 
 /// Look up the trType=0 (DCT-II) transform matrix for the given size.
-/// Returns a row-major `n_tb_s × n_tb_s` slice.
-fn trans_matrix(n_tb_s: usize) -> &'static [i16] {
+/// Returns a row-major `n_tb_s × n_tb_s` slice. `pub(crate)` so the
+/// encoder's forward counterpart (`crate::quant_enc`) inverts the same
+/// kernels the §8.7.4 inverse applies.
+pub(crate) fn trans_matrix(n_tb_s: usize) -> &'static [i16] {
     match n_tb_s {
         2 => &MAT_2,
         4 => &MAT_4,

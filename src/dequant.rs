@@ -16,7 +16,9 @@ use crate::transform::{inverse_transform, inverse_transform_ats};
 pub const LEVEL_SCALE_BASELINE: [i32; 6] = [40, 45, 51, 57, 64, 71];
 
 /// Compute `bdShift` for the scaling process (eq. 1056 / 1057).
-fn scaling_bd_shift(n_tb_w: usize, n_tb_h: usize, bit_depth: u32) -> u32 {
+/// `pub(crate)` so the encoder-side quantizer (`crate::quant_enc`)
+/// inverts the exact scale the decoder applies.
+pub(crate) fn scaling_bd_shift(n_tb_w: usize, n_tb_h: usize, bit_depth: u32) -> u32 {
     let log2_w = (n_tb_w as u32).trailing_zeros();
     let log2_h = (n_tb_h as u32).trailing_zeros();
     let logsum = log2_w + log2_h;
@@ -24,8 +26,8 @@ fn scaling_bd_shift(n_tb_w: usize, n_tb_h: usize, bit_depth: u32) -> u32 {
 }
 
 /// Compute `rectNorm` per eq. 1058. Returns 181 if `(log2W + log2H)` is
-/// odd, else 1.
-fn rect_norm(n_tb_w: usize, n_tb_h: usize) -> i32 {
+/// odd, else 1. `pub(crate)` for the encoder-side quantizer.
+pub(crate) fn rect_norm(n_tb_w: usize, n_tb_h: usize) -> i32 {
     let log2_w = (n_tb_w as u32).trailing_zeros();
     let log2_h = (n_tb_h as u32).trailing_zeros();
     if (log2_w + log2_h) & 1 == 1 {
