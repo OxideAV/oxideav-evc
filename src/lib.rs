@@ -159,6 +159,8 @@ pub mod scan;
 #[doc(hidden)]
 pub mod slice_data;
 #[doc(hidden)]
+pub mod slice_enc;
+#[doc(hidden)]
 pub mod slice_header;
 #[doc(hidden)]
 pub mod split;

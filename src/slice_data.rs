@@ -1257,7 +1257,7 @@ fn walk_residual_coding_rle(
 /// Pure transcription of eq. 33: walks the anti-diagonals starting at
 /// (0,0); odd lines proceed up-right, even lines proceed down-left. The
 /// resulting array has length `blkW * blkH`.
-fn zigzag_scan(blk_w: usize, blk_h: usize) -> Vec<usize> {
+pub(crate) fn zigzag_scan(blk_w: usize, blk_h: usize) -> Vec<usize> {
     let total = blk_w * blk_h;
     let mut zz = Vec::with_capacity(total);
     if total == 0 {
@@ -1350,7 +1350,7 @@ fn decode_residual_block(
 /// * `coeff_sign_flag`: bypass.
 /// * `coeff_last_flag` (only if `ScanPos < total - 1`): Table 86,
 ///   ctxInc `cIdx == 0 ? 0 : 1` (Table 95).
-fn decode_residual_coding_rle(
+pub(crate) fn decode_residual_coding_rle(
     eng: &mut CabacEngine,
     sel: crate::cabac_init::CtxSel,
     c_idx: u32,
