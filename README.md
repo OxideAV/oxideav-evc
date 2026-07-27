@@ -3,8 +3,9 @@
 [![CI](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-evc.svg)](https://crates.io/crates/oxideav-evc) [![docs.rs](https://docs.rs/oxideav-evc/badge.svg)](https://docs.rs/oxideav-evc) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1)
-video decoder plus a Baseline-profile intra **encoder**. Zero C
-dependencies, zero FFI, zero `*-sys`.
+video decoder plus an **encoder** (intra + low-delay P GOPs, with
+`sps_cm_init_flag` context modelling). Zero C dependencies, zero FFI,
+zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -36,9 +37,9 @@ The crate decomposes into spec-faithful modules: `bitreader`, `nal`,
 `ats`, `adcc`, `transform`, `dequant`, `deblock`, `htdf`, `hmvp`, `rpl`,
 `neighbour`, `picture`, and the registered `decoder`
 factory — plus, since round 429, the encode side: `bitwriter`,
-`headers_enc`, `quant_enc`, `slice_enc` and the registered `encoder`
-factory. All clause / equation / table numbers cite ISO/IEC
-23094-1:2020(E) directly.
+`headers_enc`, `quant_enc`, `slice_enc`, `slice_enc_p` (round 431)
+and the registered `encoder` factory. All clause / equation / table
+numbers cite ISO/IEC 23094-1:2020(E) directly.
 
 ### Main profile
 
@@ -514,6 +515,20 @@ a conformant stream produces; errata #238 (b)/(c) (the eq. 148
 anchored by regression tests against the already-conformant
 implementations.
 
+As of round 431 the P/B walker's transform-tree grammar is
+**spec-reconciled** against a close §7.3.8.4/.5 reading: skip CUs
+carry no residual syntax (the line-3028 `cbf_all` block lives in the
+non-skip branch), non-merge inter CUs (Baseline explicit MV, B-slice
+direct, ADMVP explicit AMVP, single-tree IBC) read `cbf_all` (0
+elides the whole `transform_unit()`), the per-TU cbf order is
+`cbf_cb`, `cbf_cr`, then `cbf_luma` under its presence rule
+(`isSplit || CuPredMode == MODE_INTRA || cbf_cb || cbf_cr`, absent →
+inferred 1 per §7.4.9.5), and Baseline B slices read the line-2881
+`direct_mode_flag` with the §8.5.2.5 temporal derivation (the
+collocated `MvDmvrL0` POC-scaled through eqs. 665-675; the printed
+eq. 664 `predFlagL1 = 0` — despite eqs. 674/675 deriving `mvL1` — is
+taken literally and flagged as a documented spec ambiguity).
+
 ### Not yet supported
 
 Nothing is currently gated on the decode side: every Main-profile
@@ -521,60 +536,79 @@ decode tool, multi-tile pixel reconstruction, and the post-filter
 chain (ALF / DRA / HTDF) run at every supported bit depth (8..=16,
 §7.4.3.1).
 
-## Encoder (round 429 — Baseline intra bootstrap)
+## Encoder (round 429 bootstrap; round 431 context modelling + low-delay P)
 
-The crate now registers an **encoder** alongside the decoder (dual
-API: `register(&mut codecs)` wires both factories;
-`encoder::make_encoder` stays directly callable). Scope: Baseline
-profile, all-intra — every input frame becomes a self-contained
-`[SPS][PPS][IDR]` key access unit in the Annex B length-prefixed
-framing. 4:2:0 input at 8 bits (`Yuv420P`), 10 bits (`Yuv420P10Le`)
-or 12 bits (`Yuv420P12Le`) — the whole recon chain is bit-depth
-parameterized — dimensions multiples of 4, `qp` option 0..=51
-(default 30).
+The crate registers an **encoder** alongside the decoder (dual API:
+`register(&mut codecs)` wires both factories; `encoder::make_encoder`
+stays directly callable). Scope: intra pictures plus **low-delay P
+GOPs** — every GOP opens with a self-contained `[SPS][PPS][IDR]` key
+access unit in the Annex B length-prefixed framing, and with
+`gop = N > 1` the following frames are single-NAL NonIDR P pictures
+referencing the previous reconstruction (decode order == display
+order; the decoder's `sps_pocs_flag == 0` coding-order POC +
+implicit-RPL fallback resolves the reference). 4:2:0 input at 8 bits
+(`Yuv420P`), 10 bits (`Yuv420P10Le`) or 12 bits (`Yuv420P12Le`),
+dimensions multiples of 4. Options: `qp` 0..=51 (default 30), `gop`
+(default 1 = all-intra), `deblock` (default off), `cm_init` (default
+**on**).
 
 Pipeline: §7.3 header **writers** that are field-for-field duals of
 the crate's parsers (`bitwriter` + `headers_enc`, parse-back pinned);
-the exact carry-propagation **CABAC encoder** (promoted from the
-round-384 test fixture) driving the §7.3.8 IDR `slice_data()` bin
-stream — quad `split_unit()` recursion with implicit boundary splits,
-dual-tree leaf `coding_unit()` pairs, `intra_pred_mode` U codes,
-§7.3.8.7 RLE residual writing; a **forward transform + quantizer**
-(`quant_enc`) built by linear inversion of the §8.7 decode chain (with
-one refinement iteration against the exact inverse, near-lossless at
-QP 0); and true **RD decisions** — the 5-mode Table-13 search and the
-bottom-up leaf-vs-split tree choice both run the decoder's own
-reconstruction pipeline under `SSE + λ·bits`.
+the exact carry-propagation **CABAC encoder** driving the §7.3.8
+`slice_data()` bin stream under **both entropy shapes** — the
+`sps_cm_init_flag == 1` §9.3.2.2 context-model init (Tables 40-90 at
+the slice QP) with the decoder's §9.3.4.2.1 `ctxIdxOffset + ctxInc`
+routing per syntax element, or the Baseline single-context collapse
+(`cm_init=0`; per Annex A.3.2 the cm_init stream declares
+`profile_idc = 1` with the Table A.6 binIdx-14 toolset bit); a
+**forward transform + quantizer** (`quant_enc`) built by linear
+inversion of the §8.7 decode chain; and true **RD decisions** running
+the decoder's own reconstruction pipeline under `SSE + λ·bits`.
+
+The **P slice encoder** (`slice_enc_p`) decides a per-CU mode ladder:
+*skip* (`mvp_idx` off the §8.5.2.4 AMVP list — the decoder's own
+candidate function over a decode-order side-info grid + §8.5.2.7 HMVP
+list with the per-CTU-row reset), *explicit inter* (quarter-pel motion
+search against the decoder's §8.5.4 Baseline interpolation kernels —
+full-pel hill climb seeded from the AMVP candidates, then half-/
+quarter-pel refinement — with the `cbf_all`-gated residual and the
+§7.4.9.5 `cbf_luma` inference honoured on the write side), and *intra*
+(the 5-mode search in the single-tree P shape, chroma predicting with
+the luma mode). The decide pass commits reconstruction + grid + HMVP
+in decode order so the emit pass reproduces the decoder's exact bins,
+including the §9.3.4.2.4 neighbour ctxIncs under `cm_init`. With
+`deblock` the §8.8.2 pass is **pixel-effective on P pictures** (live
+inter/cbf edges — the r429 all-intra no-op finding inverted) and the
+output remains byte-exact against the decoder's filtered picture.
 
 **Validation posture (stated plainly):** no external EVC validator
 binary is staged under `docs/video/evc/`, so the encoder's gates are
 (a) re-parse-exactness through this crate's own §7.3 parsers and
 (b) **byte-exact encode→decode == encoder-reconstruction** through the
-crate's registered decoder (itself the conformance-validated side),
-pinned across a size × QP matrix (64×64 / 32×32 / 128×96 / 100×60
-boundary-split / 176×144 × QP 4/22/37/51, plus a 10-bit loop) plus
-determinism, multi-frame-session and a single-byte mutation gate over
-the encoder's own access unit (every flip/invert decodes to a clean
+crate's registered decoder, pinned across a size × QP matrix on both
+entropy shapes, whole P GOPs (entropy × deblock × depth matrix),
+determinism, multi-frame sessions and single-byte mutation gates over
+both the IDR and P access units (every flip/invert decodes to a clean
 error or a frame, never a panic). Cross-implementation decode remains
 open until a validator lands in docs.
 
-Measured on the in-tree busy synthetic QCIF frame (176×144):
+Measured on the in-tree busy synthetic QCIF frame (176×144), intra:
 
-| QP | bytes | bpp | luma PSNR |
-|----|-------|-----|-----------|
-| 4  | 98 193 | 31.00 | 85.2 dB |
-| 22 | 46 835 | 14.78 | 79.6 dB |
-| 34 | 25 651 |  8.10 | 52.2 dB |
-| 51 |  9 905 |  3.13 | 38.1 dB |
+| QP | cm_init=0 bytes | cm_init=1 bytes | saving | luma PSNR |
+|----|----------------|----------------|--------|-----------|
+| 4  | 98 193 | 68 292 | 30.5 % | 85.2 dB |
+| 22 | 46 835 | 27 623 | 41.0 % | 79.6 dB |
+| 34 | 25 651 | 17 387 | 32.2 % | 52.2 dB |
+| 51 |  9 905 |  8 081 | 18.4 % | 38.1 dB |
 
-Absolute rates run high by design of the Baseline entropy layer the
-encoder currently drives: with `sps_cm_init_flag == 0` every regular
-bin shares a single CABAC context. Encoder follow-ups, in priority
-order: `sps_cm_init_flag == 1` per-element context modelling (the
-big rate win), low-delay P (inter search + the §7.3.8.4 inter CU
-write side), deblocking-on encode (`slice_deblocking_filter_flag = 1`
-with filtered-recon tracking), arbitrary (non-multiple-of-4)
-dimensions via cropping.
+and on a moving-scene QCIF GOP at QP 30 (cm_init on): IDR 13 308
+bytes / 55.3 dB, then P frames of 100-695 bytes at 48.0-49.2 dB with
+95-98 % of leaves riding the skip ladder.
+
+Encoder follow-ups, in priority order: B slices (bi-prediction +
+direct mode on the write side), multi-reference P (`ref_idx`
+signalling), rate control, arbitrary (non-multiple-of-4) dimensions
+via cropping.
 
 ## Usage
 
