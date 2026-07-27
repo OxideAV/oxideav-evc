@@ -19,10 +19,16 @@
 //!
 //! Options (via [`CodecParameters::options`]):
 //!
-//! * `qp` — Baseline slice QP, `0..=51` (default 30).
+//! * `qp` — slice QP, `0..=51` (default 30).
 //! * `deblock` — `1`/`true` signals `slice_deblocking_filter_flag = 1`
 //!   and the decoder runs the §8.8.2 filter; the encoder tracks the
 //!   filtered reconstruction so output stays byte-exact (default off).
+//! * `cm_init` — `sps_cm_init_flag` context modelling (§9.3.2.2 /
+//!   §9.3.4.2), default **on**: per-syntax-element CABAC contexts, the
+//!   round-431 rate win at identical reconstruction. The SPS then
+//!   signals `profile_idc = 1` (Main) because Annex A.3.2 pins
+//!   `sps_cm_init_flag == 0` in the Baseline profile. `cm_init=0`
+//!   restores the Baseline-profile single-context stream.
 
 use std::collections::VecDeque;
 
@@ -64,8 +70,25 @@ pub fn encode_idr_access_unit_with(
     slice_qp: i32,
     deblock: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_access_unit_opts(src, slice_qp, deblock, false)
+}
+
+/// [`encode_idr_access_unit_with`] plus the round-431 `sps_cm_init_flag`
+/// entropy selection: with `cm_init` the slice payload runs the
+/// §9.3.2.2 per-syntax-element context modelling and the SPS signals
+/// `profile_idc = 1` (Main) with the Table A.6 cm_init toolset bit —
+/// Annex A.3.2 bars the tool from the Baseline profile. The registered
+/// encoder defaults this ON (it is a pure rate win at identical
+/// reconstruction); `cm_init = false` keeps the historical
+/// Baseline-profile single-context stream.
+pub fn encode_idr_access_unit_opts(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     let (payload, recon, stats) =
-        crate::slice_enc::encode_idr_slice_data_with(src, slice_qp, deblock)?;
+        crate::slice_enc::encode_idr_slice_data_opts(src, slice_qp, deblock, cm_init)?;
     let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
     slice_rbsp.extend_from_slice(&payload);
 
@@ -74,6 +97,7 @@ pub fn encode_idr_access_unit_with(
         height: src.height,
         level_idc: 51, // generous cap; no external constraint checking yet
         bit_depth: src.bit_depth,
+        cm_init,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -108,18 +132,21 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )))
         }
     };
-    let deblock = match params.options.get("deblock") {
-        None => false,
-        Some(s) => match s {
-            "1" | "true" => true,
-            "0" | "false" => false,
-            other => {
-                return Err(Error::invalid(format!(
-                    "evc encoder: deblock option {other:?} not a boolean"
-                )))
-            }
-        },
+    let parse_bool = |name: &str, default: bool| -> Result<bool> {
+        match params.options.get(name) {
+            None => Ok(default),
+            Some("1") | Some("true") => Ok(true),
+            Some("0") | Some("false") => Ok(false),
+            Some(other) => Err(Error::invalid(format!(
+                "evc encoder: {name} option {other:?} not a boolean"
+            ))),
+        }
     };
+    let deblock = parse_bool("deblock", false)?;
+    // Round 431: `sps_cm_init_flag` context modelling — default ON (the
+    // rate win; identical reconstruction). `cm_init=0` selects the
+    // historical Baseline-profile single-context stream.
+    let cm_init = parse_bool("cm_init", true)?;
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -140,6 +167,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         bit_depth,
         qp,
         deblock,
+        cm_init,
         queue: VecDeque::new(),
     }))
 }
@@ -157,6 +185,7 @@ pub struct EvcEncoder {
     bit_depth: u32,
     qp: i32,
     deblock: bool,
+    cm_init: bool,
     queue: VecDeque<Packet>,
 }
 
@@ -175,7 +204,8 @@ impl Encoder for EvcEncoder {
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
         let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
-        let (data, _recon, _stats) = encode_idr_access_unit_with(&src, self.qp, self.deblock)?;
+        let (data, _recon, _stats) =
+            encode_idr_access_unit_opts(&src, self.qp, self.deblock, self.cm_init)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
         pkt.dts = v.pts; // intra-only: decode order == display order
@@ -306,9 +336,11 @@ mod tests {
         assert!(pkt.flags.keyframe);
         assert_eq!(pkt.pts, Some(42));
 
-        // Reference recon from the direct entry point.
+        // Reference recon from the direct entry point (the registry
+        // defaults `cm_init` on).
         let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
-        let (stream, recon, _stats) = encode_idr_access_unit(&src, DEFAULT_QP).unwrap();
+        let (stream, recon, _stats) =
+            encode_idr_access_unit_opts(&src, DEFAULT_QP, false, true).unwrap();
         assert_eq!(pkt.data, stream, "registry and direct paths must agree");
 
         let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -327,9 +359,37 @@ mod tests {
         assert_eq!(vf.planes[2].data, cr8, "decoded cr != encoder recon");
     }
 
-    /// The emitted access unit re-parses exactly: NAL iteration finds
-    /// SPS/PPS/IDR, probe() recovers the geometry, and the SPS/PPS
-    /// parse to the encoder's declared configuration.
+    /// The `cm_init` access unit re-parses exactly: Main profile
+    /// (Annex A.3.2 bars cm_init from Baseline), the Table A.6 binIdx-14
+    /// toolset bit, `sps_cm_init_flag = 1`, every other tool off — and
+    /// the whole loop stays recon-exact through the registered decoder.
+    #[test]
+    fn cm_init_access_unit_reparses_and_round_trips() {
+        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 8).unwrap();
+        let (stream, recon, _stats) = encode_idr_access_unit_opts(&src, 22, false, true).unwrap();
+        let nals = crate::nal::iter_length_prefixed(&stream).unwrap();
+        let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+        assert_eq!(sps.profile_idc, 1, "cm_init stream must declare Main");
+        assert_eq!(sps.toolset_idc_h, 0x4000, "Table A.6 binIdx 14 only");
+        assert_eq!(sps.toolset_idc_l, 0);
+        assert!(sps.sps_cm_init_flag);
+        assert!(!sps.sps_adcc_flag, "conditional sps_adcc_flag written 0");
+        assert!(!sps.sps_btt_flag);
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), stream);
+        dec.send_packet(&pkt).unwrap();
+        let vf = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video frame, got {other:?}"),
+        };
+        let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
+        assert_eq!(vf.planes[0].data, y8, "cm_init decode != recon");
+    }
+
+    /// The emitted Baseline (`cm_init=0`) access unit re-parses exactly:
+    /// NAL iteration finds SPS/PPS/IDR, probe() recovers the geometry,
+    /// and the SPS/PPS parse to the encoder's declared configuration.
     #[test]
     fn access_unit_reparses_exactly() {
         let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 8).unwrap();
@@ -400,6 +460,18 @@ mod tests {
         let mut bad = params(w, h);
         bad.options.insert("qp", "52");
         assert!(make_encoder(&bad).is_err());
+        let mut bad_cm = params(w, h);
+        bad_cm.options.insert("cm_init", "sometimes");
+        assert!(make_encoder(&bad_cm).is_err());
+        // cm_init=0 keeps the historical Baseline-profile stream.
+        let mut p_base = params(w, h);
+        p_base.options.insert("cm_init", "0");
+        let mut enc_base = make_encoder(&p_base).unwrap();
+        enc_base
+            .send_frame(&Frame::Video(synth_frame(w as usize, h as usize)))
+            .unwrap();
+        let pkt_base = enc_base.receive_packet().unwrap();
+        assert_eq!(crate::probe(&pkt_base.data).unwrap().profile_idc, 0);
         let mut nodims = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         nodims.pixel_format = Some(PixelFormat::Yuv420P);
         assert!(make_encoder(&nodims).is_err());
@@ -452,7 +524,7 @@ mod tests {
         assert_eq!(info.bit_depth_luma, 10);
 
         let src = video_frame_to_picture(&frame, w, h, 10).unwrap();
-        let (stream, recon, _stats) = encode_idr_access_unit(&src, 20).unwrap();
+        let (stream, recon, _stats) = encode_idr_access_unit_opts(&src, 20, false, true).unwrap();
         assert_eq!(pkt.data, stream);
 
         let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -475,7 +547,9 @@ mod tests {
     #[test]
     fn mutation_gate_over_encoded_stream() {
         let src = video_frame_to_picture(&synth_frame(48, 48), 48, 48, 8).unwrap();
-        let (stream, _recon, _stats) = encode_idr_access_unit(&src, 42).unwrap();
+        // The registry-default shape (cm_init on) — the widest context
+        // surface the decoder can be driven across by a bit flip.
+        let (stream, _recon, _stats) = encode_idr_access_unit_opts(&src, 42, false, true).unwrap();
         for i in 0..stream.len() {
             for mask in [0x01u8, 0xFF] {
                 let mut mutated = stream.clone();
@@ -534,7 +608,8 @@ mod tests {
         let pkt = enc.receive_packet().unwrap();
         assert_eq!(crate::probe(&pkt.data).unwrap().bit_depth_luma, 12);
         let src = video_frame_to_picture(&frame, w, h, 12).unwrap();
-        let (stream, recon, _stats) = encode_idr_access_unit(&src, DEFAULT_QP).unwrap();
+        let (stream, recon, _stats) =
+            encode_idr_access_unit_opts(&src, DEFAULT_QP, false, true).unwrap();
         assert_eq!(pkt.data, stream);
         let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
@@ -569,8 +644,8 @@ mod tests {
         let frame = synth_frame(w as usize, h as usize);
         let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
         let qp = 45;
-        let (stream_db, recon_db, _) = encode_idr_access_unit_with(&src, qp, true).unwrap();
-        let (stream_no, recon_no, _) = encode_idr_access_unit_with(&src, qp, false).unwrap();
+        let (stream_db, recon_db, _) = encode_idr_access_unit_opts(&src, qp, true, true).unwrap();
+        let (stream_no, recon_no, _) = encode_idr_access_unit_opts(&src, qp, false, true).unwrap();
         assert_eq!(
             recon_db.y, recon_no.y,
             "§8.8.2.3: intra edges are bS 0 — the pass must be a no-op on I pictures"
@@ -619,24 +694,25 @@ mod tests {
 
     /// Determinism: encoding the same frame twice (fresh encoder each
     /// time) must produce byte-identical access units — no hidden
-    /// state, no non-deterministic RD tie-breaks.
+    /// state, no non-deterministic RD tie-breaks. Both entropy shapes.
     #[test]
     fn encode_is_deterministic() {
         let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60, 8).unwrap();
-        let (a, _, _) = encode_idr_access_unit(&src, 33).unwrap();
-        let (b, _, _) = encode_idr_access_unit(&src, 33).unwrap();
-        assert_eq!(a, b);
+        for &cm in &[false, true] {
+            let (a, _, _) = encode_idr_access_unit_opts(&src, 33, false, cm).unwrap();
+            let (b, _, _) = encode_idr_access_unit_opts(&src, 33, false, cm).unwrap();
+            assert_eq!(a, b, "cm_init {cm}");
+        }
     }
 
-    /// QCIF-class rate/PSNR characterization across the QP grid: every
-    /// point must round-trip recon-exact through the registered
-    /// decoder, PSNR must be monotone non-increasing and rate monotone
-    /// non-increasing in QP, with sane absolute envelopes at the ends
-    /// (≥ 46 dB at QP 4; ≤ 4 bpp at QP 51 on this deliberately busy
-    /// synthetic frame — the Baseline `sps_cm_init_flag == 0` entropy
-    /// layer shares a single context across every regular bin, so
-    /// absolute rates run high; context modelling is the follow-up).
-    /// Run with `--nocapture` to read the measured curve.
+    /// QCIF-class rate/PSNR characterization across the QP grid, on
+    /// **both** entropy shapes: every point must round-trip recon-exact
+    /// through the registered decoder, PSNR must be monotone
+    /// non-increasing and rate monotone non-increasing in QP, the
+    /// reconstruction must be identical across shapes (the entropy
+    /// layer is lossless), and the round-431 `cm_init` shape must
+    /// out-compress the Baseline collapse at every QP. Run with
+    /// `--nocapture` to read the measured curves + the rate movement.
     #[test]
     fn rate_psnr_curve_qcif() {
         let (w, h) = (176u32, 144u32);
@@ -651,58 +727,84 @@ mod tests {
         }
         let src = video_frame_to_picture(&f, w, h, 8).unwrap();
         let pixels = (w * h) as f64;
-        let mut prev_psnr = f64::INFINITY;
-        let mut prev_len = usize::MAX;
-        for &qp in &[4i32, 10, 16, 22, 28, 34, 40, 46, 51] {
-            let (stream, recon, _stats) = encode_idr_access_unit(&src, qp).unwrap();
-            // Recon-exactness through the registered decoder.
-            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
-            let pkt = Packet::new(0, TimeBase::new(1, 90_000), stream.clone());
-            dec.send_packet(&pkt).unwrap();
-            let vf = match dec.receive_frame().unwrap() {
-                Frame::Video(vf) => vf,
-                other => panic!("expected video frame, got {other:?}"),
-            };
-            let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
-            assert_eq!(vf.planes[0].data, y8, "qp {qp}: decode != recon");
-            // Curve shape.
-            let mse: f64 = src
-                .y
-                .iter()
-                .zip(recon.y.iter())
-                .map(|(&a, &b)| {
-                    let d = a as f64 - b as f64;
-                    d * d
-                })
-                .sum::<f64>()
-                / pixels;
-            let psnr = if mse == 0.0 {
-                99.0
-            } else {
-                10.0 * (255.0f64 * 255.0 / mse).log10()
-            };
-            let bpp = stream.len() as f64 * 8.0 / pixels;
-            eprintln!(
-                "qcif qp {qp:2}: {:6} bytes  {bpp:5.3} bpp  {psnr:5.2} dB",
-                stream.len()
-            );
-            // Monotone in the meaningful range — above ~60 dB the
-            // points are all effectively lossless (sub-1-LSB noise) and
-            // their ordering is quantization-rounding luck.
-            assert!(
-                psnr.min(60.0) <= prev_psnr.min(60.0) + 0.01,
-                "qp {qp}: PSNR rose ({psnr:.2} after {prev_psnr:.2})"
-            );
-            assert!(stream.len() <= prev_len, "qp {qp}: rate rose");
-            if qp == 4 {
-                assert!(psnr >= 46.0, "qp 4 PSNR {psnr:.2}");
+        for &cm_init in &[false, true] {
+            let mut prev_psnr = f64::INFINITY;
+            let mut prev_len = usize::MAX;
+            for &qp in &[4i32, 10, 16, 22, 28, 34, 40, 46, 51] {
+                let (stream, recon, _stats) =
+                    encode_idr_access_unit_opts(&src, qp, false, cm_init).unwrap();
+                // Recon-exactness through the registered decoder.
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                let pkt = Packet::new(0, TimeBase::new(1, 90_000), stream.clone());
+                dec.send_packet(&pkt).unwrap();
+                let vf = match dec.receive_frame().unwrap() {
+                    Frame::Video(vf) => vf,
+                    other => panic!("expected video frame, got {other:?}"),
+                };
+                let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
+                assert_eq!(
+                    vf.planes[0].data, y8,
+                    "qp {qp} cm{cm_init}: decode != recon"
+                );
+                // The entropy layer must not touch the reconstruction.
+                let (other_stream, other_recon, _) =
+                    encode_idr_access_unit_opts(&src, qp, false, !cm_init).unwrap();
+                assert_eq!(recon.y, other_recon.y, "qp {qp}: recon differs by shape");
+                if cm_init {
+                    let saved = 100.0 * (1.0 - stream.len() as f64 / other_stream.len() as f64);
+                    assert!(
+                        stream.len() < other_stream.len(),
+                        "qp {qp}: cm_init {} must beat baseline {}",
+                        stream.len(),
+                        other_stream.len()
+                    );
+                    eprintln!(
+                        "qcif qp {qp:2}: cm_init saves {saved:5.1}% \
+                         ({} vs {} bytes)",
+                        stream.len(),
+                        other_stream.len()
+                    );
+                }
+                // Curve shape.
+                let mse: f64 = src
+                    .y
+                    .iter()
+                    .zip(recon.y.iter())
+                    .map(|(&a, &b)| {
+                        let d = a as f64 - b as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / pixels;
+                let psnr = if mse == 0.0 {
+                    99.0
+                } else {
+                    10.0 * (255.0f64 * 255.0 / mse).log10()
+                };
+                let bpp = stream.len() as f64 * 8.0 / pixels;
+                eprintln!(
+                    "qcif cm{} qp {qp:2}: {:6} bytes  {bpp:5.3} bpp  {psnr:5.2} dB",
+                    u8::from(cm_init),
+                    stream.len()
+                );
+                // Monotone in the meaningful range — above ~60 dB the
+                // points are all effectively lossless (sub-1-LSB noise)
+                // and their ordering is quantization-rounding luck.
+                assert!(
+                    psnr.min(60.0) <= prev_psnr.min(60.0) + 0.01,
+                    "qp {qp}: PSNR rose ({psnr:.2} after {prev_psnr:.2})"
+                );
+                assert!(stream.len() <= prev_len, "qp {qp}: rate rose");
+                if qp == 4 {
+                    assert!(psnr >= 46.0, "qp 4 PSNR {psnr:.2}");
+                }
+                if qp == 51 {
+                    assert!(bpp <= 4.0, "qp 51 bpp {bpp:.3}");
+                }
+                prev_psnr = psnr;
+                prev_len = stream.len();
             }
-            if qp == 51 {
-                assert!(bpp <= 4.0, "qp 51 bpp {bpp:.3}");
-            }
-            prev_psnr = psnr;
-            prev_len = stream.len();
         }
     }
 }

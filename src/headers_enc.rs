@@ -26,10 +26,24 @@ pub struct EncSequenceConfig {
     /// `BitDepthY == BitDepthC` (§7.4.3.1) — 8..=16; the writer emits
     /// `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` from it.
     pub bit_depth: u32,
+    /// `sps_cm_init_flag` (§7.4.3.1) — the §9.3.2.2 context-model
+    /// initialization the round-431 encoder drives for its rate win.
+    /// Annex A.3.2 requires `sps_cm_init_flag == 0` in the Baseline
+    /// profile, so setting this switches the SPS to `profile_idc = 1`
+    /// (Main) with `toolset_idc_h` carrying exactly the Table A.6
+    /// binIdx-14 cm_init bit (`0x4000`; every other tool stays barred
+    /// by the zero upper bound, and `toolset_idc_l = 0` keeps the
+    /// lower bound permissive).
+    pub cm_init: bool,
 }
 
-/// Write the §7.3.2.1 SPS RBSP for the Baseline intra configuration:
-/// `profile_idc = 0` (Baseline), every tool flag 0, 8-bit 4:2:0.
+/// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
+/// with `cm_init == false`, `profile_idc = 0` (Baseline) and every tool
+/// flag 0; with `cm_init == true`, `profile_idc = 1` (Main, per the
+/// Annex A.3.2 `sps_cm_init_flag == 0 only` Baseline constraint) with
+/// `sps_cm_init_flag = 1` as the single enabled tool (Table A.6
+/// `toolset_idc_h = 0x4000`) and the §7.3.2.1 conditional
+/// `sps_adcc_flag` written 0 (the crate's §7.3.8.7 RLE residual layer).
 ///
 /// With `sps_btt_flag == 0` the parser applies the §7.4.3.1 defaults
 /// `log2_ctu_size_minus5 = 1` (64×64 CTU) and `log2_min_cb_size_minus2
@@ -49,9 +63,9 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     }
     let mut w = BitWriter::new();
     w.ue(0); // sps_seq_parameter_set_id
-    w.u(8, 0); // profile_idc = 0 (Baseline)
+    w.u(8, u32::from(cfg.cm_init)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
-    w.u(32, 0); // toolset_idc_h
+    w.u(32, if cfg.cm_init { 0x4000 } else { 0 }); // toolset_idc_h (Table A.6 binIdx 14)
     w.u(32, 0); // toolset_idc_l
     w.ue(1); // chroma_format_idc = 1 (4:2:0)
     w.ue(cfg.width); // pic_width_in_luma_samples
@@ -62,7 +76,10 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.u1(false); // sps_suco_flag
     w.u1(false); // sps_admvp_flag
     w.u1(false); // sps_eipd_flag
-    w.u1(false); // sps_cm_init_flag
+    w.u1(cfg.cm_init); // sps_cm_init_flag
+    if cfg.cm_init {
+        w.u1(false); // sps_adcc_flag (§7.3.2.1: present when cm_init)
+    }
     w.u1(false); // sps_iqt_flag
     w.u1(false); // sps_addb_flag
     w.u1(false); // sps_alf_flag
@@ -157,6 +174,7 @@ mod tests {
             height: 144,
             level_idc: 30,
             bit_depth: 8,
+            cm_init: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -202,6 +220,7 @@ mod tests {
             height: 64,
             level_idc: 30,
             bit_depth: 10,
+            cm_init: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -238,6 +257,7 @@ mod tests {
             height: 64,
             level_idc: 30,
             bit_depth: 8,
+            cm_init: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -297,6 +317,7 @@ mod tests {
             height: 240,
             level_idc: 30,
             bit_depth: 8,
+            cm_init: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

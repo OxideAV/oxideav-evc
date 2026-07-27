@@ -1,10 +1,24 @@
-//! Baseline-profile **intra slice encoder** (round 429): the write-side
-//! dual of the §7.3.8 IDR `slice_data()` walker in [`crate::slice_data`].
+//! **Intra slice encoder** (round 429 bootstrap, round 431 context
+//! modelling): the write-side dual of the §7.3.8 IDR `slice_data()`
+//! walker in [`crate::slice_data`].
 //!
-//! The emitted bin stream mirrors the decoder's read order bin for bin
-//! (`sps_cm_init_flag == 0`: every regular bin shares the single
-//! `(ctxTable 0, ctxIdx 0)` context, so encoder and decoder context
-//! state evolve identically):
+//! The emitted bin stream mirrors the decoder's read order bin for bin.
+//! Two entropy shapes, selected by `sps_cm_init_flag`:
+//!
+//! * `cm_init == false` — the Baseline collapse: every regular bin
+//!   shares the single `(ctxTable 0, ctxIdx 0)` context;
+//! * `cm_init == true` — the §9.3.2.2 context-model initialization
+//!   (Tables 40-90 at the slice QP, initType 0) with the §9.3.4.2.1
+//!   `ctxIdx = ctxIdxOffset + ctxInc` selection per syntax element,
+//!   exactly the decoder's [`crate::cabac_init::CtxSel`] routing:
+//!   `split_cu_flag` (Table 41, ctxInc 0), `intra_pred_mode` (Table 62,
+//!   bin0 → 0 / later bins → 1), `cbf_luma`/`cbf_cb`/`cbf_cr`
+//!   (Tables 75/76/77, ctxInc 0), and the §7.3.8.7 RLE residual
+//!   (Tables 84/85 with the §9.3.4.2.2 eq. 1434/1435 `PrevLevel`-chain
+//!   ctxInc, Table 86 `coeff_last_flag` at cIdx-keyed ctxInc).
+//!
+//! In both shapes encoder and decoder context state evolve identically,
+//! so the emit is byte-exact under re-decode:
 //!
 //! * per CTU — `split_unit()` quad recursion (§7.3.8.3, `sps_btt_flag
 //!   == 0` shape): `split_cu_flag` on recursable in-picture blocks,
@@ -35,7 +49,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::cabac::CabacEncoder;
+use crate::cabac::{CabacEncoder, InitType};
+use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
 use crate::intra::{predict, IntraMode, RefSamples};
@@ -103,12 +118,12 @@ struct EncCtx<'a> {
 }
 
 /// [`encode_idr_slice_data_with`] with deblocking off — the historical
-/// entry point.
+/// entry point (Baseline `sps_cm_init_flag == 0` entropy shape).
 pub fn encode_idr_slice_data(
     src: &YuvPicture,
     slice_qp: i32,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
-    encode_idr_slice_data_with(src, slice_qp, false)
+    encode_idr_slice_data_opts(src, slice_qp, false, false)
 }
 
 /// Encode one Baseline IDR picture's `slice_data()` payload. Returns
@@ -135,6 +150,23 @@ pub fn encode_idr_slice_data_with(
     src: &YuvPicture,
     slice_qp: i32,
     deblock: bool,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_slice_data_opts(src, slice_qp, deblock, false)
+}
+
+/// [`encode_idr_slice_data_with`] plus the `sps_cm_init_flag` entropy
+/// selection (round 431): with `cm_init` the emit pass initialises the
+/// §9.3.2.2 Main-profile context tables (initType 0 at `slice_qp`) and
+/// routes every regular bin through the decoder's §9.3.4.2.1
+/// `ctxIdxOffset + ctxInc` selection — the per-syntax-element context
+/// modelling that collapses the Baseline single-context rate penalty.
+/// The caller must signal `sps_cm_init_flag = 1` in the SPS
+/// ([`crate::headers_enc::EncSequenceConfig::cm_init`]).
+pub fn encode_idr_slice_data_opts(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
@@ -185,11 +217,18 @@ pub fn encode_idr_slice_data_with(
     }
 
     // Emit pass: replay the decided tree into the arithmetic coder in
-    // the decoder's exact read order.
+    // the decoder's exact read order. Under `cm_init` the encoder's
+    // context table starts from the identical §9.3.2.2 init the decoder
+    // runs (initType 0 — I slice — at the slice QP), so both context
+    // states evolve in lockstep bin for bin.
+    let sel = CtxSel::new(cm_init, InitType::I);
     let mut enc = CabacEncoder::new();
+    if cm_init {
+        enc.init_main_profile(InitType::I, slice_qp);
+    }
     for (x0, y0, node) in &roots {
         emit_split_unit(
-            &mut enc, &mut stats, &ctx, *x0, *y0, CTB_LOG2, CTB_LOG2, node,
+            &mut enc, &mut stats, &ctx, sel, *x0, *y0, CTB_LOG2, CTB_LOG2, node,
         );
     }
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
@@ -558,6 +597,7 @@ fn emit_split_unit(
     enc: &mut CabacEncoder,
     stats: &mut EncStats,
     ctx: &EncCtx<'_>,
+    sel: CtxSel,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -566,56 +606,84 @@ fn emit_split_unit(
 ) {
     let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
     let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
+    // Table 41, ctxInc 0 (Table 95) — the decoder's `resolve_split_unit`
+    // routing; the Baseline shape keeps the legacy (0, 0) collapse.
+    let (split_t, split_i) = sel.ctx(MainCtxTable::SplitCuFlag, 0);
     match node {
         Node::Split(children) => {
             if flag_present {
-                enc.encode_decision(0, 0, 1);
+                enc.encode_decision(split_t, split_i, 1);
                 stats.split_flag_bins += 1;
             }
             // (implicit split when !within: no bin, matching the decoder)
             for (cx, cy, clw, clh, child) in children {
-                emit_split_unit(enc, stats, ctx, *cx, *cy, *clw, *clh, child);
+                emit_split_unit(enc, stats, ctx, sel, *cx, *cy, *clw, *clh, child);
             }
         }
         Node::Leaf(plan) => {
             if flag_present {
-                enc.encode_decision(0, 0, 0);
+                enc.encode_decision(split_t, split_i, 0);
                 stats.split_flag_bins += 1;
             }
-            emit_leaf(enc, plan, log2_w, log2_h);
+            emit_leaf(enc, sel, plan, log2_w, log2_h);
         }
     }
 }
 
-fn emit_leaf(enc: &mut CabacEncoder, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
-    // Luma coding_unit(): intra_pred_mode (U, all bins on (0,0)) —
-    // the decoder reads it via `decode_u_regular` (63-bin compat cap).
-    enc.encode_u_regular_capped(plan.mode_idx as u32, 63, 0, |_| 0);
-    // transform_unit(), DUAL_TREE_LUMA: cbf_luma only.
-    enc.encode_decision(0, 0, u8::from(plan.cbf_y));
+fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
+    // Luma coding_unit(): intra_pred_mode — U over Table 62 with the
+    // Table 95 ctxInc (bin0 → 0, later bins → 1) under `cm_init`; all
+    // bins on (0, 0) under the Baseline collapse. The decoder reads it
+    // via `decode_u_regular` (63-bin compat cap).
+    if sel.cm_init {
+        let table = MainCtxTable::IntraPredMode;
+        let off = table.ctx_idx_offset(sel.init_type);
+        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, table.as_usize(), |bin_idx| {
+            off + (bin_idx as usize).min(1)
+        });
+    } else {
+        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, 0, |_| 0);
+    }
+    // transform_unit(), DUAL_TREE_LUMA: cbf_luma only (Table 75,
+    // ctxInc 0).
+    let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+    enc.encode_decision(t, i, u8::from(plan.cbf_y));
     if plan.cbf_y {
-        emit_residual_rle(enc, &plan.levels_y, log2_w, log2_h);
+        emit_residual_rle(enc, sel, 0, &plan.levels_y, log2_w, log2_h);
     }
     // Chroma coding_unit(): no intra_pred_mode read (DualTreeChroma),
-    // transform_unit() reads cbf_cb then cbf_cr then the residuals at
-    // the 4:2:0 dimensions.
-    enc.encode_decision(0, 0, u8::from(plan.cbf_cb));
-    enc.encode_decision(0, 0, u8::from(plan.cbf_cr));
+    // transform_unit() reads cbf_cb then cbf_cr (Tables 76/77, ctxInc 0)
+    // then the residuals at the 4:2:0 dimensions.
+    let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+    enc.encode_decision(t, i, u8::from(plan.cbf_cb));
+    let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+    enc.encode_decision(t, i, u8::from(plan.cbf_cr));
     if plan.cbf_cb {
-        emit_residual_rle(enc, &plan.levels_cb, log2_w - 1, log2_h - 1);
+        emit_residual_rle(enc, sel, 1, &plan.levels_cb, log2_w - 1, log2_h - 1);
     }
     if plan.cbf_cr {
-        emit_residual_rle(enc, &plan.levels_cr, log2_w - 1, log2_h - 1);
+        emit_residual_rle(enc, sel, 2, &plan.levels_cr, log2_w - 1, log2_h - 1);
     }
 }
 
 /// §7.3.8.7 `residual_coding_rle()` writer — the exact dual of
 /// `decode_residual_coding_rle`: per non-zero coefficient in §6.5.2
-/// zig-zag order, `coeff_zero_run` (U, cMax = blockSize − 1),
-/// `coeff_abs_level_minus1` (U, cMax 32767), `coeff_sign_flag`
-/// (bypass), and `coeff_last_flag` unless the coefficient sits at the
-/// final scan position (where the decoder infers 1).
-fn emit_residual_rle(enc: &mut CabacEncoder, levels: &[i32], log2_w: u32, log2_h: u32) {
+/// zig-zag order, `coeff_zero_run` (U, cMax = blockSize − 1, Table 84),
+/// `coeff_abs_level_minus1` (U, cMax 32767, Table 85), `coeff_sign_flag`
+/// (bypass), and `coeff_last_flag` (Table 86) unless the coefficient
+/// sits at the final scan position (where the decoder infers 1). Under
+/// `cm_init` the run/level bins carry the §9.3.4.2.2 eq. 1434/1435
+/// ctxInc driven by `cIdx`, the bin position and the §7.3.8.7
+/// `PrevLevel` chain (init 6, then the previous coefficient's absolute
+/// level), and `coeff_last_flag` the Table 95 `cIdx == 0 ? 0 : 1`.
+fn emit_residual_rle(
+    enc: &mut CabacEncoder,
+    sel: CtxSel,
+    c_idx: u32,
+    levels: &[i32],
+    log2_w: u32,
+    log2_h: u32,
+) {
     let blk_w = 1usize << log2_w;
     let blk_h = 1usize << log2_h;
     let total = blk_w * blk_h;
@@ -632,15 +700,34 @@ fn emit_residual_rle(enc: &mut CabacEncoder, levels: &[i32], log2_w: u32, log2_h
     debug_assert!(!nz.is_empty(), "cbf set with all-zero levels");
     let zero_run_c_max = (total as u32) - 1;
     let mut cursor = 0usize;
+    let mut prev_level = 6u32;
     let last = nz.len() - 1;
     for (i, &(scan_pos, level)) in nz.iter().enumerate() {
         let zero_run = (scan_pos - cursor) as u32;
-        enc.encode_u_regular_capped(zero_run, zero_run_c_max, 0, |_| 0);
-        enc.encode_u_regular_capped(level.unsigned_abs() - 1, 32767, 0, |_| 0);
+        let lvl_minus1 = level.unsigned_abs() - 1;
+        if sel.cm_init {
+            let zr_table = MainCtxTable::CoeffZeroRun;
+            let zr_off = zr_table.ctx_idx_offset(sel.init_type);
+            enc.encode_u_regular_capped(zero_run, zero_run_c_max, zr_table.as_usize(), |bin_idx| {
+                zr_off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
+            });
+            let lv_table = MainCtxTable::CoeffAbsLevelMinus1;
+            let lv_off = lv_table.ctx_idx_offset(sel.init_type);
+            enc.encode_u_regular_capped(lvl_minus1, 32767, lv_table.as_usize(), |bin_idx| {
+                lv_off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
+            });
+        } else {
+            enc.encode_u_regular_capped(zero_run, zero_run_c_max, 0, |_| 0);
+            enc.encode_u_regular_capped(lvl_minus1, 32767, 0, |_| 0);
+        }
         enc.encode_bypass(u8::from(level < 0));
         if scan_pos < total - 1 {
-            enc.encode_decision(0, 0, u8::from(i == last));
+            let inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, ci) = sel.ctx(MainCtxTable::CoeffLastFlag, inc);
+            enc.encode_decision(t, ci, u8::from(i == last));
         }
+        // §7.3.8.7: PrevLevel = coeff_abs_level_minus1 + 1.
+        prev_level = lvl_minus1 + 1;
         cursor = scan_pos + 1;
     }
 }
@@ -653,6 +740,10 @@ mod tests {
     };
 
     fn walk_inputs(w: u32, h: u32) -> SliceWalkInputs {
+        walk_inputs_cm(w, h, false)
+    }
+
+    fn walk_inputs_cm(w: u32, h: u32, cm_init: bool) -> SliceWalkInputs {
         SliceWalkInputs {
             pic_width: w,
             pic_height: h,
@@ -673,7 +764,10 @@ mod tests {
             slice_alf_chroma_map_flag: false,
             slice_chroma2_alf_enabled_flag: false,
             slice_alf_chroma2_map_flag: false,
-            tree_gates: CodingTreeGates::default(),
+            tree_gates: CodingTreeGates {
+                sps_cm_init_flag: cm_init,
+                ..CodingTreeGates::default()
+            },
         }
     }
 
@@ -745,23 +839,55 @@ mod tests {
 
     /// THE core pin: encode → decode with the crate's own §7.3.8 walker
     /// must (a) consume every bin cleanly and (b) reconstruct
-    /// byte-exactly the encoder's recon, across a size × QP matrix that
-    /// covers CTU-aligned, sub-CTU and implicit-boundary-split shapes.
+    /// byte-exactly the encoder's recon, across a size × QP ×
+    /// `sps_cm_init_flag` matrix that covers CTU-aligned, sub-CTU and
+    /// implicit-boundary-split shapes on both entropy shapes.
     #[test]
     fn round_trip_recon_exact_size_qp_matrix() {
-        for &(w, h) in &[(64u32, 64u32), (32, 32), (128, 96), (100, 60), (176, 144)] {
-            for &qp in &[4i32, 22, 37, 51] {
-                let src = synth_picture(w, h, 0xC0FFEE ^ (w * 31 + h * 7 + qp as u32));
-                let (payload, enc_recon, stats) = encode_idr_slice_data(&src, qp).expect("encode");
-                assert!(stats.ctus >= 1);
-                let (dec, dec_stats) =
-                    decode_baseline_idr_slice(&payload, walk_inputs(w, h), decode_inputs(qp))
-                        .unwrap_or_else(|e| panic!("{w}x{h} qp{qp}: decode failed: {e}"));
-                assert_eq!(dec.y, enc_recon.y, "{w}x{h} qp{qp}: luma recon mismatch");
-                assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp}: cb recon mismatch");
-                assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp}: cr recon mismatch");
-                assert_eq!(dec_stats.ctus, stats.ctus);
+        for &cm_init in &[false, true] {
+            for &(w, h) in &[(64u32, 64u32), (32, 32), (128, 96), (100, 60), (176, 144)] {
+                for &qp in &[4i32, 22, 37, 51] {
+                    let src = synth_picture(w, h, 0xC0FFEE ^ (w * 31 + h * 7 + qp as u32));
+                    let (payload, enc_recon, stats) =
+                        encode_idr_slice_data_opts(&src, qp, false, cm_init).expect("encode");
+                    assert!(stats.ctus >= 1);
+                    let (dec, dec_stats) = decode_baseline_idr_slice(
+                        &payload,
+                        walk_inputs_cm(w, h, cm_init),
+                        decode_inputs(qp),
+                    )
+                    .unwrap_or_else(|e| panic!("{w}x{h} qp{qp} cm{cm_init}: decode failed: {e}"));
+                    assert_eq!(dec.y, enc_recon.y, "{w}x{h} qp{qp} cm{cm_init}: luma recon");
+                    assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp} cm{cm_init}: cb recon");
+                    assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp} cm{cm_init}: cr recon");
+                    assert_eq!(dec_stats.ctus, stats.ctus);
+                }
             }
+        }
+    }
+
+    /// The `sps_cm_init_flag == 1` entropy shape must never lose to the
+    /// Baseline single-context collapse on the busy synthetic frame:
+    /// same decisions, same recon, strictly fewer payload bytes at
+    /// every QP (the per-element context modelling is precisely the
+    /// rate win the r429 README promised).
+    #[test]
+    fn cm_init_shrinks_payload_at_every_qp() {
+        let (w, h) = (128u32, 96u32);
+        let src = synth_picture(w, h, 0xFEED_BEEF);
+        for &qp in &[4i32, 16, 28, 40, 51] {
+            let (p0, r0, _) = encode_idr_slice_data_opts(&src, qp, false, false).unwrap();
+            let (p1, r1, _) = encode_idr_slice_data_opts(&src, qp, false, true).unwrap();
+            assert_eq!(
+                r0.y, r1.y,
+                "qp {qp}: entropy layer must not change the reconstruction"
+            );
+            assert!(
+                p1.len() < p0.len(),
+                "qp {qp}: cm_init payload {} must beat baseline {}",
+                p1.len(),
+                p0.len()
+            );
         }
     }
 
@@ -872,26 +998,42 @@ mod tests {
             (1..=16).map(|i| if i % 3 == 0 { -i } else { i }).collect(),
         ];
         for levels in patterns {
-            let mut enc = CabacEncoder::new();
-            emit_residual_rle(&mut enc, &levels, 2, 2);
-            enc.encode_terminate(true);
-            let bytes = enc.finish();
-            let mut eng = CabacEngine::new(&bytes).unwrap();
-            let sel = crate::cabac_init::CtxSel::new(false, crate::cabac::InitType::I);
-            let mut decoded = vec![0i32; 16];
-            let mut runs = 0u32;
-            crate::slice_data::decode_residual_coding_rle(
-                &mut eng,
-                sel,
-                0,
-                &mut decoded,
-                &mut runs,
-                2,
-                2,
-            )
-            .unwrap();
-            assert!(eng.decode_terminate().unwrap());
-            assert_eq!(decoded, levels);
+            // Both entropy shapes, both colour classes: the writer must
+            // be the exact dual of the reader — including the cm_init
+            // PrevLevel-chain ctxInc walk over Tables 84/85/86.
+            for &(cm_init, c_idx) in &[(false, 0u32), (true, 0), (true, 1)] {
+                let sel = crate::cabac_init::CtxSel::new(cm_init, crate::cabac::InitType::I);
+                let mut enc = CabacEncoder::new();
+                if cm_init {
+                    enc.init_main_profile(crate::cabac::InitType::I, 27);
+                }
+                emit_residual_rle(&mut enc, sel, c_idx, &levels, 2, 2);
+                enc.encode_terminate(true);
+                let bytes = enc.finish();
+                let mut eng = CabacEngine::new(&bytes).unwrap();
+                if cm_init {
+                    crate::cabac_init::init_main_profile_contexts(
+                        &mut eng,
+                        crate::cabac::InitType::I,
+                        27,
+                    )
+                    .unwrap();
+                }
+                let mut decoded = vec![0i32; 16];
+                let mut runs = 0u32;
+                crate::slice_data::decode_residual_coding_rle(
+                    &mut eng,
+                    sel,
+                    c_idx,
+                    &mut decoded,
+                    &mut runs,
+                    2,
+                    2,
+                )
+                .unwrap();
+                assert!(eng.decode_terminate().unwrap());
+                assert_eq!(decoded, levels, "cm_init {cm_init} c_idx {c_idx}");
+            }
         }
     }
 
