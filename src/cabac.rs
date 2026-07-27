@@ -667,6 +667,53 @@ impl CabacEncoder {
         self.encode_decision(ctx_table, ctx_idx_for(value), 0);
     }
 
+    /// Encode an EG0 value (§9.3.3.4, k = 0) with every bin bypass —
+    /// the write dual of [`CabacEngine::decode_egk_bypass`] with
+    /// `k_in = 0` (the `sps_cm_init_flag == 0` `abs_mvd` shape). The
+    /// prefix is `p` 1-bins (where `2^p − 1 <= value`), a 0-bin, then
+    /// `p` suffix bits of `value − (2^p − 1)`, MSB first.
+    pub fn encode_eg0_bypass(&mut self, value: u32) {
+        let mut p = 0u32;
+        while (1u64 << (p + 1)) - 1 <= value as u64 {
+            p += 1;
+        }
+        for _ in 0..p {
+            self.encode_bypass(1);
+        }
+        self.encode_bypass(0);
+        let suffix = value - ((1u32 << p) - 1);
+        for i in (0..p).rev() {
+            self.encode_bypass(((suffix >> i) & 1) as u8);
+        }
+    }
+
+    /// Encode an EG0 value whose **first bin is regular-coded** — the
+    /// write dual of [`CabacEngine::decode_eg0_first_regular`] (the
+    /// Table 95 `abs_mvd` shape under `sps_cm_init_flag == 1`: bin0 on
+    /// Table 73, the rest of the prefix and every suffix bit bypass).
+    pub fn encode_eg0_first_regular(&mut self, ctx_table: usize, ctx_idx: usize, value: u32) {
+        let mut p = 0u32;
+        while (1u64 << (p + 1)) - 1 <= value as u64 {
+            p += 1;
+        }
+        for i in 0..p {
+            if i == 0 {
+                self.encode_decision(ctx_table, ctx_idx, 1);
+            } else {
+                self.encode_bypass(1);
+            }
+        }
+        if p == 0 {
+            self.encode_decision(ctx_table, ctx_idx, 0);
+        } else {
+            self.encode_bypass(0);
+        }
+        let suffix = value - ((1u32 << p) - 1);
+        for i in (0..p).rev() {
+            self.encode_bypass(((suffix >> i) & 1) as u8);
+        }
+    }
+
     pub fn encode_terminate(&mut self, terminate: bool) {
         // EVC §9.3.4.3.5: the decoder does ivlCurrRange -= 1, then the
         // bin is 1 iff ivl_offset >= ivl_curr_range (no renormalisation
@@ -1129,6 +1176,44 @@ mod tests {
             }
             assert!(dec.decode_terminate().unwrap());
         }
+    }
+
+    /// Round 431 — the two EG0 writers are exact duals of their
+    /// readers across the value range, in both entropy shapes.
+    #[test]
+    fn eg0_writers_round_trip() {
+        let values: Vec<u32> = (0..40).chain([63, 64, 100, 500, 4095]).collect();
+        // All-bypass shape (sps_cm_init_flag == 0 abs_mvd).
+        let mut enc = CabacEncoder::new();
+        for &v in &values {
+            enc.encode_eg0_bypass(v);
+        }
+        enc.encode_terminate(true);
+        let bs = enc.finish();
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        for &v in &values {
+            assert_eq!(eng.decode_egk_bypass(0).unwrap(), v, "bypass EG0 {v}");
+        }
+        assert!(eng.decode_terminate().unwrap());
+        // First-bin-regular shape (Table 95 abs_mvd under cm_init) —
+        // contexts must track on both sides.
+        let mut enc = CabacEncoder::new();
+        enc.init_main_profile(InitType::Pb, 30);
+        for &v in &values {
+            enc.encode_eg0_first_regular(73, 1, v);
+        }
+        enc.encode_terminate(true);
+        let bs = enc.finish();
+        let mut eng = CabacEngine::new(&bs).unwrap();
+        crate::cabac_init::init_main_profile_contexts(&mut eng, InitType::Pb, 30).unwrap();
+        for &v in &values {
+            assert_eq!(
+                eng.decode_eg0_first_regular(73, 1).unwrap(),
+                v,
+                "regular-bin0 EG0 {v}"
+            );
+        }
+        assert!(eng.decode_terminate().unwrap());
     }
 
     #[test]

@@ -145,6 +145,34 @@ pub fn write_idr_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
     Ok(w.into_bytes())
 }
 
+/// Write the §7.3.4 slice header for a Baseline **P** slice under the
+/// encoder's SPS/PPS shape (single tile, `sps_pocs_flag == 0`,
+/// `sps_rpl_flag == 0`, `sps_admvp_flag == 0`, `sps_alf_flag == 0`):
+/// after `slice_type = 1` (P) no POC and no RPL fields follow — the
+/// decoder derives POC as coding order and builds L0 implicitly from
+/// the highest-POC DPB picture — then
+/// `num_ref_idx_active_override_flag = 0` (the PPS default
+/// `num_ref_idx_default_active_minus1[0] = 0` → one active reference),
+/// the deblocking flag, `slice_qp` and the chroma QP offsets, padded to
+/// the byte boundary (§7.4.5: `slice_data()` starts byte-aligned).
+pub fn write_p_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
+    if slice_qp > 51 {
+        return Err(Error::invalid(format!(
+            "evc enc slice header: slice_qp {slice_qp} > 51"
+        )));
+    }
+    let mut w = BitWriter::new();
+    w.ue(0); // slice_pic_parameter_set_id
+    w.ue(1); // slice_type = P (§7.4.5)
+    w.u1(false); // num_ref_idx_active_override_flag
+    w.u1(deblock); // slice_deblocking_filter_flag
+    w.u(6, slice_qp); // slice_qp
+    w.se(0); // slice_cb_qp_offset
+    w.se(0); // slice_cr_qp_offset
+    w.align_to_byte_zero(); // byte_alignment() before slice_data()
+    Ok(w.into_bytes())
+}
+
 /// Wrap an RBSP in the 2-byte §7.3.1.2 NAL header plus the Annex B
 /// 4-byte big-endian `nal_unit_length` prefix, appending to `out`.
 pub fn append_length_prefixed_nal(out: &mut Vec<u8>, nut: NalUnitType, rbsp: &[u8]) {

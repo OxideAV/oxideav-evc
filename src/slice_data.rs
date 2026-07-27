@@ -2405,7 +2405,7 @@ fn btt_num_smaller(
 /// same already-decoded side-info-grid probe as [`btt_num_smaller`].
 /// `cond` evaluates the Table 96 condition on the neighbouring cell.
 #[allow(clippy::too_many_arguments)]
-fn ctx_inc_neighbour_cells(
+pub(crate) fn ctx_inc_neighbour_cells(
     side_info: &SideInfoGrid,
     walk: &SliceWalkInputs,
     x0: u32,
@@ -5930,7 +5930,13 @@ fn derive_direct_mode_mvs(
 /// §7.4.9.4) so the §9.3.4.2.4 Table 96 `cu_skip_flag` neighbour ctxInc
 /// can consult it. Runs after the CU's motion stamp (which resets the
 /// cell to `cu_skip = 0` via `Default`).
-fn mark_cu_skip_cells(side_info: &mut SideInfoGrid, x0: u32, y0: u32, n_cb_w: u32, n_cb_h: u32) {
+pub(crate) fn mark_cu_skip_cells(
+    side_info: &mut SideInfoGrid,
+    x0: u32,
+    y0: u32,
+    n_cb_w: u32,
+    n_cb_h: u32,
+) {
     for yy in (y0..y0 + n_cb_h).step_by(4) {
         for xx in (x0..x0 + n_cb_w).step_by(4) {
             let xc = (xx >> 2) as usize;
@@ -7222,7 +7228,7 @@ fn spatial_neighbour_mv(
 /// (§8.5.2.4.4) to fill the slot. The temporal slot keeps its zero
 /// MV regardless (HMVP only substitutes for the `(1, 1)` slots).
 #[allow(clippy::too_many_arguments)]
-fn baseline_amvp_select_with_grid_and_hmvp(
+pub(crate) fn baseline_amvp_select_with_grid_and_hmvp(
     mvp_idx: u32,
     side_info: &SideInfoGrid,
     hmvp: &crate::hmvp::HmvpCandList,

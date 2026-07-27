@@ -1,11 +1,14 @@
-//! Registry glue for the EVC **encoder** (round 429): the
-//! [`oxideav_core::Encoder`]-trait wrapper over the Baseline intra
-//! pipeline (`headers_enc` + `slice_enc`).
+//! Registry glue for the EVC **encoder** (round 429 intra bootstrap,
+//! round 431 context modelling + low-delay P): the
+//! [`oxideav_core::Encoder`]-trait wrapper over the intra
+//! (`headers_enc` + `slice_enc`) and P (`slice_enc_p`) pipelines.
 //!
-//! Every input frame becomes one self-contained key access unit —
+//! Every GOP opens with a self-contained key access unit —
 //! `[SPS][PPS][IDR slice]` in the Annex B length-prefixed framing — so
-//! any packet decodes standalone through [`crate::decoder::make_decoder`].
-//! All-intra only for now (low-delay P is the next encoder milestone).
+//! that packet decodes standalone through
+//! [`crate::decoder::make_decoder`]; with `gop > 1` the following
+//! frames are single-NAL low-delay P access units, each referencing
+//! the previous reconstruction (decode order == display order).
 //!
 //! ## Validation posture
 //!
@@ -29,6 +32,10 @@
 //!   signals `profile_idc = 1` (Main) because Annex A.3.2 pins
 //!   `sps_cm_init_flag == 0` in the Baseline profile. `cm_init=0`
 //!   restores the Baseline-profile single-context stream.
+//! * `gop` — GOP length (default 1 = the historical all-intra shape):
+//!   frame indices `0, gop, 2·gop, …` are IDR access units, the rest
+//!   low-delay P pictures (skip / explicit-MV inter / intra mode
+//!   ladder per CU against the previous reconstruction).
 
 use std::collections::VecDeque;
 
@@ -36,12 +43,13 @@ use oxideav_core::format::PixelFormat;
 use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, TimeBase};
 
 use crate::headers_enc::{
-    append_length_prefixed_nal, write_idr_slice_header, write_pps_rbsp, write_sps_rbsp,
-    EncSequenceConfig,
+    append_length_prefixed_nal, write_idr_slice_header, write_p_slice_header, write_pps_rbsp,
+    write_sps_rbsp, EncSequenceConfig,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
 use crate::slice_enc::EncStats;
+use crate::slice_enc_p::PEncStats;
 use crate::CODEC_ID_STR;
 
 /// Default slice QP when the caller doesn't pass the `qp` option.
@@ -106,6 +114,31 @@ pub fn encode_idr_access_unit_opts(
     Ok((out, recon, stats))
 }
 
+/// Encode one **P** access unit (round 431) — a single NonIDR NAL
+/// referencing `ref_pic`, the previous picture exactly as the decoder
+/// holds it in the DPB (post-§8.8.2 when `deblock` is on). The SPS/PPS
+/// travel with the GOP's opening IDR access unit; the decoder's
+/// `sps_pocs_flag == 0` fallback derives POC as coding order and its
+/// implicit-RPL fallback resolves L0[0] to the highest-POC DPB entry —
+/// i.e. this picture's `ref_pic`. Returns the bitstream, the
+/// reconstruction the decoder reproduces byte-exactly (the caller's
+/// next reference), and the P-slice statistics.
+pub fn encode_p_access_unit_opts(
+    src: &YuvPicture,
+    ref_pic: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+) -> Result<(Vec<u8>, YuvPicture, PEncStats)> {
+    let (payload, recon, stats) =
+        crate::slice_enc_p::encode_p_slice_data(src, ref_pic, slice_qp, deblock, cm_init)?;
+    let mut slice_rbsp = write_p_slice_header(slice_qp as u32, deblock)?;
+    slice_rbsp.extend_from_slice(&payload);
+    let mut out = Vec::new();
+    append_length_prefixed_nal(&mut out, NalUnitType::NonIdr, &slice_rbsp);
+    Ok((out, recon, stats))
+}
+
 /// Build the registered encoder — the [`crate::register`] factory and
 /// the historical direct constructor of the workspace dual-API
 /// convention.
@@ -155,6 +188,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             .filter(|q| (0..=51).contains(q))
             .ok_or_else(|| Error::invalid(format!("evc encoder: qp option {s:?} not in 0..=51")))?,
     };
+    // Round 431: GOP length — every gop-th frame opens with an IDR
+    // access unit, the rest are low-delay P pictures referencing the
+    // previous reconstruction. Default 1 keeps the historical
+    // all-intra shape.
+    let gop = match params.options.get("gop") {
+        None => 1u32,
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&g| g >= 1)
+            .ok_or_else(|| Error::invalid(format!("evc encoder: gop option {s:?} not >= 1")))?,
+    };
     let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     out_params.width = Some(width);
     out_params.height = Some(height);
@@ -168,6 +213,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         qp,
         deblock,
         cm_init,
+        gop,
+        frame_idx: 0,
+        ref_recon: None,
         queue: VecDeque::new(),
     }))
 }
@@ -186,6 +234,13 @@ pub struct EvcEncoder {
     qp: i32,
     deblock: bool,
     cm_init: bool,
+    /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
+    /// units, the rest low-delay P pictures.
+    gop: u32,
+    frame_idx: u64,
+    /// The previous reconstruction — the decoder's DPB picture the next
+    /// P frame references (post-deblock when the option is on).
+    ref_recon: Option<YuvPicture>,
     queue: VecDeque<Packet>,
 }
 
@@ -204,12 +259,26 @@ impl Encoder for EvcEncoder {
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
         let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
-        let (data, _recon, _stats) =
-            encode_idr_access_unit_opts(&src, self.qp, self.deblock, self.cm_init)?;
+        let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
+        let (data, recon) = if is_idr {
+            let (data, recon, _stats) =
+                encode_idr_access_unit_opts(&src, self.qp, self.deblock, self.cm_init)?;
+            (data, recon)
+        } else {
+            let refp = self
+                .ref_recon
+                .as_ref()
+                .expect("non-IDR frame always follows a reconstructed frame");
+            let (data, recon, _stats) =
+                encode_p_access_unit_opts(&src, refp, self.qp, self.deblock, self.cm_init)?;
+            (data, recon)
+        };
+        self.ref_recon = Some(recon);
+        self.frame_idx += 1;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
-        pkt.dts = v.pts; // intra-only: decode order == display order
-        pkt.flags.keyframe = true;
+        pkt.dts = v.pts; // low delay: decode order == display order
+        pkt.flags.keyframe = is_idr;
         self.queue.push_back(pkt);
         Ok(())
     }
@@ -463,6 +532,12 @@ mod tests {
         let mut bad_cm = params(w, h);
         bad_cm.options.insert("cm_init", "sometimes");
         assert!(make_encoder(&bad_cm).is_err());
+        let mut bad_gop = params(w, h);
+        bad_gop.options.insert("gop", "0");
+        assert!(make_encoder(&bad_gop).is_err());
+        let mut bad_gop2 = params(w, h);
+        bad_gop2.options.insert("gop", "-3");
+        assert!(make_encoder(&bad_gop2).is_err());
         // cm_init=0 keeps the historical Baseline-profile stream.
         let mut p_base = params(w, h);
         p_base.options.insert("cm_init", "0");
@@ -679,6 +754,140 @@ mod tests {
         let mut bad = params(w, h);
         bad.options.insert("deblock", "maybe");
         assert!(make_encoder(&bad).is_err());
+    }
+
+    /// Round 431 — the registry GOP loop: `gop=4` over 8 frames yields
+    /// the IDR/P/P/P cadence (keyframe flags + NAL shapes), and every
+    /// decoded frame is byte-identical to the encoder's own
+    /// reconstruction chain (P frames predicting from the previous
+    /// recon exactly as the decoder's DPB serves it).
+    #[test]
+    fn registry_gop_p_frames_round_trip_exact() {
+        let (w, h) = (64u32, 48u32);
+        let mut p = params(w, h);
+        p.options.insert("gop", "4");
+        p.options.insert("qp", "30");
+        let mut enc = make_encoder(&p).unwrap();
+        // Moving scene: shift a bright block per frame.
+        let mk = |t: usize| -> VideoFrame {
+            let mut f = synth_frame(w as usize, h as usize);
+            for yy in 0..h as usize {
+                for xx in 0..w as usize {
+                    let bx = 4 + 3 * t;
+                    let by = 4 + 2 * t;
+                    if xx >= bx && xx < bx + 10 && yy >= by && yy < by + 8 {
+                        f.planes[0].data[yy * w as usize + xx] = 230;
+                    }
+                }
+            }
+            f.pts = Some(t as i64 * 3000);
+            f
+        };
+        // Reference chain through the direct entry points.
+        let mut ref_recon: Option<crate::picture::YuvPicture> = None;
+        let mut expected: Vec<(bool, Vec<u8>)> = Vec::new();
+        for t in 0..8usize {
+            let src = video_frame_to_picture(&mk(t), w, h, 8).unwrap();
+            let is_idr = t % 4 == 0;
+            let recon = if is_idr {
+                let (_d, r, _s) = encode_idr_access_unit_opts(&src, 30, false, true).unwrap();
+                r
+            } else {
+                let (_d, r, _s) =
+                    encode_p_access_unit_opts(&src, ref_recon.as_ref().unwrap(), 30, false, true)
+                        .unwrap();
+                r
+            };
+            let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
+            expected.push((is_idr, y8));
+            ref_recon = Some(recon);
+        }
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        for (t, (exp_idr, exp_y)) in expected.iter().enumerate() {
+            enc.send_frame(&Frame::Video(mk(t))).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            assert_eq!(pkt.flags.keyframe, *exp_idr, "frame {t} keyframe flag");
+            let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+            if *exp_idr {
+                assert_eq!(nals.len(), 3, "IDR AU carries SPS+PPS+IDR");
+                assert_eq!(nals[2].header.nal_unit_type, NalUnitType::Idr);
+            } else {
+                assert_eq!(nals.len(), 1, "P AU is a single NonIDR NAL");
+                assert_eq!(nals[0].header.nal_unit_type, NalUnitType::NonIdr);
+            }
+            dec.send_packet(&pkt).unwrap();
+            let vf = match dec.receive_frame().unwrap() {
+                Frame::Video(vf) => vf,
+                other => panic!("expected video frame, got {other:?}"),
+            };
+            assert_eq!(&vf.planes[0].data, exp_y, "frame {t}: decode != recon");
+        }
+    }
+
+    /// Round 431 — GOP rate sanity: with mostly-static content the P
+    /// frames must cost a small fraction of the IDR frames, and the
+    /// whole-GOP byte count must undercut the all-intra encode of the
+    /// same frames.
+    #[test]
+    fn registry_gop_beats_all_intra_on_static_content() {
+        let (w, h) = (96u32, 64u32);
+        let frame = synth_frame(w as usize, h as usize);
+        let run = |gop: &str| -> usize {
+            let mut p = params(w, h);
+            p.options.insert("gop", gop);
+            let mut enc = make_encoder(&p).unwrap();
+            let mut total = 0usize;
+            for t in 0..6i64 {
+                let mut f = frame.clone();
+                f.pts = Some(t);
+                enc.send_frame(&Frame::Video(f)).unwrap();
+                total += enc.receive_packet().unwrap().data.len();
+            }
+            total
+        };
+        let all_intra = run("1");
+        let gop6 = run("6");
+        assert!(
+            gop6 * 3 < all_intra,
+            "static GOP ({gop6}) must be well under a third of all-intra ({all_intra})"
+        );
+    }
+
+    /// Round 431 — single-byte mutation gate over a P access unit: feed
+    /// the intact IDR AU, then every low-bit flip / inversion of every
+    /// P-AU byte, into a fresh decoder session. Clean error or frame —
+    /// never a panic.
+    #[test]
+    fn mutation_gate_over_p_access_unit() {
+        let (w, h) = (48u32, 48u32);
+        let f0 = synth_frame(w as usize, h as usize);
+        let mut f1 = synth_frame(w as usize, h as usize);
+        for (i, v) in f1.planes[0].data.iter_mut().enumerate() {
+            if i % 37 == 0 {
+                *v = v.wrapping_add(40);
+            }
+        }
+        let src0 = video_frame_to_picture(&f0, w, h, 8).unwrap();
+        let src1 = video_frame_to_picture(&f1, w, h, 8).unwrap();
+        let (idr_au, recon0, _s) = encode_idr_access_unit_opts(&src0, 38, false, true).unwrap();
+        let (p_au, _recon1, _s) =
+            encode_p_access_unit_opts(&src1, &recon0, 38, false, true).unwrap();
+        for i in 0..p_au.len() {
+            for mask in [0x01u8, 0xFF] {
+                let mut mutated = p_au.clone();
+                mutated[i] ^= mask;
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                let pkt0 = Packet::new(0, TimeBase::new(1, 90_000), idr_au.clone());
+                dec.send_packet(&pkt0).unwrap();
+                let _ = dec.receive_frame();
+                let pkt1 = Packet::new(0, TimeBase::new(1, 90_000), mutated);
+                if dec.send_packet(&pkt1).is_ok() {
+                    let _ = dec.receive_frame();
+                }
+            }
+        }
     }
 
     /// Output params advertise the stream a muxer needs.

@@ -59,7 +59,7 @@ use crate::quant_enc::forward_quantize;
 use crate::slice_data::zigzag_scan;
 
 /// The five Table-13 Baseline intra modes in syntax-index order.
-const MODES: [IntraMode; 5] = [
+pub(crate) const MODES: [IntraMode; 5] = [
     IntraMode::Dc,
     IntraMode::Hor,
     IntraMode::Ver,
@@ -469,7 +469,7 @@ fn decide_leaf(
 /// through the decoder's pipeline; returns (levels, cbf, recon
 /// residual, SSE distortion).
 #[allow(clippy::too_many_arguments)]
-fn quantize_block(
+pub(crate) fn quantize_block(
     refs: &RefSamples,
     mode: IntraMode,
     src: &[i32],
@@ -500,7 +500,7 @@ fn quantize_block(
 
 /// Crude §7.3.8.7 rate estimate in bins: per non-zero coefficient the
 /// zero-run unary, the level unary, the sign and the last flag.
-fn rle_bits_estimate(levels: &[i32], cbf: bool) -> f64 {
+pub(crate) fn rle_bits_estimate(levels: &[i32], cbf: bool) -> f64 {
     if !cbf {
         return 0.0;
     }
@@ -517,7 +517,14 @@ fn rle_bits_estimate(levels: &[i32], cbf: bool) -> f64 {
     bits
 }
 
-fn gather_block(plane: &[u16], stride: usize, x0: u32, y0: u32, w: usize, h: usize) -> Vec<i32> {
+pub(crate) fn gather_block(
+    plane: &[u16],
+    stride: usize,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+) -> Vec<i32> {
     let mut out = Vec::with_capacity(w * h);
     for yy in 0..h {
         let row = (y0 as usize + yy) * stride + x0 as usize;
@@ -528,13 +535,19 @@ fn gather_block(plane: &[u16], stride: usize, x0: u32, y0: u32, w: usize, h: usi
 
 /// Saved recon rectangle (luma + both chroma sub-rects), for the
 /// leaf-vs-split trial rewinds.
-struct RegionSave {
+pub(crate) struct RegionSave {
     y: Vec<u16>,
     cb: Vec<u16>,
     cr: Vec<u16>,
 }
 
-fn save_region(pic: &YuvPicture, x0: u32, y0: u32, log2_w: u32, log2_h: u32) -> RegionSave {
+pub(crate) fn save_region(
+    pic: &YuvPicture,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+) -> RegionSave {
     let grab = |plane: &[u16], stride: usize, x: usize, y: usize, w: usize, h: usize| {
         let mut out = Vec::with_capacity(w * h);
         for yy in 0..h {
@@ -559,7 +572,7 @@ fn save_region(pic: &YuvPicture, x0: u32, y0: u32, log2_w: u32, log2_h: u32) -> 
     }
 }
 
-fn restore_region(
+pub(crate) fn restore_region(
     pic: &mut YuvPicture,
     save: &RegionSave,
     x0: u32,
@@ -676,7 +689,7 @@ fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, 
 /// ctxInc driven by `cIdx`, the bin position and the §7.3.8.7
 /// `PrevLevel` chain (init 6, then the previous coefficient's absolute
 /// level), and `coeff_last_flag` the Table 95 `cIdx == 0 ? 0 : 1`.
-fn emit_residual_rle(
+pub(crate) fn emit_residual_rle(
     enc: &mut CabacEncoder,
     sel: CtxSel,
     c_idx: u32,
