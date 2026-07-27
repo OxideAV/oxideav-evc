@@ -755,9 +755,10 @@ fn parse_slice_header_consume(
 }
 
 /// Register the EVC implementation with a codec registry: the working
-/// Baseline/Main decoder plus (round 429) the Baseline intra encoder.
-/// The dual-API convention holds — [`decoder::make_decoder`] and
-/// [`encoder::make_encoder`] stay directly callable alongside the
+/// Baseline/Main decoder plus the encoder (round 429 intra bootstrap;
+/// round 431 `sps_cm_init_flag` context modelling and low-delay P
+/// GOPs). The dual-API convention holds — [`decoder::make_decoder`]
+/// and [`encoder::make_encoder`] stay directly callable alongside the
 /// registry factories.
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("evc_sw")

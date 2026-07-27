@@ -220,9 +220,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     }))
 }
 
-/// The registered Baseline intra encoder. Stateless across frames
-/// (every frame is an IDR access unit), so `flush` has nothing to
-/// drain beyond the packet queue.
+/// The registered encoder. With `gop = 1` (the default) every frame is
+/// a self-contained IDR access unit; with `gop > 1` the encoder keeps
+/// the previous reconstruction as the low-delay P reference. No
+/// lookahead either way, so `flush` has nothing to drain beyond the
+/// packet queue.
 // Internal: reach it through [`make_encoder`] / the registry instead.
 #[doc(hidden)]
 pub struct EvcEncoder {

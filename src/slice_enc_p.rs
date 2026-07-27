@@ -1421,6 +1421,61 @@ mod tests {
         assert!(dec_stats.deblock_edges > 0);
     }
 
+    /// A scene cut inside the GOP: the P frame's content shares nothing
+    /// with the reference, so the ladder falls back to intra CUs — the
+    /// single-tree intra-in-P write path (chroma-first cbfs, luma-mode
+    /// chroma prediction) must round-trip byte-exactly.
+    #[test]
+    fn scene_cut_p_frame_goes_intra_and_round_trips() {
+        let (w, h) = (64u32, 64u32);
+        let f0 = synth_moving(w, h, 0, 8);
+        // A completely different scene: inverted checkerboard field.
+        let mut f1 = YuvPicture::new(w, h, 1, 8).unwrap();
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                f1.y[y * w as usize + x] = if (x / 8 + y / 8) % 2 == 0 { 30 } else { 225 };
+            }
+        }
+        for (i, v) in f1.cb.iter_mut().enumerate() {
+            *v = (60 + i % 130) as u16;
+        }
+        for (i, v) in f1.cr.iter_mut().enumerate() {
+            *v = (190 - i % 120) as u16;
+        }
+        let qp = 30;
+        let (_ip, refr, _s) =
+            crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, false, true).unwrap();
+        for &cm_init in &[false, true] {
+            let (payload, recon, stats) =
+                encode_p_slice_data(&f1, &refr, qp, false, cm_init).unwrap();
+            assert!(
+                stats.intra_cus > stats.skip_cus,
+                "a scene cut must refresh with intra CUs: {stats:?}"
+            );
+            let (dec, _) = decode_p(&payload, &refr, w, h, qp, false, cm_init);
+            assert_eq!(dec.y, recon.y, "cm{cm_init}: luma");
+            assert_eq!(dec.cb, recon.cb, "cm{cm_init}: cb");
+            assert_eq!(dec.cr, recon.cr, "cm{cm_init}: cr");
+        }
+    }
+
+    /// 12-bit P frame closes the encoder depth matrix on the inter path.
+    #[test]
+    fn p_twelve_bit_round_trip_exact() {
+        let (w, h) = (32u32, 32u32);
+        let f0 = synth_moving(w, h, 0, 12);
+        let f1 = synth_moving(w, h, 1, 12);
+        let qp = 30;
+        let (_ip, refr, _s) =
+            crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, false, true).unwrap();
+        let (payload, recon, _stats) = encode_p_slice_data(&f1, &refr, qp, false, true).unwrap();
+        let (dec, _) = decode_p(&payload, &refr, w, h, qp, false, true);
+        assert_eq!(dec.y, recon.y);
+        assert_eq!(dec.cb, recon.cb);
+        assert_eq!(dec.cr, recon.cr);
+        assert!(recon.y.iter().any(|&v| v > 1023), "true 12-bit range");
+    }
+
     /// 10-bit P GOP: the depth-parameterized loop holds byte-exactly.
     #[test]
     fn p_ten_bit_round_trip_exact() {
