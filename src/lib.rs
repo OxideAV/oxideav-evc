@@ -1473,9 +1473,7 @@ mod tests {
         for _ in 0..3 {
             p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 prefix (3 ones)
         }
-        p_enc.encode_decision(0, 0, 0); // cbf_luma
-        p_enc.encode_decision(0, 0, 0); // cbf_cb
-        p_enc.encode_decision(0, 0, 0); // cbf_cr
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         p_enc.encode_terminate(true);
         p_rbsp.extend_from_slice(&p_enc.finish());
 
@@ -1612,9 +1610,7 @@ mod tests {
         for _ in 0..3 {
             p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3 prefix
         }
-        p_enc.encode_decision(0, 0, 0); // cbf_luma
-        p_enc.encode_decision(0, 0, 0); // cbf_cb
-        p_enc.encode_decision(0, 0, 0); // cbf_cr
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         p_enc.encode_terminate(true);
         p_rbsp.extend_from_slice(&p_enc.finish());
 
@@ -1730,9 +1726,7 @@ mod tests {
             for _ in 0..3 {
                 p_enc.encode_decision(0, 0, 1); // mvp_idx_l0 = 3
             }
-            p_enc.encode_decision(0, 0, 0); // cbf_luma
-            p_enc.encode_decision(0, 0, 0); // cbf_cb
-            p_enc.encode_decision(0, 0, 0); // cbf_cr
+            // round 431: skip CU — no residual syntax (§7.3.8.4).
             p_enc.encode_terminate(true);
             p_rbsp.extend_from_slice(&p_enc.finish());
             p_rbsp
@@ -1992,9 +1986,7 @@ mod tests {
                                         // affine gate on (32×32) → affine_flag bin.
         p_enc.encode_decision(0, 0, 0); // affine_flag = 0
         p_enc.encode_decision(0, 0, 0); // merge_idx = 0
-        p_enc.encode_decision(0, 0, 0); // cbf_luma
-        p_enc.encode_decision(0, 0, 0); // cbf_cb
-        p_enc.encode_decision(0, 0, 0); // cbf_cr
+                                        // round 431: skip CU — no residual syntax (§7.3.8.4).
         p_enc.encode_terminate(true);
         p_rbsp.extend_from_slice(&p_enc.finish());
 
@@ -2303,9 +2295,7 @@ mod tests {
             for _ in 0..3 {
                 enc.encode_decision(0, 0, 1); // mvp_idx = 3 (zero slot)
             }
-            enc.encode_decision(0, 0, 0); // cbf_luma
-            enc.encode_decision(0, 0, 0); // cbf_cb
-            enc.encode_decision(0, 0, 0); // cbf_cr
+            // round 431: skip CU — no residual syntax (§7.3.8.4).
             enc.encode_terminate(true);
             enc.finish()
         };
