@@ -1493,6 +1493,29 @@ mod tests {
         assert!(recon.y.iter().any(|&v| v > 255), "true 10-bit range");
     }
 
+    /// Ragged dimensions (multiples of 4, not of the 64-CTU): the
+    /// implicit boundary splits ride the P emit path too, across the
+    /// QP extremes.
+    #[test]
+    fn p_boundary_split_dims_and_qp_extremes_round_trip() {
+        for &(w, h) in &[(100u32, 60u32), (72, 40)] {
+            let f0 = synth_moving(w, h, 0, 8);
+            let f1 = synth_moving(w, h, 1, 8);
+            for &qp in &[4i32, 51] {
+                let (_ip, refr, _s) =
+                    crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, false, true).unwrap();
+                let (payload, recon, stats) =
+                    encode_p_slice_data(&f1, &refr, qp, false, true).unwrap();
+                assert!(stats.ctus >= 2, "{w}x{h}: multiple CTUs walked");
+                let (dec, dec_stats) = decode_p(&payload, &refr, w, h, qp, false, true);
+                assert_eq!(dec.y, recon.y, "{w}x{h} qp{qp}: luma");
+                assert_eq!(dec.cb, recon.cb, "{w}x{h} qp{qp}: cb");
+                assert_eq!(dec.cr, recon.cr, "{w}x{h} qp{qp}: cr");
+                assert_eq!(dec_stats.ctus, stats.ctus);
+            }
+        }
+    }
+
     /// Determinism across the whole P pipeline.
     #[test]
     fn p_encode_is_deterministic() {
