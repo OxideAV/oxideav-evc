@@ -39,6 +39,51 @@ use crate::slice_data::{InterDecodeInputs, SliceDecodeInputs, SliceWalkInputs};
 use crate::sps::{self, Sps};
 use crate::CODEC_ID_STR;
 
+/// §7.4.3.1 conformance cropping window, held in **luma samples** (the
+/// SPS `picture_crop_*_offset` fields already multiplied by
+/// SubWidthC / SubHeightC). The decoding process reconstructs the full
+/// `pic_width/height_in_luma_samples` grid — references stay uncropped —
+/// and only the samples inside this window are output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CropWindow {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+}
+
+impl CropWindow {
+    /// Derive the output cropping window from the active SPS. The luma
+    /// window spans `SubWidthC * picture_crop_left_offset ..=
+    /// pic_width_in_luma_samples − (SubWidthC * picture_crop_right_offset
+    /// + 1)` horizontally (§7.4.3.1), and the vertical analogue.
+    fn from_sps(sps: &Sps) -> Self {
+        if !sps.picture_cropping_flag {
+            return Self::default();
+        }
+        let (sub_w, sub_h) = sub_wh(sps.chroma_format_idc);
+        Self {
+            left: sps.picture_crop_left_offset * sub_w,
+            right: sps.picture_crop_right_offset * sub_w,
+            top: sps.picture_crop_top_offset * sub_h,
+            bottom: sps.picture_crop_bottom_offset * sub_h,
+        }
+    }
+
+    fn is_noop(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `(SubWidthC, SubHeightC)` per the §6.2 chroma-format table.
+fn sub_wh(chroma_format_idc: u32) -> (u32, u32) {
+    match chroma_format_idc {
+        1 => (2, 2), // 4:2:0
+        2 => (2, 1), // 4:2:2
+        _ => (1, 1), // monochrome / 4:4:4
+    }
+}
+
 /// Decoded-picture buffer entry (round-9 / round-10). Each slot keeps
 /// the reconstructed picture, its POC and the original presentation
 /// timestamp so frames can be re-ordered by POC before emission.
@@ -67,6 +112,10 @@ struct DpbEntry {
     /// decode time — the eq.-502 `refPicOfColPic[ X ]` resolution tables.
     ref_pocs_l0: Vec<i32>,
     ref_pocs_l1: Vec<i32>,
+    /// §7.4.3.1 conformance cropping window active when this picture was
+    /// decoded, applied at output time only (the stored `pic` keeps the
+    /// full reconstructed grid for reference use).
+    crop: CropWindow,
 }
 
 /// Result of decoding one non-IDR (P/B) slice. Round 113 threads the
@@ -436,6 +485,7 @@ impl Decoder for EvcDecoder {
                         side_info: None,
                         ref_pocs_l0: Vec::new(),
                         ref_pocs_l1: Vec::new(),
+                        crop: CropWindow::from_sps(&sps),
                     };
                     self.prev_poc_lsb = 0;
                     self.poc_msb = 0;
@@ -512,6 +562,7 @@ impl Decoder for EvcDecoder {
                         side_info: Some(side_info),
                         ref_pocs_l0,
                         ref_pocs_l1,
+                        crop: CropWindow::from_sps(&sps),
                     };
                     self.dpb_insert(entry);
                     self.enqueue_for_output(poc);
@@ -596,7 +647,7 @@ impl EvcDecoder {
     /// `flush()` doesn't re-push it.
     fn enqueue_for_output(&mut self, poc: i32) {
         let (frame, pts) = match self.dpb_find(poc) {
-            Some(e) => (picture_to_video_frame(&e.pic, e.pts), e.pts),
+            Some(e) => (picture_to_video_frame_cropped(&e.pic, e.pts, e.crop), e.pts),
             None => return,
         };
         let _ = pts; // silence unused
@@ -1226,6 +1277,62 @@ fn apply_chroma_alf_masked_or_whole_plane(
     }
 }
 
+/// Extract the `w × h` window at `(x0, y0)` from a `stride`-wide plane.
+fn crop_plane(src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in y0..y0 + h {
+        let row = &src[y * stride + x0..y * stride + x0 + w];
+        out.extend_from_slice(row);
+    }
+    out
+}
+
+/// Output conversion with the §7.4.3.1 conformance cropping window
+/// applied: only the samples inside the window are emitted. A no-op
+/// window falls through to the historical full-picture pack.
+fn picture_to_video_frame_cropped(
+    pic: &crate::picture::YuvPicture,
+    pts: Option<i64>,
+    crop: CropWindow,
+) -> VideoFrame {
+    if crop.is_noop() {
+        return picture_to_video_frame(pic, pts);
+    }
+    let (sub_w, sub_h) = sub_wh(pic.chroma_format_idc);
+    let luma_w = (pic.width - crop.left - crop.right) as usize;
+    let luma_h = (pic.height - crop.top - crop.bottom) as usize;
+    let crop_chroma = |src: &[u16]| -> Vec<u16> {
+        if src.is_empty() {
+            return Vec::new();
+        }
+        crop_plane(
+            src,
+            pic.c_stride(),
+            (crop.left / sub_w) as usize,
+            (crop.top / sub_h) as usize,
+            luma_w / sub_w as usize,
+            luma_h / sub_h as usize,
+        )
+    };
+    let cropped = crate::picture::YuvPicture {
+        width: luma_w as u32,
+        height: luma_h as u32,
+        chroma_format_idc: pic.chroma_format_idc,
+        bit_depth: pic.bit_depth,
+        y: crop_plane(
+            &pic.y,
+            pic.y_stride(),
+            crop.left as usize,
+            crop.top as usize,
+            luma_w,
+            luma_h,
+        ),
+        cb: crop_chroma(&pic.cb),
+        cr: crop_chroma(&pic.cr),
+    };
+    picture_to_video_frame(&cropped, pts)
+}
+
 fn picture_to_video_frame(pic: &crate::picture::YuvPicture, pts: Option<i64>) -> VideoFrame {
     let y_stride = pic.y_stride();
     let c_stride = pic.c_stride();
@@ -1320,6 +1427,7 @@ mod tests {
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
                 ref_pocs_l1: Vec::new(),
+                crop: CropWindow::default(),
             });
         }
         assert_eq!(dec.dpb.len(), MAX_DPB_ENTRIES);
@@ -1344,6 +1452,7 @@ mod tests {
             side_info: None,
             ref_pocs_l0: Vec::new(),
             ref_pocs_l1: Vec::new(),
+            crop: CropWindow::default(),
         });
         dec.poc_msb = 256;
         dec.prev_poc_lsb = 100;
@@ -1375,6 +1484,7 @@ mod tests {
             side_info: None,
             ref_pocs_l0: Vec::new(),
             ref_pocs_l1: Vec::new(),
+            crop: CropWindow::default(),
         });
         dec.dpb_insert(DpbEntry {
             pic: pic.clone(),
@@ -1385,6 +1495,7 @@ mod tests {
             side_info: None,
             ref_pocs_l0: Vec::new(),
             ref_pocs_l1: Vec::new(),
+            crop: CropWindow::default(),
         });
         dec.dpb_insert(DpbEntry {
             pic,
@@ -1395,6 +1506,7 @@ mod tests {
             side_info: None,
             ref_pocs_l0: Vec::new(),
             ref_pocs_l1: Vec::new(),
+            crop: CropWindow::default(),
         });
         assert!(dec.out.is_empty());
         dec.drain_dpb_to_output();
@@ -1429,6 +1541,7 @@ mod tests {
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
                 ref_pocs_l1: Vec::new(),
+                crop: CropWindow::default(),
             });
         }
         let rpl = RefPicListStruct {
@@ -1473,6 +1586,7 @@ mod tests {
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
                 ref_pocs_l1: Vec::new(),
+                crop: CropWindow::default(),
             });
         }
         let rpl = RefPicListStruct {
@@ -1904,6 +2018,52 @@ mod tests {
         assert!(applied, "spec-faithful path reads dra_syntax_aps[4]");
         // Identity scale ⇒ luma plane unchanged.
         assert_eq!(pic.y, before);
+    }
+
+    /// §7.4.3.1: the output conversion emits only the conformance
+    /// cropping window; the chroma window scales by SubWidthC /
+    /// SubHeightC. An 8×8 4:2:0 picture cropped by (right=4, bottom=2)
+    /// in luma samples emits a 4×6 luma / 2×3 chroma frame whose samples
+    /// come from the window's rows.
+    #[test]
+    fn output_crop_window_applies() {
+        use crate::picture::YuvPicture;
+        let mut pic = YuvPicture::new(8, 8, 1, 8).unwrap();
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = i as u16;
+        }
+        for (i, v) in pic.cb.iter_mut().enumerate() {
+            *v = 100 + i as u16;
+        }
+        for (i, v) in pic.cr.iter_mut().enumerate() {
+            *v = 200 + i as u16;
+        }
+        let crop = CropWindow {
+            left: 0,
+            right: 4,
+            top: 0,
+            bottom: 2,
+        };
+        let f = picture_to_video_frame_cropped(&pic, None, crop);
+        assert_eq!(f.planes[0].stride, 4);
+        assert_eq!(f.planes[0].data.len(), 4 * 6);
+        // Row y of the cropped luma is the first 4 samples of row y.
+        for y in 0..6usize {
+            for x in 0..4usize {
+                assert_eq!(f.planes[0].data[y * 4 + x], (y * 8 + x) as u8);
+            }
+        }
+        assert_eq!(f.planes[1].stride, 2);
+        assert_eq!(f.planes[1].data.len(), 2 * 3);
+        for y in 0..3usize {
+            for x in 0..2usize {
+                assert_eq!(f.planes[1].data[y * 2 + x], (100 + y * 4 + x) as u8);
+                assert_eq!(f.planes[2].data[y * 2 + x], (200 + y * 4 + x) as u8);
+            }
+        }
+        // A no-op window is the historical full-picture pack.
+        let f_full = picture_to_video_frame_cropped(&pic, None, CropWindow::default());
+        assert_eq!(f_full.planes[0].data.len(), 64);
     }
 
     /// Round 391: `picture_to_video_frame` packs 8-bit pictures one

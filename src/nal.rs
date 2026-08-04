@@ -194,13 +194,36 @@ impl<'a> NalRef<'a> {
     }
 }
 
-/// Iterate length-prefixed EVC NAL units (Annex B raw bitstream format —
-/// `nal_unit_length` is `u(32)`).
-pub fn iter_length_prefixed(data: &[u8]) -> Result<Vec<NalRef<'_>>> {
+/// Byte order of the 4-byte `nal_unit_length` field in a length-prefixed
+/// stream.
+///
+/// Annex B specifies `nal_unit_length` as `u(32)`, and §B.1 fixes the
+/// file-storage bit order as MSB-first — i.e. **big-endian** — so that is
+/// the order this crate writes and prefers on read. Deployed `.evb`/`.bit`
+/// raw files (notably the ISO/IEC 23094-4 conformance-bitstream
+/// packaging) carry the same field **little-endian** instead, so the
+/// reader auto-detects: a whole-stream walk must tile the buffer exactly
+/// under the chosen order, and only one order survives that check on any
+/// real stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LengthPrefixOrder {
+    /// `u(32)` MSB-first per Annex B / §B.1.
+    BigEndian,
+    /// The deployed raw-file variant (conformance packaging).
+    LittleEndian,
+}
+
+/// Walk a length-prefixed NAL stream under one fixed byte order. The
+/// walk succeeds only if the prefixes tile `data` exactly.
+fn walk_length_prefixed(data: &[u8], order: LengthPrefixOrder) -> Result<Vec<NalRef<'_>>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 4 <= data.len() {
-        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let word = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+        let len = match order {
+            LengthPrefixOrder::BigEndian => u32::from_be_bytes(word),
+            LengthPrefixOrder::LittleEndian => u32::from_le_bytes(word),
+        } as usize;
         i += 4;
         if len < 2 {
             return Err(Error::invalid(format!(
@@ -225,6 +248,25 @@ pub fn iter_length_prefixed(data: &[u8]) -> Result<Vec<NalRef<'_>>> {
         )));
     }
     Ok(out)
+}
+
+/// Iterate length-prefixed EVC NAL units (Annex B raw bitstream file
+/// storage format — `nal_unit_length` is `u(32)`).
+///
+/// The byte order of the length field is auto-detected per
+/// [`LengthPrefixOrder`]: the spec's big-endian order is tried first and
+/// wins ties; the little-endian raw-file variant is accepted when only it
+/// tiles the buffer exactly.
+pub fn iter_length_prefixed(data: &[u8]) -> Result<Vec<NalRef<'_>>> {
+    match walk_length_prefixed(data, LengthPrefixOrder::BigEndian) {
+        Ok(nals) => Ok(nals),
+        Err(be_err) => match walk_length_prefixed(data, LengthPrefixOrder::LittleEndian) {
+            Ok(nals) => Ok(nals),
+            // Report the spec-order error: it is the diagnosis a
+            // conforming stream's corruption produces.
+            Err(_) => Err(be_err),
+        },
+    }
 }
 
 /// Tolerant Annex B start-code scanner. EVC does not normatively use
@@ -304,6 +346,62 @@ mod tests {
         w |= (reserved as u16 & 0x1F) << 1;
         w |= if ext { 1 } else { 0 };
         [(w >> 8) as u8, (w & 0xFF) as u8]
+    }
+
+    /// Wrap `body` NALs with 4-byte length prefixes in the given order.
+    fn frame_stream(bodies: &[Vec<u8>], order: LengthPrefixOrder) -> Vec<u8> {
+        let mut out = Vec::new();
+        for b in bodies {
+            let len = b.len() as u32;
+            match order {
+                LengthPrefixOrder::BigEndian => out.extend_from_slice(&len.to_be_bytes()),
+                LengthPrefixOrder::LittleEndian => out.extend_from_slice(&len.to_le_bytes()),
+            }
+            out.extend_from_slice(b);
+        }
+        out
+    }
+
+    /// A little-endian length-prefixed stream (the ISO/IEC 23094-4
+    /// conformance-packaging framing) is auto-detected by
+    /// `iter_length_prefixed`, and the same bodies under the spec's
+    /// big-endian order parse identically.
+    #[test]
+    fn length_prefix_order_auto_detect() {
+        let sps: Vec<u8> = {
+            let mut v = mk_header(24, 0, 0, false).to_vec();
+            v.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+            v
+        };
+        let idr: Vec<u8> = {
+            let mut v = mk_header(1, 0, 0, false).to_vec();
+            v.extend_from_slice(&[0x11; 40]);
+            v
+        };
+        let bodies = [sps, idr];
+        for order in [
+            LengthPrefixOrder::BigEndian,
+            LengthPrefixOrder::LittleEndian,
+        ] {
+            let stream = frame_stream(&bodies, order);
+            let nals = iter_length_prefixed(&stream).unwrap();
+            assert_eq!(nals.len(), 2, "{order:?}");
+            assert_eq!(nals[0].header.nal_unit_type, NalUnitType::Sps);
+            assert_eq!(nals[1].header.nal_unit_type, NalUnitType::Idr);
+            assert_eq!(nals[0].rbsp(), &[0xAA, 0xBB, 0xCC]);
+            assert_eq!(nals[1].rbsp(), &[0x11; 40]);
+        }
+    }
+
+    /// A stream valid under neither order reports the big-endian
+    /// (spec-order) diagnosis.
+    #[test]
+    fn length_prefix_order_neither_is_an_error() {
+        // 4-byte prefix claiming 200 bytes with only 2 present — invalid
+        // under both byte orders.
+        let mut stream = 200u32.to_be_bytes().to_vec();
+        stream.extend_from_slice(&mk_header(24, 0, 0, false));
+        assert!(iter_length_prefixed(&stream).is_err());
     }
 
     #[test]
