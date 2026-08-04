@@ -564,7 +564,7 @@ fn quantize_inter_plane(
     let cbf = forward_quantize(&diff, &mut levels, w, h, qp, bit_depth)?;
     let mut res = vec![0i32; n];
     if cbf {
-        scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth)?;
+        scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth, false)?;
     }
     let mut dist = 0f64;
     for i in 0..n {
@@ -750,11 +750,15 @@ fn decide_leaf(
     let mvp = cands[best_mvp_idx as usize];
     let mvd = MotionVector::quarter_pel(me_mv.x - mvp.x, me_mv.y - mvp.y);
     let (py, pcb, pcr) = mc_pred(ctx, x0, y0, w, h, me_mv)?;
-    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(&src_y, &py, w, h, ctx.qp, bd)?;
+    // §8.7.1: quantize at qP = Qp′ (eqs. 1050-1052) — see the IDR
+    // encoder's derivation.
+    let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
+    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
+    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(&src_y, &py, w, h, qp_y, bd)?;
     let (levels_cb, cbf_cb, res_cb, dist_cb) =
-        quantize_inter_plane(&src_cb, &pcb, wc, hc, ctx.qp, bd)?;
+        quantize_inter_plane(&src_cb, &pcb, wc, hc, qp_c, bd)?;
     let (levels_cr, cbf_cr, res_cr, dist_cr) =
-        quantize_inter_plane(&src_cr, &pcr, wc, hc, ctx.qp, bd)?;
+        quantize_inter_plane(&src_cr, &pcr, wc, hc, qp_c, bd)?;
     // §7.4.9.5: with quiet chroma cbf_luma is inferred 1, so an
     // "explicit CU with luma-only-zero residual" collapses to
     // cbf_all = 0 (drop the chroma residuals too if luma is quiet and
@@ -795,8 +799,16 @@ fn decide_leaf(
     let mut best_intra: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
     let mut best_intra_luma_cost = f64::INFINITY;
     for (mode_idx, &mode) in MODES.iter().enumerate() {
-        let (levels, cbf, res, dist) =
-            quantize_block(&refs, mode, &src_y, w, h, ctx.qp, bd, max_val)?;
+        let (levels, cbf, res, dist) = quantize_block(
+            &refs,
+            mode,
+            &src_y,
+            w,
+            h,
+            crate::dequant::qp_prime_y(ctx.qp, bd),
+            bd,
+            max_val,
+        )?;
         let bits = 2.0 + (mode_idx + 1) as f64 + 1.0 + rle_bits_estimate(&levels, cbf);
         let cost = dist + ctx.lambda * bits;
         if cost < best_intra_luma_cost {
@@ -808,11 +820,27 @@ fn decide_leaf(
     // Chroma with the same mode (decoder: IntraPredModeC = IntraPredModeY).
     let mode = MODES[i_mode];
     let refs_cb = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 1);
-    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) =
-        quantize_block(&refs_cb, mode, &src_cb, wc, hc, ctx.qp, bd, max_val)?;
+    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) = quantize_block(
+        &refs_cb,
+        mode,
+        &src_cb,
+        wc,
+        hc,
+        crate::dequant::qp_prime_c(ctx.qp, 0, bd, false),
+        bd,
+        max_val,
+    )?;
     let refs_cr = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 2);
-    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) =
-        quantize_block(&refs_cr, mode, &src_cr, wc, hc, ctx.qp, bd, max_val)?;
+    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) = quantize_block(
+        &refs_cr,
+        mode,
+        &src_cr,
+        wc,
+        hc,
+        crate::dequant::qp_prime_c(ctx.qp, 0, bd, false),
+        bd,
+        max_val,
+    )?;
     let intra_cost = best_intra_luma_cost
         + i_dist_cb
         + i_dist_cr

@@ -35,8 +35,18 @@ use oxideav_core::{Error, Result};
 /// array of scaled coefficients in `coeffs` (row-major). `coeffs` is
 /// overwritten with the residual sample array.
 ///
+/// `sps_iqt_flag` selects the §8.7.4.1 step-2 intermediate: under the
+/// improved quantization/transform (eq. 1060) the vertical-stage output
+/// is renormalised `Clip3(−32768, 32767, (e + 64) >> 7)` before the
+/// horizontal stage; under `== 0` (eq. 1061) it passes through.
+///
 /// Both dimensions must be powers of two in `{2, 4, 8, 16, 32, 64}`.
-pub fn inverse_transform(coeffs: &mut [i32], n_tb_w: usize, n_tb_h: usize) -> Result<()> {
+pub fn inverse_transform(
+    coeffs: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    sps_iqt_flag: bool,
+) -> Result<()> {
     if coeffs.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
             "evc inverse_transform: buffer len {} != {}*{} = {}",
@@ -65,8 +75,14 @@ pub fn inverse_transform(coeffs: &mut [i32], n_tb_w: usize, n_tb_h: usize) -> Re
             e[y * n_tb_w + x] = out_v[y];
         }
     }
-    // Step 2 (sps_iqt_flag = 0, eq. 1061): g[x][y] = e[x][y].
-    let g = e;
+    // Step 2: eq. 1060 (iqt) renormalises + clips the vertical-stage
+    // output; eq. 1061 passes it through.
+    let mut g = e;
+    if sps_iqt_flag {
+        for v in g.iter_mut() {
+            *v = ((*v + 64) >> 7).clamp(-32768, 32767);
+        }
+    }
     // Step 3: horizontal 1-D transform on each row → r[x][y].
     let m_h = trans_matrix(n_tb_w);
     let mut out_h = vec![0i32; n_tb_w];
@@ -100,6 +116,7 @@ pub fn inverse_transform_ats(
     n_tb_h: usize,
     tr_type_hor: u32,
     tr_type_ver: u32,
+    sps_iqt_flag: bool,
 ) -> Result<()> {
     if coeffs.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
@@ -129,8 +146,14 @@ pub fn inverse_transform_ats(
             e[y * n_tb_w + x] = out_v[y];
         }
     }
-    // Step 2 (sps_iqt_flag = 0, eq. 1061): g = e.
-    let g = e;
+    // Step 2: eq. 1060 (iqt) renormalises + clips; eq. 1061 passes
+    // through.
+    let mut g = e;
+    if sps_iqt_flag {
+        for v in g.iter_mut() {
+            *v = ((*v + 64) >> 7).clamp(-32768, 32767);
+        }
+    }
     // Step 3: horizontal 1-D transform per row with trTypeHor.
     let mut out_h = vec![0i32; n_tb_w];
     for y in 0..n_tb_h {
@@ -577,7 +600,7 @@ mod tests {
     fn inverse_transform_dc_only_4x4() {
         let mut coeffs = vec![0i32; 16];
         coeffs[0] = 1;
-        inverse_transform(&mut coeffs, 4, 4).unwrap();
+        inverse_transform(&mut coeffs, 4, 4, false).unwrap();
         assert_eq!(coeffs[0], 4096);
         assert_eq!(coeffs[1], 5376);
         assert_eq!(coeffs[4], 5376);
@@ -592,8 +615,8 @@ mod tests {
         a[0] = 1;
         a[5] = 3;
         let mut b = a.clone();
-        inverse_transform(&mut a, 4, 4).unwrap();
-        inverse_transform_ats(&mut b, 4, 4, 0, 0).unwrap();
+        inverse_transform(&mut a, 4, 4, false).unwrap();
+        inverse_transform_ats(&mut b, 4, 4, 0, 0, false).unwrap();
         assert_eq!(a, b);
     }
 
@@ -606,7 +629,7 @@ mod tests {
     fn ats_dst7_4x4_dc() {
         let mut coeffs = vec![0i32; 16];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 4, 4, 1, 1).unwrap();
+        inverse_transform_ats(&mut coeffs, 4, 4, 1, 1, false).unwrap();
         assert_eq!(coeffs[0], 29 * 29);
         assert_eq!(coeffs[1], 74 * 29);
         assert_eq!(coeffs[4], 29 * 74);
@@ -620,7 +643,7 @@ mod tests {
     fn ats_dct8_4x4_dc() {
         let mut coeffs = vec![0i32; 16];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 4, 4, 2, 2).unwrap();
+        inverse_transform_ats(&mut coeffs, 4, 4, 2, 2, false).unwrap();
         assert_eq!(coeffs[0], 84 * 84);
         assert_eq!(coeffs[1], 74 * 84);
         assert_eq!(coeffs[4], 84 * 74);
@@ -636,7 +659,7 @@ mod tests {
     fn ats_mixed_kernels_dc() {
         let mut coeffs = vec![0i32; 16];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 4, 4, 1, 2).unwrap();
+        inverse_transform_ats(&mut coeffs, 4, 4, 1, 2, false).unwrap();
         assert_eq!(coeffs[0], 84 * 29);
         assert_eq!(coeffs[1], 84 * 74);
         assert_eq!(coeffs[4], 74 * 29);
@@ -647,7 +670,7 @@ mod tests {
     fn ats_8x8_zero() {
         for (h, v) in [(1u32, 1u32), (2, 2), (1, 2), (2, 1)] {
             let mut coeffs = vec![0i32; 64];
-            inverse_transform_ats(&mut coeffs, 8, 8, h, v).unwrap();
+            inverse_transform_ats(&mut coeffs, 8, 8, h, v, false).unwrap();
             assert!(coeffs.iter().all(|&c| c == 0));
         }
     }
@@ -657,11 +680,11 @@ mod tests {
     #[test]
     fn ats_unsupported_size_errors() {
         let mut coeffs = vec![0i32; 64 * 64];
-        assert!(inverse_transform_ats(&mut coeffs, 64, 64, 1, 1).is_err());
-        assert!(inverse_transform_ats(&mut coeffs, 64, 64, 2, 0).is_err());
+        assert!(inverse_transform_ats(&mut coeffs, 64, 64, 1, 1, false).is_err());
+        assert!(inverse_transform_ats(&mut coeffs, 64, 64, 2, 0, false).is_err());
         // trType 2 with nTbS = 2 is also out of range.
         let mut small = vec![0i32; 4];
-        assert!(inverse_transform_ats(&mut small, 2, 2, 1, 1).is_err());
+        assert!(inverse_transform_ats(&mut small, 2, 2, 1, 1, false).is_err());
     }
 
     /// 32×32 DST-VII / DCT-VIII zero input → zero output (matrix integrity).
@@ -669,7 +692,7 @@ mod tests {
     fn ats_32x32_zero() {
         for (h, v) in [(1u32, 1u32), (2, 2), (1, 2), (2, 1)] {
             let mut coeffs = vec![0i32; 32 * 32];
-            inverse_transform_ats(&mut coeffs, 32, 32, h, v).unwrap();
+            inverse_transform_ats(&mut coeffs, 32, 32, h, v, false).unwrap();
             assert!(coeffs.iter().all(|&c| c == 0));
         }
     }
@@ -681,7 +704,7 @@ mod tests {
     fn ats_dst7_32x32_dc() {
         let mut coeffs = vec![0i32; 32 * 32];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 32, 32, 1, 1).unwrap();
+        inverse_transform_ats(&mut coeffs, 32, 32, 1, 1, false).unwrap();
         assert_eq!(coeffs[0], 4 * 4);
         assert_eq!(coeffs[1], 13 * 4);
         assert_eq!(coeffs[32], 4 * 13);
@@ -695,7 +718,7 @@ mod tests {
     fn ats_dct8_32x32_dc() {
         let mut coeffs = vec![0i32; 32 * 32];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 32, 32, 2, 2).unwrap();
+        inverse_transform_ats(&mut coeffs, 32, 32, 2, 2, false).unwrap();
         assert_eq!(coeffs[0], 90 * 90);
         assert_eq!(coeffs[1], 90 * 90);
         assert_eq!(coeffs[32], 90 * 90);
@@ -707,7 +730,7 @@ mod tests {
     fn ats_16x16_zero() {
         for (h, v) in [(1u32, 1u32), (2, 2), (1, 2), (2, 1)] {
             let mut coeffs = vec![0i32; 16 * 16];
-            inverse_transform_ats(&mut coeffs, 16, 16, h, v).unwrap();
+            inverse_transform_ats(&mut coeffs, 16, 16, h, v, false).unwrap();
             assert!(coeffs.iter().all(|&c| c == 0));
         }
     }
@@ -721,7 +744,7 @@ mod tests {
     fn ats_dst7_16x16_dc() {
         let mut coeffs = vec![0i32; 16 * 16];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 16, 16, 1, 1).unwrap();
+        inverse_transform_ats(&mut coeffs, 16, 16, 1, 1, false).unwrap();
         assert_eq!(coeffs[0], 8 * 8);
         assert_eq!(coeffs[1], 25 * 8);
         assert_eq!(coeffs[16], 8 * 25);
@@ -735,7 +758,7 @@ mod tests {
     fn ats_dct8_16x16_dc() {
         let mut coeffs = vec![0i32; 16 * 16];
         coeffs[0] = 1;
-        inverse_transform_ats(&mut coeffs, 16, 16, 2, 2).unwrap();
+        inverse_transform_ats(&mut coeffs, 16, 16, 2, 2, false).unwrap();
         assert_eq!(coeffs[0], 89 * 89);
         assert_eq!(coeffs[1], 88 * 89);
         assert_eq!(coeffs[16], 89 * 88);
@@ -772,7 +795,7 @@ mod tests {
     #[test]
     fn inverse_transform_zero_8x8() {
         let mut coeffs = vec![0i32; 64];
-        inverse_transform(&mut coeffs, 8, 8).unwrap();
+        inverse_transform(&mut coeffs, 8, 8, false).unwrap();
         assert!(coeffs.iter().all(|&v| v == 0));
     }
 
@@ -785,7 +808,7 @@ mod tests {
     #[test]
     fn inverse_transform_2x2() {
         let mut coeffs = vec![1, 0, 0, 0];
-        inverse_transform(&mut coeffs, 2, 2).unwrap();
+        inverse_transform(&mut coeffs, 2, 2, false).unwrap();
         for v in &coeffs {
             assert_eq!(*v, 4096);
         }
@@ -806,7 +829,7 @@ mod tests {
     #[test]
     fn inverse_transform_zero_16x16() {
         let mut coeffs = vec![0i32; 256];
-        inverse_transform(&mut coeffs, 16, 16).unwrap();
+        inverse_transform(&mut coeffs, 16, 16, false).unwrap();
         assert!(coeffs.iter().all(|&v| v == 0));
     }
 
@@ -814,7 +837,7 @@ mod tests {
     #[test]
     fn inverse_transform_zero_64x64() {
         let mut coeffs = vec![0i32; 64 * 64];
-        inverse_transform(&mut coeffs, 64, 64).unwrap();
+        inverse_transform(&mut coeffs, 64, 64, false).unwrap();
         assert!(coeffs.iter().all(|&v| v == 0));
     }
 
@@ -826,7 +849,7 @@ mod tests {
     fn inverse_transform_dc_only_64x64() {
         let mut coeffs = vec![0i32; 64 * 64];
         coeffs[0] = 1; // (y=0, x=0)
-        inverse_transform(&mut coeffs, 64, 64).unwrap();
+        inverse_transform(&mut coeffs, 64, 64, false).unwrap();
         // After cascade: coeffs[y*64 + x] = mat_64[x][0] * mat_64[y][0].
         // mat[0][0]=64, mat[1][0]=90, mat[63][0]=2.
         assert_eq!(coeffs[0], 64 * 64); // (y=0, x=0)
@@ -841,7 +864,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_size() {
         let mut coeffs = vec![0i32; 9];
-        let err = inverse_transform(&mut coeffs, 3, 3).unwrap_err();
+        let err = inverse_transform(&mut coeffs, 3, 3, false).unwrap_err();
         assert!(format!("{err}").contains("nTbS"));
     }
 
@@ -871,7 +894,7 @@ mod tests {
     #[test]
     fn rejects_wrong_buffer_len() {
         let mut coeffs = vec![0i32; 5];
-        let err = inverse_transform(&mut coeffs, 4, 4).unwrap_err();
+        let err = inverse_transform(&mut coeffs, 4, 4, false).unwrap_err();
         assert!(format!("{err}").contains("buffer len"));
     }
 
@@ -879,7 +902,7 @@ mod tests {
     #[test]
     fn inverse_transform_zero_32x32() {
         let mut coeffs = vec![0i32; 1024];
-        inverse_transform(&mut coeffs, 32, 32).unwrap();
+        inverse_transform(&mut coeffs, 32, 32, false).unwrap();
         assert!(coeffs.iter().all(|&v| v == 0));
     }
 
@@ -889,7 +912,7 @@ mod tests {
     fn inverse_transform_dc_only_32x32() {
         let mut coeffs = vec![0i32; 1024];
         coeffs[0] = 1;
-        inverse_transform(&mut coeffs, 32, 32).unwrap();
+        inverse_transform(&mut coeffs, 32, 32, false).unwrap();
         assert_eq!(coeffs[0], 4096);
     }
 }

@@ -459,6 +459,7 @@ pub fn decode_idr_slice(
     };
     let decode = slice_data::SliceDecodeInputs {
         slice_qp,
+        sps_iqt_flag: sps.sps_iqt_flag,
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
         enable_deblock: false, // round-3 fixtures keep deblock off
@@ -655,6 +656,7 @@ pub fn decode_idr_slice_full(
     };
     let decode = slice_data::SliceDecodeInputs {
         slice_qp: header.slice_qp as i32,
+        sps_iqt_flag: sps.sps_iqt_flag,
         bit_depth_luma: sps.bit_depth_y(),
         bit_depth_chroma: sps.bit_depth_c(),
         enable_deblock: header.slice_deblocking_filter_flag,
@@ -2200,8 +2202,11 @@ mod tests {
             "10-bit residual leaf must lift samples above the mid-level"
         );
         assert!((0..16).all(|j| (0..16).all(|i| pic.y[j * 32 + i] >= 512)));
-        // Residual-free leaves stay at the 10-bit mid-level.
-        assert!((0..16).all(|j| (16..32).all(|i| pic.y[j * 32 + i] == 512)));
+        // The residual-free leaves DC-predict from their causal
+        // neighbours (which include the first leaf's lifted samples at
+        // the eq. 1050 Qp′Y = QpY + 12 scale), so they sit at or above
+        // the mid-level rather than pinned to it.
+        assert!((0..16).all(|j| (16..32).all(|i| pic.y[j * 32 + i] >= 512)));
         assert!(pic.cb.iter().all(|&v| v == 512));
         assert!(pic.cr.iter().all(|&v| v == 512));
     }

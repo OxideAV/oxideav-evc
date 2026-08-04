@@ -869,6 +869,7 @@ impl EvcDecoder {
         };
         let decode = SliceDecodeInputs {
             slice_qp: slice_qp as i32,
+            sps_iqt_flag: sps.sps_iqt_flag,
             bit_depth_luma: sps.bit_depth_y(),
             bit_depth_chroma: sps.bit_depth_c(),
             enable_deblock: slice_deblocking_filter_flag,

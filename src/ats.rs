@@ -86,13 +86,20 @@ impl AtsIntra {
     /// kernels per [`crate::transform::inverse_transform_ats`]. Chroma is never ATS-coded
     /// (§8.7.4.1 passes `trType = 0` for `cIdx != 0`), so chroma callers
     /// use [`crate::transform::inverse_transform`] directly.
-    pub fn apply_inverse(self, coeffs: &mut [i32], n_tb_w: usize, n_tb_h: usize) -> Result<()> {
+    pub fn apply_inverse(
+        self,
+        coeffs: &mut [i32],
+        n_tb_w: usize,
+        n_tb_h: usize,
+        sps_iqt_flag: bool,
+    ) -> Result<()> {
         crate::transform::inverse_transform_ats(
             coeffs,
             n_tb_w,
             n_tb_h,
             self.tr_type_hor,
             self.tr_type_ver,
+            sps_iqt_flag,
         )
     }
 }
@@ -575,8 +582,10 @@ mod tests {
             a[0] = 5;
             a[n + 1] = -3;
             let mut b = a.clone();
-            crate::transform::inverse_transform(&mut a, n, n).unwrap();
-            AtsIntra::disabled().apply_inverse(&mut b, n, n).unwrap();
+            crate::transform::inverse_transform(&mut a, n, n, false).unwrap();
+            AtsIntra::disabled()
+                .apply_inverse(&mut b, n, n, false)
+                .unwrap();
             assert_eq!(a, b, "disabled apply_inverse must equal plain DCT for {n}");
         }
     }
@@ -617,7 +626,7 @@ mod tests {
             block[n + 1] = 2;
 
             let mut via_decision = block.clone();
-            ats.apply_inverse(&mut via_decision, n, n).unwrap();
+            ats.apply_inverse(&mut via_decision, n, n, false).unwrap();
 
             let mut via_direct = block.clone();
             crate::transform::inverse_transform_ats(
@@ -626,6 +635,7 @@ mod tests {
                 n,
                 ats.tr_type_hor,
                 ats.tr_type_ver,
+                false,
             )
             .unwrap();
 
@@ -637,7 +647,7 @@ mod tests {
             // DCT-II for this engaged decision (sanity that a non-DCT kernel
             // was selected, not silently falling back to trType 0).
             let mut plain = block.clone();
-            crate::transform::inverse_transform(&mut plain, n, n).unwrap();
+            crate::transform::inverse_transform(&mut plain, n, n, false).unwrap();
             assert_ne!(
                 via_decision, plain,
                 "engaged ATS at nTbS={n} should differ from plain DCT-II"

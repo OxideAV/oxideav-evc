@@ -1011,7 +1011,11 @@ mod tests {
                     assert!(psnr >= 46.0, "qp 4 PSNR {psnr:.2}");
                 }
                 if qp == 51 {
-                    assert!(bpp <= 4.0, "qp 51 bpp {bpp:.3}");
+                    // The §8.7.1 ChromaQpTable mapping caps the chroma
+                    // quantizer below the luma QP at the top of the
+                    // range (Table 5: qPi 51 → 44), so the floor rate
+                    // sits a little above the pre-mapping pin.
+                    assert!(bpp <= 4.5, "qp 51 bpp {bpp:.3}");
                 }
                 prev_psnr = psnr;
                 prev_len = stream.len();

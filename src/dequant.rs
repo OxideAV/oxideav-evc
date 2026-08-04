@@ -11,9 +11,40 @@ use oxideav_core::{Error, Result};
 
 use crate::transform::{inverse_transform, inverse_transform_ats};
 
-/// `levelScale` — eq. 1059. Round-3 only ships the `sps_iqt_flag = 0`
-/// list (the `sps_iqt_flag = 1` path swaps the trailing 71 for 72).
+/// `levelScale` — §8.7.3, the `sps_iqt_flag == 0` list.
 pub const LEVEL_SCALE_BASELINE: [i32; 6] = [40, 45, 51, 57, 64, 71];
+
+/// `levelScale` — §8.7.3, the `sps_iqt_flag == 1` list (the improved
+/// quantization swaps the trailing 71 for 72).
+pub const LEVEL_SCALE_IQT: [i32; 6] = [40, 45, 51, 57, 64, 72];
+
+/// §8.7.1 eq. 1043 — `Qp′Y = QpY + QpBdOffsetY` with
+/// `QpBdOffsetY = 6 * (BitDepthY − 8)`: the luma quantization parameter
+/// the §8.7.2 scaling consumes (eq. 1050).
+pub fn qp_prime_y(qp_y: i32, bit_depth_luma: u32) -> i32 {
+    qp_y + 6 * (bit_depth_luma as i32 - 8)
+}
+
+/// §8.7.1 eqs. 1044-1049 — the chroma quantization parameter `Qp′C` the
+/// §8.7.2 scaling consumes (eqs. 1051/1052): `qPi = Clip3(−QpBdOffsetC,
+/// 57, QpY + slice_c*_qp_offset)` mapped through `ChromaQpTable` (the
+/// spec-page-67 default Table 5 / Table 6 selected by `sps_iqt_flag` for
+/// 4:2:0 with `chroma_qp_table_present_flag == 0`) plus `QpBdOffsetC`.
+pub fn qp_prime_c(
+    qp_y: i32,
+    chroma_qp_offset: i32,
+    bit_depth_chroma: u32,
+    sps_iqt_flag: bool,
+) -> i32 {
+    let qp_bd_offset_c = 6 * (bit_depth_chroma as i32 - 8);
+    let qpi = (qp_y + chroma_qp_offset).clamp(-qp_bd_offset_c, 57);
+    let qp_c = if sps_iqt_flag {
+        crate::dra::table6_qp_c(qpi)
+    } else {
+        crate::dra::table5_qp_c(qpi)
+    };
+    qp_c + qp_bd_offset_c
+}
 
 /// Compute `bdShift` for the scaling process (eq. 1056 / 1057).
 /// `pub(crate)` so the encoder-side quantizer (`crate::quant_enc`)
@@ -54,9 +85,20 @@ pub fn scale_and_inverse_transform(
     n_tb_h: usize,
     qp: i32,
     bit_depth: u32,
+    sps_iqt_flag: bool,
 ) -> Result<()> {
     // trType 0/0 → the plain §8.7.4.3 DCT-II path.
-    scale_and_inverse_transform_typed(levels, dst, n_tb_w, n_tb_h, qp, bit_depth, 0, 0)
+    scale_and_inverse_transform_typed(
+        levels,
+        dst,
+        n_tb_w,
+        n_tb_h,
+        qp,
+        bit_depth,
+        0,
+        0,
+        sps_iqt_flag,
+    )
 }
 
 /// §8.7 scaling + **ATS-selected** inverse transform (§7.3.8.5 / Table 30):
@@ -75,6 +117,7 @@ pub fn scale_and_inverse_transform_ats(
     bit_depth: u32,
     tr_type_hor: u32,
     tr_type_ver: u32,
+    sps_iqt_flag: bool,
 ) -> Result<()> {
     scale_and_inverse_transform_typed(
         levels,
@@ -85,6 +128,7 @@ pub fn scale_and_inverse_transform_ats(
         bit_depth,
         tr_type_hor,
         tr_type_ver,
+        sps_iqt_flag,
     )
 }
 
@@ -102,6 +146,7 @@ fn scale_and_inverse_transform_typed(
     bit_depth: u32,
     tr_type_hor: u32,
     tr_type_ver: u32,
+    sps_iqt_flag: bool,
 ) -> Result<()> {
     if levels.len() != n_tb_w * n_tb_h || dst.len() != n_tb_w * n_tb_h {
         return Err(Error::invalid(format!(
@@ -113,15 +158,22 @@ fn scale_and_inverse_transform_typed(
             n_tb_w * n_tb_h
         )));
     }
-    if !(0..=63).contains(&qp) {
+    // qP is Qp′ (eqs. 1050-1052): QpY/QpC plus the bit-depth offset
+    // 6 * (BitDepth − 8), so the legal ceiling grows with depth
+    // (51 + 48 at the §7.4.3.1 16-bit maximum).
+    if !(0..=99).contains(&qp) {
         return Err(Error::invalid(format!(
-            "evc dequant: qp {qp} out of range [0,63]"
+            "evc dequant: qP {qp} out of range [0,99]"
         )));
     }
     // Step 1: scaling per §8.7.3 eq. 1059.
     let bd_shift = scaling_bd_shift(n_tb_w, n_tb_h, bit_depth);
     let rect = rect_norm(n_tb_w, n_tb_h);
-    let level_scale = LEVEL_SCALE_BASELINE[(qp % 6) as usize];
+    let level_scale = if sps_iqt_flag {
+        LEVEL_SCALE_IQT[(qp % 6) as usize]
+    } else {
+        LEVEL_SCALE_BASELINE[(qp % 6) as usize]
+    };
     let level_shift = qp / 6;
     let one_shl = 1i32 << (bd_shift - 1);
     let mut scaled = vec![0i32; n_tb_w * n_tb_h];
@@ -133,15 +185,29 @@ fn scale_and_inverse_transform_typed(
         let clipped = v.clamp(-32768, 32767) as i32;
         scaled[idx] = clipped;
     }
-    // Step 2: inverse transform (cascaded 1-D matrix mul, eq. 1062).
+    // Step 2: inverse transform (cascaded 1-D matrix mul, eq. 1062;
+    // the §8.7.4.1 step-2 eq. 1060/1061 intermediate rides inside).
     if tr_type_hor == 0 && tr_type_ver == 0 {
-        inverse_transform(&mut scaled, n_tb_w, n_tb_h)?;
+        inverse_transform(&mut scaled, n_tb_w, n_tb_h, sps_iqt_flag)?;
     } else {
-        inverse_transform_ats(&mut scaled, n_tb_w, n_tb_h, tr_type_hor, tr_type_ver)?;
+        inverse_transform_ats(
+            &mut scaled,
+            n_tb_w,
+            n_tb_h,
+            tr_type_hor,
+            tr_type_ver,
+            sps_iqt_flag,
+        )?;
     }
-    // Step 3: final renormalisation per eq. 1055. With sps_iqt_flag = 0:
-    //   bdShift_post = (20 - bitDepth) + 7
-    let bd_shift_post = (20 - bit_depth) + 7;
+    // Step 3: final renormalisation per eq. 1055 with the §8.7.2 step-3
+    // bdShift — eq. 1053 (`(20 − BitDepth) + 7`) under
+    // `sps_iqt_flag == 0`, eq. 1054 (`20 − BitDepth`) under `== 1` (the
+    // 7-bit renorm already happened at the eq. 1060 intermediate).
+    let bd_shift_post = if sps_iqt_flag {
+        20 - bit_depth
+    } else {
+        (20 - bit_depth) + 7
+    };
     let one_shl_post = 1i32 << (bd_shift_post - 1);
     for (out, &v) in dst.iter_mut().zip(scaled.iter()) {
         *out = (v + one_shl_post) >> bd_shift_post;
@@ -158,7 +224,7 @@ mod tests {
     fn zero_levels_produce_zero_residuals() {
         let levels = vec![0i32; 16];
         let mut dst = vec![0i32; 16];
-        scale_and_inverse_transform(&levels, &mut dst, 4, 4, 22, 8).unwrap();
+        scale_and_inverse_transform(&levels, &mut dst, 4, 4, 22, 8, false).unwrap();
         assert!(dst.iter().all(|&v| v == 0));
     }
 
@@ -191,8 +257,8 @@ mod tests {
     fn rejects_out_of_range_qp() {
         let levels = vec![0i32; 16];
         let mut dst = vec![0i32; 16];
-        let err = scale_and_inverse_transform(&levels, &mut dst, 4, 4, 64, 8).unwrap_err();
-        assert!(format!("{err}").contains("qp"));
+        let err = scale_and_inverse_transform(&levels, &mut dst, 4, 4, 100, 8, false).unwrap_err();
+        assert!(format!("{err}").contains("qP"));
     }
 
     /// Length mismatch produces Invalid.
@@ -200,7 +266,7 @@ mod tests {
     fn rejects_length_mismatch() {
         let levels = vec![0i32; 15];
         let mut dst = vec![0i32; 16];
-        let err = scale_and_inverse_transform(&levels, &mut dst, 4, 4, 22, 8).unwrap_err();
+        let err = scale_and_inverse_transform(&levels, &mut dst, 4, 4, 22, 8, false).unwrap_err();
         assert!(format!("{err}").contains("length"));
     }
 }

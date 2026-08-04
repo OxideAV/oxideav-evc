@@ -2017,7 +2017,7 @@ fn build_one_signalled_table(
 
 /// Table 5 (ISO/IEC 23094-1:2020(E) page 67) — `QpC` as a function of
 /// `qPi` when `sps_iqt_flag == 0`.
-fn table5_qp_c(qpi: i32) -> i32 {
+pub(crate) fn table5_qp_c(qpi: i32) -> i32 {
     // Tabulated entries for qPi ∈ [30, 57]. qPi < 30 ⇒ QpC = qPi.
     // qPi >= 58 is out-of-range per §8.9.8 (Clip3(−QpBdOffsetC, 57, ...))
     // but we tolerate it defensively by returning the qPi == 57 value.
@@ -2034,7 +2034,7 @@ fn table5_qp_c(qpi: i32) -> i32 {
 
 /// Table 6 (ISO/IEC 23094-1:2020(E) page 67) — `QpC` as a function of
 /// `qPi` when `sps_iqt_flag == 1`.
-fn table6_qp_c(qpi: i32) -> i32 {
+pub(crate) fn table6_qp_c(qpi: i32) -> i32 {
     // qPi < 30 ⇒ QpC = qPi. qPi > 43 ⇒ QpC = qPi − 3. Tabulated for
     // qPi ∈ [30, 43].
     if qpi < 30 {

@@ -65,7 +65,11 @@ pub fn forward_quantize(
     // error and fold the correction in. This squares the approximation
     // error away, leaving only the irreducible quantization rounding.
     let mut back = vec![0i32; n];
-    crate::dequant::scale_and_inverse_transform(levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth)?;
+    // The encoder's SPS always declares sps_iqt_flag = 0, so the
+    // inversion targets the eq. 1053/1061 chain.
+    crate::dequant::scale_and_inverse_transform(
+        levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth, false,
+    )?;
     let err: Vec<i32> = residual
         .iter()
         .zip(back.iter())
@@ -170,7 +174,7 @@ mod tests {
         let mut levels = vec![0i32; w * h];
         forward_quantize(residual, &mut levels, w, h, qp, 8).unwrap();
         let mut back = vec![0i32; w * h];
-        scale_and_inverse_transform(&levels, &mut back, w, h, qp, 8).unwrap();
+        scale_and_inverse_transform(&levels, &mut back, w, h, qp, 8, false).unwrap();
         residual
             .iter()
             .zip(back.iter())

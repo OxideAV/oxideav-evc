@@ -392,9 +392,14 @@ fn decide_leaf(
     let src_y = gather_block(&ctx.src.y, ctx.src.y_stride(), x0, y0, w, h);
     let mut best: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
     let mut best_cost = f64::INFINITY;
+    // §8.7.1: quantization runs at qP = Qp′ (eqs. 1050-1052) — the
+    // luma bit-depth offset and the chroma ChromaQpTable mapping (the
+    // encoder's SPS declares sps_iqt_flag = 0 and zero chroma offsets).
+    let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
+    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
     for (mode_idx, &mode) in MODES.iter().enumerate() {
         let (levels, cbf, res, dist) =
-            quantize_block(&refs, mode, &src_y, w, h, ctx.qp, bd, max_val)?;
+            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val)?;
         let bits = (mode_idx + 1) as f64 + 1.0 + rle_bits_estimate(&levels, cbf);
         let cost = dist + ctx.lambda * bits;
         if cost < best_cost {
@@ -427,7 +432,7 @@ fn decide_leaf(
         let refs_c = ctx.recon.fetch_intra_refs(x0 >> 1, y0 >> 1, wc, hc, c_idx);
         let src_c = gather_block(plane, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
         let (levels, cbf, res, dist) =
-            quantize_block(&refs_c, IntraMode::Dc, &src_c, wc, hc, ctx.qp, bd, max_val)?;
+            quantize_block(&refs_c, IntraMode::Dc, &src_c, wc, hc, qp_c, bd, max_val)?;
         let bits = 1.0 + rle_bits_estimate(&levels, cbf);
         cost += dist + ctx.lambda * bits;
         intra_reconstruct_cb_in_tile(
@@ -487,7 +492,7 @@ pub(crate) fn quantize_block(
     let cbf = forward_quantize(&diff, &mut levels, w, h, qp, bit_depth)?;
     let mut res = vec![0i32; n];
     if cbf {
-        scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth)?;
+        scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth, false)?;
     }
     let mut dist = 0f64;
     for i in 0..n {
@@ -799,6 +804,7 @@ mod tests {
     fn decode_inputs(qp: i32) -> SliceDecodeInputs {
         SliceDecodeInputs {
             slice_qp: qp,
+            sps_iqt_flag: false,
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             enable_deblock: false,

@@ -1780,6 +1780,11 @@ pub struct SliceDecodeInputs {
     /// `log2MaxIbcCandSize` (eq. 70). Only consulted when
     /// `sps_ibc_flag` is true.
     pub log2_max_ibc_cand_size: u32,
+    /// `sps_iqt_flag` (§7.4.3.1): selects the improved quantization and
+    /// transform — the §8.7.3 levelScale tail (72), the §8.7.4.1
+    /// eq. 1060 intermediate renorm, the §8.7.2 eq. 1054 final shift,
+    /// and the Table 6 default ChromaQpTable.
+    pub sps_iqt_flag: bool,
     /// `sps_htdf_flag` (§7.4.3.1): when true the §8.7.6 Hadamard
     /// Transform Domain Filter runs on each qualifying luma coding
     /// block right after its reconstruction — unconditionally on intra
@@ -1803,6 +1808,7 @@ impl Default for SliceDecodeInputs {
             slice_cr_qp_offset: 0,
             sps_ibc_flag: false,
             log2_max_ibc_cand_size: 0,
+            sps_iqt_flag: false,
             sps_htdf_flag: false,
         }
     }
@@ -3080,8 +3086,9 @@ fn apply_ibc_branch_predict_and_reconstruct(
             &mut residual_y,
             n_cb_w_l,
             n_cb_h_l,
-            cu_qp,
+            crate::dequant::qp_prime_y(cu_qp, decode.bit_depth_luma),
             decode.bit_depth_luma,
+            decode.sps_iqt_flag,
         )?;
     }
     for (p, r) in pred_y.iter_mut().zip(residual_y.iter()) {
@@ -3258,10 +3265,11 @@ fn decode_transform_unit(
                 &mut tu_res,
                 1usize << log2_tb_width,
                 1usize << log2_tb_height,
-                cu_qp,
+                crate::dequant::qp_prime_y(cu_qp, decode.bit_depth_luma),
                 decode.bit_depth_luma,
                 ats_intra.tr_type_hor,
                 ats_intra.tr_type_ver,
+                decode.sps_iqt_flag,
             )?;
             scatter_tb_residual(
                 &mut res_y,
@@ -3298,8 +3306,14 @@ fn decode_transform_unit(
                     &mut tu_res,
                     1usize << log2_c_w,
                     1usize << log2_c_h,
-                    cu_qp,
+                    crate::dequant::qp_prime_c(
+                        cu_qp,
+                        decode.slice_cb_qp_offset,
+                        decode.bit_depth_chroma,
+                        decode.sps_iqt_flag,
+                    ),
                     decode.bit_depth_chroma,
+                    decode.sps_iqt_flag,
                 )?;
                 scatter_tb_residual(
                     &mut res_cb,
@@ -3330,8 +3344,14 @@ fn decode_transform_unit(
                     &mut tu_res,
                     1usize << log2_c_w,
                     1usize << log2_c_h,
-                    cu_qp,
+                    crate::dequant::qp_prime_c(
+                        cu_qp,
+                        decode.slice_cr_qp_offset,
+                        decode.bit_depth_chroma,
+                        decode.sps_iqt_flag,
+                    ),
                     decode.bit_depth_chroma,
+                    decode.sps_iqt_flag,
                 )?;
                 scatter_tb_residual(
                     &mut res_cr,
@@ -6298,10 +6318,11 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                 &mut sb_res,
                 1usize << sb_lw,
                 1usize << sb_lh,
-                cu_qp,
+                crate::dequant::qp_prime_y(cu_qp, inputs.decode.bit_depth_luma),
                 inputs.decode.bit_depth_luma,
                 tr_hor,
                 tr_ver,
+                inputs.decode.sps_iqt_flag,
             )?;
             let tb_res = if ats_inter.used {
                 scatter_subblock(
@@ -6366,13 +6387,24 @@ fn decode_inter_cu_residual_and_reconstruct_motion(
                     sb_ch,
                 )?;
                 let mut sb_res = vec![0i32; sb_c_n];
+                let c_off = if c_idx == 1 {
+                    inputs.decode.slice_cb_qp_offset
+                } else {
+                    inputs.decode.slice_cr_qp_offset
+                };
                 scale_and_inverse_transform(
                     &levels,
                     &mut sb_res,
                     1usize << sb_cw,
                     1usize << sb_ch,
-                    cu_qp,
+                    crate::dequant::qp_prime_c(
+                        cu_qp,
+                        c_off,
+                        inputs.decode.bit_depth_chroma,
+                        inputs.decode.sps_iqt_flag,
+                    ),
                     inputs.decode.bit_depth_chroma,
+                    inputs.decode.sps_iqt_flag,
                 )?;
                 let tb_res = if ats_inter.used {
                     scatter_subblock(
@@ -7583,10 +7615,11 @@ fn decode_inter_intra_cu(
                     &mut tu_res,
                     1usize << log2_tb_w,
                     1usize << log2_tb_h,
-                    cu_qp,
+                    crate::dequant::qp_prime_y(cu_qp, decode.bit_depth_luma),
                     decode.bit_depth_luma,
                     ats_intra.tr_type_hor,
                     ats_intra.tr_type_ver,
+                    decode.sps_iqt_flag,
                 )?;
                 scatter_tb_residual(
                     &mut res_y,
@@ -7621,13 +7654,24 @@ fn decode_inter_intra_cu(
                     log2_c_h,
                 )?;
                 let mut tu_res = vec![0i32; n_c];
+                let c_off = if c_idx == 1 {
+                    decode.slice_cb_qp_offset
+                } else {
+                    decode.slice_cr_qp_offset
+                };
                 scale_and_inverse_transform(
                     &levels,
                     &mut tu_res,
                     1usize << log2_c_w,
                     1usize << log2_c_h,
-                    cu_qp,
+                    crate::dequant::qp_prime_c(
+                        cu_qp,
+                        c_off,
+                        decode.bit_depth_chroma,
+                        decode.sps_iqt_flag,
+                    ),
                     decode.bit_depth_chroma,
+                    decode.sps_iqt_flag,
                 )?;
                 scatter_tb_residual(
                     dst,
@@ -8052,8 +8096,9 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
             &mut residual_y,
             n_cb_w_l,
             n_cb_h_l,
-            cu_qp,
+            crate::dequant::qp_prime_y(cu_qp, decode.bit_depth_luma),
             decode.bit_depth_luma,
+            decode.sps_iqt_flag,
         )?;
     }
     for (p, r) in pred_y.iter_mut().zip(residual_y.iter()) {
@@ -8075,8 +8120,14 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
                 &mut residual_cb,
                 n_c_w,
                 n_c_h,
-                cu_qp,
+                crate::dequant::qp_prime_c(
+                    cu_qp,
+                    decode.slice_cb_qp_offset,
+                    decode.bit_depth_chroma,
+                    decode.sps_iqt_flag,
+                ),
                 decode.bit_depth_chroma,
+                decode.sps_iqt_flag,
             )?;
         }
         if cbf_cr != 0 {
@@ -8091,8 +8142,14 @@ fn apply_inter_ibc_branch_predict_and_reconstruct(
                 &mut residual_cr,
                 n_c_w,
                 n_c_h,
-                cu_qp,
+                crate::dequant::qp_prime_c(
+                    cu_qp,
+                    decode.slice_cr_qp_offset,
+                    decode.bit_depth_chroma,
+                    decode.sps_iqt_flag,
+                ),
                 decode.bit_depth_chroma,
+                decode.sps_iqt_flag,
             )?;
         }
         for (p, r) in pred_cb.iter_mut().zip(residual_cb.iter()) {
@@ -9794,18 +9851,31 @@ mod tests {
         ];
         let mut dct2 = vec![0i32; 16];
         let mut ats = vec![0i32; 16];
-        crate::dequant::scale_and_inverse_transform(&levels, &mut dct2, 4, 4, 30, 8).unwrap();
-        // trTypeHor = 2 (DCT-VIII), trTypeVer = 1 (DST-VII).
-        crate::dequant::scale_and_inverse_transform_ats(&levels, &mut ats, 4, 4, 30, 8, 2, 1)
+        crate::dequant::scale_and_inverse_transform(&levels, &mut dct2, 4, 4, 30, 8, false)
             .unwrap();
+        // trTypeHor = 2 (DCT-VIII), trTypeVer = 1 (DST-VII).
+        crate::dequant::scale_and_inverse_transform_ats(
+            &levels, &mut ats, 4, 4, 30, 8, 2, 1, false,
+        )
+        .unwrap();
         assert_ne!(
             dct2, ats,
             "ATS kernel selection must alter the residual vs DCT-II"
         );
         // trType (0, 0) must be byte-for-byte the DCT-II path.
         let mut ats_zero = vec![0i32; 16];
-        crate::dequant::scale_and_inverse_transform_ats(&levels, &mut ats_zero, 4, 4, 30, 8, 0, 0)
-            .unwrap();
+        crate::dequant::scale_and_inverse_transform_ats(
+            &levels,
+            &mut ats_zero,
+            4,
+            4,
+            30,
+            8,
+            0,
+            0,
+            false,
+        )
+        .unwrap();
         assert_eq!(dct2, ats_zero, "trType (0,0) must equal DCT-II");
     }
 
