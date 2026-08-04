@@ -387,11 +387,13 @@ lifted from the decoder gates:
   `numSmaller`, the §9.3.4.2.4 eq. 1438 neighbour sums
   (cu_skip/pred_mode/ibc/affine), the §9.3.4.2.2 `PrevLevel` chain on
   the RLE residual, the Table-95-exact `ref_idx` (regular 0/1 then
-  bypass) and `abs_mvd` (regular bin0 EG0) reads are all in. Under
-  `sps_cm_init_flag == 0` the crate keeps its historical single-`(0,0)`
-  collapse (initial probabilities identical; only adaptation
-  trajectories merge — no conformance stream exists in docs/ to
-  arbitrate the spec-literal shared-`ctxTable 0` alternative).
+  bypass) and `abs_mvd` (regular bin0 EG0) reads are all in. As of
+  round 437 the `sps_cm_init_flag == 0` shape follows §9.3.4.2.1
+  literally: every element decodes on the **shared ctxTable 0** at
+  `ctxIdx = ctxInc + ctxIdxOffset` with the Table-95 cm-init-0 ctxInc
+  rows and the Table-39 cm-init-0 initType offsets (the historical
+  collapse-to-`(0,0)` — one adapting context for everything — was
+  arbitrated wrong by the ISO/IEC 23094-4 conformance corpus).
 * **DQUANT (`sps_dquant_flag == 1`)** — the §7.3.8.3 `cuQpDeltaCode`
   marks thread the split recursion, the §7.3.8.5 two-arm presence gate
   (code-1 cbf-gated, code-2 once-per-area even cbf-less) drives the
