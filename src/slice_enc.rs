@@ -620,7 +620,7 @@ fn emit_split_unit(
     let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
     let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
     // Table 41, ctxInc 0 (Table 95) — the decoder's `resolve_split_unit`
-    // routing; the Baseline shape keeps the legacy (0, 0) collapse.
+    // routing; the Baseline shape lands on the shared ctxTable 0.
     let (split_t, split_i) = sel.ctx(MainCtxTable::SplitCuFlag, 0);
     match node {
         Node::Split(children) => {
@@ -648,14 +648,16 @@ fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, 
     // Table 95 ctxInc (bin0 → 0, later bins → 1) under `cm_init`; all
     // bins on (0, 0) under the Baseline collapse. The decoder reads it
     // via `decode_u_regular` (63-bin compat cap).
-    if sel.cm_init {
+    {
         let table = MainCtxTable::IntraPredMode;
-        let off = table.ctx_idx_offset(sel.init_type);
-        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, table.as_usize(), |bin_idx| {
+        let (t, off) = if sel.cm_init {
+            (table.as_usize(), table.ctx_idx_offset(sel.init_type))
+        } else {
+            (0, table.cm0_ctx_idx_offset(sel.init_type))
+        };
+        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, t, |bin_idx| {
             off + (bin_idx as usize).min(1)
         });
-    } else {
-        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, 0, |_| 0);
     }
     // transform_unit(), DUAL_TREE_LUMA: cbf_luma only (Table 75,
     // ctxInc 0).
@@ -730,8 +732,18 @@ pub(crate) fn emit_residual_rle(
                 lv_off + ctx_inc_coeff_zero_run(bin_idx, c_idx, prev_level)
             });
         } else {
-            enc.encode_u_regular_capped(zero_run, zero_run_c_max, 0, |_| 0);
-            enc.encode_u_regular_capped(lvl_minus1, 32767, 0, |_| 0);
+            // Table 95, sps_cm_init_flag == 0 rows: bin 0 is
+            // `cIdx == 0 ? 0 : 2`, later bins `cIdx == 0 ? 1 : 3`, on
+            // the shared ctxTable 0 at each element's Table-39 offset.
+            let chroma = if c_idx == 0 { 0 } else { 2 };
+            let zr_off = MainCtxTable::CoeffZeroRun.cm0_ctx_idx_offset(sel.init_type);
+            enc.encode_u_regular_capped(zero_run, zero_run_c_max, 0, |bin_idx| {
+                zr_off + chroma + (bin_idx.min(1) as usize)
+            });
+            let lv_off = MainCtxTable::CoeffAbsLevelMinus1.cm0_ctx_idx_offset(sel.init_type);
+            enc.encode_u_regular_capped(lvl_minus1, 32767, 0, |bin_idx| {
+                lv_off + chroma + (bin_idx.min(1) as usize)
+            });
         }
         enc.encode_bypass(u8::from(level < 0));
         if scan_pos < total - 1 {

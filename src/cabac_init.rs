@@ -534,6 +534,37 @@ impl MainCtxTable {
         self.init_type_range(init_type).0
     }
 
+    /// Table 39, `sps_cm_init_flag == 0` column — the lowest ctxIdx for
+    /// this element at the given initType. Per §9.3.4.2.1 this is the
+    /// `ctxIdxOffset` added to the Table-95 `cm_init == 0` ctxInc on the
+    /// shared **ctxTable 0**. For initType 0 every element's column
+    /// starts at 0; for initType 1 it starts past the element's
+    /// initType-0 range (a per-element constant transcribed from the
+    /// printed table — note `last_sig_coeff_*_prefix`, `sig_coeff_flag`
+    /// and the greaterA/B flags print a lowest of 1 even though their
+    /// Table-95 ctxInc rules span more than one variable; the spec text
+    /// says "the lowest value of ctxIdx in Table 39", so the printed
+    /// lowest is what offsets them).
+    pub const fn cm0_ctx_idx_offset(self, init_type: InitType) -> usize {
+        match init_type {
+            InitType::I => 0,
+            InitType::Pb => match self {
+                Self::MvpIdx | Self::MmvdMergeIdx => 3,
+                Self::MergeIdx | Self::AffineMergeIdx => 5,
+                Self::MmvdGroupIdx
+                | Self::MmvdDirectionIdx
+                | Self::IntraPredMode
+                | Self::InterPredIdc
+                | Self::BiPredIdx
+                | Self::RefIdx
+                | Self::CoeffLastFlag => 2,
+                Self::MmvdDistanceIdx => 7,
+                Self::AmvrIdx | Self::CoeffZeroRun | Self::CoeffAbsLevelMinus1 => 4,
+                _ => 1,
+            },
+        }
+    }
+
     pub fn init_type_range(self, init_type: InitType) -> (usize, usize) {
         let len = self.init_values().len();
         // Most tables split exactly in half. Three special-cases:
@@ -616,15 +647,22 @@ pub fn init_main_profile_contexts(
 /// exactly that ctxIdx range from the printed initValue lists, so the
 /// decode-side offset and the init-side range always agree.
 ///
-/// Under `sps_cm_init_flag == 0` the selector preserves the crate's
-/// established Baseline collapse: [`CtxSel::ctx`] routes to the single
-/// `(0, 0)` slot (the historical Baseline-walker convention every
-/// existing fixture encodes against), while [`CtxSel::tree_ctx`] keeps
-/// the §7.3.8.3 tree elements on their per-element table at ctxIdx 0
-/// (the round-391 convention). Both conventions initialise every
-/// context to the same §9.3.2.2 case-1 default `(256, 0)`, so the
-/// collapse only merges *adaptation trajectories*, never initial
-/// probabilities.
+/// Under `sps_cm_init_flag == 0` §9.3.4.2.1 sets **`ctxTable = 0`
+/// for every element** — one shared context space — with
+/// `ctxIdx = ctxInc + ctxIdxOffset` where the ctxInc comes from the
+/// Table-95 "When sps_cm_init_flag == 0" rows (mostly 0; a handful of
+/// elements keep a reduced multi-context rule) and the ctxIdxOffset is
+/// the lowest ctxIdx of the Table-39 `sps_cm_init_flag == 0` column for
+/// the slice's initType ([`MainCtxTable::cm0_ctx_idx_offset`]: 0 for
+/// initType 0, a small per-element constant for initType 1). Distinct
+/// syntax elements therefore **share** ctxTable-0 variables whenever
+/// their ranges overlap — that sharing is normative, arbitrated against
+/// the ISO/IEC 23094-4 conformance streams (the pre-round-437 crate
+/// collapsed every element to a single `(0, 0)` slot instead, which
+/// self-round-trips but mis-decodes every conformant stream).
+///
+/// Every ctxTable-0 variable initialises to the §9.3.2.2 case-1 default
+/// `(256, 0)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CtxSel {
     /// `sps_cm_init_flag` (§7.4.3.1).
@@ -645,33 +683,32 @@ impl CtxSel {
         Self::new(false, InitType::I)
     }
 
-    /// `(ctxTable, ctxIdx)` for a syntax element whose Baseline
-    /// (`sps_cm_init_flag == 0`) bins collapse to the legacy `(0, 0)`
-    /// slot.
+    /// `(ctxTable, ctxIdx)` for a syntax element whose Table-95 ctxInc
+    /// rule is the **same under both entropy shapes** (the plain-binIdx
+    /// and cIdx-selected elements: mvp/merge/mmvd/amvr indices,
+    /// `intra_pred_mode`, `inter_pred_idc`, `bi_pred_idx`, `ref_idx`,
+    /// `abs_mvd`, `coeff_last_flag`, every single-context flag, …).
     #[inline]
     pub fn ctx(self, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
-        if self.cm_init {
-            (
-                table.as_usize(),
-                table.ctx_idx_offset(self.init_type) + ctx_inc,
-            )
-        } else {
-            (0, 0)
-        }
+        self.ctx_shaped(table, ctx_inc, ctx_inc)
     }
 
-    /// `(ctxTable, ctxIdx)` for a §7.3.8.3 tree element that the crate
-    /// keeps on its per-element table (at ctxIdx 0) even under
-    /// `sps_cm_init_flag == 0` — the round-391 `split_unit()` convention.
+    /// `(ctxTable, ctxIdx)` for a syntax element whose Table-95 ctxInc
+    /// rule **differs by entropy shape** (`btt_split_flag`/`dir`,
+    /// `split_unit_coding_order_flag`, the §9.3.4.2.4
+    /// neighbour-derived flags, the RLE run/level pair, the ADCC
+    /// last-position prefixes / significance / greaterA-B flags):
+    /// `cm1_inc` is the `sps_cm_init_flag == 1` derivation, `cm0_inc`
+    /// the `== 0` row.
     #[inline]
-    pub fn tree_ctx(self, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
+    pub fn ctx_shaped(self, table: MainCtxTable, cm1_inc: usize, cm0_inc: usize) -> (usize, usize) {
         if self.cm_init {
             (
                 table.as_usize(),
-                table.ctx_idx_offset(self.init_type) + ctx_inc,
+                table.ctx_idx_offset(self.init_type) + cm1_inc,
             )
         } else {
-            (table.as_usize(), 0)
+            (0, table.cm0_ctx_idx_offset(self.init_type) + cm0_inc)
         }
     }
 }

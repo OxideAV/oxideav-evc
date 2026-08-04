@@ -120,14 +120,13 @@ pub struct AffineSyntaxStats {
     pub mvd_flag_bins: u32,
 }
 
-/// `(ctxTable, ctxIdx)` for a single-context Main-profile table, with the
-/// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
+/// `(ctxTable, ctxIdx)` for an affine element whose Table-95
+/// `sps_cm_init_flag == 0` row is the single ctxInc 0 (`affine_flag`
+/// drops its §9.3.4.2.4 neighbour ctxInc under the shared-ctxTable-0
+/// Baseline shape; the mode/mvp/mvd flags are single-context in both
+/// shapes).
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
-    if ctx.is_cm_init() {
-        (table.as_usize(), ctx.offset(table) + ctx_inc)
-    } else {
-        (0, 0)
-    }
+    ctx.resolve(table, ctx_inc, 0)
 }
 
 /// §7.3.8.4 + Table 95/96 — read `affine_flag` (FL cMax = 1) with the
@@ -151,19 +150,15 @@ pub fn read_affine_merge_idx(
     ctx: EipdCtx,
     stats: &mut AffineSyntaxStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::AffineMergeIdx.as_usize();
+    // Table 95: per-bin ctxInc = binIdx under both entropy shapes.
+    let table = ctx.table(MainCtxTable::AffineMergeIdx);
     let off = ctx.offset(MainCtxTable::AffineMergeIdx);
     // Count the bins consumed so the stats reflect the actual prefix
     // length; decode_tr_regular's ctxInc closure is invoked once per bin.
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(5, 0, if cm_init { table } else { 0 }, |bin_idx| {
+    let v = eng.decode_tr_regular(5, 0, table, |bin_idx| {
         bins += 1;
-        if cm_init {
-            off + bin_idx as usize
-        } else {
-            0
-        }
+        off + bin_idx as usize
     })?;
     stats.merge_idx_bins += bins;
     Ok(v)
@@ -284,6 +279,17 @@ mod tests {
     use super::*;
     use crate::cabac::CabacEncoder;
 
+    /// Encode `(ctxIdx, bin)` pairs on the shared ctxTable 0 (the
+    /// baseline §9.3.4.2.1 mapping), terminate, and return the RBSP.
+    fn regular_bins_ctx(bins: &[(usize, u8)]) -> Vec<u8> {
+        let mut enc = CabacEncoder::new();
+        for &(idx, b) in bins {
+            enc.encode_decision(0, idx, b);
+        }
+        enc.encode_terminate(true);
+        enc.finish()
+    }
+
     fn regular_bins(bins: &[u8]) -> Vec<u8> {
         let mut enc = CabacEncoder::new();
         for &b in bins {
@@ -393,7 +399,8 @@ mod tests {
     /// 0 once the prefix is full).
     #[test]
     fn read_merge_idx_saturates() {
-        let bs = regular_bins(&[1, 1, 1, 1, 1]);
+        // Per-bin ctxIdx = binIdx on the shared ctxTable 0 (baseline).
+        let bs = regular_bins_ctx(&[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)]);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = AffineSyntaxStats::default();
         let v = read_affine_merge_idx(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
@@ -404,7 +411,7 @@ mod tests {
     /// Merge branch of the full group: only affine_merge_idx is read.
     #[test]
     fn group_merge_branch() {
-        let bs = regular_bins(&[1, 0]); // merge_idx = 1 (TR: "1 0")
+        let bs = regular_bins_ctx(&[(0, 1), (1, 0)]); // merge_idx = 1 (TR: "1 0")
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = AffineSyntaxStats::default();
         let d = read_affine_group(&mut eng, EipdCtx::new(false), true, true, false, &mut stats)

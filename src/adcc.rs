@@ -130,9 +130,17 @@ fn decode_last_sig_coord(
             off + ctx_inc_last_sig_coeff_prefix(bin_idx, c_idx, log2_trafo_size, chroma_array_type)
         })?
     } else {
-        eng.decode_tr_regular(c_max, 0, 0, |_| {
+        // Table 95, sps_cm_init_flag == 0 row: ctxInc = binIdx for luma,
+        // 11 + binIdx for chroma, on the shared ctxTable 0 at the
+        // element's Table-39 offset.
+        let off = table.cm0_ctx_idx_offset(sel.init_type);
+        eng.decode_tr_regular(c_max, 0, 0, |bin_idx| {
             bins += 1;
-            0
+            off + if c_idx == 0 {
+                bin_idx as usize
+            } else {
+                11 + bin_idx as usize
+            }
         })?
     };
     stats.last_sig_prefix_bins += bins;
@@ -257,18 +265,19 @@ pub(crate) fn decode_residual_coding_adv(
             let sig = if i_pos as usize != scan_pos_last {
                 // Table 89 / §9.3.4.2.7 stencil over the already-decoded
                 // significance map.
-                let (t, i) = if sel.cm_init {
+                // Table 95: the sps_cm_init_flag == 0 row is
+                // `cIdx == 0 ? 0 : 1` (no stencil).
+                let cm1_inc = if sel.cm_init {
                     let num_flags =
                         stencil_sum(levels, xc, yc, log2_tb_width, log2_tb_height, |v| {
                             (v != 0) as u32
                         });
-                    sel.ctx(
-                        MainCtxTable::SigCoeffFlag,
-                        ctx_inc_sig_coeff_flag(c_idx, xc, yc, num_flags),
-                    )
+                    ctx_inc_sig_coeff_flag(c_idx, xc, yc, num_flags)
                 } else {
-                    (0, 0)
+                    0
                 };
+                let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+                let (t, i) = sel.ctx_shaped(MainCtxTable::SigCoeffFlag, cm1_inc, cm0_inc);
                 let bin = eng.decode_decision(t, i)?;
                 stats.sig_coeff_bins += 1;
                 bin != 0
@@ -290,17 +299,18 @@ pub(crate) fn decode_residual_coding_adv(
         let num_c1 = num_nz.min(8);
         for (n, &(blk_pos, xc, yc)) in nz.iter().enumerate().take(num_c1) {
             let is_last = n == 0 && cg_idx as usize == last_coef_group;
-            let (t, i) = if sel.cm_init {
+            // Table 95: the sps_cm_init_flag == 0 row is
+            // `cIdx == 0 ? 0 : 1`.
+            let cm1_inc = if sel.cm_init {
                 let num_flags = stencil_sum(levels, xc, yc, log2_tb_width, log2_tb_height, |v| {
                     (v.unsigned_abs() > 1) as u32
                 });
-                sel.ctx(
-                    MainCtxTable::CoeffAbsLevelGreaterFlag,
-                    ctx_inc_coeff_abs_level_greater_a(c_idx, xc, yc, is_last, num_flags),
-                )
+                ctx_inc_coeff_abs_level_greater_a(c_idx, xc, yc, is_last, num_flags)
             } else {
-                (0, 0)
+                0
             };
+            let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, i) = sel.ctx_shaped(MainCtxTable::CoeffAbsLevelGreaterFlag, cm1_inc, cm0_inc);
             let flag = eng.decode_decision(t, i)?;
             stats.greater_a_bins += 1;
             levels[blk_pos] += flag as i32;
@@ -316,17 +326,18 @@ pub(crate) fn decode_residual_coding_adv(
         if let Some(n) = last_greater_a {
             let (blk_pos, xc, yc) = nz[n];
             let is_last = n == 0 && cg_idx as usize == last_coef_group;
-            let (t, i) = if sel.cm_init {
+            // Table 95: the sps_cm_init_flag == 0 row is
+            // `cIdx == 0 ? 0 : 1`.
+            let cm1_inc = if sel.cm_init {
                 let num_flags = stencil_sum(levels, xc, yc, log2_tb_width, log2_tb_height, |v| {
                     (v.unsigned_abs() > 2) as u32
                 });
-                sel.ctx(
-                    MainCtxTable::CoeffAbsLevelGreaterFlag,
-                    ctx_inc_coeff_abs_level_greater_b(c_idx, xc, yc, is_last, num_flags),
-                )
+                ctx_inc_coeff_abs_level_greater_b(c_idx, xc, yc, is_last, num_flags)
             } else {
-                (0, 0)
+                0
             };
+            let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, i) = sel.ctx_shaped(MainCtxTable::CoeffAbsLevelGreaterFlag, cm1_inc, cm0_inc);
             let flag = eng.decode_decision(t, i)?;
             stats.greater_b_bins += 1;
             levels[blk_pos] += flag as i32;
@@ -485,11 +496,12 @@ mod tests {
     #[test]
     fn adcc_last_sig_suffix_composition() {
         let mut enc = CabacEncoder::new();
-        // x_prefix = 4 → TR "11110" (cMax = 5 on log2 3).
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 1);
+        // x_prefix = 4 → TR "11110" (cMax = 5 on log2 3); baseline
+        // per-bin ctxIdx = binIdx for luma (Table 95, cm_init == 0 row).
+        for b in 0..4 {
+            enc.encode_decision(0, b, 1);
         }
-        enc.encode_decision(0, 0, 0);
+        enc.encode_decision(0, 4, 0);
         enc.encode_bypass(1); // x_suffix = 1 (1 bin)
                               // y_prefix = 0.
         enc.encode_decision(0, 0, 0);
@@ -541,17 +553,18 @@ mod tests {
         let mut enc = CabacEncoder::new();
         // last_x = 12: x_prefix = 7 (TR "1111111", cMax = 7 on log2 4, no
         // terminator), 2-bin x_suffix "00" → (1 << 2)·(2 + 1) + 0 = 12.
-        for _ in 0..7 {
-            enc.encode_decision(0, 0, 1);
+        // Baseline per-bin ctxIdx = binIdx for luma.
+        for b in 0..7 {
+            enc.encode_decision(0, b, 1);
         }
         enc.encode_bypass(0);
         enc.encode_bypass(0);
         // last_y = 5: y_prefix = 4 (TR "11110"), 1-bin y_suffix "1" →
         // (1 << 1)·(2 + 0) + 1 = 5.
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 1);
+        for b in 0..4 {
+            enc.encode_decision(0, b, 1);
         }
-        enc.encode_decision(0, 0, 0);
+        enc.encode_decision(0, 4, 0);
         enc.encode_bypass(1);
         // Single non-zero coefficient at (12, 5): the reverse sig walk reads
         // a 0 for every non-last scan position below scanPosLast.

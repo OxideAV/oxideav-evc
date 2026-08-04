@@ -52,14 +52,10 @@ pub struct InterModeGateStats {
     pub bi_pred_idx_bins: u32,
 }
 
-/// `(ctxTable, ctxIdx)` for a single-context Main-profile table, with the
-/// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
+/// `(ctxTable, ctxIdx)` for a single-context element (identical
+/// Table-95 ctxInc rule under both entropy shapes).
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
-    if ctx.is_cm_init() {
-        (table.as_usize(), ctx.offset(table) + ctx_inc)
-    } else {
-        (0, 0)
-    }
+    ctx.resolve_same(table, ctx_inc)
 }
 
 /// §7.3.8.4 + Table 67 — read `amvr_idx` (TR cMax=4, per-bin ctxInc
@@ -73,23 +69,14 @@ pub fn read_amvr_idx(
     ctx: EipdCtx,
     stats: &mut InterModeGateStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::AmvrIdx.as_usize();
+    // Table 95: per-bin ctxInc rule is the same under both entropy shapes.
+    let table = ctx.table(MainCtxTable::AmvrIdx);
     let off = ctx.offset(MainCtxTable::AmvrIdx);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(
-        AMVR_IDX_MAX,
-        0,
-        if cm_init { table } else { 0 },
-        |bin_idx| {
-            bins += 1;
-            if cm_init {
-                off + amvr_idx_ctx_inc(bin_idx).unwrap_or(0)
-            } else {
-                0
-            }
-        },
-    )?;
+    let v = eng.decode_tr_regular(AMVR_IDX_MAX, 0, table, |bin_idx| {
+        bins += 1;
+        off + amvr_idx_ctx_inc(bin_idx).unwrap_or(0)
+    })?;
     stats.amvr_idx_bins += bins;
     Ok(v)
 }
@@ -142,18 +129,13 @@ pub fn read_merge_idx(
     n_cb_h: u32,
     stats: &mut InterModeGateStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::MergeIdx.as_usize();
+    let table = ctx.table(MainCtxTable::MergeIdx);
     let off = ctx.offset(MainCtxTable::MergeIdx);
     let c_max = merge_idx_c_max(n_cb_w, n_cb_h);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
+    let v = eng.decode_tr_regular(c_max, 0, table, |bin_idx| {
         bins += 1;
-        if cm_init {
-            off + merge_idx_ctx_inc(bin_idx).unwrap_or(0)
-        } else {
-            0
-        }
+        off + merge_idx_ctx_inc(bin_idx).unwrap_or(0)
     })?;
     stats.merge_idx_bins += bins;
     Ok(v)
@@ -174,18 +156,13 @@ pub fn read_inter_pred_idc(
     n_cb_h: u32,
     stats: &mut InterModeGateStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::InterPredIdc.as_usize();
+    let table = ctx.table(MainCtxTable::InterPredIdc);
     let off = ctx.offset(MainCtxTable::InterPredIdc);
     let c_max = inter_pred_idc_c_max(sps_admvp_flag, n_cb_w, n_cb_h);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(c_max, 0, if cm_init { table } else { 0 }, |bin_idx| {
+    let v = eng.decode_tr_regular(c_max, 0, table, |bin_idx| {
         bins += 1;
-        if cm_init {
-            off + inter_pred_idc_ctx_inc(bin_idx).unwrap_or(0)
-        } else {
-            0
-        }
+        off + inter_pred_idc_ctx_inc(bin_idx).unwrap_or(0)
     })?;
     stats.inter_pred_idc_bins += bins;
     Ok(v)
@@ -204,23 +181,13 @@ pub fn read_bi_pred_idx(
     ctx: EipdCtx,
     stats: &mut InterModeGateStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::BiPredIdx.as_usize();
+    let table = ctx.table(MainCtxTable::BiPredIdx);
     let off = ctx.offset(MainCtxTable::BiPredIdx);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(
-        BI_PRED_IDX_MAX,
-        0,
-        if cm_init { table } else { 0 },
-        |bin_idx| {
-            bins += 1;
-            if cm_init {
-                off + bi_pred_idx_ctx_inc(bin_idx).unwrap_or(0)
-            } else {
-                0
-            }
-        },
-    )?;
+    let v = eng.decode_tr_regular(BI_PRED_IDX_MAX, 0, table, |bin_idx| {
+        bins += 1;
+        off + bi_pred_idx_ctx_inc(bin_idx).unwrap_or(0)
+    })?;
     stats.bi_pred_idx_bins += bins;
     Ok(v)
 }
@@ -230,27 +197,30 @@ mod tests {
     use super::*;
     use crate::cabac::CabacEncoder;
 
-    fn regular_bins(bins: &[u8]) -> Vec<u8> {
+    /// Encode `bins` on ctxTable 0 with a per-bin ctxIdx rule mirroring
+    /// the element's Table-95 `sps_cm_init_flag == 0` row (I-slice
+    /// offset 0 on the shared table).
+    fn regular_bins_ctx(bins: &[(usize, u8)]) -> Vec<u8> {
         let mut enc = CabacEncoder::new();
-        for &b in bins {
-            enc.encode_decision(0, 0, b);
+        for &(idx, b) in bins {
+            enc.encode_decision(0, idx, b);
         }
         enc.encode_terminate(true);
         enc.finish()
     }
 
-    /// Encode a TR-cMax-4 value as the table-0 bin string the cm_init=false
-    /// decoder reads, padded with trailing 0s so the range coder has enough
-    /// renormalisation headroom for the final prefix bin (a too-short
-    /// stream under-flushes and trips the decoder's bit reader).
+    /// Encode a TR-cMax-4 value as the ctxTable-0 bin string the
+    /// cm_init=false decoder reads (per-bin ctxIdx = binIdx), padded with
+    /// trailing 0s so the range coder has enough renormalisation headroom
+    /// for the final prefix bin.
     fn amvr_bins(value: u32) -> Vec<u8> {
-        let mut bins = vec![1u8; value as usize];
+        let mut bins: Vec<(usize, u8)> = (0..value as usize).map(|b| (b, 1u8)).collect();
         if value < AMVR_IDX_MAX {
-            bins.push(0u8);
+            bins.push((value as usize, 0u8));
         }
         // Renormalisation padding.
-        bins.extend_from_slice(&[0, 0, 0, 0]);
-        regular_bins(&bins)
+        bins.extend_from_slice(&[(0, 0), (0, 0), (0, 0), (0, 0)]);
+        regular_bins_ctx(&bins)
     }
 
     /// amvr_idx TR cMax=4, value 0 (1/4-pel): a single leading-0 bin.
@@ -302,14 +272,14 @@ mod tests {
     /// merge_mode_flag / direct_mode_flag: single FL bin each.
     #[test]
     fn mode_flags_single_bin() {
-        let bs = regular_bins(&[1]);
+        let bs = regular_bins_ctx(&[(0, 1)]);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let m = read_merge_mode_flag(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
         assert!(m);
         assert_eq!(stats.merge_mode_flag_bins, 1);
 
-        let bs2 = regular_bins(&[0]);
+        let bs2 = regular_bins_ctx(&[(0, 0)]);
         let mut eng2 = CabacEngine::new(&bs2).unwrap();
         let mut stats2 = InterModeGateStats::default();
         let d = read_direct_mode_flag(&mut eng2, EipdCtx::new(false), &mut stats2).unwrap();
@@ -317,15 +287,17 @@ mod tests {
         assert_eq!(stats2.direct_mode_flag_bins, 1);
     }
 
-    /// Encode a TR value as the table-0 bin string the cm_init=false
-    /// decoder reads, padded with trailing 0s for renormalisation headroom.
-    fn tr_bins(value: u32, c_max: u32) -> Vec<u8> {
-        let mut bins = vec![1u8; value as usize];
+    /// Encode a TR value as the ctxTable-0 bin string the cm_init=false
+    /// decoder reads (per-bin ctxIdx capped at `idx_cap`), padded with
+    /// trailing 0s for renormalisation headroom.
+    fn tr_bins_capped(value: u32, c_max: u32, idx_cap: usize) -> Vec<u8> {
+        let mut bins: Vec<(usize, u8)> =
+            (0..value as usize).map(|b| (b.min(idx_cap), 1u8)).collect();
         if value < c_max {
-            bins.push(0u8);
+            bins.push(((value as usize).min(idx_cap), 0u8));
         }
-        bins.extend_from_slice(&[0, 0, 0, 0]);
-        regular_bins(&bins)
+        bins.extend_from_slice(&[(0, 0), (0, 0), (0, 0), (0, 0)]);
+        regular_bins_ctx(&bins)
     }
 
     /// merge_idx cMax depends on the coding-block area (§9.3.3): 32-sample
@@ -343,7 +315,7 @@ mod tests {
     /// merge_idx value 0 on a large block: single leading-0 bin.
     #[test]
     fn merge_idx_zero_large_block() {
-        let bs = tr_bins(0, 5);
+        let bs = tr_bins_capped(0, 5, 4);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_merge_idx(&mut eng, EipdCtx::new(false), 16, 16, &mut stats).unwrap();
@@ -354,7 +326,7 @@ mod tests {
     /// merge_idx value 4 (cMax 5 branch): "1 1 1 1 0" → five bins.
     #[test]
     fn merge_idx_four_large_block() {
-        let bs = tr_bins(4, 5);
+        let bs = tr_bins_capped(4, 5, 4);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_merge_idx(&mut eng, EipdCtx::new(false), 16, 16, &mut stats).unwrap();
@@ -366,7 +338,7 @@ mod tests {
     /// "1 1 1" string with no terminating 0 reads value 3 in three bins.
     #[test]
     fn merge_idx_small_block_saturates_at_three() {
-        let bs = tr_bins(3, 3);
+        let bs = tr_bins_capped(3, 3, 4);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_merge_idx(&mut eng, EipdCtx::new(false), 4, 8, &mut stats).unwrap();
@@ -378,7 +350,7 @@ mod tests {
     /// "1 1" with no terminator → value 2 in two bins.
     #[test]
     fn inter_pred_idc_bi_large_block() {
-        let bs = tr_bins(2, 2);
+        let bs = tr_bins_capped(2, 2, 1);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_inter_pred_idc(&mut eng, EipdCtx::new(false), true, 8, 8, &mut stats).unwrap();
@@ -390,7 +362,7 @@ mod tests {
     /// "1" bin (no terminator) reads PRED_L1.
     #[test]
     fn inter_pred_idc_small_block_caps_unipred() {
-        let bs = tr_bins(1, 1);
+        let bs = tr_bins_capped(1, 1, 1);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_inter_pred_idc(&mut eng, EipdCtx::new(false), true, 4, 4, &mut stats).unwrap();
@@ -401,7 +373,7 @@ mod tests {
     /// bi_pred_idx value 0 (both MVDs present): single leading-0 bin.
     #[test]
     fn bi_pred_idx_zero() {
-        let bs = tr_bins(0, 2);
+        let bs = tr_bins_capped(0, 2, 1);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_bi_pred_idx(&mut eng, EipdCtx::new(false), &mut stats).unwrap();
@@ -412,7 +384,7 @@ mod tests {
     /// bi_pred_idx value 2 (list-0 MVD absent): "1 1" → two bins, cMax 2.
     #[test]
     fn bi_pred_idx_two() {
-        let bs = tr_bins(2, 2);
+        let bs = tr_bins_capped(2, 2, 1);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterModeGateStats::default();
         let v = read_bi_pred_idx(&mut eng, EipdCtx::new(false), &mut stats).unwrap();

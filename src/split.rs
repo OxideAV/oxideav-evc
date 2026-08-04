@@ -583,7 +583,7 @@ pub fn decode_btt_split(
         } else {
             0
         };
-        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitFlag, ctx_inc);
+        let (t, i) = sel.ctx(MainCtxTable::BttSplitFlag, ctx_inc);
         let bin = eng.decode_decision(t, i)?;
         stats.flag_bins += 1;
         bin != 0
@@ -624,7 +624,7 @@ pub fn decode_btt_split(
         } else {
             0
         };
-        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitDir, ctx_inc);
+        let (t, i) = sel.ctx(MainCtxTable::BttSplitDir, ctx_inc);
         let bin = eng.decode_decision(t, i)?;
         stats.dir_bins += 1;
         bin as u32
@@ -635,7 +635,7 @@ pub fn decode_btt_split(
     // --- btt_split_type (spec lines 2656-2658) ---
     let split_type = if btt_split_type_present(allowed, dir) {
         // Table 44 / Table 95: single context, ctxInc 0 unconditionally.
-        let (t, i) = sel.tree_ctx(MainCtxTable::BttSplitType, 0);
+        let (t, i) = sel.ctx(MainCtxTable::BttSplitType, 0);
         let bin = eng.decode_decision(t, i)?;
         stats.type_bins += 1;
         bin as u32
@@ -1405,12 +1405,15 @@ mod tests {
         tt_hor: true,
     };
 
-    /// Encode `bins` against `(ctx_table, 0)` slots, terminate, and build a
-    /// fresh decode engine over the produced RBSP.
-    fn engine_for(bins: &[(usize, u8)]) -> Vec<u8> {
+    /// Encode `bins` against the same `(ctxTable, ctxIdx)` slots the
+    /// baseline reader resolves (the shared ctxTable 0 per §9.3.4.2.1),
+    /// terminate, and build a fresh decode engine over the produced RBSP.
+    fn engine_for(bins: &[(MainCtxTable, u8)]) -> Vec<u8> {
+        let sel = crate::cabac_init::CtxSel::baseline();
         let mut enc = CabacEncoder::new();
-        for &(ctx_table, bin) in bins {
-            enc.encode_decision(ctx_table, 0, bin);
+        for &(table, bin) in bins {
+            let (t, i) = sel.ctx_shaped(table, 0, 0);
+            enc.encode_decision(t, i, bin);
         }
         enc.encode_terminate(true);
         enc.finish()
@@ -1421,9 +1424,9 @@ mod tests {
         // 32×32 block, all splits allowed. Encode flag=1, dir=0, type=0 →
         // SPLIT_BT_HOR. All three elements present (both axes + both
         // shapes available).
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
-        let dir_t = MainCtxTable::BttSplitDir as usize;
-        let type_t = MainCtxTable::BttSplitType as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
+        let dir_t = MainCtxTable::BttSplitDir;
+        let type_t = MainCtxTable::BttSplitType;
         let rbsp = engine_for(&[(flag_t, 1), (dir_t, 0), (type_t, 0)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
@@ -1453,9 +1456,9 @@ mod tests {
     #[test]
     fn decode_btt_split_ternary_vertical() {
         // flag=1, dir=1 (vertical), type=1 (ternary) → SPLIT_TT_VER.
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
-        let dir_t = MainCtxTable::BttSplitDir as usize;
-        let type_t = MainCtxTable::BttSplitType as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
+        let dir_t = MainCtxTable::BttSplitDir;
+        let type_t = MainCtxTable::BttSplitType;
         let rbsp = engine_for(&[(flag_t, 1), (dir_t, 1), (type_t, 1)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
@@ -1483,9 +1486,9 @@ mod tests {
     #[test]
     fn decode_btt_split_type1_horizontal_is_tt_hor() {
         // flag=1, dir=0, type=1 → SPLIT_TT_HOR (errata-corrected branch).
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
-        let dir_t = MainCtxTable::BttSplitDir as usize;
-        let type_t = MainCtxTable::BttSplitType as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
+        let dir_t = MainCtxTable::BttSplitDir;
+        let type_t = MainCtxTable::BttSplitType;
         let rbsp = engine_for(&[(flag_t, 1), (dir_t, 0), (type_t, 1)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
@@ -1510,7 +1513,7 @@ mod tests {
     fn decode_btt_split_flag_zero_in_picture_is_no_split() {
         // flag=0 with the block fully inside the picture → NO_SPLIT, and
         // only the single flag bin is consumed (no dir/type reads).
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
         let rbsp = engine_for(&[(flag_t, 0)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
@@ -1546,8 +1549,8 @@ mod tests {
             tt_ver: true,
             tt_hor: false,
         };
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
-        let type_t = MainCtxTable::BttSplitType as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
+        let type_t = MainCtxTable::BttSplitType;
         let rbsp = engine_for(&[(flag_t, 1), (type_t, 0)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();
@@ -1581,7 +1584,7 @@ mod tests {
             tt_ver: false,
             tt_hor: false,
         };
-        let flag_t = MainCtxTable::BttSplitFlag as usize;
+        let flag_t = MainCtxTable::BttSplitFlag;
         let rbsp = engine_for(&[(flag_t, 1)]);
         let mut eng = CabacEngine::new(&rbsp).unwrap();
         let mut stats = BttSplitStats::default();

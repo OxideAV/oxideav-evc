@@ -999,7 +999,8 @@ fn skip_flag_ctx(
         });
         sel.ctx(MainCtxTable::CuSkipFlag, inc)
     } else {
-        (0, 0)
+        // Table 95, sps_cm_init_flag == 0 row: ctxInc 0.
+        sel.ctx_shaped(MainCtxTable::CuSkipFlag, 0, 0)
     }
 }
 
@@ -1018,26 +1019,22 @@ fn pred_mode_flag_ctx(
         });
         sel.ctx(MainCtxTable::PredModeFlag, inc)
     } else {
-        (0, 0)
+        // Table 95, sps_cm_init_flag == 0 row: ctxInc 0.
+        sel.ctx_shaped(MainCtxTable::PredModeFlag, 0, 0)
     }
 }
 
 /// TR cMax 3 write for `mvp_idx_l0` — the dual of the decoder's
 /// `decode_tr_regular(3, 0, …)` with the Table 48 per-bin ctxInc.
 fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
+    // Table 95: per-bin ctxInc 0,1,2 under both entropy shapes.
+    let table = MainCtxTable::MvpIdx;
     let (t, off) = if sel.cm_init {
-        let table = MainCtxTable::MvpIdx;
         (table.as_usize(), table.ctx_idx_offset(sel.init_type))
     } else {
-        (0, 0)
+        (0, table.cm0_ctx_idx_offset(sel.init_type))
     };
-    let idx = |b: u32| -> usize {
-        if sel.cm_init {
-            off + (b as usize).min(2)
-        } else {
-            0
-        }
-    };
+    let idx = |b: u32| -> usize { off + (b as usize).min(2) };
     for b in 0..v {
         enc.encode_decision(t, idx(b), 1);
     }
@@ -1051,11 +1048,10 @@ fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
 /// all-bypass otherwise; sign bypass when non-zero).
 fn emit_signed_mvd(enc: &mut CabacEncoder, sel: CtxSel, v: i32) {
     let abs = v.unsigned_abs();
-    if sel.cm_init {
+    // Table 95: bin0 regular under both entropy shapes, rest bypass.
+    {
         let (t, i) = sel.ctx(MainCtxTable::AbsMvd, 0);
         enc.encode_eg0_first_regular(t, i, abs);
-    } else {
-        enc.encode_eg0_bypass(abs);
     }
     if abs != 0 {
         enc.encode_bypass(u8::from(v < 0));
@@ -1164,14 +1160,14 @@ fn emit_leaf(
             let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 1); // pred_mode_flag = 1 (MODE_INTRA)
                                           // intra_pred_mode — U over Table 62 (bin0 → 0, later → 1).
-            if sel.cm_init {
+            {
                 let table = MainCtxTable::IntraPredMode;
-                let off = table.ctx_idx_offset(sel.init_type);
-                enc.encode_u_regular_capped(*mode_idx as u32, 63, table.as_usize(), |b| {
-                    off + (b as usize).min(1)
-                });
-            } else {
-                enc.encode_u_regular_capped(*mode_idx as u32, 63, 0, |_| 0);
+                let (t, off) = if sel.cm_init {
+                    (table.as_usize(), table.ctx_idx_offset(sel.init_type))
+                } else {
+                    (0, table.cm0_ctx_idx_offset(sel.init_type))
+                };
+                enc.encode_u_regular_capped(*mode_idx as u32, 63, t, |b| off + (b as usize).min(1));
             }
             // Single-tree intra TU: cbf_cb, cbf_cr, then cbf_luma
             // (always present — MODE_INTRA), then luma/cb/cr residuals.

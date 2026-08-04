@@ -371,17 +371,13 @@ fn read_mvp_idx(
     ctx: EipdCtx,
     stats: &mut InterCuSyntaxStats,
 ) -> Result<u32> {
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::MvpIdx.as_usize();
+    // Table 95: per-bin ctxInc 0,1,2 under both entropy shapes.
+    let table = ctx.table(MainCtxTable::MvpIdx);
     let off = ctx.offset(MainCtxTable::MvpIdx);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(3, 0, if cm_init { table } else { 0 }, |bin_idx| {
+    let v = eng.decode_tr_regular(3, 0, table, |bin_idx| {
         bins += 1;
-        if cm_init {
-            off + bin_idx.min(2) as usize
-        } else {
-            0
-        }
+        off + bin_idx.min(2) as usize
     })?;
     stats.gate.merge_idx_bins += bins;
     Ok(v)
@@ -472,10 +468,17 @@ pub struct ExplicitAmvpStats {
     pub affine: AffineSyntaxStats,
 }
 
-/// §7.3.8.4 — read one `abs_mvd` (EG0 bypass) + optional `mvd_sign_flag`
-/// (bypass) component, returning the signed value (spec lines 2918-2925).
-fn read_signed_mvd_component(eng: &mut CabacEngine, stats: &mut ExplicitAmvpStats) -> Result<i32> {
-    let abs = eng.decode_egk_bypass(0)?;
+/// §7.3.8.4 — read one `abs_mvd` (EG0; Table 95 codes bin 0 regular with
+/// ctxInc 0 under both entropy shapes, the rest bypass) + optional
+/// `mvd_sign_flag` (bypass) component, returning the signed value (spec
+/// lines 2918-2925).
+fn read_signed_mvd_component(
+    eng: &mut CabacEngine,
+    ctx: EipdCtx,
+    stats: &mut ExplicitAmvpStats,
+) -> Result<i32> {
+    let (t, i) = ctx.resolve_same(MainCtxTable::AbsMvd, 0);
+    let abs = eng.decode_eg0_first_regular(t, i)?;
     stats.abs_mvd_bins += 1;
     if abs == 0 {
         return Ok(0);
@@ -502,26 +505,8 @@ fn read_explicit_list(
     stats: &mut ExplicitAmvpStats,
 ) -> Result<ExplicitListMv> {
     let ref_idx = if num_ref_idx_active_minus1 > 0 && bi_pred_idx == 0 {
-        let cm_init = ctx.is_cm_init();
-        let table = MainCtxTable::RefIdx.as_usize();
-        let off = ctx.offset(MainCtxTable::RefIdx);
         let mut bins = 0u32;
-        let v = eng.decode_tr_regular(
-            num_ref_idx_active_minus1,
-            0,
-            if cm_init { table } else { 0 },
-            |bin_idx| {
-                bins += 1;
-                // ref_idx ctxInc is 0,1 for the first two bins, then bypass
-                // (Table 9.3.4.2). Under the Baseline collapse all bins are
-                // (0,0); the first two regular ctxIdx are 0 and 1.
-                if cm_init {
-                    off + bin_idx.min(1) as usize
-                } else {
-                    0
-                }
-            },
-        )?;
+        let v = read_ref_idx_tr(eng, ctx, num_ref_idx_active_minus1, &mut bins)?;
         stats.ref_idx_bins += bins;
         v
     } else {
@@ -529,8 +514,8 @@ fn read_explicit_list(
     };
 
     let mvd = if bi_pred_idx != mvd_absent_value {
-        let x = read_signed_mvd_component(eng, stats)?;
-        let y = read_signed_mvd_component(eng, stats)?;
+        let x = read_signed_mvd_component(eng, ctx, stats)?;
+        let y = read_signed_mvd_component(eng, ctx, stats)?;
         MotionVector { x, y }
     } else {
         MotionVector::default()
@@ -569,8 +554,8 @@ fn read_explicit_affine_list(
     let mut mvd_cp = [MotionVector::default(); 3];
     if flags.mvd_flag {
         for slot in mvd_cp.iter_mut().take(vertex_num as usize) {
-            let x = read_signed_mvd_component(eng, stats)?;
-            let y = read_signed_mvd_component(eng, stats)?;
+            let x = read_signed_mvd_component(eng, ctx, stats)?;
+            let y = read_signed_mvd_component(eng, ctx, stats)?;
             *slot = MotionVector { x, y };
         }
     }
@@ -594,25 +579,35 @@ fn read_ref_idx(
     if num_ref_idx_active_minus1 == 0 {
         return Ok(0);
     }
-    let cm_init = ctx.is_cm_init();
-    let table = MainCtxTable::RefIdx.as_usize();
-    let off = ctx.offset(MainCtxTable::RefIdx);
     let mut bins = 0u32;
-    let v = eng.decode_tr_regular(
-        num_ref_idx_active_minus1,
-        0,
-        if cm_init { table } else { 0 },
-        |bin_idx| {
-            bins += 1;
-            if cm_init {
-                off + bin_idx.min(1) as usize
-            } else {
-                0
-            }
-        },
-    )?;
+    let v = read_ref_idx_tr(eng, ctx, num_ref_idx_active_minus1, &mut bins)?;
     stats.ref_idx_bins += bins;
     Ok(v)
+}
+
+/// §9.3.3.2 TR read for `ref_idx_lX` honouring the Table-95 bin map:
+/// binIdx 0 and 1 are regular-coded (ctxInc 0 and 1, identical under
+/// both entropy shapes), every later bin is **bypass** — the historical
+/// all-regular read only matched streams with at most three active
+/// references.
+fn read_ref_idx_tr(eng: &mut CabacEngine, ctx: EipdCtx, c_max: u32, bins: &mut u32) -> Result<u32> {
+    let table = ctx.table(MainCtxTable::RefIdx);
+    let off = ctx.offset(MainCtxTable::RefIdx);
+    let mut value = 0u32;
+    while value < c_max {
+        let bin_idx = value;
+        *bins += 1;
+        let bin = if bin_idx < 2 {
+            eng.decode_decision(table, off + bin_idx as usize)?
+        } else {
+            eng.decode_bypass()?
+        };
+        if bin == 0 {
+            break;
+        }
+        value += 1;
+    }
+    Ok(value)
 }
 
 /// Drive the §7.3.8.4 `sps_admvp_flag == 1` explicit-AMVP body (spec lines
@@ -789,6 +784,9 @@ mod tests {
     /// A bin token: regular `(0,0)`-ctx decision or a bypass bin.
     enum Tok {
         Reg(u8),
+        /// Regular bin at an explicit shared-table-0 ctxIdx (the
+        /// baseline §9.3.4.2.1 mapping for multi-context elements).
+        RegAt(usize, u8),
         Byp(u8),
     }
 
@@ -798,6 +796,7 @@ mod tests {
         for t in toks {
             match t {
                 Tok::Reg(b) => enc.encode_decision(0, 0, *b),
+                Tok::RegAt(i, b) => enc.encode_decision(0, *i, *b),
                 Tok::Byp(b) => enc.encode_bypass(*b),
             }
         }
@@ -872,7 +871,7 @@ mod tests {
     /// Bin string: amvr "1 0" (value 1) only.
     #[test]
     fn amvr_nonzero_infers_merge_mode_zero() {
-        let bs = bins(&[1, 0]);
+        let bs = mixed(&[Tok::RegAt(0, 1), Tok::RegAt(1, 0)]);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = InterCuSyntaxStats::default();
         let d = read_inter_cu_mode(&mut eng, EipdCtx::new(false), gates_all(), 2, 2, &mut stats)
@@ -977,13 +976,13 @@ mod tests {
     #[test]
     fn explicit_amvp_b_bipred_both_lists() {
         let toks = [
-            Tok::Reg(1), // inter_pred_idc bin 0
-            Tok::Reg(1), // inter_pred_idc bin 1 → value 2 = PRED_BI
-            Tok::Reg(0), // bi_pred_idx "0" → 0 (both lists' MVD present)
-            Tok::Byp(0), // L0 mvd_x abs
-            Tok::Byp(0), // L0 mvd_y abs
-            Tok::Byp(0), // L1 mvd_x abs
-            Tok::Byp(0), // L1 mvd_y abs
+            Tok::RegAt(0, 1), // inter_pred_idc bin 0
+            Tok::RegAt(1, 1), // inter_pred_idc bin 1 → value 2 = PRED_BI
+            Tok::Reg(0),      // bi_pred_idx "0" → 0 (both lists' MVD present)
+            Tok::Reg(0),      // L0 mvd_x abs (EG0 bin 0 — regular, Table 73)
+            Tok::Reg(0),      // L0 mvd_y abs
+            Tok::Reg(0),      // L1 mvd_x abs
+            Tok::Reg(0),      // L1 mvd_y abs
         ];
         let bs = mixed(&toks);
         let mut eng = CabacEngine::new(&bs).unwrap();
@@ -1017,13 +1016,13 @@ mod tests {
     #[test]
     fn explicit_amvp_bi_pred_idx_one_suppresses_l1_mvd() {
         let toks = [
-            Tok::Reg(1), // inter_pred_idc bin 0
-            Tok::Reg(1), // bin 1 → PRED_BI
-            Tok::Reg(1), // bi_pred_idx bin 0
-            Tok::Reg(0), // bi_pred_idx bin 1 → value 1
-            Tok::Byp(0), // L0 mvd_x abs
-            Tok::Byp(0), // L0 mvd_y abs
-                         // L1 MVD suppressed (bi_pred_idx == 1).
+            Tok::RegAt(0, 1), // inter_pred_idc bin 0
+            Tok::RegAt(1, 1), // bin 1 → PRED_BI
+            Tok::RegAt(0, 1), // bi_pred_idx bin 0
+            Tok::RegAt(1, 0), // bi_pred_idx bin 1 → value 1
+            Tok::Reg(0),      // L0 mvd_x abs (EG0 bin 0 — regular, Table 73)
+            Tok::Reg(0),      // L0 mvd_y abs
+                              // L1 MVD suppressed (bi_pred_idx == 1).
         ];
         let bs = mixed(&toks);
         let mut eng = CabacEngine::new(&bs).unwrap();

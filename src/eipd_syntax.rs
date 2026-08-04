@@ -85,36 +85,60 @@ impl EipdCtx {
         }
     }
 
-    /// Whether `sps_cm_init_flag == 1` (Main-profile per-element contexts).
-    /// Used by sibling syntax readers (e.g. [`crate::ats`]) that share the
-    /// same Baseline-collapse-to-`(0, 0)` discipline.
+    /// Whether `sps_cm_init_flag == 1` (Main-profile per-element context
+    /// tables; under `== 0` every element shares ctxTable 0 per
+    /// §9.3.4.2.1).
     #[inline]
     pub fn is_cm_init(self) -> bool {
         self.cm_init
     }
 
-    /// §9.3.4.2.1 `ctxIdxOffset` for the named table under this slice's
-    /// init type — 0 under `sps_cm_init_flag == 0` (the collapse) and
-    /// for I slices; the second-half start of the Table 39 range on
-    /// P/B slices.
+    /// §9.3.4.2.1 `ctxTable` for the named element under this slice's
+    /// entropy shape: the element's Table 39 table when
+    /// `sps_cm_init_flag == 1`, the shared table 0 otherwise.
     #[inline]
-    pub fn offset(self, table: MainCtxTable) -> usize {
+    pub fn table(self, table: MainCtxTable) -> usize {
         if self.cm_init {
-            table.ctx_idx_offset(self.init_type)
+            table.as_usize()
         } else {
             0
         }
     }
 
-    /// `(ctxTable, ctxIdx)` for the named Main-profile context table at
-    /// `ctxInc = 0`.
+    /// §9.3.4.2.1 `ctxIdxOffset` for the named table under this slice's
+    /// init type — the lowest ctxIdx of the Table 39 column that
+    /// matches the slice's `sps_cm_init_flag` and initType.
+    #[inline]
+    pub fn offset(self, table: MainCtxTable) -> usize {
+        if self.cm_init {
+            table.ctx_idx_offset(self.init_type)
+        } else {
+            table.cm0_ctx_idx_offset(self.init_type)
+        }
+    }
+
+    /// `(ctxTable, ctxIdx)` for a syntax element whose Table-95 ctxInc
+    /// rule differs by entropy shape: `cm1_inc` is the
+    /// `sps_cm_init_flag == 1` derivation, `cm0_inc` the `== 0` row.
+    #[inline]
+    pub fn resolve(self, table: MainCtxTable, cm1_inc: usize, cm0_inc: usize) -> (usize, usize) {
+        (
+            self.table(table),
+            self.offset(table) + if self.cm_init { cm1_inc } else { cm0_inc },
+        )
+    }
+
+    /// `(ctxTable, ctxIdx)` for a syntax element whose Table-95 ctxInc
+    /// rule is the same under both entropy shapes.
+    #[inline]
+    pub fn resolve_same(self, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
+        self.resolve(table, ctx_inc, ctx_inc)
+    }
+
+    /// `(ctxTable, ctxIdx)` for the named context table at `ctxInc = 0`.
     #[inline]
     fn ctx(self, table: MainCtxTable) -> (usize, usize) {
-        if self.cm_init {
-            (table.as_usize(), self.offset(table))
-        } else {
-            (0, 0)
-        }
+        self.resolve_same(table, 0)
     }
 }
 

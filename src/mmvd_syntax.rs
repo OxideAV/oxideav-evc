@@ -105,8 +105,6 @@ pub fn read_mmvd_group(
     log2_cb_height: u32,
     stats: &mut MmvdSyntaxStats,
 ) -> Result<MmvdDecision> {
-    let cm_init = ctx.is_cm_init();
-
     // mmvd_flag — FL cMax=1, ctxInc 0 (Table 50 / 95).
     let (t, i) = ctx1(ctx, MainCtxTable::MmvdFlag, 0);
     let flag = eng.decode_decision(t, i)? != 0;
@@ -118,22 +116,13 @@ pub fn read_mmvd_group(
     // mmvd_group_idx — TR cMax=2, per-bin ctxInc 0,1 (Table 51), gated.
     let group_idx = if mmvd_group_idx_present(mmvd_group_enable_flag, log2_cb_width, log2_cb_height)
     {
-        let table = MainCtxTable::MmvdGroupIdx.as_usize();
+        let table = ctx.table(MainCtxTable::MmvdGroupIdx);
         let off = ctx.offset(MainCtxTable::MmvdGroupIdx);
         let mut bins = 0u32;
-        let v = eng.decode_tr_regular(
-            MMVD_GROUP_IDX_MAX,
-            0,
-            if cm_init { table } else { 0 },
-            |bin_idx| {
-                bins += 1;
-                if cm_init {
-                    off + mmvd_group_idx_ctx_inc(bin_idx).unwrap_or(0)
-                } else {
-                    0
-                }
-            },
-        )?;
+        let v = eng.decode_tr_regular(MMVD_GROUP_IDX_MAX, 0, table, |bin_idx| {
+            bins += 1;
+            off + mmvd_group_idx_ctx_inc(bin_idx).unwrap_or(0)
+        })?;
         stats.group_idx_bins += bins;
         v
     } else {
@@ -142,61 +131,38 @@ pub fn read_mmvd_group(
 
     // mmvd_merge_idx — TR cMax=3, per-bin ctxInc 0,1,2 (Table 52).
     let merge_idx = {
-        let table = MainCtxTable::MmvdMergeIdx.as_usize();
+        let table = ctx.table(MainCtxTable::MmvdMergeIdx);
         let off = ctx.offset(MainCtxTable::MmvdMergeIdx);
         let mut bins = 0u32;
-        let v = eng.decode_tr_regular(
-            MMVD_MERGE_IDX_MAX,
-            0,
-            if cm_init { table } else { 0 },
-            |bin_idx| {
-                bins += 1;
-                if cm_init {
-                    off + mmvd_merge_idx_ctx_inc(bin_idx).unwrap_or(0)
-                } else {
-                    0
-                }
-            },
-        )?;
+        let v = eng.decode_tr_regular(MMVD_MERGE_IDX_MAX, 0, table, |bin_idx| {
+            bins += 1;
+            off + mmvd_merge_idx_ctx_inc(bin_idx).unwrap_or(0)
+        })?;
         stats.merge_idx_bins += bins;
         v
     };
 
     // mmvd_distance_idx — TR cMax=7, per-bin ctxInc 0..6 (Table 53).
     let distance_idx = {
-        let table = MainCtxTable::MmvdDistanceIdx.as_usize();
+        let table = ctx.table(MainCtxTable::MmvdDistanceIdx);
         let off = ctx.offset(MainCtxTable::MmvdDistanceIdx);
         let mut bins = 0u32;
-        let v = eng.decode_tr_regular(
-            MMVD_DISTANCE_IDX_MAX,
-            0,
-            if cm_init { table } else { 0 },
-            |bin_idx| {
-                bins += 1;
-                if cm_init {
-                    off + mmvd_distance_idx_ctx_inc(bin_idx).unwrap_or(0)
-                } else {
-                    0
-                }
-            },
-        )?;
+        let v = eng.decode_tr_regular(MMVD_DISTANCE_IDX_MAX, 0, table, |bin_idx| {
+            bins += 1;
+            off + mmvd_distance_idx_ctx_inc(bin_idx).unwrap_or(0)
+        })?;
         stats.distance_idx_bins += bins;
         v
     };
 
     // mmvd_direction_idx — FL cMax=3 (2 bins), per-bin ctxInc 0,1 (Table 54).
     let direction_idx = {
-        let table = MainCtxTable::MmvdDirectionIdx.as_usize();
+        let table = ctx.table(MainCtxTable::MmvdDirectionIdx);
         let off = ctx.offset(MainCtxTable::MmvdDirectionIdx);
         let mut value = 0u32;
         for bin_idx in 0..2u32 {
-            let ctx_inc = if cm_init {
-                off + mmvd_direction_idx_ctx_inc(bin_idx).unwrap_or(0)
-            } else {
-                0
-            };
-            let (tbl, idx) = if cm_init { (table, ctx_inc) } else { (0, 0) };
-            let bin = eng.decode_decision(tbl, idx)?;
+            let idx = off + mmvd_direction_idx_ctx_inc(bin_idx).unwrap_or(0);
+            let bin = eng.decode_decision(table, idx)?;
             value = (value << 1) | bin as u32;
         }
         stats.direction_idx_bins += 2;
@@ -212,20 +178,27 @@ pub fn read_mmvd_group(
     })
 }
 
-/// `(ctxTable, ctxIdx)` for a single-context Main-profile table, with the
-/// Baseline `sps_cm_init_flag == 0` collapse to `(0, 0)`.
+/// `(ctxTable, ctxIdx)` for a single-context element (identical
+/// Table-95 ctxInc rule under both entropy shapes).
 fn ctx1(ctx: EipdCtx, table: MainCtxTable, ctx_inc: usize) -> (usize, usize) {
-    if ctx.is_cm_init() {
-        (table.as_usize(), ctx.offset(table) + ctx_inc)
-    } else {
-        (0, 0)
-    }
+    ctx.resolve_same(table, ctx_inc)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cabac::CabacEncoder;
+
+    /// Encode `(ctxIdx, bin)` pairs on the shared ctxTable 0 (the
+    /// baseline §9.3.4.2.1 mapping), terminate, and return the RBSP.
+    fn regular_bins_ctx(bins: &[(usize, u8)]) -> Vec<u8> {
+        let mut enc = CabacEncoder::new();
+        for &(idx, b) in bins {
+            enc.encode_decision(0, idx, b);
+        }
+        enc.encode_terminate(true);
+        enc.finish()
+    }
 
     fn regular_bins(bins: &[u8]) -> Vec<u8> {
         let mut enc = CabacEncoder::new();
@@ -298,7 +271,20 @@ mod tests {
     fn distance_idx_saturates_at_7() {
         // flag=1, group absent (small CB), merge=0 ("0"),
         // distance: seven 1s → 7, direction 2 bins.
-        let bs = regular_bins(&[1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0]);
+        // flag(0), merge bin0(0), distance binIdx 0..6, direction bins 0,1
+        let bs = regular_bins_ctx(&[
+            (0, 1),
+            (0, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (0, 0),
+            (1, 0),
+        ]);
         let mut eng = CabacEngine::new(&bs).unwrap();
         let mut stats = MmvdSyntaxStats::default();
         let d = read_mmvd_group(&mut eng, EipdCtx::new(false), false, 2, 2, &mut stats).unwrap();

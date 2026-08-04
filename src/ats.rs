@@ -430,61 +430,37 @@ trait AtsInterCtx {
 
 impl AtsInterCtx for EipdCtx {
     fn ats_cu_inter_flag_ctx(self, log2_w: u32, log2_h: u32) -> (usize, usize) {
-        if self.is_cm_init() {
-            // eq. 1472: (Log2(nCbW) + Log2(nCbH)) >= 8 ? 0 : 1.
-            let ctx_inc = if log2_w + log2_h >= 8 { 0 } else { 1 };
-            let t = MainCtxTable::AtsCuInterFlag;
-            (t.as_usize(), self.offset(t) + ctx_inc)
-        } else {
-            (0, 0)
-        }
+        // eq. 1472: (Log2(nCbW) + Log2(nCbH)) >= 8 ? 0 : 1 — the Table-95
+        // sps_cm_init_flag == 0 row drops the derivation to ctxInc 0.
+        let ctx_inc = if log2_w + log2_h >= 8 { 0 } else { 1 };
+        self.resolve(MainCtxTable::AtsCuInterFlag, ctx_inc, 0)
     }
 
     fn ats_cu_inter_quad_flag_ctx(self) -> (usize, usize) {
-        if self.is_cm_init() {
-            let t = MainCtxTable::AtsCuInterQuadFlag;
-            (t.as_usize(), self.offset(t))
-        } else {
-            (0, 0)
-        }
+        self.resolve_same(MainCtxTable::AtsCuInterQuadFlag, 0)
     }
 
     fn ats_cu_inter_horizontal_flag_ctx(self, log2_w: u32, log2_h: u32) -> (usize, usize) {
-        if self.is_cm_init() {
-            // eq. 1473: (nCbW == nCbH) ? 0 : (nCbW < nCbH ? 1 : 2).
-            let ctx_inc = match log2_w.cmp(&log2_h) {
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Less => 1,
-                std::cmp::Ordering::Greater => 2,
-            };
-            let t = MainCtxTable::AtsCuInterHorizontalFlag;
-            (t.as_usize(), self.offset(t) + ctx_inc)
-        } else {
-            (0, 0)
-        }
+        // eq. 1473: (nCbW == nCbH) ? 0 : (nCbW < nCbH ? 1 : 2) — the
+        // Table-95 sps_cm_init_flag == 0 row drops the derivation to 0.
+        let ctx_inc = match log2_w.cmp(&log2_h) {
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Greater => 2,
+        };
+        self.resolve(MainCtxTable::AtsCuInterHorizontalFlag, ctx_inc, 0)
     }
 
     fn ats_cu_inter_pos_flag_ctx(self) -> (usize, usize) {
-        if self.is_cm_init() {
-            let t = MainCtxTable::AtsCuInterPosFlag;
-            (t.as_usize(), self.offset(t))
-        } else {
-            (0, 0)
-        }
+        self.resolve_same(MainCtxTable::AtsCuInterPosFlag, 0)
     }
 }
 
 impl AtsModeCtx for EipdCtx {
     fn ats_mode_ctx(self) -> (usize, usize) {
-        // Mirror EipdCtx::ctx for the single-context AtsMode table: under
-        // sps_cm_init_flag == 0 every regular bin shares (0, 0); under
-        // sps_cm_init_flag == 1 it lands on Table 79 at ctxIdx 0.
-        if self.is_cm_init() {
-            let t = MainCtxTable::AtsMode;
-            (t.as_usize(), self.offset(t))
-        } else {
-            (0, 0)
-        }
+        // Single-context in both entropy shapes (Table 79 / the shared
+        // ctxTable-0 slot at the element's Table-39 offset).
+        self.resolve_same(MainCtxTable::AtsMode, 0)
     }
 }
 
