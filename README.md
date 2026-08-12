@@ -538,6 +538,20 @@ decode tool, multi-tile pixel reconstruction, and the post-filter
 chain (ALF / DRA / HTDF) run at every supported bit depth (8..=16,
 §7.4.3.1).
 
+### Conformance (ISO/IEC 23094-4)
+
+The official 219-stream corpus gate (`tests/conformance.rs`,
+docs-staged, skip-if-absent) is **red**: every stream still diverges
+inside the first IDR. Round 441 hand-anchored the framing, SPS/PPS
+and slice-header layouts, the `slice_data()` offset and the §9.3
+engine mechanics bit-exactly against the raw stream bytes, localizing
+the remaining divergence to the leaf-level `coding_unit()` element
+modelling of the very first CTUs; the identified §7.3.8.3/§8.4.3
+re-reading (I-slice leaves are SINGLE_TREE with DM chroma, not
+per-leaf dual trees with DC chroma) needs a decoder + encoder +
+fixture lockstep restructure — see the CHANGELOG round-441 entry for
+the full finding list.
+
 ## Encoder (round 429 bootstrap; round 431 context modelling + low-delay P)
 
 The crate registers an **encoder** alongside the decoder (dual API:

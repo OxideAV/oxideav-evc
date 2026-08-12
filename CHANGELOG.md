@@ -4,6 +4,44 @@
 
 ### Other
 
+- **Conformance-gate triage, round 441 (documentation of findings; no behaviour change).**
+  A forensic pass over the ISO/IEC 23094-4 corpus hand-anchored, bit-exactly
+  against the raw stream bytes, everything from the framing down to the first
+  CABAC bins: the little-endian length prefixes, the SPS and PPS field layouts
+  (hand-decoded from the raw bits and matching this crate's parsers, including
+  the eq. 41 inferred `CtbLog2SizeY` when `sps_btt_flag == 0`), the §7.3.4
+  slice-header layout (arbitrated by a stream carrying non-zero
+  `slice_cb_qp_offset`/`slice_cr_qp_offset` of +1/+2, which decode at exactly
+  the crate's field positions), the byte-aligned `slice_data()` start, and the
+  §9.3.2.3 engine init + first §9.3.4.3.2 decisions (hand-computed
+  `ivlLpsRange`/renorm/state-transition sequences match the crate's trace).
+  Two corpus wire-format facts fell out and are recorded here: (a) the
+  deployed streams write **zero bits** where §7.3.2.9 `byte_alignment()`
+  prints `alignment_bit_equal_to_one`, and their SPS/PPS tails carry **no
+  §7.3.2.8 `rbsp_stop_one_bit`** (zero-padded instead; the printed clauses
+  were re-verified against the staged PDF, page 38) — this crate's parsers
+  never validated those bits, so offsets are unaffected either way; (b) every
+  stream carries a **picture-hash SEI whose payload equals the `.opl`
+  per-plane MD5 row**, a second in-band anchor available for future
+  per-picture validation. With all of the above pinned, the remaining
+  first-IDR divergence is localized to the very first CTUs' leaf-level
+  element modelling (a decoded-plane dump is structureless from CTU 0 on
+  Baseline and Main streams alike), and one concrete spec re-reading is
+  staged for the next round because it requires an encoder-lockstep
+  restructure to land: §7.3.8.3 lines 2788-2795 assign `treeType` from the
+  constraint the leaf was *reached* with (the line-2791 I-slice / admvp-4×4
+  reassignment binds only the `coding_unit()`-internal presence gates), so an
+  I-slice leaf under `PRED_MODE_NO_CONSTRAINT` is a **SINGLE_TREE** CU —
+  chroma cbfs and residuals inside the same `transform_unit()`, and no
+  per-leaf `DUAL_TREE_CHROMA` partner (§7.4.9.3 `isTreeSplitPoint` compares
+  the split-time derivation, which stays `PRED_MODE_NO_CONSTRAINT` at a
+  `NO_SPLIT` leaf) — and §8.4.3 with the never-present (`sps_eipd_flag == 0`)
+  `intra_chroma_pred_mode` inferred 0 sets **IntraPredModeC =
+  IntraPredModeY** (the co-located luma mode on a standalone chroma tree),
+  not INTRA_DC. The crate currently decodes *and* encodes the other,
+  self-consistent shape, so the fix must move both walkers, both encoders and
+  the hand-built CABAC fixtures in one commit. The 219-stream gate stands at
+  0 passes, unchanged.
 - **ISO/IEC 23094-4 conformance corpus wired in (round 437).** `tests/conformance.rs` drives the registered decoder over the official conformance bitstream sets staged in the private docs repo (docs-gated: skips cleanly when the staging directory is absent, honours `EVC_CONFORMANCE_DIR` / `EVC_CONF_FILTER`), checking every output picture per plane against the published `.opl` MD5 rows with a vendored RFC-1321 MD5. Support work the corpus immediately forced: the Annex-B `nal_unit_length` reader auto-detects the byte order (the spec's `u(32)` big-endian preferred; the deployed little-endian raw-file variant accepted when only it tiles the stream), and the decoder applies the §7.4.3.1 conformance cropping window at output (references stay full-size; the emitted frame is the SubWidthC/SubHeightC-scaled window). **Standing state:** the corpus does not pass yet — every stream still diverges inside the first IDR (the round-437 entropy + quantization fixes below moved the divergence point deep into the picture; the remaining delta is under active triage), so the gate is red where the corpus is staged and green on CI (no corpus).
 - **`sps_cm_init_flag == 0` entropy shape corrected to the spec-literal shared-ctxTable-0 mapping (round 437).** §9.3.4.2.1 sets `ctxTable = 0` for every element under `cm_init == 0`, with `ctxIdx =` (Table-95 cm-init-0 ctxInc) + (the lowest ctxIdx of the Table-39 cm-init-0 column for the slice's initType). The crate's historical collapse-to-`(0, 0)` merged every element onto one adapting context and dropped the multi-context elements' per-bin ctxIncs (mvp/merge/mmvd/amvr indices, `intra_pred_mode`, `inter_pred_idc`, `bi_pred_idx`, `ref_idx`, the RLE run/level pair, `coeff_last_flag`, the ADCC last-position/sig/greater flags) — self-round-trip-consistent, wrong for every conformant stream. Also aligned to the Table-95 bin maps in both entropy shapes: `abs_mvd` bin 0 is regular-coded on the explicit-AMVP/affine paths, `ref_idx` bins past 1 are bypass, and the per-CTU `alf_ctb_*` reads land on Table 40 under `cm_init == 1`. Encoder writers moved in lockstep; every hand-encoded CABAC fixture re-indexed.
 - **§8.7 quantization-domain conformance (round 437).** Three spec-mandated pieces the §8.7 chain ran without: the `sps_iqt_flag == 1` branches (levelScale tail 72, the eq. 1060 mid-stage renorm + clip between the two 1-D transforms, the eq. 1054 final `bdShift` without the +7), `qP = Qp′` (eqs. 1050-1052 — the bit-depth offsets `6·(BitDepth − 8)`, so >8-bit streams stop dequantizing 12-too-fine at 10 bits), and the §8.7.1 chroma QP mapping (eqs. 1044-1049 through the default Table 5 / Table 6 `ChromaQpTable` selected by `sps_iqt_flag`). The encoder quantizes at the same mapped values (it keeps declaring `sps_iqt_flag = 0`), so the self-loop stays byte-exact; the QP-51 rate floor moves slightly (the chroma quantizer caps at Table 5's 44). Follow-up: an SPS-signalled `chroma_qp_table` is parsed but not yet routed into residual scaling.
