@@ -1019,11 +1019,12 @@ fn walk_coding_unit(
         if is_ibc {
             stats.ibc_cus += 1;
             // Spec lines 2868–2876: abs_mvd_l0[x0][y0][0], optional
-            // sign, abs_mvd_l0[x0][y0][1], optional sign. The
-            // binariser is EG-0 bypass for the magnitude and FL/bypass
-            // for the sign (mvd_l0_sign_flag is Table 95 "bypass").
+            // sign, abs_mvd_l0[x0][y0][1], optional sign. The abs_mvd
+            // binariser is EG-0 with a regular bin 0 (Table 95 — the
+            // pixel walker's `decode_signed_mvd` shape); the sign is
+            // bypass.
             for _comp in 0..2 {
-                let abs = eng.decode_egk_bypass(0)?;
+                let abs = eng.decode_eg0_first_regular(0, 0)?;
                 stats.ibc_abs_mvd_bins += 1;
                 if abs != 0 {
                     let _sign = eng.decode_bypass()?;
@@ -3215,8 +3216,19 @@ fn apply_ibc_branch_predict_and_reconstruct(
     }
     pic.store_block(x0, y0, n_cb_w_l, n_cb_h_l, 0, &pred_y);
     if chroma_present {
-        pic.store_block(x0, y0, n_c_w, n_c_h, 1, &pred_cb);
-        pic.store_block(x0, y0, n_c_w, n_c_h, 2, &pred_cr);
+        // `store_block` expects destination coordinates IN the target
+        // plane: for c_idx > 0 those are chroma-pel coordinates derived
+        // by the active sub-sampling (the P/B IBC helper already did
+        // this; the historical luma-coords call here mis-placed — and
+        // at plane edges silently dropped — the §8.6.3 chroma copy of
+        // any CU with a non-zero origin).
+        let (sub_w, sub_h) = match pic.chroma_format_idc {
+            1 => (2u32, 2u32),
+            2 => (2u32, 1u32),
+            _ => (1u32, 1u32),
+        };
+        pic.store_block(x0 / sub_w, y0 / sub_h, n_c_w, n_c_h, 1, &pred_cb);
+        pic.store_block(x0 / sub_w, y0 / sub_h, n_c_w, n_c_h, 2, &pred_cr);
     }
     if matches!(tree_type, TreeType::DualTreeLuma | TreeType::SingleTree) {
         side_info.stamp_block(
@@ -17767,5 +17779,269 @@ mod tests {
         // Deep CU cores stay untouched (no over-reach).
         assert_eq!(pic.y[row * 32 + 8], raw.y[row * 32 + 8]);
         assert_eq!(pic.y[row * 32 + 24], raw.y[row * 32 + 24]);
+    }
+
+    /// Round 444: build the two-CU 8×4 IBC bitstream shared by the
+    /// `cbf_all` stream fixtures — CU 0 at (0,0) is an intra DC CU with
+    /// a luma DC level 40 and a Cb DC level 40 (so the copy is visible
+    /// in both planes), CU 1 at (4,0) is `ibc_flag = 1` with
+    /// BV = (−4, 0); the closure appends CU 1's post-mvd tail (the
+    /// line-3028 `cbf_all` group under test).
+    fn build_ibc_cbf_all_stream(tail: impl Fn(&mut crate::cabac::CabacEncoder)) -> Vec<u8> {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // CU 0 (4×4 leaf reached through implicit boundary splits — no
+        // split_cu_flag bins anywhere on an 8×4 picture under CTB 32).
+        enc.encode_decision(0, 0, 0); // ibc_flag = 0 (MODE_INTRA)
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_cb = 1
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
+                                      // Luma residual: DC level +40.
+        enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
+        for _ in 1..39 {
+            enc.encode_decision(0, 1, 1);
+        }
+        enc.encode_decision(0, 1, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign +
+        enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
+                                      // Cb residual (2×2): DC level +40 on the chroma contexts.
+        enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
+        enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
+        for _ in 1..39 {
+            enc.encode_decision(0, 3, 1);
+        }
+        enc.encode_decision(0, 3, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign +
+        enc.encode_decision(0, 1, 1); // coeff_last_flag = 1 (chroma ctx)
+                                      // CU 1 (4×4 at (4,0)): MODE_IBC, BV = (−4, 0). The abs_mvd
+                                      // binarization is EG0 with a regular bin 0 (Table 95).
+        enc.encode_decision(0, 0, 1); // ibc_flag = 1
+        enc.encode_eg0_first_regular(0, 0, 4); // abs_mvd_l0[0] = 4
+        enc.encode_bypass(1); // mvd_l0_sign_flag → −4
+        enc.encode_eg0_first_regular(0, 0, 0); // abs_mvd_l0[1] = 0 (no sign)
+        tail(&mut enc);
+        enc.encode_terminate(true);
+        enc.finish()
+    }
+
+    fn ibc_cbf_all_walk() -> SliceWalkInputs {
+        SliceWalkInputs {
+            pic_width: 8,
+            pic_height: 4,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        }
+    }
+
+    /// Round 444 — the line-3028 `cbf_all` on a SINGLE_TREE MODE_IBC CU
+    /// through the bitstream: `CuPredMode != MODE_INTRA` and the
+    /// I-slice-absent `merge_mode_flag` (inferred 0) satisfy the
+    /// presence condition, and `cbf_all = 0` elides the whole
+    /// `transform_unit()` — no cbf bins, no residual, a pure §8.6
+    /// block copy in both planes. The stats walker consumes the same
+    /// stream to the same tallies.
+    #[test]
+    fn round444_single_tree_ibc_cbf_all_zero_is_pure_copy() {
+        let rbsp = build_ibc_cbf_all_stream(|enc| {
+            enc.encode_decision(0, 0, 0); // cbf_all = 0
+        });
+        let decode = SliceDecodeInputs {
+            slice_qp: 40,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, ibc_cbf_all_walk(), decode).unwrap();
+        assert_eq!(stats.coding_units, 2);
+        assert_eq!(stats.ibc_flag_bins, 2, "both CUs are IBC-eligible");
+        assert_eq!(stats.ibc_cus, 1);
+        assert_eq!(stats.cbf_all_bins, 1, "one line-3028 read on the IBC CU");
+        assert_eq!(
+            stats.cbf_luma_bins, 1,
+            "CU 0 only — cbf_all = 0 elides CU 1's TU"
+        );
+        assert_eq!(stats.cbf_chroma_bins, 2, "CU 0 only");
+        assert_eq!(stats.coeff_runs, 2, "CU 0's luma + Cb coefficients");
+        // CU 0's lifted block copied verbatim into the right half.
+        for j in 0..4 {
+            for i in 0..4 {
+                assert_eq!(
+                    pic.y[j * 8 + 4 + i],
+                    pic.y[j * 8 + i],
+                    "luma copy at ({i},{j})"
+                );
+            }
+        }
+        for j in 0..2 {
+            for i in 0..2 {
+                assert_eq!(
+                    pic.cb[j * 4 + 2 + i],
+                    pic.cb[j * 4 + i],
+                    "Cb copy at ({i},{j})"
+                );
+            }
+        }
+        assert!(
+            pic.y[0] > 128,
+            "CU 0's DC residual must have lifted the source block"
+        );
+        assert!(
+            pic.cb[0] > 128,
+            "CU 0's Cb residual must have lifted the source block"
+        );
+        // The stats-only walker consumes the identical bin stream.
+        let walk_stats = walk_baseline_idr_slice(&rbsp, ibc_cbf_all_walk()).unwrap();
+        assert_eq!(walk_stats.cbf_all_bins, 1);
+        assert_eq!(walk_stats.cbf_luma_bins, 1);
+        assert_eq!(walk_stats.cbf_chroma_bins, 2);
+        assert_eq!(walk_stats.coding_units, 2);
+    }
+
+    /// Round 444 — `cbf_all = 1` on the SINGLE_TREE IBC CU: `cbf_cb` /
+    /// `cbf_cr` are read (line 3066), a set chroma cbf forces the
+    /// `cbf_luma` read (the `(isSplit || MODE_INTRA || cbf_cb ||
+    /// cbf_cr)` presence rule — MODE_IBC alone would infer it 1), and
+    /// the Cb residual lands **on top of** the §8.6.3 block-copied
+    /// chroma prediction.
+    #[test]
+    fn round444_single_tree_ibc_chroma_residual_atop_copy() {
+        let rbsp = build_ibc_cbf_all_stream(|enc| {
+            enc.encode_decision(0, 0, 1); // cbf_all = 1
+            enc.encode_decision(0, 0, 1); // cbf_cb = 1
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0 (read: cbf_cb set)
+                                          // Cb residual: DC level +40 (chroma contexts).
+            enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
+            enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
+            for _ in 1..39 {
+                enc.encode_decision(0, 3, 1);
+            }
+            enc.encode_decision(0, 3, 0); // U terminator → level 40
+            enc.encode_bypass(0); // sign +
+            enc.encode_decision(0, 1, 1); // coeff_last_flag = 1
+        });
+        let decode = SliceDecodeInputs {
+            slice_qp: 40,
+            sps_ibc_flag: true,
+            log2_max_ibc_cand_size: 5,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, ibc_cbf_all_walk(), decode).unwrap();
+        assert_eq!(stats.cbf_all_bins, 1);
+        assert_eq!(
+            stats.cbf_luma_bins, 2,
+            "CU 0 + the chroma-cbf-forced CU 1 read"
+        );
+        assert_eq!(stats.cbf_chroma_bins, 4);
+        assert_eq!(stats.coeff_runs, 3);
+        // Luma: pure copy (cbf_luma = 0).
+        for j in 0..4 {
+            for i in 0..4 {
+                assert_eq!(
+                    pic.y[j * 8 + 4 + i],
+                    pic.y[j * 8 + i],
+                    "luma copy at ({i},{j})"
+                );
+            }
+        }
+        // Cb: the copied prediction plus the same DC lift CU 0 decoded
+        // (identical level at the identical chroma QP — the 2×2 DC
+        // basis reconstructs uniformly), i.e. right = left + (left −
+        // 128).
+        for j in 0..2 {
+            for i in 0..2 {
+                let left = pic.cb[j * 4 + i] as i32;
+                let right = pic.cb[j * 4 + 2 + i] as i32;
+                assert_eq!(
+                    right,
+                    left + (left - 128),
+                    "Cb residual atop copy at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Round 444 — §8.4.3 DM chroma to pixels: with the never-present
+    /// (`sps_eipd_flag == 0`) `intra_chroma_pred_mode` inferred 0,
+    /// `IntraPredModeC = IntraPredModeY`. Two stacked 4×4 CUs on a 4×8
+    /// picture: CU 0 decodes a Cb coefficient at scan position 1 (the
+    /// 2×2 horizontal AC basis — its bottom chroma row has two
+    /// *different* column values), CU 1 selects INTRA_VER. CU 1's Cb
+    /// must copy CU 0's bottom chroma row column-for-column — the
+    /// historical INTRA_DC chroma would average the two samples into a
+    /// uniform block instead.
+    #[test]
+    fn round444_dm_chroma_ver_copies_top_chroma_row() {
+        use crate::cabac::CabacEncoder;
+        let mut enc = CabacEncoder::new();
+        // CU 0 at (0,0) (implicit boundary splits only): DC luma, Cb AC.
+        enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 1); // cbf_cb = 1
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+                                      // Cb residual: coeff_zero_run = 1 → scan position 1 = (1, 0).
+        enc.encode_decision(0, 2, 1); // coeff_zero_run bin 0
+        enc.encode_decision(0, 3, 0); // U terminator → run = 1
+        enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
+        for _ in 1..39 {
+            enc.encode_decision(0, 3, 1);
+        }
+        enc.encode_decision(0, 3, 0); // U terminator → level 40
+        enc.encode_bypass(0); // sign +
+        enc.encode_decision(0, 1, 1); // coeff_last_flag = 1
+                                      // CU 1 at (0,4): INTRA_VER (U "110"), no residual.
+        enc.encode_decision(0, 0, 1); // intra_pred_mode ...
+        enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
+        enc.encode_decision(0, 1, 0); //   U terminator
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
+        enc.encode_terminate(true);
+        let rbsp = enc.finish();
+        let walk = SliceWalkInputs {
+            pic_width: 4,
+            pic_height: 8,
+            ctb_log2_size_y: 5,
+            min_cb_log2_size_y: 2,
+            max_tb_log2_size_y: 5,
+            chroma_format_idc: 1,
+            cu_qp_delta_enabled: false,
+            ..Default::default()
+        };
+        let decode = SliceDecodeInputs {
+            slice_qp: 40,
+            ..Default::default()
+        };
+        let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
+        assert_eq!(stats.coding_units, 2);
+        assert_eq!(stats.intra_pred_mode_bins, 2);
+        // Cb plane is 2×4. CU 0's rows 0-1 carry the horizontal-AC
+        // residual: vertically uniform, columns distinct.
+        assert_eq!(pic.cb[0], pic.cb[2], "AC basis is vertically uniform");
+        assert_ne!(pic.cb[2], pic.cb[3], "AC basis columns must differ");
+        // CU 1 (rows 2-3): DM = INTRA_VER copies row 1 per column. The
+        // historical INTRA_DC would average row 1 into a uniform block.
+        for j in 2..4 {
+            for i in 0..2 {
+                assert_eq!(
+                    pic.cb[j * 2 + i],
+                    pic.cb[2 + i],
+                    "DM chroma VER copy mismatch at ({i},{j})"
+                );
+            }
+        }
+        assert_ne!(
+            pic.cb[2 * 2],
+            pic.cb[2 * 2 + 1],
+            "CU 1's chroma keeps the distinct columns — DC averaging would flatten them"
+        );
     }
 }

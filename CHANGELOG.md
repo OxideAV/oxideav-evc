@@ -46,6 +46,21 @@
   U-at-cMax truncation and §9.3.4.3.4 bypass-formulation asks, and the
   in-repo #213 (c) `sps_cm_init_flag == 0` context-topology entry, which
   its own text marks corpus-adjudicable) — not on the tree shape.
+- **New stream-level pins + two exposed-bug fixes (round 444).** Three
+  bitstream fixtures pin the restructure's new paths to pixels: the
+  line-3028 `cbf_all` on a SINGLE_TREE MODE_IBC CU (both arms — `0`
+  elides the whole `transform_unit()` leaving a pure §8.6 block copy;
+  `1` with a set `cbf_cb` forces the `cbf_luma` read and lands the Cb
+  residual on top of the §8.6.3 block-copied chroma), and the §8.4.3 DM
+  chroma to pixels (a horizontal-AC chroma basis copied
+  column-for-column by an INTRA_VER DM CU — the historical INTRA_DC
+  averaging would flatten it). Writing them exposed two real defects,
+  fixed in the same commit: the IDR IBC helper stored its §8.6.3 chroma
+  prediction at **luma** coordinates in the chroma plane (mis-placed —
+  and at plane edges silently dropped — for any CU with a non-zero
+  origin; the P/B IBC helper had already been corrected), and the
+  stats-only walker still read the IBC `abs_mvd_l0` as all-bypass EG-0
+  where Table 95 (and the pixel walker) put bin 0 on a regular context.
 
 - **Conformance-gate triage, round 441 (documentation of findings; no behaviour change).**
   A forensic pass over the ISO/IEC 23094-4 corpus hand-anchored, bit-exactly
