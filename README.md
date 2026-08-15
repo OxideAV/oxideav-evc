@@ -616,18 +616,19 @@ both the IDR and P access units (every flip/invert decodes to a clean
 error or a frame, never a panic). Cross-implementation decode remains
 open until a validator lands in docs.
 
-Measured on the in-tree busy synthetic QCIF frame (176×144), intra:
+Measured on the in-tree busy synthetic QCIF frame (176×144), intra
+(round-444 re-measure after the single-tree/DM-chroma restructure):
 
 | QP | cm_init=0 bytes | cm_init=1 bytes | saving | luma PSNR |
 |----|----------------|----------------|--------|-----------|
-| 4  | 98 193 | 68 292 | 30.5 % | 85.2 dB |
-| 22 | 46 835 | 27 623 | 41.0 % | 79.6 dB |
-| 34 | 25 651 | 17 387 | 32.2 % | 52.2 dB |
-| 51 |  9 905 |  8 081 | 18.4 % | 38.1 dB |
+| 4  | 80 280 | 67 391 | 16.1 % | 92.2 dB |
+| 22 | 35 849 | 27 019 | 24.6 % | 80.7 dB |
+| 34 | 23 531 | 18 256 | 22.4 % | 52.2 dB |
+| 51 | 13 574 | 11 135 | 18.0 % | 37.8 dB |
 
-and on a moving-scene QCIF GOP at QP 30 (cm_init on): IDR 13 308
-bytes / 55.3 dB, then P frames of 100-695 bytes at 48.0-49.2 dB with
-95-98 % of leaves riding the skip ladder.
+and on a moving-scene QCIF GOP at QP 30 (cm_init on): IDR 12 535
+bytes / 55.2 dB, then P frames of 69-875 bytes at 47.8-49.1 dB with
+93-99.5 % of leaves riding the skip ladder.
 
 Encoder follow-ups, in priority order: B slices (bi-prediction +
 direct mode on the write side), multi-reference P (`ref_idx`

@@ -1104,7 +1104,13 @@ pub fn derive_pred_mode_constraint(
 /// 2790-2793): a `coding_unit()` leaf reached with
 /// `PRED_MODE_NO_CONSTRAINT` becomes `PRED_MODE_CONSTRAINT_INTRA_IBC`
 /// on an I slice, or on any slice for a 4×4 block under
-/// `sps_admvp_flag == 1` (Main profile has no 4×4 inter CUs).
+/// `sps_admvp_flag == 1` (Main profile has no 4×4 inter CUs). The
+/// reassignment binds only the `coding_unit()`-internal presence gates
+/// (no `cu_skip_flag` / `pred_mode_flag`); the leaf's `treeType` was
+/// already resolved from the *incoming* constraint (lines 2788-2789),
+/// so the transition never creates a `DUAL_TREE_CHROMA` partner —
+/// §7.4.9.3 `isTreeSplitPoint` compares the split-time derivation,
+/// which stays `PRED_MODE_NO_CONSTRAINT` at a `NO_SPLIT` leaf.
 pub fn leaf_pred_mode_constraint(
     constraint: ModeConstraint,
     slice_is_i: bool,
