@@ -45,7 +45,13 @@
   divergence sits on the still-open entropy questions (the filed Table-91
   U-at-cMax truncation and §9.3.4.3.4 bypass-formulation asks, and the
   in-repo #213 (c) `sps_cm_init_flag == 0` context-topology entry, which
-  its own text marks corpus-adjudicable) — not on the tree shape.
+  its own text marks corpus-adjudicable) — not on the tree shape. The
+  restructure sharpened the corpus failure signatures into element-level
+  evidence for the filed truncation ask: 35 of 219 streams now fail with
+  `intra_pred_mode N out of Baseline range` (N ≥ 5 — ≥ 5 consecutive
+  1-bins where the terminated U reading expects a terminator, exactly
+  what a truncated-at-cMax writer produces at its first mode-4 CU),
+  where round 441's runs showed only undifferentiated desync tails.
 - **New stream-level pins + two exposed-bug fixes (round 444).** Three
   bitstream fixtures pin the restructure's new paths to pixels: the
   line-3028 `cbf_all` on a SINGLE_TREE MODE_IBC CU (both arms — `0`
