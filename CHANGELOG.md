@@ -4,6 +4,49 @@
 
 ### Other
 
+- **§7.3.8.3/§8.4.3 single-tree leaf + DM-chroma restructure (round 444)** — the
+  round-441-staged re-reading lands as one decoder + encoder + fixture
+  lockstep. §7.3.8.3 (spec lines 2788-2795) assigns `treeType` from the
+  constraint the leaf was *reached* with: a leaf under
+  `PRED_MODE_NO_CONSTRAINT` is a **SINGLE_TREE** `coding_unit()` — chroma
+  cbfs and residuals inside the same `transform_unit()` — because the
+  line-2791 in-leaf INTRA_IBC reassignment (I slice, or admvp 4×4) binds
+  only the CU-internal presence gates, and §7.4.9.3 `isTreeSplitPoint`
+  compares the split-time derivation (still `PRED_MODE_NO_CONSTRAINT` at a
+  `NO_SPLIT` leaf), so no per-leaf `DUAL_TREE_CHROMA` partner exists;
+  `DUAL_TREE_LUMA`/`DUAL_TREE_CHROMA` survive only inside ancestor-armed
+  INTRA_IBC subtrees (the §7.4.9.3 local dual tree). §8.4.3 with the
+  never-present (`sps_eipd_flag == 0`) `intra_chroma_pred_mode` inferred 0
+  (§7.4.9.4) sets **IntraPredModeC = IntraPredModeY** (DM — this CU's luma
+  mode on SINGLE_TREE, the co-located luma mode on a standalone chroma
+  tree), replacing the historical INTRA_DC chroma. Moved together: the
+  stats-only walker (plus a dead-code repair — its `sps_btt_flag == 0`
+  boundary-CU implicit split was unreachable because `can_split` folded
+  `cb_within_picture`, diverging from the pixel walker), the IDR pixel
+  walker (`intra_mode_c` threaded into `decode_transform_unit`; the
+  reconstruction runs luma then, on any chroma-carrying tree, the chroma
+  pair at IntraPredModeC), the IDR IBC branch (SINGLE_TREE now reads the
+  line-3028 `cbf_all` — MODE_IBC with the inferred-0 `merge_mode_flag`
+  satisfies the presence condition — then `cbf_cb`/`cbf_cr` and the
+  presence-gated `cbf_luma` (§7.4.9.5 inferred 1), with chroma residuals
+  added on top of the §8.6.3 block-copied prediction), the P/B walker
+  (the admvp-4×4 leaf-reassigned CU stays SINGLE_TREE with its own
+  chroma; the local-dual-tree chroma CU takes the DM co-located luma
+  mode), the EIPD leaf shape (a SINGLE_TREE CU reads the luma MPM group
+  *and* `intra_chroma_pred_mode` in the same `coding_unit()`, matching
+  the P/B walker's existing shape), the intra slice encoder
+  (`slice_enc`: one SINGLE_TREE CU per leaf, §7.3.8.5 cbf order
+  `cbf_cb`/`cbf_cr`/`cbf_luma`, chroma predicted and quantized at the DM
+  luma mode), and every hand-built CABAC fixture (36 re-derived across
+  both walkers, the tile paths, BTT/SUCO/EIPD/ADCC/DQUANT/ADDB/ATS and
+  the registered-decoder e2e streams). The encode→decode self-loop stays
+  byte-exact across the size × QP × entropy matrix. The 219-stream
+  conformance gate still stands at 0 passes: the remaining first-IDR
+  divergence sits on the still-open entropy questions (the filed Table-91
+  U-at-cMax truncation and §9.3.4.3.4 bypass-formulation asks, and the
+  in-repo #213 (c) `sps_cm_init_flag == 0` context-topology entry, which
+  its own text marks corpus-adjudicable) — not on the tree shape.
+
 - **Conformance-gate triage, round 441 (documentation of findings; no behaviour change).**
   A forensic pass over the ISO/IEC 23094-4 corpus hand-anchored, bit-exactly
   against the raw stream bytes, everything from the framing down to the first

@@ -22,13 +22,16 @@
 //!
 //! * per CTU — `split_unit()` quad recursion (§7.3.8.3, `sps_btt_flag
 //!   == 0` shape): `split_cu_flag` on recursable in-picture blocks,
-//!   implicit splits at picture edges, leaves as the I-slice local dual
-//!   tree (luma `coding_unit()` then chroma `coding_unit()`);
-//! * luma CU — `intra_pred_mode` (U over the Table-13 5-mode set),
-//!   `cbf_luma`, `residual_coding_rle()` (§7.3.8.7);
-//! * chroma CU — `cbf_cb`, `cbf_cr`, per-component RLE residuals at the
-//!   4:2:0 sub-sampled TB dimensions (prediction is the decoder's
-//!   Baseline chroma shape: `INTRA_DC`);
+//!   implicit splits at picture edges, each leaf one SINGLE_TREE
+//!   `coding_unit()` (§7.3.8.3 lines 2788-2795 — the in-leaf INTRA_IBC
+//!   reassignment binds only the CU-internal presence gates, so no
+//!   per-leaf chroma partner CU exists);
+//! * per CU — `intra_pred_mode` (U over the Table-13 5-mode set), then
+//!   the §7.3.8.5 `transform_unit()`: `cbf_cb`, `cbf_cr`, `cbf_luma`,
+//!   and per-component `residual_coding_rle()` (§7.3.8.7) in luma / Cb /
+//!   Cr order (chroma at the 4:2:0 sub-sampled TB dimensions; chroma
+//!   prediction is the §8.4.3 DM — `IntraPredModeC = IntraPredModeY`
+//!   via the inferred-0 `intra_chroma_pred_mode`);
 //! * one `end_of_tile_one_bit` terminate after the last CTU (§7.3.8.1).
 //!
 //! ## Mode / split decisions
@@ -77,7 +80,7 @@ const MIN_CB_LOG2: u32 = 2;
 pub struct EncStats {
     /// CTUs walked.
     pub ctus: u32,
-    /// Leaf coding units (each is a luma + chroma `coding_unit()` pair).
+    /// Leaf coding units (one SINGLE_TREE `coding_unit()` each).
     pub leaves: u32,
     /// Leaves per chosen luma intra mode (Table 13 order DC/HOR/VER/UL/UR).
     pub mode_histogram: [u32; 5],
@@ -318,7 +321,7 @@ fn decide_split_unit(
         return Ok((Node::Split(children), cost));
     }
     if !flag_present {
-        // 4×4 in-picture leaf: nothing signalled, coding_unit() pair.
+        // 4×4 in-picture leaf: nothing signalled, one coding_unit().
         let (plan, cost) = decide_leaf(ctx, stats, x0, y0, log2_w, log2_h)?;
         return Ok((Node::Leaf(plan), cost + ctx.lambda));
     }
@@ -371,7 +374,7 @@ fn decide_children(
     Ok((out, cost))
 }
 
-/// Decide one leaf: 5-mode luma search + DC chroma, committing the
+/// Decide one leaf: 5-mode luma search + §8.4.3 DM chroma, committing the
 /// winning reconstruction (via the decoder's own
 /// `intra_reconstruct_cb_in_tile`) and returning the plan + RD cost.
 fn decide_leaf(
@@ -421,8 +424,11 @@ fn decide_leaf(
         None,
     )?;
 
-    // ---- chroma: the decoder's Baseline chroma prediction is INTRA_DC
-    // on the dual-tree chroma CU; quantize each component's residual ----
+    // ---- chroma: §8.4.3 DM — the never-present (`sps_eipd_flag == 0`)
+    // `intra_chroma_pred_mode` is inferred 0, so IntraPredModeC =
+    // IntraPredModeY (the mode just decided for this SINGLE_TREE CU);
+    // quantize each component's residual under that prediction ----
+    let mode_c = MODES[mode_idx];
     let wc = 1usize << (log2_w - 1);
     let hc = 1usize << (log2_h - 1);
     let mut cost = cost_y;
@@ -432,7 +438,7 @@ fn decide_leaf(
         let refs_c = ctx.recon.fetch_intra_refs(x0 >> 1, y0 >> 1, wc, hc, c_idx);
         let src_c = gather_block(plane, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
         let (levels, cbf, res, dist) =
-            quantize_block(&refs_c, IntraMode::Dc, &src_c, wc, hc, qp_c, bd, max_val)?;
+            quantize_block(&refs_c, mode_c, &src_c, wc, hc, qp_c, bd, max_val)?;
         let bits = 1.0 + rle_bits_estimate(&levels, cbf);
         cost += dist + ctx.lambda * bits;
         intra_reconstruct_cb_in_tile(
@@ -441,7 +447,7 @@ fn decide_leaf(
             y0,
             log2_w,
             log2_h,
-            IntraMode::Dc,
+            mode_c,
             c_idx,
             &res,
             None,
@@ -649,10 +655,10 @@ fn emit_split_unit(
 }
 
 fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
-    // Luma coding_unit(): intra_pred_mode — U over Table 62 with the
-    // Table 95 ctxInc (bin0 → 0, later bins → 1) under `cm_init`; all
-    // bins on (0, 0) under the Baseline collapse. The decoder reads it
-    // via `decode_u_regular` (63-bin compat cap).
+    // One SINGLE_TREE coding_unit(): intra_pred_mode — U over Table 62
+    // with the Table 95 ctxInc (bin0 → 0, later bins → 1) under
+    // `cm_init`; all bins on (0, 0) under the Baseline collapse. The
+    // decoder reads it via `decode_u_regular` (63-bin compat cap).
     {
         let table = MainCtxTable::IntraPredMode;
         let (t, off) = if sel.cm_init {
@@ -664,20 +670,20 @@ fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, 
             off + (bin_idx as usize).min(1)
         });
     }
-    // transform_unit(), DUAL_TREE_LUMA: cbf_luma only (Table 75,
-    // ctxInc 0).
+    // transform_unit(), SINGLE_TREE (§7.3.8.5): cbf_cb then cbf_cr
+    // (Tables 76/77, ctxInc 0 — the line-3066 chroma-carrying-tree
+    // gate), then cbf_luma (Table 75 — always present on a MODE_INTRA
+    // CU), then the residuals in luma, Cb, Cr order (chroma at the
+    // 4:2:0 sub-sampled dimensions).
+    let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+    enc.encode_decision(t, i, u8::from(plan.cbf_cb));
+    let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+    enc.encode_decision(t, i, u8::from(plan.cbf_cr));
     let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
     enc.encode_decision(t, i, u8::from(plan.cbf_y));
     if plan.cbf_y {
         emit_residual_rle(enc, sel, 0, &plan.levels_y, log2_w, log2_h);
     }
-    // Chroma coding_unit(): no intra_pred_mode read (DualTreeChroma),
-    // transform_unit() reads cbf_cb then cbf_cr (Tables 76/77, ctxInc 0)
-    // then the residuals at the 4:2:0 dimensions.
-    let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
-    enc.encode_decision(t, i, u8::from(plan.cbf_cb));
-    let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
-    enc.encode_decision(t, i, u8::from(plan.cbf_cr));
     if plan.cbf_cb {
         emit_residual_rle(enc, sel, 1, &plan.levels_cb, log2_w - 1, log2_h - 1);
     }

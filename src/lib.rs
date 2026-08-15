@@ -915,13 +915,13 @@ mod tests {
     /// picture (a single 64×64 CTU explicitly split via `split_cu_flag = 1`
     /// into four 32×32 leaves; each leaf then declines to split via
     /// `split_cu_flag = 0` since the walker permits more recursion under
-    /// the Baseline default `MinCbLog2SizeY = 2`). Each leaf goes through
-    /// the dual-tree luma + chroma `coding_unit()` pair with no CBFs set.
+    /// the Baseline default `MinCbLog2SizeY = 2`). Each leaf is one
+    /// SINGLE_TREE `coding_unit()` with no CBFs set.
     ///
     /// Bin sequence (21 regular bins + terminate):
     /// * 1 × `split_cu_flag = 1` (CTB)
     /// * 4 × `split_cu_flag = 0` (each 32×32 child)
-    /// * 4 × (intra_pred_mode + cbf_luma + cbf_cb + cbf_cr) = 16
+    /// * 4 × (intra_pred_mode + cbf_cb + cbf_cr + cbf_luma) = 16
     #[test]
     fn end_to_end_walk_baseline_idr_slice() {
         use crate::cabac::CabacEncoder;
@@ -988,16 +988,16 @@ mod tests {
         // CABAC-encoded slice_data:
         //   1× split_cu_flag = 1 at the CTB
         //   4× split_cu_flag = 0 at each 32×32 child
-        //   4× (intra_pred_mode + cbf_luma + cbf_cb + cbf_cr)
+        //   4× (intra_pred_mode + cbf_cb + cbf_cr + cbf_luma)
         //   then terminate(true).
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 1); // CTB split = 1
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // child split = 0
             enc.encode_decision(0, 0, 0); // intra_pred_mode
-            enc.encode_decision(0, 0, 0); // cbf_luma
             enc.encode_decision(0, 0, 0); // cbf_cb
             enc.encode_decision(0, 0, 0); // cbf_cr
+            enc.encode_decision(0, 0, 0); // cbf_luma
         }
         enc.encode_terminate(true);
         let slice_data_bytes = enc.finish();
@@ -1006,7 +1006,7 @@ mod tests {
         let stats = walk_idr_slice(&sps, &pps, &slice_rbsp).expect("walk succeeds");
         assert_eq!(stats.ctus, 1);
         assert_eq!(stats.split_cu_flag_bins, 5, "1 CTB split + 4 child splits");
-        assert_eq!(stats.coding_units, 8, "4 leaves × (luma + chroma)");
+        assert_eq!(stats.coding_units, 4, "one SINGLE_TREE CU per leaf");
         assert_eq!(stats.intra_pred_mode_bins, 4);
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 8);
@@ -1219,13 +1219,11 @@ mod tests {
         enc.encode_decision(0, 0, 1); // CTB split_cu_flag = 1
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // child split_cu_flag = 0 (leaf)
-                                          // dual-tree luma CU: intra_pred_mode + cbf_luma
+                                          // one SINGLE_TREE CU per leaf (§7.3.8.3 lines 2788-2795)
             enc.encode_decision(0, 0, 0); // intra_pred_mode_idx = 0 (one "0" bin)
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                          // dual-tree chroma CU: cbf_cb + cbf_cr (no intra_pred_mode_idx
-                                          // for chroma in sps_eipd_flag=0 dual-tree path)
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
         enc.encode_terminate(true);
         slice_rbsp.extend_from_slice(&enc.finish());
@@ -1237,12 +1235,12 @@ mod tests {
         assert_eq!(pic.y.len(), 64 * 64);
         assert_eq!(pic.cb.len(), 32 * 32);
         assert_eq!(pic.cr.len(), 32 * 32);
-        // Stats: 1 CTU, 5 split_cu_flag bins (1 CTB + 4 children), 8
-        // coding_units (luma+chroma per leaf), 4 intra_pred_mode bins,
-        // 4 cbf_luma bins, 8 cbf_chroma bins.
+        // Stats: 1 CTU, 5 split_cu_flag bins (1 CTB + 4 children), 4
+        // coding_units (one SINGLE_TREE CU per leaf), 4 intra_pred_mode
+        // bins, 4 cbf_luma bins, 8 cbf_chroma bins.
         assert_eq!(stats.ctus, 1);
         assert_eq!(stats.split_cu_flag_bins, 5);
-        assert_eq!(stats.coding_units, 8);
+        assert_eq!(stats.coding_units, 4);
         assert_eq!(stats.intra_pred_mode_bins, 4);
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 8);
@@ -1299,8 +1297,10 @@ mod tests {
         let mut slice_rbsp = hdr.into_bytes();
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → unsplit 64×64 CB
-                                      // luma CU: DC mode + one DC coefficient.
+                                      // one SINGLE_TREE CU: DC mode + one DC coefficient.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -1310,9 +1310,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 64
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // chroma CU: no residual.
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         slice_rbsp.extend_from_slice(&enc.finish());
 
@@ -1369,9 +1366,9 @@ mod tests {
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // child split = 0
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
         enc.encode_terminate(true);
         idr_rbsp.extend_from_slice(&enc.finish());
@@ -1447,12 +1444,11 @@ mod tests {
         // With ctb_log2 = 5 and min_cb_log2 = 4, the CTU is 32×32, and
         // we want a single 32x32 leaf → split_cu_flag = 0.
         idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0 at CTB
-                                          // dual-tree luma CU (32x32):
+                                          // one SINGLE_TREE CU (32x32):
         idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-        idr_enc.encode_decision(0, 0, 0); // cbf_luma
-                                          // dual-tree chroma CU:
         idr_enc.encode_decision(0, 0, 0); // cbf_cb
         idr_enc.encode_decision(0, 0, 0); // cbf_cr
+        idr_enc.encode_decision(0, 0, 0); // cbf_luma
         idr_enc.encode_terminate(true);
         idr_rbsp.extend_from_slice(&idr_enc.finish());
 
@@ -2115,7 +2111,7 @@ mod tests {
         assert_eq!(stats.tree.btt.flag_bins, 6);
         assert_eq!(stats.tree.btt.dir_bins, 2);
         assert_eq!(stats.tree.btt.type_bins, 2);
-        assert_eq!(stats.coding_units, 8);
+        assert_eq!(stats.coding_units, 4);
         assert!(pic.y.iter().all(|&v| v == 128));
     }
 
@@ -2163,14 +2159,16 @@ mod tests {
         }
         let mut slice_rbsp = hdr.into_bytes();
 
-        // One 32x32 CTU: split_cu_flag = 1 → four 16x16 dual-tree leaf
-        // pairs; the first luma CU carries a DC level of +30, the rest
+        // One 32x32 CTU: split_cu_flag = 1 → four 16x16 SINGLE_TREE
+        // leaves; the first CU carries a luma DC level of +30, the rest
         // are residual-free.
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 1); // split_cu_flag = 1
         for leaf_idx in 0..4 {
             enc.encode_decision(0, 0, 0); // child split_cu_flag = 0
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             if leaf_idx == 0 {
                 enc.encode_decision(0, 0, 1); // cbf_luma = 1
                 enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
@@ -2184,8 +2182,6 @@ mod tests {
             } else {
                 enc.encode_decision(0, 0, 0); // cbf_luma = 0
             }
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
         }
         enc.encode_terminate(true);
         slice_rbsp.extend_from_slice(&enc.finish());
@@ -2246,6 +2242,8 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (64×64 leaf)
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         for b in 0..abs_minus1 {
@@ -2254,8 +2252,6 @@ mod tests {
         enc.encode_decision(0, (abs_minus1 as usize).min(1), 0); // U terminator
         enc.encode_bypass(0); // sign +
         enc.encode_decision(0, 0, 1); // coeff_last_flag
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true); // end_of_tile_one_bit
         enc.finish()
     }

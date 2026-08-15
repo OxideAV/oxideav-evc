@@ -263,10 +263,9 @@ pub struct TreeSplitStats {
     pub suco_mirrored_units: u32,
     /// `pred_mode_constraint_type_flag` regular bins decoded.
     pub pred_mode_constraint_flag_bins: u32,
-    /// Non-leaf `DUAL_TREE_CHROMA` coding units decoded at §7.4.9.3
-    /// tree-split points (the local dual-tree chroma CU covering a
-    /// whole BTT subtree). Leaf-level dual-tree chroma CUs (the
-    /// Baseline I-slice shape) are not counted here.
+    /// `DUAL_TREE_CHROMA` coding units decoded at §7.4.9.3 tree-split
+    /// points (the local dual-tree chroma CU covering a whole
+    /// INTRA_IBC-constrained subtree).
     pub chroma_tree_split_points: u32,
 }
 
@@ -580,13 +579,16 @@ pub struct SliceWalkStats {
     pub ctus: u32,
     /// `split_cu_flag` bins decoded (one per non-leaf split point).
     pub split_cu_flag_bins: u32,
-    /// `coding_unit()` invocations (luma + chroma trees combined for an
-    /// I slice in dual-tree mode).
+    /// `coding_unit()` invocations (one SINGLE_TREE CU per leaf).
     pub coding_units: u32,
     /// `cbf_luma` bins decoded.
     pub cbf_luma_bins: u32,
     /// `cbf_cb` + `cbf_cr` bins decoded.
     pub cbf_chroma_bins: u32,
+    /// `cbf_all` bins decoded (line 3028 — a SINGLE_TREE MODE_IBC CU on
+    /// an I slice satisfies the presence condition with the inferred-0
+    /// `merge_mode_flag`).
+    pub cbf_all_bins: u32,
     /// `cu_qp_delta_abs` bins decoded (per CU when enabled).
     pub cu_qp_delta_abs_bins: u32,
     /// `intra_pred_mode` bins decoded (per luma CU under sps_eipd=0).
@@ -630,18 +632,20 @@ pub struct SliceWalkStats {
 }
 
 /// Predicate marking which kind of `coding_unit()` invocation we're in.
-/// Baseline + I slice splits per §7.3.8.3 lines 2789–2799 — the I-slice
-/// path always lands in dual-tree mode (`predModeConstraint = INTRA_IBC`),
-/// so only the dual-tree variants are constructed in this round; the
-/// `SingleTree` variant is reserved for round-3 P/B slices.
+/// Per §7.3.8.3 lines 2788-2795 treeType derives from the constraint the
+/// leaf was *reached* with: a leaf under `PRED_MODE_NO_CONSTRAINT` is a
+/// `SINGLE_TREE` CU (chroma included — the line-2791 in-leaf INTRA_IBC
+/// reassignment binds only the CU-internal presence gates), while
+/// leaves inside an ancestor-armed INTRA_IBC subtree are
+/// `DUAL_TREE_LUMA` with one `DUAL_TREE_CHROMA` partner decoded by the
+/// tree-split-point ancestor (§7.4.9.3 isTreeSplitPoint).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TreeType {
-    /// Single-tree CU (P/B slice path — round 3).
-    #[allow(dead_code)]
+    /// Single-tree CU — luma + chroma in one `coding_unit()`.
     SingleTree,
-    /// Luma-only CU, dual-tree mode.
+    /// Luma-only CU inside an INTRA_IBC-constrained subtree.
     DualTreeLuma,
-    /// Chroma-only CU, dual-tree mode.
+    /// The local-dual-tree chroma CU covering the split unit.
     DualTreeChroma,
 }
 
@@ -893,7 +897,7 @@ pub fn walk_baseline_idr_slice_tiled(
 
 /// `split_unit()` per §7.3.8.3 — Baseline subset (`sps_btt_flag == 0`).
 /// Recurses into four sub-units when `split_cu_flag == 1`, else lands on
-/// the dual-tree `coding_unit()` pair (luma + chroma) for an I slice.
+/// one SINGLE_TREE `coding_unit()` (§7.3.8.3 lines 2788-2795).
 fn walk_split_unit(
     eng: &mut CabacEngine,
     stats: &mut SliceWalkStats,
@@ -904,22 +908,24 @@ fn walk_split_unit(
     log2_cb_height: u32,
 ) -> Result<()> {
     // §7.3.8.3: with sps_btt_flag == 0 the split_cu_flag is read iff
-    // log2CbWidth > 2 || log2CbHeight > 2.
+    // log2CbWidth > 2 || log2CbHeight > 2 and the block lies within the
+    // picture; a boundary-straddling block reads no flag and splits
+    // implicitly (the pixel walker's `resolve_split_unit` behaviour —
+    // the historical `can_split` fold of `cb_within_picture` made the
+    // implicit-split arm unreachable here).
     let mut split = false;
     let cb_w = 1u32 << log2_cb_width;
     let cb_h = 1u32 << log2_cb_height;
     let cb_within_picture = x0 + cb_w <= inputs.pic_width && y0 + cb_h <= inputs.pic_height;
-    let can_split = log2_cb_width > inputs.min_cb_log2_size_y
-        && log2_cb_height > inputs.min_cb_log2_size_y
-        && cb_within_picture;
-    if can_split && (log2_cb_width > 2 || log2_cb_height > 2) {
+    let can_split =
+        log2_cb_width > inputs.min_cb_log2_size_y && log2_cb_height > inputs.min_cb_log2_size_y;
+    if can_split && cb_within_picture && (log2_cb_width > 2 || log2_cb_height > 2) {
         // Baseline path: ctxTable 0, ctxIdx 0 (sps_cm_init_flag=0).
         let bin = eng.decode_decision(0, 0)?;
         stats.split_cu_flag_bins += 1;
         split = bin != 0;
-    } else if !cb_within_picture && can_split {
-        // Boundary CU: spec implies it's split implicitly (no flag in the
-        // bitstream). Recurse.
+    } else if can_split && !cb_within_picture {
+        // Boundary CU: implicit split, no coded flag.
         split = true;
     }
 
@@ -942,7 +948,13 @@ fn walk_split_unit(
         return Ok(());
     }
 
-    // Leaf: dual-tree pair for I slice (predModeConstraint = INTRA_IBC).
+    // Leaf: one SINGLE_TREE coding_unit(). §7.3.8.3 lines 2788-2795
+    // assign treeType from the constraint the leaf was *reached* with
+    // (NO_CONSTRAINT here → SINGLE_TREE); the line-2791 in-leaf I-slice
+    // reassignment to INTRA_IBC binds only the coding_unit()-internal
+    // presence gates, and §7.4.9.3 isTreeSplitPoint compares the
+    // split-time derivation (still NO_CONSTRAINT at a NO_SPLIT leaf),
+    // so no DUAL_TREE_CHROMA partner follows.
     walk_coding_unit(
         eng,
         stats,
@@ -951,17 +963,7 @@ fn walk_split_unit(
         y0,
         log2_cb_width,
         log2_cb_height,
-        TreeType::DualTreeLuma,
-    )?;
-    walk_coding_unit(
-        eng,
-        stats,
-        inputs,
-        x0,
-        y0,
-        log2_cb_width,
-        log2_cb_height,
-        TreeType::DualTreeChroma,
+        TreeType::SingleTree,
     )?;
     Ok(())
 }
@@ -1030,10 +1032,8 @@ fn walk_coding_unit(
             }
             // IBC CUs drop the intra_pred_mode + chroma intra_pred_mode
             // paths (line 2847 gates them on CuPredMode == MODE_INTRA).
-            // Fall through to transform_unit(): same cbf parse as
-            // intra-luma in DUAL_TREE_LUMA — the round-90 walker treats
-            // the residual side identically since the trans/dequant
-            // pipeline is mode-agnostic.
+            // Fall through to transform_unit(); the MODE_IBC cbf_luma
+            // presence rule differs from MODE_INTRA (see below).
         }
     }
     if !is_ibc && is_luma_tree {
@@ -1046,10 +1046,20 @@ fn walk_coding_unit(
         stats.intra_pred_mode_bins += 1;
     }
     // sps_eipd_flag=0 ⇒ intra_chroma_pred_mode is suppressed (gated by
-    // sps_eipd_flag==1 on line 2864).
+    // sps_eipd_flag==1 on line 2864) → §7.4.9.4 infers it 0 → §8.4.3
+    // IntraPredModeC = IntraPredModeY (stats-only walker: no pixels).
 
-    // CuPredMode == MODE_INTRA + dual-tree → cbf_all path is suppressed
-    // (line 3028 needs treeType == SINGLE_TREE).
+    // Line 3028: a SINGLE_TREE MODE_IBC CU satisfies the cbf_all
+    // presence condition (CuPredMode != MODE_INTRA, merge_mode_flag
+    // inferred 0 on an I slice); cbf_all == 0 elides the whole
+    // transform_unit(). MODE_INTRA CUs never read it (inferred 1).
+    if is_ibc && tree_type == TreeType::SingleTree {
+        let cbf_all = eng.decode_decision(0, 0)?;
+        stats.cbf_all_bins += 1;
+        if cbf_all == 0 {
+            return Ok(());
+        }
+    }
     walk_transform_unit(
         eng,
         stats,
@@ -1059,6 +1069,7 @@ fn walk_coding_unit(
         log2_cb_width,
         log2_cb_height,
         tree_type,
+        !is_ibc,
     )
 }
 
@@ -1138,15 +1149,17 @@ fn walk_transform_unit(
     log2_cb_width: u32,
     log2_cb_height: u32,
     tree_type: TreeType,
+    is_intra: bool,
 ) -> Result<()> {
     let log2_tb_width = log2_cb_width.min(inputs.max_tb_log2_size_y);
     let log2_tb_height = log2_cb_height.min(inputs.max_tb_log2_size_y);
     let chroma_present = inputs.chroma_format_idc != 0;
     // Line 3070: (isSplit || CuPredMode==INTRA || cbf_cb || cbf_cr) &&
-    //            treeType != DUAL_TREE_CHROMA → cbf_luma.
+    //            treeType != DUAL_TREE_CHROMA → cbf_luma; absent →
+    //            inferred 1 (§7.4.9.5). `is_intra` is false for a
+    //            MODE_IBC CU.
     let is_split =
         log2_cb_width > inputs.max_tb_log2_size_y || log2_cb_height > inputs.max_tb_log2_size_y;
-    let is_intra = true;
     // §7.3.8.4 tiling — each TU repeats the whole §7.3.8.5 body (the
     // stats-only walker ignores the offsets).
     for (_tu_x, _tu_y) in
@@ -1162,11 +1175,14 @@ fn walk_transform_unit(
             cbf_cr = eng.decode_decision(0, 0)? as u32;
             stats.cbf_chroma_bins += 2;
         }
-        if (is_split || is_intra || cbf_cb != 0 || cbf_cr != 0)
-            && tree_type != TreeType::DualTreeChroma
-        {
-            cbf_luma = eng.decode_decision(0, 0)? as u32;
-            stats.cbf_luma_bins += 1;
+        if tree_type != TreeType::DualTreeChroma {
+            if is_split || is_intra || cbf_cb != 0 || cbf_cr != 0 {
+                cbf_luma = eng.decode_decision(0, 0)? as u32;
+                stats.cbf_luma_bins += 1;
+            } else {
+                // §7.4.9.5: cbf_luma absent → inferred 1.
+                cbf_luma = 1;
+            }
         }
         // Line 3073: cu_qp_delta_abs gated by cu_qp_delta_enabled_flag and
         // a complex condition. With sps_dquant_flag=0 (Baseline) the inner
@@ -1832,6 +1848,10 @@ pub struct SliceDecodeStats {
     pub coding_units: u32,
     pub cbf_luma_bins: u32,
     pub cbf_chroma_bins: u32,
+    /// `cbf_all` bins decoded (line 3028 — a SINGLE_TREE MODE_IBC CU on
+    /// an I slice satisfies the presence condition with the inferred-0
+    /// `merge_mode_flag`).
+    pub cbf_all_bins: u32,
     pub intra_pred_mode_bins: u32,
     /// `ibc_flag` regular bins decoded per §7.3.8.4 line 2845 (gated on
     /// the round-90 `isIbcAllowed` predicate). One per IBC-eligible CU.
@@ -2617,19 +2637,18 @@ fn decode_split_unit(
             )?;
         }
     } else {
-        // coding_unit() leaf (spec lines 2789-2794): on an I slice a
-        // NO_CONSTRAINT leaf transitions to INTRA_IBC, making the CU a
-        // DUAL_TREE_LUMA one; inside an already-constrained subtree the
-        // leaf stays luma-only and the chroma CU belongs to the
-        // tree-split ancestor.
-        let leaf_constraint = split::leaf_pred_mode_constraint(
-            constraint_current,
-            true,
-            walk.tree_gates.sps_admvp_flag,
-            log2_cb_width,
-            log2_cb_height,
-        );
-        let tree_type = if leaf_constraint == ModeConstraint::IntraIbc {
+        // coding_unit() leaf (spec lines 2788-2795): treeType derives
+        // from the constraint the leaf was REACHED with — DUAL_TREE_LUMA
+        // only inside an INTRA_IBC subtree armed by an ancestor split
+        // (whose split_unit() owns the DUAL_TREE_CHROMA CU); otherwise
+        // SINGLE_TREE, chroma included. The line-2791 in-leaf
+        // reassignment (I slice, or admvp 4×4) constrains the
+        // coding_unit()-internal presence gates only — per §7.4.9.3
+        // isTreeSplitPoint compares against the split-time derived
+        // predModeConstraint, which at a NO_SPLIT leaf stays
+        // PRED_MODE_NO_CONSTRAINT, so the leaf transition never creates
+        // a chroma CU.
+        let tree_type = if constraint_current == ModeConstraint::IntraIbc {
             TreeType::DualTreeLuma
         } else {
             TreeType::SingleTree
@@ -2649,23 +2668,6 @@ fn decode_split_unit(
             qp,
             tree_type,
         )?;
-        if split::is_tree_split_point(constraint_current, leaf_constraint) {
-            decode_coding_unit(
-                eng,
-                pic,
-                stats,
-                side_info,
-                walk,
-                decode,
-                x0,
-                y0,
-                log2_cb_width,
-                log2_cb_height,
-                cu_qp_delta_code,
-                qp,
-                TreeType::DualTreeChroma,
-            )?;
-        }
         return Ok(());
     }
     // Non-leaf tree-split point (spec lines 2797-2799): after the whole
@@ -2796,38 +2798,42 @@ fn decode_coding_unit(
     // `luma_cu_is_ibc` flag threaded through `decode_transform_unit`.
     let luma_cu_is_ibc =
         matches!(tree_type, TreeType::DualTreeChroma) && luma_cell_is_ibc(side_info, x0, y0);
-    // Decode intra_pred_mode for luma CU under sps_eipd_flag = 0.
-    // Binarisation: U with cMax=4 (Table 91) — an unbounded unary prefix
-    // capped to 4 leading 1s; the value is the number of leading 1s.
-    // sps_cm_init_flag=0 → all bins land on (ctxTable=0, ctxIdx=0).
-    let intra_mode = if walk.sps_eipd_flag {
-        // §7.3.8.4 `sps_eipd_flag == 1` intra syntax: the luma
-        // MPM/PIMS/rem-mode group (resolved through the §8.4.2
-        // three-list derivation over the grid neighbours) on luma
-        // trees; `intra_chroma_pred_mode` (resolved through §8.4.3
-        // against the co-located luma mode) on the chroma tree.
+    // §7.3.8.4 intra syntax: the luma mode element/group is read on any
+    // tree carrying luma (`treeType != DUAL_TREE_CHROMA`);
+    // `intra_chroma_pred_mode` is read on any tree carrying chroma
+    // (`treeType != DUAL_TREE_LUMA`, `sps_eipd_flag == 1`,
+    // `ChromaArrayType != 0`). Under `sps_eipd_flag == 0` the chroma
+    // element is never present, so §7.4.9.4 infers it 0 and §8.4.3 sets
+    // IntraPredModeC = IntraPredModeY (this CU's luma mode on
+    // SINGLE_TREE, the co-located luma mode on a standalone
+    // DUAL_TREE_CHROMA tree).
+    let carries_chroma = tree_type != TreeType::DualTreeLuma && walk.chroma_format_idc != 0;
+    let (intra_mode, intra_mode_c) = if walk.sps_eipd_flag {
         let ctx = crate::eipd_syntax::EipdCtx::for_slice(
             walk.tree_gates.sps_cm_init_flag,
             crate::cabac::InitType::I,
         );
-        if is_luma_tree {
+        let mode_y = if is_luma_tree {
             let (a, b, c) = eipd_neighbours(side_info, walk, x0, y0, log2_cb_width);
-            let m = crate::eipd_syntax::resolve_eipd_luma_mode(eng, ctx, &mut stats.eipd, a, b, c)?;
-            CuIntraMode::Eipd(m)
-        } else if walk.chroma_format_idc != 0 {
-            let luma_mode = colocated_luma_mode(side_info, x0, y0);
-            let m =
-                crate::eipd_syntax::resolve_eipd_chroma_mode(eng, ctx, &mut stats.eipd, luma_mode)?;
-            CuIntraMode::Eipd(m)
+            crate::eipd_syntax::resolve_eipd_luma_mode(eng, ctx, &mut stats.eipd, a, b, c)?
         } else {
-            CuIntraMode::Eipd(crate::eipd::INTRA_DC)
-        }
+            // DUAL_TREE_CHROMA: §8.4.3 consults the co-located
+            // IntraPredModeY.
+            colocated_luma_mode(side_info, x0, y0)
+        };
+        let mode_c = if carries_chroma {
+            crate::eipd_syntax::resolve_eipd_chroma_mode(eng, ctx, &mut stats.eipd, mode_y)?
+        } else {
+            crate::eipd::INTRA_DC
+        };
+        (CuIntraMode::Eipd(mode_y), CuIntraMode::Eipd(mode_c))
     } else {
+        // Decode intra_pred_mode under sps_eipd_flag = 0. Binarisation:
+        // U with cMax=4 (Table 91). Table 62; Table 95 ctxInc: bin0 →
+        // 0, every later bin → 1 (the same rule under both entropy
+        // shapes; under `sps_cm_init_flag == 0` the bins land on the
+        // shared ctxTable 0 at the element's Table-39 offset).
         let intra_idx = if is_luma_tree {
-            // Table 62; Table 95 ctxInc: bin0 → 0, every later bin → 1
-            // (the same rule under both entropy shapes; under
-            // `sps_cm_init_flag == 0` the bins land on the shared
-            // ctxTable 0 at the element's Table-39 offset).
             let table = crate::cabac_init::MainCtxTable::IntraPredMode;
             let (t, off) = if sel.cm_init {
                 (table.as_usize(), table.ctx_idx_offset(sel.init_type))
@@ -2838,13 +2844,18 @@ fn decode_coding_unit(
             stats.intra_pred_mode_bins += 1;
             v
         } else {
-            0
+            // DUAL_TREE_CHROMA: §8.4.3 DM — the co-located luma mode
+            // (INTRA_DC when the cell is not intra-stamped).
+            colocated_luma_mode(side_info, x0, y0).clamp(0, 4) as u32
         };
-        CuIntraMode::Baseline(IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
+        let m = IntraMode::from_baseline_idx(intra_idx).ok_or_else(|| {
             Error::invalid(format!(
                 "evc decode: intra_pred_mode {intra_idx} out of Baseline range 0..=4"
             ))
-        })?)
+        })?;
+        // §8.4.3 with the inferred-0 intra_chroma_pred_mode:
+        // IntraPredModeC = IntraPredModeY.
+        (CuIntraMode::Baseline(m), CuIntraMode::Baseline(m))
     };
 
     decode_transform_unit(
@@ -2862,6 +2873,7 @@ fn decode_coding_unit(
         qp,
         tree_type,
         intra_mode,
+        intra_mode_c,
         luma_cu_is_ibc,
     )
 }
@@ -2884,19 +2896,22 @@ fn luma_cell_is_ibc(side_info: &SideInfoGrid, x_luma: u32, y_luma: u32) -> bool 
 /// §7.3.8.4 + §8.6.1 IBC branch for the IDR `coding_unit()` path.
 ///
 /// Composes:
-///   1. `transform_unit()` cbf parse (round-3 pattern: `cbf_luma` only
-///      for DUAL_TREE_LUMA since the chroma-cbf gate of line 3066
-///      excludes DUAL_TREE_LUMA);
+///   1. `transform_unit()` cbf parse — on a chroma-carrying tree
+///      (SINGLE_TREE, the I-slice leaf shape) `cbf_cb`/`cbf_cr` first
+///      (line 3066), then `cbf_luma` under its presence rule (absent →
+///      inferred 1 per §7.4.9.5, since MODE_IBC fails the
+///      `CuPredMode == MODE_INTRA` bullet);
 ///   2. `ibc::decode_ibc_cu` for the §8.6.1 step 1-3 prediction
 ///      pipeline (`mvL` derivation, conformance, `mvC` derivation,
 ///      integer-pel block copy from the current picture's
 ///      reconstructed region);
 ///   3. residual decode + scale/IDCT + `clip(pred + res)` picture
-///      construction (§8.7.5 eq. 1091) for luma; chroma residual is
-///      deferred to `DualTreeChroma`'s own `transform_unit()` pass.
+///      construction (§8.7.5 eq. 1091) for luma, then each set chroma
+///      cbf's residual added on top of the §8.6.3 block-copied chroma
+///      prediction.
 ///
 /// Stamps `CuPredMode::Ibc` into the side-info grid for the matching
-/// luma cells so (a) the chroma-tree pass can skip its intra
+/// luma cells so (a) a local-dual-tree chroma pass can skip its intra
 /// reconstruction (see `luma_cell_is_ibc`) and (b) the deblocking
 /// pass treats IBC edges as boundary-strength 2 per Table 33.
 #[allow(clippy::too_many_arguments)]
@@ -2920,26 +2935,56 @@ fn decode_ibc_branch(
     let log2_tb_height = log2_cb_height.min(walk.max_tb_log2_size_y);
     let sel =
         crate::cabac_init::CtxSel::new(walk.tree_gates.sps_cm_init_flag, crate::cabac::InitType::I);
-    // `cbf_all` of line 3028 only fires for SINGLE_TREE; round 90
-    // restricts IBC to DUAL_TREE_LUMA (the dual-tree chroma sibling
-    // is handled separately) so we follow the DUAL_TREE_LUMA
-    // transform_unit cbf path: skip cbf_cb/cbf_cr (line 3066 gate),
-    // then unconditionally read cbf_luma since `isSplit` is moot for
-    // CB ≤ MaxTb and CuPredMode != MODE_INTRA: the spec gate
-    // `(isSplit || CuPredMode == MODE_INTRA || cbf_cb || cbf_cr)`
-    // would suppress cbf_luma in our DUAL_TREE_LUMA + IBC case ⇒
-    // cbf_luma is inferred = 1 per §7.4.9.5 (line 6065-6066: "...
-    // inferred to be equal to 1" when treeType is DUAL_TREE_LUMA).
-    // No bin is consumed.
-    let cbf_luma = 1u32;
-    // When CB > MaxTb the spec splits into multiple TBs; round-90
-    // synthetic fixtures keep CB == TB so the single block covers the
-    // whole CB.
+    // §7.3.8.5 transform_unit() cbf group for the IBC CU. On any
+    // chroma-carrying tree (SINGLE_TREE — the I-slice leaf shape — per
+    // the line-3066 `treeType != DUAL_TREE_LUMA` gate) `cbf_cb` and
+    // `cbf_cr` are read first; `cbf_luma` is then present only when
+    // `(isSplit || CuPredMode == MODE_INTRA || cbf_cb || cbf_cr)` —
+    // MODE_IBC with no set chroma cbf and CB ≤ MaxTb suppresses it and
+    // §7.4.9.5 infers 1.
     if log2_tb_width != log2_cb_width || log2_tb_height != log2_cb_height {
         return Err(Error::unsupported(
             "evc ibc decode: round-90 requires log2_cb == log2_tb (CB ≤ MaxTb)",
         ));
     }
+    let chroma_present = walk.chroma_format_idc != 0;
+    let single_tree = tree_type == TreeType::SingleTree;
+    // Line 3028: `CuPredMode != MODE_INTRA && merge_mode_flag == 0 &&
+    // treeType == SINGLE_TREE` → cbf_all (merge_mode_flag never present
+    // on an I slice → inferred 0 per §7.4). cbf_all == 0 elides the
+    // whole transform_unit(); absent (DUAL_TREE_LUMA) → inferred 1.
+    let read_tu = if single_tree {
+        let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfAll, 0);
+        let cbf_all = eng.decode_decision(t, i)?;
+        stats.cbf_all_bins += 1;
+        cbf_all != 0
+    } else {
+        true
+    };
+    let ibc_chroma_tree = tree_type != TreeType::DualTreeLuma && chroma_present;
+    let mut cbf_cb = 0u32;
+    let mut cbf_cr = 0u32;
+    let cbf_luma = if read_tu {
+        if ibc_chroma_tree {
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCb, 0);
+            cbf_cb = eng.decode_decision(t, i)? as u32;
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfCr, 0);
+            cbf_cr = eng.decode_decision(t, i)? as u32;
+            stats.cbf_chroma_bins += 2;
+        }
+        if cbf_cb != 0 || cbf_cr != 0 {
+            let (t, i) = sel.ctx(crate::cabac_init::MainCtxTable::CbfLuma, 0);
+            stats.cbf_luma_bins += 1;
+            eng.decode_decision(t, i)? as u32
+        } else {
+            // §7.4.9.5: absent cbf_luma on a non-DUAL_TREE_CHROMA tree
+            // → inferred 1.
+            1u32
+        }
+    } else {
+        // cbf_all == 0: no transform_unit(), zero residual (§8.6.1).
+        0u32
+    };
     // §7.3.8.5 transform_unit() cu_qp_delta (line 3073-3078). The presence
     // condition is mode-independent and follows the cbf decode, so an
     // IBC-coded CU reads `cu_qp_delta_abs` / `cu_qp_delta_sign_flag`
@@ -2954,7 +2999,7 @@ fn decode_ibc_branch(
     // bypass-coded and only present when the magnitude is non-zero. The
     // signed delta is applied to the slice QP per eq. 148, clamped to the
     // legal 8-bit-depth range [0, 51].
-    let cbf_any = cbf_luma != 0;
+    let cbf_any = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
     let mut qp_delta: i32 = 0;
     let read_delta = qp.cu_qp_delta_present(walk, cu_qp_delta_code, cbf_any);
     if read_delta {
@@ -2975,8 +3020,7 @@ fn decode_ibc_branch(
     } else {
         qp.qp_y
     };
-    // Decode the luma residual levels (always present per the
-    // DUAL_TREE_LUMA inference rule of spec §7.4.9.5 line 6065-6066).
+    // Decode the residual levels in the §7.3.8.5 order (luma, Cb, Cr).
     let n_tb = (1usize << log2_tb_width) * (1usize << log2_tb_height);
     let mut residual_levels_y = vec![0i32; n_tb];
     if cbf_luma != 0 {
@@ -2990,6 +3034,41 @@ fn decode_ibc_branch(
             &mut stats.adcc,
             log2_tb_width,
             log2_tb_height,
+        )?;
+    }
+    let log2_c_w = log2_tb_width.saturating_sub(1);
+    let log2_c_h = log2_tb_height.saturating_sub(1);
+    let n_c = if ibc_chroma_tree {
+        (1usize << log2_c_w) * (1usize << log2_c_h)
+    } else {
+        0
+    };
+    let mut residual_levels_cb = vec![0i32; if cbf_cb != 0 { n_c } else { 0 }];
+    if cbf_cb != 0 {
+        decode_residual_block(
+            eng,
+            sel,
+            walk,
+            1,
+            &mut residual_levels_cb,
+            &mut stats.coeff_runs,
+            &mut stats.adcc,
+            log2_c_w,
+            log2_c_h,
+        )?;
+    }
+    let mut residual_levels_cr = vec![0i32; if cbf_cr != 0 { n_c } else { 0 }];
+    if cbf_cr != 0 {
+        decode_residual_block(
+            eng,
+            sel,
+            walk,
+            2,
+            &mut residual_levels_cr,
+            &mut stats.coeff_runs,
+            &mut stats.adcc,
+            log2_c_w,
+            log2_c_h,
         )?;
     }
     // Hand off to the no-CABAC helper for the §8.6.1 step 1-5 pipeline
@@ -3010,7 +3089,47 @@ fn decode_ibc_branch(
         cbf_luma as u8,
         &residual_levels_y,
         cu_qp,
-    )
+    )?;
+    // SINGLE_TREE IBC chroma residual: scale + inverse-transform each
+    // set chroma cbf's levels at the mapped chroma QP and add on top of
+    // the §8.6.3 block-copied chroma prediction.
+    if cbf_cb != 0 {
+        let mut tu_res = vec![0i32; n_c];
+        scale_and_inverse_transform(
+            &residual_levels_cb,
+            &mut tu_res,
+            1usize << log2_c_w,
+            1usize << log2_c_h,
+            crate::dequant::qp_prime_c(
+                cu_qp,
+                decode.slice_cb_qp_offset,
+                decode.bit_depth_chroma,
+                decode.sps_iqt_flag,
+            ),
+            decode.bit_depth_chroma,
+            decode.sps_iqt_flag,
+        )?;
+        add_chroma_residual_to_block(pic, x0, y0, log2_cb_width, log2_cb_height, 1, &tu_res)?;
+    }
+    if cbf_cr != 0 {
+        let mut tu_res = vec![0i32; n_c];
+        scale_and_inverse_transform(
+            &residual_levels_cr,
+            &mut tu_res,
+            1usize << log2_c_w,
+            1usize << log2_c_h,
+            crate::dequant::qp_prime_c(
+                cu_qp,
+                decode.slice_cr_qp_offset,
+                decode.bit_depth_chroma,
+                decode.sps_iqt_flag,
+            ),
+            decode.bit_depth_chroma,
+            decode.sps_iqt_flag,
+        )?;
+        add_chroma_residual_to_block(pic, x0, y0, log2_cb_width, log2_cb_height, 2, &tu_res)?;
+    }
+    Ok(())
 }
 
 /// Pure compute helper (no CABAC engine, no bitstream): given the
@@ -3138,6 +3257,7 @@ fn decode_transform_unit(
     qp: &mut QpState,
     tree_type: TreeType,
     intra_mode: CuIntraMode,
+    intra_mode_c: CuIntraMode,
     luma_cu_is_ibc: bool,
 ) -> Result<()> {
     let log2_tb_width = log2_cb_width.min(walk.max_tb_log2_size_y);
@@ -3158,7 +3278,9 @@ fn decode_transform_unit(
     let log2_cb_c_h = log2_cb_height.saturating_sub(1);
     let n_cb_c = (1usize << log2_cb_c_w) * (1usize << log2_cb_c_h);
     let mut res_y = vec![0i32; if is_luma_intra_tree { n_cb } else { 0 }];
-    let chroma_tree = tree_type == TreeType::DualTreeChroma && chroma_present;
+    // §7.3.8.5: chroma cbfs + residual belong to every tree that
+    // carries chroma — SINGLE_TREE as well as DUAL_TREE_CHROMA.
+    let chroma_tree = tree_type != TreeType::DualTreeLuma && chroma_present;
     let mut res_cb = vec![0i32; if chroma_tree { n_cb_c } else { 0 }];
     let mut res_cr = vec![0i32; if chroma_tree { n_cb_c } else { 0 }];
     let mut cbf_luma_any = 0u32;
@@ -3390,9 +3512,11 @@ fn decode_transform_unit(
     }
     // Reconstruct: whole-CB intra prediction + the accumulated residual
     // (§8.4.1 predicts at CB dimensions; the TB split only affects the
-    // residual assembly above).
-    match tree_type {
-        TreeType::DualTreeLuma | TreeType::SingleTree => {
+    // residual assembly above). Luma first, then — on any
+    // chroma-carrying tree (§8.4.1 "treeType is not equal to
+    // DUAL_TREE_LUMA") — the chroma pair at IntraPredModeC.
+    {
+        if is_luma_intra_tree {
             match intra_mode {
                 CuIntraMode::Baseline(m) => crate::picture::intra_reconstruct_cb_in_tile(
                     pic,
@@ -3444,19 +3568,20 @@ fn decode_transform_unit(
                 }
             }
         }
-        TreeType::DualTreeChroma => {
-            if chroma_present {
-                // For sps_eipd_flag=0, intra_chroma_pred_mode is suppressed
-                // → IntraPredModeC = IntraPredModeY for the same CU. Round-5
-                // fixtures restrict to DC so this inheritance is moot.
+        {
+            if chroma_tree {
+                // IntraPredModeC per §8.4.3: under sps_eipd_flag == 0
+                // the absent intra_chroma_pred_mode is inferred 0 →
+                // IntraPredModeC = IntraPredModeY (this CU's luma mode
+                // on SINGLE_TREE, the co-located luma mode on
+                // DUAL_TREE_CHROMA — resolved by the caller into
+                // `intra_mode_c`).
                 if luma_cu_is_ibc {
-                    // Round 90: the matching luma `coding_unit()` was
-                    // IBC and already wrote chroma samples via
+                    // Local dual tree: the matching luma `coding_unit()`
+                    // was IBC and already wrote chroma samples via
                     // `decode_ibc_cu`'s §8.6.3 step. The chroma tree
-                    // must NOT overwrite them with intra-DC; instead
-                    // just add the chroma residual on top (rare in
-                    // round-90 fixtures — `cbf_cb == cbf_cr == 0`
-                    // typically).
+                    // must NOT overwrite them with an intra prediction;
+                    // instead just add the chroma residual on top.
                     if cbf_cb_any != 0 {
                         add_chroma_residual_to_block(
                             pic,
@@ -3480,7 +3605,7 @@ fn decode_transform_unit(
                         )?;
                     }
                 } else {
-                    match intra_mode {
+                    match intra_mode_c {
                         CuIntraMode::Baseline(m) => {
                             crate::picture::intra_reconstruct_cb_in_tile(
                                 pic,
@@ -4286,7 +4411,14 @@ fn decode_inter_split_unit(
             )?;
         }
     } else {
-        // coding_unit() leaf (spec lines 2789-2794).
+        // coding_unit() leaf (spec lines 2788-2795): treeType derives
+        // from the constraint the leaf was REACHED with. The line-2791
+        // in-leaf reassignment (admvp 4×4 on a P/B slice) constrains
+        // only the coding_unit()-internal presence gates (no
+        // cu_skip_flag / pred_mode_flag) — the CU stays SINGLE_TREE
+        // with its own chroma, and no DUAL_TREE_CHROMA partner follows
+        // (§7.4.9.3 isTreeSplitPoint compares against the split-time
+        // derivation, which is NO_CONSTRAINT at a NO_SPLIT leaf).
         let leaf_constraint = split::leaf_pred_mode_constraint(
             constraint_current,
             false,
@@ -4295,8 +4427,11 @@ fn decode_inter_split_unit(
             log2_cb_height,
         );
         if leaf_constraint == ModeConstraint::IntraIbc {
-            // Luma-only intra/IBC CU (DUAL_TREE_LUMA): no cu_skip_flag,
-            // no pred_mode_flag (§7.3.8.4 presence gates).
+            let tree_type = if constraint_current == ModeConstraint::IntraIbc {
+                TreeType::DualTreeLuma
+            } else {
+                TreeType::SingleTree
+            };
             decode_inter_constrained_intra_ibc_cu(
                 eng,
                 pic,
@@ -4310,25 +4445,8 @@ fn decode_inter_split_unit(
                 log2_cb_height,
                 cu_qp_delta_code,
                 qp,
+                tree_type,
             )?;
-            if split::is_tree_split_point(constraint_current, leaf_constraint) {
-                stats.coding_units += 1;
-                decode_inter_intra_cu(
-                    eng,
-                    pic,
-                    stats,
-                    side_info,
-                    walk,
-                    inputs.decode,
-                    x0,
-                    y0,
-                    log2_cb_width,
-                    log2_cb_height,
-                    cu_qp_delta_code,
-                    qp,
-                    TreeType::DualTreeChroma,
-                )?;
-            }
         } else {
             decode_inter_coding_unit(
                 eng,
@@ -4372,14 +4490,16 @@ fn decode_inter_split_unit(
     Ok(())
 }
 
-/// §7.3.8.4 `coding_unit()` for a P/B leaf inside a
-/// `PRED_MODE_CONSTRAINT_INTRA_IBC` subtree: `cu_skip_flag` and
+/// §7.3.8.4 `coding_unit()` for a P/B leaf whose in-CU constraint is
+/// `PRED_MODE_CONSTRAINT_INTRA_IBC`: `cu_skip_flag` and
 /// `pred_mode_flag` are both absent (presence gates at spec lines
 /// 2806-2808 / 2843-2844), so the CU is MODE_INTRA unless the
 /// `isIbcAllowed` `ibc_flag` (§7.4.9.4 — the constraint satisfies the
 /// "not NO_CONSTRAINT" arm of its last condition) selects MODE_IBC.
-/// Decodes as `DUAL_TREE_LUMA`; the chroma CU belongs to the tree-split
-/// ancestor.
+/// `tree_type` is `DUAL_TREE_LUMA` only inside an ancestor-armed
+/// INTRA_IBC subtree (the chroma CU belongs to the tree-split
+/// ancestor); a leaf-reassigned CU (admvp 4×4) is `SINGLE_TREE` with
+/// its own chroma.
 #[allow(clippy::too_many_arguments)]
 fn decode_inter_constrained_intra_ibc_cu(
     eng: &mut CabacEngine,
@@ -4394,6 +4514,7 @@ fn decode_inter_constrained_intra_ibc_cu(
     log2_cb_height: u32,
     cu_qp_delta_code: u8,
     qp: &mut QpState,
+    tree_type: TreeType,
 ) -> Result<()> {
     stats.coding_units += 1;
     stats.intra_ibc_constrained_cus += 1;
@@ -4456,7 +4577,7 @@ fn decode_inter_constrained_intra_ibc_cu(
                 cu_qp_delta_code,
                 qp,
                 MotionVector { x: mvd_x, y: mvd_y },
-                TreeType::DualTreeLuma,
+                tree_type,
             );
         }
     }
@@ -4473,7 +4594,7 @@ fn decode_inter_constrained_intra_ibc_cu(
         log2_cb_height,
         cu_qp_delta_code,
         qp,
-        TreeType::DualTreeLuma,
+        tree_type,
     )
 }
 
@@ -7466,8 +7587,8 @@ fn decode_inter_intra_cu(
     use crate::intra::IntraMode;
     // §7.3.8.4: intra_pred_mode is read only when
     // `treeType != DUAL_TREE_CHROMA`. A standalone DUAL_TREE_CHROMA CU
-    // (the local-dual-tree chroma at a §7.4.9.3 tree-split point) uses
-    // INTRA_DC, mirroring the IDR-side round-5 simplification.
+    // (the local-dual-tree chroma at a §7.4.9.3 tree-split point) takes
+    // the §8.4.3 DM — the co-located luma cell's IntraPredModeY.
     let is_luma_tree = tree_type != TreeType::DualTreeChroma;
     let sel = crate::cabac_init::CtxSel::new(
         walk.tree_gates.sps_cm_init_flag,
@@ -7515,7 +7636,11 @@ fn decode_inter_intra_cu(
                 ))
             })?
         } else {
-            IntraMode::Dc
+            // DUAL_TREE_CHROMA: §8.4.3 with the inferred-0
+            // intra_chroma_pred_mode — the co-located luma mode
+            // (INTRA_DC when the cell is not intra-stamped).
+            IntraMode::from_baseline_idx(colocated_luma_mode(side_info, x0, y0).clamp(0, 4) as u32)
+                .unwrap_or(IntraMode::Dc)
         };
         (CuIntraMode::Baseline(m), crate::eipd::INTRA_DC)
     };
@@ -8396,6 +8521,8 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (32×32 leaf)
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         for b in 0..abs_minus1 {
@@ -8407,8 +8534,6 @@ mod tests {
         enc.encode_decision(0, (abs_minus1 as usize).min(1), 0);
         enc.encode_bypass(0); // coeff_sign_flag = 0 → positive
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-        enc.encode_decision(0, 0, 0); // chroma tree: cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // chroma tree: cbf_cr = 0
         enc.encode_terminate(true); // end_of_tile_one_bit
         enc.finish()
     }
@@ -8484,14 +8609,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.ctus, 2);
-        assert_eq!(stats.coding_units, 4, "2 tiles × (luma + chroma trees)");
+        assert_eq!(stats.coding_units, 2, "2 tiles × one SINGLE_TREE CU");
 
         // Standalone controls: each subset decoded as its own 32×32
         // picture.
         let (pic_a, stats_a) =
             decode_baseline_idr_slice(&subset_a, tile_walk_inputs(32, 32), tile_decode_inputs())
                 .unwrap();
-        assert_eq!(stats_a.coding_units, 2);
+        assert_eq!(stats_a.coding_units, 1);
         assert_eq!(stats_a.coeff_runs, 1);
         let (pic_b, _) =
             decode_baseline_idr_slice(&subset_b, tile_walk_inputs(32, 32), tile_decode_inputs())
@@ -8996,15 +9121,15 @@ mod tests {
     ///
     /// The fixture splits the 32×32 CTB into four 16×16 sub-CBs (one
     /// `split_cu_flag = 1` at the CTB) and then runs every sub-CB
-    /// through the dual-tree luma + chroma `coding_unit()` pair with no
-    /// CBFs set (so no residual coding fires).
+    /// through one SINGLE_TREE `coding_unit()` with no CBFs set (so no
+    /// residual coding fires).
     ///
     /// Bin sequence:
     /// * `split_cu_flag = 1` (1 bin at the CTB)
     /// * For each of the 4 sub-CBs:
     ///     * `intra_pred_mode = 0` (1 U bin)
+    ///     * `cbf_cb = 0`, `cbf_cr = 0` (2 FL bins, line 3066)
     ///     * `cbf_luma = 0` (1 FL bin)
-    ///     * `cbf_cb = 0`, `cbf_cr = 0` (2 FL bins, dual-tree chroma)
     /// * `end_of_tile_one_bit` → terminate=true
     ///
     /// Total: 17 regular bins on (ctxTable=0, ctxIdx=0) + terminate.
@@ -9019,9 +9144,9 @@ mod tests {
         // four children → 16 bins.
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode = "0"
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -9039,7 +9164,7 @@ mod tests {
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 1);
         assert_eq!(stats.split_cu_flag_bins, 1, "one split decision at the CTB");
-        assert_eq!(stats.coding_units, 8, "4 children × (luma + chroma) = 8");
+        assert_eq!(stats.coding_units, 4, "one SINGLE_TREE CU per child");
         assert_eq!(stats.intra_pred_mode_bins, 4);
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 8);
@@ -9059,9 +9184,9 @@ mod tests {
             enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
             for _ in 0..4 {
                 enc.encode_decision(0, 0, 0); // intra_pred_mode
-                enc.encode_decision(0, 0, 0); // cbf_luma
                 enc.encode_decision(0, 0, 0); // cbf_cb
                 enc.encode_decision(0, 0, 0); // cbf_cr
+                enc.encode_decision(0, 0, 0); // cbf_luma
             }
         }
         enc.encode_terminate(true);
@@ -9080,25 +9205,25 @@ mod tests {
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 2);
         assert_eq!(stats.split_cu_flag_bins, 2);
-        assert_eq!(stats.coding_units, 16); // 2 CTUs × 4 children × (luma+chroma)
+        assert_eq!(stats.coding_units, 8); // 2 CTUs × 4 children, one CU each
         assert_eq!(stats.intra_pred_mode_bins, 8);
         assert_eq!(stats.cbf_luma_bins, 8);
         assert_eq!(stats.cbf_chroma_bins, 16);
     }
 
     /// A 4:0:0 (monochrome) variant of the split-CTU fixture. Without
-    /// chroma the dual-tree-chroma `coding_unit()` calls still happen
-    /// but consume no `cbf_cb`/`cbf_cr` bins (the walker's chroma
-    /// `transform_unit` branch is gated by `chroma_format_idc != 0`).
+    /// chroma the SINGLE_TREE `transform_unit()` consumes no
+    /// `cbf_cb`/`cbf_cr` bins (the walker's chroma branch is gated by
+    /// `chroma_format_idc != 0`).
     #[test]
     fn fixture_split_ctu_monochrome_consumes_all_bins() {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 1); // split_cu_flag = 1
         for _ in 0..4 {
-            enc.encode_decision(0, 0, 0); // intra_pred_mode (luma CU)
-            enc.encode_decision(0, 0, 0); // cbf_luma (luma CU)
-                                          // Chroma CU: no cbf_cb / cbf_cr (chroma_format_idc == 0).
+            enc.encode_decision(0, 0, 0); // intra_pred_mode
+            enc.encode_decision(0, 0, 0); // cbf_luma
+                                          // No cbf_cb / cbf_cr (chroma_format_idc == 0).
         }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -9116,7 +9241,7 @@ mod tests {
         let stats = walk_baseline_idr_slice(&rbsp, inputs).unwrap();
         assert_eq!(stats.ctus, 1);
         assert_eq!(stats.split_cu_flag_bins, 1);
-        assert_eq!(stats.coding_units, 8);
+        assert_eq!(stats.coding_units, 4);
         assert_eq!(stats.intra_pred_mode_bins, 4);
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 0, "no chroma at chroma_format_idc=0");
@@ -9708,21 +9833,20 @@ mod tests {
     fn idr_decode_with_residual_dc_only() {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
-        // 4×4 picture → no split (log2 = 2 == min). Dual-tree luma CU:
+        // 4×4 picture → no split (log2 = 2 == min). One SINGLE_TREE CU:
         //   intra_pred_mode = 0 (1 bin "0")
-        //   cbf_luma = 1 (1 bin)
+        //   cbf_cb = 0, cbf_cr = 0, cbf_luma = 1 (§7.3.8.5 order)
         //   residual_coding_rle: zero_run=0, abs_lvl-1=0 (just "0"),
         //     sign=0 bypass, last=1 (only 1 coeff).
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
                                       // residual_coding_rle:
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0 → level=1
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +1
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Dual-tree chroma CU:
-        enc.encode_decision(0, 0, 0); // cbf_cb
-        enc.encode_decision(0, 0, 0); // cbf_cr
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -9745,7 +9869,7 @@ mod tests {
             ..Default::default()
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
-        assert_eq!(stats.coding_units, 2, "luma + chroma trees");
+        assert_eq!(stats.coding_units, 1, "one SINGLE_TREE CU");
         assert_eq!(stats.cbf_luma_bins, 1);
         assert_eq!(stats.coeff_runs, 1);
         // The residual is a basis-vector outer product of mat_4 row 0.
@@ -9776,8 +9900,10 @@ mod tests {
     fn round404_ats_intra_idr_decode_uses_dst7_dct8_kernels() {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
-        // Dual-tree luma CU (sps_eipd_flag = 0, sps_cm_init_flag = 0):
+        // One SINGLE_TREE CU (sps_eipd_flag = 0, sps_cm_init_flag = 0):
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
                                       // §7.3.8.5 ATS-intra group:
         enc.encode_bypass(1); // ats_cu_intra_flag = 1 (bypass)
@@ -9788,9 +9914,6 @@ mod tests {
         enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0 → level 1
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +1
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Dual-tree chroma CU:
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -9817,7 +9940,7 @@ mod tests {
             ..Default::default()
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
-        assert_eq!(stats.coding_units, 2, "luma + chroma trees");
+        assert_eq!(stats.coding_units, 1, "one SINGLE_TREE CU");
         assert_eq!(stats.cbf_luma_bins, 1);
         assert_eq!(stats.coeff_runs, 1);
         // The three ATS-intra syntax elements were consumed (the whole
@@ -9890,6 +10013,8 @@ mod tests {
         let build = |ats_on: bool| {
             let mut enc = CabacEncoder::new();
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_decision(0, 0, 1); // cbf_luma = 1
             if ats_on {
                 enc.encode_bypass(0); // ats_cu_intra_flag = 0 → no modes
@@ -9898,8 +10023,6 @@ mod tests {
             enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0
             enc.encode_bypass(0); // sign = 0
             enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_terminate(true);
             enc.finish()
         };
@@ -10503,12 +10626,11 @@ mod tests {
         // 64×64 picture, log2 = 6, min_cb = 4, max_tb = 6 (allow 64×64 TB).
         // Single CTU at log2 = 6 → split_cu_flag = 0 (no split needed).
         enc.encode_decision(0, 0, 0); // CTB split = 0 → leaf 64×64
-                                      // Luma CU:
+                                      // One SINGLE_TREE CU:
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // Chroma CU:
         enc.encode_decision(0, 0, 0); // cbf_cb
         enc.encode_decision(0, 0, 0); // cbf_cr
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -10532,7 +10654,7 @@ mod tests {
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.ctus, 1);
-        assert_eq!(stats.coding_units, 2);
+        assert_eq!(stats.coding_units, 1);
         assert!(pic.y.iter().all(|&v| v == 128));
         assert!(pic.cb.iter().all(|&v| v == 128));
         assert!(pic.cr.iter().all(|&v| v == 128));
@@ -10574,11 +10696,15 @@ mod tests {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
-                                      // Luma CU: DC mode, then four TUs.
+                                      // One SINGLE_TREE CU: DC mode, then four TUs.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
                                       // TU 1 (top-left): no residual.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 2 (top-right): one coefficient.
+                                      // TU 2 (top-right): one luma coefficient.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -10589,8 +10715,12 @@ mod tests {
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
                                       // TU 3 (bottom-left): no residual.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 4 (bottom-right): one coefficient.
+                                      // TU 4 (bottom-right): one luma coefficient.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -10600,11 +10730,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Chroma CU: also TB-split → four TUs, all quiet.
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
-        }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -10628,8 +10753,8 @@ mod tests {
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.ctus, 1);
-        assert_eq!(stats.coding_units, 2);
-        // Four luma TUs → 4 cbf_luma bins; four chroma TUs → 8 chroma bins.
+        assert_eq!(stats.coding_units, 1);
+        // Four TUs → 4 cbf_luma bins + 8 chroma cbf bins (same TUs).
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 8);
         // Quadrant placement: (qx, qy) indexes the 32×32 quadrants.
@@ -10675,9 +10800,15 @@ mod tests {
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 128×128 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
         for _ in 0..3 {
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0 (TUs 1-3)
+            // TUs 1-3: quiet.
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
-        enc.encode_decision(0, 0, 1); // cbf_luma = 1 (TU 4, bottom-right)
+        // TU 4 (bottom-right): one luma coefficient.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
         for _ in 1..63 {
@@ -10686,11 +10817,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 64
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Chroma CU: four TUs, all quiet.
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
-        }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -10745,8 +10871,12 @@ mod tests {
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
                                       // TU 1 (top-left): quiet → no cu_qp_delta read.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
                                       // TU 2 (top-right): cbf → delta_abs = 0 (single U "0").
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
@@ -10758,8 +10888,12 @@ mod tests {
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
                                       // TU 3 (bottom-left): quiet.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
                                       // TU 4 (bottom-right): cbf → delta_abs = 21, sign +.
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         for _ in 0..21 {
             enc.encode_decision(0, 0, 1); // cu_qp_delta_abs U prefix
@@ -10774,11 +10908,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Chroma CU: four quiet TUs (cbf-gated → no delta reads).
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
-        }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -10829,6 +10958,8 @@ mod tests {
             let mut enc = CabacEncoder::new();
             enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → 32×32 leaf
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_decision(0, 0, cbf); // cbf_luma
             if cbf != 0 {
                 enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
@@ -10840,8 +10971,6 @@ mod tests {
                 enc.encode_bypass(0); // sign = +
                 enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
             }
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_terminate(true);
             enc.finish()
         };
@@ -10895,9 +11024,9 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -11041,6 +11170,8 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
                                       // Luma run/level U bins: ctxIdx 0 for bin 0, 1 for later bins
                                       // (Table 95, cm_init == 0 row).
@@ -11056,8 +11187,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 200
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -11081,26 +11210,26 @@ mod tests {
         );
     }
 
-    /// §7.3.8.4 TB-split on the **chroma** dual tree: the same 64×64
+    /// §7.3.8.4 TB-split chroma placement: the same 64×64 SINGLE_TREE
     /// leaf with all luma TUs quiet and a chroma residual in the
-    /// bottom-right chroma TU only. The chroma TB is 16×16 (4:2:0 half
-    /// of the 32×32 luma TB) at the (16, 16) chroma offset.
+    /// bottom-right TU only. The chroma TB is 16×16 (4:2:0 half of the
+    /// 32×32 luma TB) at the (16, 16) chroma offset.
     #[test]
     fn errata_238a_tb_split_chroma_bottom_right() {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-        for _ in 0..4 {
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0 (all four TUs)
-        }
-        // Chroma CU: TUs 1-3 quiet, TU 4 carries a Cb coefficient.
+                                      // TUs 1-3: all quiet.
         for _ in 0..3 {
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
-        enc.encode_decision(0, 0, 1); // cbf_cb = 1 (TU 4)
+        // TU 4 (bottom-right): a Cb coefficient only.
+        enc.encode_decision(0, 0, 1); // cbf_cb = 1
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
                                       // Chroma run/level U bins: ctxIdx 2 for bin 0, 3 for later bins;
                                       // chroma coeff_last_flag at ctxIdx 1 (Table 95, cm_init == 0).
         enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
@@ -14729,9 +14858,9 @@ mod tests {
         enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode
-            enc.encode_decision(0, 0, 0); // cbf_luma
             enc.encode_decision(0, 0, 0); // cbf_cb
             enc.encode_decision(0, 0, 0); // cbf_cr
+            enc.encode_decision(0, 0, 0); // cbf_luma
         }
         enc.encode_terminate(true);
         enc.finish()
@@ -14788,7 +14917,7 @@ mod tests {
         // Both CTUs visited, both subsets fully consumed.
         assert_eq!(stats.ctus, 2);
         assert_eq!(stats.split_cu_flag_bins, 2); // one per CTB
-        assert_eq!(stats.coding_units, 16); // 2 CTUs × 4 leaves × (luma+chroma)
+        assert_eq!(stats.coding_units, 8); // 2 CTUs × 4 leaves, one CU each
         assert_eq!(stats.intra_pred_mode_bins, 8);
         assert_eq!(stats.cbf_luma_bins, 8);
         assert_eq!(stats.cbf_chroma_bins, 16);
@@ -14938,9 +15067,9 @@ mod tests {
         enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode
-            enc.encode_decision(0, 0, 0); // cbf_luma
             enc.encode_decision(0, 0, 0); // cbf_cb
             enc.encode_decision(0, 0, 0); // cbf_cr
+            enc.encode_decision(0, 0, 0); // cbf_luma
         }
     }
 
@@ -15833,10 +15962,10 @@ mod tests {
     fn round391_btt_idr_bt_hor_then_tt_ver_tree_decodes_to_pixels() {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
-        // Leaf CU pair on a monochrome picture: the luma CU decodes
+        // SINGLE_TREE leaf CU on a monochrome picture: the CU decodes
         // intra_pred_mode = 2 (INTRA_VER, U bins "110") + cbf_luma = 0;
-        // the dual-tree chroma CU consumes no bins with
-        // chroma_format_idc = 0. INTRA_VER copies the (all-128) top
+        // no chroma cbf bins with chroma_format_idc = 0. INTRA_VER
+        // copies the (all-128) top
         // reference row, so every leaf shape — including the
         // rectangular BTT leaves — reconstructs to uniform 128 (the
         // eq. 285 DC average is square-block-shaped by construction and
@@ -15894,7 +16023,7 @@ mod tests {
         assert_eq!(stats.tree.btt.dir_bins, 2);
         assert_eq!(stats.tree.btt.type_bins, 2);
         assert_eq!(stats.tree.suco_flag_bins, 0, "SUCO disabled");
-        assert_eq!(stats.coding_units, 8, "4 leaves × (luma + chroma) CUs");
+        assert_eq!(stats.coding_units, 4, "one SINGLE_TREE CU per leaf");
         // INTRA_VER over the all-128 initial fill: uniform mid-grey.
         assert!(pic.y.iter().all(|&v| v == 128));
     }
@@ -15925,9 +16054,11 @@ mod tests {
         // split_unit_coding_order_flag present. 1 = mirrored.
         enc.encode_decision(0, 0, 1);
         // First-decoded 16×16 child (the RIGHT one at x=16): flag=0
-        // leaf, luma CU with cbf_luma=1 and one DC level of +20.
+        // SINGLE_TREE leaf with cbf_luma=1 and one DC level of +20.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -15937,14 +16068,12 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +20
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
                                       // Second-decoded 16×16 child (the LEFT one at x=0): plain leaf.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
                                       // Bottom child (0,16) 32×16: NO_SPLIT leaf (SUCO suppressed by
                                       // condition 4 — NO_SPLIT without quad split). INTRA_HOR (U bins
                                       // "10") copies the unavailable-left 128 column — shape-neutral
@@ -15953,9 +16082,9 @@ mod tests {
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 1); // intra_pred_mode ...
         enc.encode_decision(0, 1, 0); //   = 1 (INTRA_HOR)
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -15982,7 +16111,7 @@ mod tests {
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.tree.suco_flag_bins, 1, "exactly one SUCO decision");
         assert_eq!(stats.tree.suco_mirrored_units, 1);
-        assert_eq!(stats.coding_units, 6, "3 leaves × (luma + chroma) trees");
+        assert_eq!(stats.coding_units, 3, "one SINGLE_TREE CU per leaf");
         // The DC residual decoded with the FIRST child must have landed
         // in the right half (x ≥ 16) of the top 32×16 region.
         let right_has_residual = (0..16).any(|j| (16..32).any(|i| pic.y[j * 32 + i] != 128));
@@ -16173,6 +16302,8 @@ mod tests {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -16182,8 +16313,6 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 30
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -16288,6 +16417,8 @@ mod tests {
         enc.encode_decision(0, 0, 1); // split_unit_coding_order_flag = 1
                                       // First-decoded quadrant (TR at (16,0)): DC + level +20.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -16297,14 +16428,12 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 20
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
                                       // TL, BR, BL: plain DC leaves.
         for _ in 0..3 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
         }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -16333,7 +16462,7 @@ mod tests {
         assert_eq!(stats.split_cu_flag_bins, 1);
         assert_eq!(stats.tree.suco_flag_bins, 1);
         assert_eq!(stats.tree.suco_mirrored_units, 1);
-        assert_eq!(stats.coding_units, 8);
+        assert_eq!(stats.coding_units, 4);
         // Residual landed in the top-right quadrant only.
         let tr_has_residual = (0..16).any(|j| (16..32).any(|i| pic.y[j * 32 + i] != 128));
         assert!(tr_has_residual, "first-decoded quadrant must be top-right");
@@ -16389,7 +16518,7 @@ mod tests {
         );
         assert_eq!(stats.tree.btt.dir_bins, 0);
         assert_eq!(stats.tree.btt.type_bins, 0);
-        assert_eq!(stats.coding_units, 4, "two leaves × (luma + chroma)");
+        assert_eq!(stats.coding_units, 2, "two SINGLE_TREE leaves");
         assert!(pic.y.iter().all(|&v| v == 128));
     }
 
@@ -16449,13 +16578,14 @@ mod tests {
             enc.encode_bypass(0); // coeff_sign_flag → +60
             enc.encode_decision(t_last, if c_idx == 0 { 0 } else { 1 }, 1);
         };
-        // An empty leaf CU pair: intra_pred_mode = 0 (DC, single U bin
-        // "0" at Table 62 ctxInc 0), all CBFs zero.
+        // An empty SINGLE_TREE leaf CU: intra_pred_mode = 0 (DC, single
+        // U bin "0" at Table 62 ctxInc 0), all CBFs zero (§7.3.8.5
+        // order: cbf_cb, cbf_cr, cbf_luma).
         let empty_leaf = |enc: &mut CabacEncoder| {
             enc.encode_decision(t_intra, 0, 0);
-            enc.encode_decision(t_cbf_l, 0, 0);
             enc.encode_decision(t_cbf_cb, 0, 0);
             enc.encode_decision(t_cbf_cr, 0, 0);
+            enc.encode_decision(t_cbf_l, 0, 0);
         };
 
         // CTU 32×32: BT_HOR (flag ctxInc 6 = Table 97 ctxSetIdx 2 · 3,
@@ -16481,13 +16611,14 @@ mod tests {
         // Leaf (0,16): empty.
         enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
         empty_leaf(&mut enc);
-        // Leaf (16,16): luma DC residual + Cb DC residual.
+        // Leaf (16,16): luma DC residual + Cb DC residual (§7.3.8.5:
+        // cbf group first, then residuals in luma, Cb order).
         enc.encode_decision(t_flag, ctx_inc_btt_split_flag(0, 16, 16), 0);
         enc.encode_decision(t_intra, 0, 0); // DC
-        enc.encode_decision(t_cbf_l, 0, 1);
-        dc_residual(&mut enc, 0);
         enc.encode_decision(t_cbf_cb, 0, 1);
         enc.encode_decision(t_cbf_cr, 0, 0);
+        enc.encode_decision(t_cbf_l, 0, 1);
+        dc_residual(&mut enc, 0);
         dc_residual(&mut enc, 1);
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -16518,7 +16649,7 @@ mod tests {
         assert_eq!(stats.cbf_luma_bins, 4);
         assert_eq!(stats.cbf_chroma_bins, 8);
         assert_eq!(stats.coeff_runs, 2, "one luma + one Cb DC coefficient");
-        assert_eq!(stats.coding_units, 8, "4 leaves × (luma + chroma)");
+        assert_eq!(stats.coding_units, 4, "one SINGLE_TREE CU per leaf");
         // Every prediction is DC over flat-128 references → 128. Only
         // the bottom-right quadrant carries the residual; its exact
         // per-sample shape follows the spec-literal eq. 1062 inverse
@@ -16879,17 +17010,18 @@ mod tests {
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0);
         for sign in [0u8, 1u8] {
-            // 32×16 leaf: flag = 0 → cond-1 mark (code 1, latch reset).
+            // 32×16 SINGLE_TREE leaf: flag = 0 → cond-1 mark (code 1,
+            // latch reset). Its one TU carries luma + Cb residuals and
+            // reads the area's single cu_qp_delta after the cbf group.
             enc.encode_decision(0, 0, 0);
             enc.encode_decision(0, 0, 1); // intra_pred_mode ...
             enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
             enc.encode_decision(0, 1, 0); //   U terminator
+            enc.encode_decision(0, 0, 1); // cbf_cb = 1
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_decision(0, 0, 1); // cbf_luma = 1
             qp_delta(&mut enc, 5, sign); // first TU of the area reads
             dc1(&mut enc, 0);
-            // Chroma CU: cbf_cb = 1 — latch suppresses its delta read.
-            enc.encode_decision(0, 0, 1); // cbf_cb = 1
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             dc1(&mut enc, 1);
         }
         enc.encode_terminate(true);
@@ -16915,12 +17047,9 @@ mod tests {
             ..Default::default()
         };
         let (_pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
-        assert_eq!(
-            stats.cu_qp_delta_abs_bins, 2,
-            "one delta per 32×16 area; chroma CUs latch-suppressed"
-        );
+        assert_eq!(stats.cu_qp_delta_abs_bins, 2, "one delta per 32×16 area");
         assert_eq!(stats.coeff_runs, 4, "2 luma + 2 chroma DC coefficients");
-        assert_eq!(stats.coding_units, 4);
+        assert_eq!(stats.coding_units, 2);
     }
 
     /// Round 397: §7.3.8.3 DQUANT `cuQpDeltaCode = 2` — with
@@ -16945,18 +17074,18 @@ mod tests {
         enc.encode_decision(0, 0, 1); // intra_pred_mode ...
         enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
         enc.encode_decision(0, 1, 0); //   U terminator
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0 (code-2 arm)
-        enc.encode_decision(0, 0, 0); // chroma CU: cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
                                       // Second leaf: latch set → no delta read anywhere.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 1); // intra_pred_mode = 2 again
         enc.encode_decision(0, 1, 1);
         enc.encode_decision(0, 1, 0);
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -16984,7 +17113,7 @@ mod tests {
             stats.cu_qp_delta_abs_bins, 1,
             "exactly one code-2 delta read for the CTU area"
         );
-        assert_eq!(stats.coding_units, 4);
+        assert_eq!(stats.coding_units, 2);
         assert!(pic.y.iter().all(|&v| v == 128), "no residual anywhere");
     }
 
@@ -17117,6 +17246,9 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 1); // intra_luma_pred_mpm_flag = 1
         enc.encode_decision(0, 0, 0); // intra_luma_pred_mpm_idx = 0
+        enc.encode_decision(0, 0, 1); // intra_chroma_pred_mode bin0 = 1 → DM
+        enc.encode_decision(0, 0, 0); // cbf_cb = 0
+        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
@@ -17126,10 +17258,6 @@ mod tests {
         enc.encode_decision(0, 1, 0);
         enc.encode_bypass(0); // +60
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Chroma CU: DM + no residual.
-        enc.encode_decision(0, 0, 1); // intra_chroma_pred_mode bin0 = 1 → DM
-        enc.encode_decision(0, 0, 0); // cbf_cb = 0
-        enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -17155,7 +17283,7 @@ mod tests {
         assert_eq!(stats.eipd.pims_flag_bins, 0);
         assert_eq!(stats.eipd.chroma_pred_mode_bins, 1);
         assert_eq!(stats.intra_pred_mode_bins, 0, "Baseline read suppressed");
-        assert_eq!(stats.coding_units, 2);
+        assert_eq!(stats.coding_units, 1);
         // DC over unavailable refs = 128 + the +60 residual: the luma
         // plane is shifted well above 128; chroma untouched.
         let mean: i64 = pic.y.iter().map(|&v| v as i64).sum::<i64>() / (32 * 32);
@@ -17181,6 +17309,9 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag
         enc.encode_decision(0, 0, 1); // mpm_flag = 1
         enc.encode_decision(0, 0, 0); // mpm_idx = 0 → DC
+        enc.encode_decision(0, 0, 1); // chroma DM
+        enc.encode_decision(0, 0, 0); // cbf_cb
+        enc.encode_decision(0, 0, 0); // cbf_cr
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
         enc.encode_decision(0, 0, 0); // zero_run 0
         enc.encode_decision(0, 0, 1); // level bin 0
@@ -17190,9 +17321,6 @@ mod tests {
         enc.encode_decision(0, 1, 0);
         enc.encode_bypass(0);
         enc.encode_decision(0, 0, 1); // last
-        enc.encode_decision(0, 0, 1); // chroma DM
-        enc.encode_decision(0, 0, 0); // cbf_cb
-        enc.encode_decision(0, 0, 0); // cbf_cr
                                       // CTU1 at (0, 32): neighbours A invalid (x = −1), B = CTU0 (DC),
                                       // C invalid → find INTRA_VER in the derived lists and encode the
                                       // matching selector.
@@ -17218,10 +17346,10 @@ mod tests {
         } else {
             panic!("INTRA_VER must appear in the MPM or PIMS lists for (na, DC, na)");
         }
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 1); // chroma DM
         enc.encode_decision(0, 0, 0); // cbf_cb
         enc.encode_decision(0, 0, 0); // cbf_cr
+        enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -17243,7 +17371,7 @@ mod tests {
         };
         let (pic, stats) = decode_baseline_idr_slice(&rbsp, walk, decode).unwrap();
         assert_eq!(stats.ctus, 2);
-        assert_eq!(stats.coding_units, 4);
+        assert_eq!(stats.coding_units, 2);
         // CTU0 carries the residual.
         assert_ne!(pic.y[0], 128);
         // CTU1: INTRA_VER copies CTU0's reconstructed bottom row
@@ -17356,6 +17484,8 @@ mod tests {
         let t90 = MainCtxTable::CoeffAbsLevelGreaterFlag as usize;
         enc.encode_decision(t41, 0, 0); // split_cu_flag = 0 → 32×32 CU
         enc.encode_decision(t62, 0, 0); // intra_pred_mode = 0 (DC)
+        enc.encode_decision(t76, 0, 0); // cbf_cb = 0
+        enc.encode_decision(t77, 0, 0); // cbf_cr = 0
         enc.encode_decision(t75, 0, 1); // cbf_luma = 1
                                         // residual_coding_adv: last = (0,0).
         let xi = |b: u32| ctx_inc_last_sig_coeff_prefix(b, 0, 5, 1);
@@ -17369,9 +17499,6 @@ mod tests {
         enc.encode_bypass(1);
         enc.encode_bypass(0);
         enc.encode_bypass(0); // sign +
-                              // Chroma CU: no residual.
-        enc.encode_decision(t76, 0, 0); // cbf_cb = 0
-        enc.encode_decision(t77, 0, 0); // cbf_cr = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -17401,7 +17528,7 @@ mod tests {
         assert_eq!(stats.adcc.remaining_syms, 1);
         assert_eq!(stats.adcc.sign_bins, 1);
         assert_eq!(stats.coeff_runs, 0, "RLE path never runs under adcc");
-        assert_eq!(stats.coding_units, 2);
+        assert_eq!(stats.coding_units, 1);
         // The +5 DC at qp 51 shifts the whole (DC-predicted 128) CU.
         assert!(
             pic.y.iter().any(|&v| v != 128),
@@ -17421,9 +17548,9 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-        enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // Chroma CU: cbf_cb = 1, cbf_cr = 0.
+                                      // cbf group: cbf_cb = 1, cbf_cr = 0, cbf_luma = 0.
         enc.encode_decision(0, 0, 1);
+        enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0);
         // residual_coding_adv on the 16×16 Cb block: last = (1, 0).
         // Chroma last_sig prefix bins ride ctxIdx 11 + binIdx; the
@@ -17572,6 +17699,8 @@ mod tests {
             enc.encode_decision(0, 0, 1); // split_cu_flag = 1 → 4× 16×16
                                           // CU (0,0): DC + strong residual (level 60 at qp 40).
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
+            enc.encode_decision(0, 0, 0); // cbf_cb = 0
+            enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_decision(0, 0, 1); // cbf_luma = 1
             enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
             enc.encode_decision(0, 0, 1); // level bin 0
@@ -17581,22 +17710,20 @@ mod tests {
             enc.encode_decision(0, 1, 0);
             enc.encode_bypass(0); // +60
             enc.encode_decision(0, 0, 1); // coeff_last_flag
-            enc.encode_decision(0, 0, 0); // cbf_cb = 0
-            enc.encode_decision(0, 0, 0); // cbf_cr = 0
                                           // CU (16,0): INTRA_VER (copies the unavailable-top 128
                                           // column, keeping a sharp step against the shifted CU 1).
             enc.encode_decision(0, 0, 1); // intra_pred_mode ...
             enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
             enc.encode_decision(0, 1, 0);
-            enc.encode_decision(0, 0, 0); // cbf_luma = 0
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
+            enc.encode_decision(0, 0, 0); // cbf_luma = 0
             for _ in 0..2 {
                 // CUs (0,16), (16,16): DC, no residual.
                 enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
-                enc.encode_decision(0, 0, 0); // cbf_luma = 0
                 enc.encode_decision(0, 0, 0); // cbf_cb = 0
                 enc.encode_decision(0, 0, 0); // cbf_cr = 0
+                enc.encode_decision(0, 0, 0); // cbf_luma = 0
             }
             enc.encode_terminate(true);
             enc.finish()

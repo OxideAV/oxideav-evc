@@ -546,11 +546,19 @@ inside the first IDR. Round 441 hand-anchored the framing, SPS/PPS
 and slice-header layouts, the `slice_data()` offset and the §9.3
 engine mechanics bit-exactly against the raw stream bytes, localizing
 the remaining divergence to the leaf-level `coding_unit()` element
-modelling of the very first CTUs; the identified §7.3.8.3/§8.4.3
-re-reading (I-slice leaves are SINGLE_TREE with DM chroma, not
-per-leaf dual trees with DC chroma) needs a decoder + encoder +
-fixture lockstep restructure — see the CHANGELOG round-441 entry for
-the full finding list.
+modelling of the very first CTUs. Round 444 landed the identified
+§7.3.8.3/§8.4.3 re-reading as one decoder + encoder + fixture
+lockstep: I-slice leaves are **SINGLE_TREE** `coding_unit()`s (chroma
+cbfs + residuals in the same `transform_unit()`; the line-2791
+in-leaf INTRA_IBC reassignment binds only the CU-internal presence
+gates and creates no `DUAL_TREE_CHROMA` partner) and chroma predicts
+at the §8.4.3 **DM** (`IntraPredModeC = IntraPredModeY` via the
+inferred-0 `intra_chroma_pred_mode`), not INTRA_DC. The remaining
+first-IDR divergence sits on the still-open entropy-layer questions
+— the filed Table-91 U-at-cMax truncation and §9.3.4.3.4
+bypass-formulation asks, and the in-repo #213 (c)
+`sps_cm_init_flag == 0` context-topology entry (corpus-adjudicable
+per its own text) — see the CHANGELOG round-441/444 entries.
 
 ## Encoder (round 429 bootstrap; round 431 context modelling + low-delay P)
 
