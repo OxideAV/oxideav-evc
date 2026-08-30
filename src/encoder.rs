@@ -1620,6 +1620,52 @@ mod tests {
         );
     }
 
+    /// Round 452 — single-byte mutation gate over a **B** access unit
+    /// (the new syntax surface: direct_mode_flag, inter_pred_idc, the
+    /// second skip mvp_idx, per-list ref_idx): feed the intact IDR +
+    /// P/B prefix, then every low-bit flip / inversion of every third
+    /// AU byte, into a fresh decoder session. Clean error or frame —
+    /// never a panic.
+    #[test]
+    fn mutation_gate_over_b_access_unit() {
+        let (w, h) = (48u32, 48u32);
+        let mut p = params(w, h);
+        p.options.insert("gop", "8");
+        p.options.insert("refs", "2");
+        p.options.insert("b", "1");
+        p.options.insert("qp", "30");
+        let mut enc = make_encoder(&p).unwrap();
+        let mut aus = Vec::new();
+        for t in 0..3usize {
+            let mut f = synth_frame(w as usize, h as usize);
+            for (i, v) in f.planes[0].data.iter_mut().enumerate() {
+                if (i + t * 13) % 29 == 0 {
+                    *v = v.wrapping_add(50);
+                }
+            }
+            enc.send_frame(&Frame::Video(f)).unwrap();
+            aus.push(enc.receive_packet().unwrap().data);
+        }
+        // aus[2] is a B AU with a two-deep reference list.
+        for i in 0..aus[2].len() {
+            for mask in [0x01u8, 0xFF] {
+                let mut mutated = aus[2].clone();
+                mutated[i] ^= mask;
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                for prefix in &aus[..2] {
+                    let pkt = Packet::new(0, TimeBase::new(1, 90_000), prefix.clone());
+                    dec.send_packet(&pkt).unwrap();
+                    let _ = dec.receive_frame();
+                }
+                let pkt = Packet::new(0, TimeBase::new(1, 90_000), mutated);
+                if dec.send_packet(&pkt).is_ok() {
+                    let _ = dec.receive_frame();
+                }
+            }
+        }
+    }
+
     /// Output params advertise the stream a muxer needs.
     #[test]
     fn output_params_shape() {
