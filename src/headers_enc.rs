@@ -41,6 +41,16 @@ pub struct EncSequenceConfig {
     /// address. 1 is the round-431 single-reference stream; the value is
     /// bounded by 5.
     pub max_num_tid0_ref_pics: u32,
+    /// §7.4.3.1 conformance-cropping right/bottom offsets in **luma
+    /// samples** (round 452). `pic_width/height_in_luma_samples` must
+    /// be integer multiples of `Max( MinCbSizeY, 8 ) = 8`, so a source
+    /// of any other even geometry is coded padded and these offsets
+    /// carve the true picture back out at output; the writer emits
+    /// them divided by SubWidthC/SubHeightC (= 2 in 4:2:0), which is
+    /// why odd offsets are unrepresentable. `(0, 0)` keeps
+    /// `picture_cropping_flag = 0` — the historical SPS byte for byte.
+    pub crop_right: u32,
+    pub crop_bottom: u32,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -57,6 +67,22 @@ pub struct EncSequenceConfig {
 pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     if cfg.width == 0 || cfg.height == 0 {
         return Err(Error::invalid("evc enc sps: zero dimensions"));
+    }
+    if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
+        return Err(Error::invalid(format!(
+            "evc enc sps: coded dimensions {}x{} must be multiples of Max( MinCbSizeY, 8 ) = 8              (§7.4.3.1) — pad and crop",
+            cfg.width, cfg.height
+        )));
+    }
+    if cfg.crop_right % 2 != 0 || cfg.crop_bottom % 2 != 0 {
+        return Err(Error::invalid(
+            "evc enc sps: crop offsets are signalled in SubWidthC/SubHeightC units (4:2:0: 2              luma samples) — odd luma offsets are unrepresentable",
+        ));
+    }
+    if cfg.crop_right >= cfg.width || cfg.crop_bottom >= cfg.height {
+        return Err(Error::invalid(
+            "evc enc sps: crop exceeds the coded picture",
+        ));
     }
     if cfg.width > crate::sps::MAX_DIMENSION || cfg.height > crate::sps::MAX_DIMENSION {
         return Err(Error::invalid("evc enc sps: dimensions exceed bound"));
@@ -108,7 +134,15 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
              // marking depth (eq. 170 with RefPicGapLength 1 keeps the
              // most recent max_num_tid0_ref_pics pictures).
     w.ue(cfg.max_num_tid0_ref_pics);
-    w.u1(false); // picture_cropping_flag
+    let cropping = cfg.crop_right != 0 || cfg.crop_bottom != 0;
+    w.u1(cropping); // picture_cropping_flag
+    if cropping {
+        // §7.4.3.1: offsets in SubWidthC / SubHeightC units.
+        w.ue(0); // picture_crop_left_offset
+        w.ue(cfg.crop_right / 2); // picture_crop_right_offset
+        w.ue(0); // picture_crop_top_offset
+        w.ue(cfg.crop_bottom / 2); // picture_crop_bottom_offset
+    }
     w.u1(false); // chroma_qp_table_present_flag (chroma_format_idc != 0)
     w.u1(false); // vui_parameters_present_flag
     w.rbsp_trailing_bits();
@@ -251,6 +285,8 @@ mod tests {
             bit_depth: 8,
             cm_init: false,
             max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -298,6 +334,8 @@ mod tests {
             bit_depth: 10,
             cm_init: false,
             max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -336,6 +374,8 @@ mod tests {
             bit_depth: 8,
             cm_init: false,
             max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -397,6 +437,8 @@ mod tests {
             bit_depth: 8,
             cm_init: false,
             max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

@@ -126,6 +126,39 @@ pub fn encode_idr_access_unit_refs(
     cm_init: bool,
     refs: u32,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    // §7.4.3.1: pic_width/height_in_luma_samples must be integer
+    // multiples of Max( MinCbSizeY, 8 ) = 8 — a source of any other
+    // even geometry is edge-padded up and the conformance-cropping
+    // window carves it back out at the decoder's output (round 452).
+    let (coded_w, coded_h) = coded_dims(src.width, src.height)?;
+    let padded;
+    let coded_src = if (coded_w, coded_h) == (src.width, src.height) {
+        src
+    } else {
+        padded = pad_to_coded(src, coded_w, coded_h)?;
+        &padded
+    };
+    encode_idr_au_coded(
+        coded_src,
+        slice_qp,
+        deblock,
+        cm_init,
+        refs,
+        (coded_w - src.width, coded_h - src.height),
+    )
+}
+
+/// The coded-geometry IDR access-unit writer: `src` is already the
+/// §7.4.3.1 multiple-of-8 picture and `crop` the (right, bottom)
+/// conformance-window offsets in luma samples.
+fn encode_idr_au_coded(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+    refs: u32,
+    crop: (u32, u32),
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     let (payload, recon, stats) =
         crate::slice_enc::encode_idr_slice_data_opts(src, slice_qp, deblock, cm_init)?;
     let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
@@ -138,12 +171,71 @@ pub fn encode_idr_access_unit_refs(
         bit_depth: src.bit_depth,
         cm_init,
         max_num_tid0_ref_pics: refs,
+        crop_right: crop.0,
+        crop_bottom: crop.1,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
     append_length_prefixed_nal(&mut out, NalUnitType::Pps, &write_pps_rbsp()?);
     append_length_prefixed_nal(&mut out, NalUnitType::Idr, &slice_rbsp);
     Ok((out, recon, stats))
+}
+
+/// The coded geometry for a source picture: each dimension rounded up
+/// to the next multiple of 8 (§7.4.3.1 pins the SPS dimensions to
+/// multiples of `Max( MinCbSizeY, 8 )`). Odd dimensions are refused:
+/// the 4:2:0 cropping offsets are signalled in SubWidthC/SubHeightC
+/// units of 2 luma samples, so an odd pad is unrepresentable.
+fn coded_dims(w: u32, h: u32) -> Result<(u32, u32)> {
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("evc encoder: zero dimensions"));
+    }
+    if w % 2 != 0 || h % 2 != 0 {
+        return Err(Error::unsupported(format!(
+            "evc encoder: odd dimensions {w}x{h} are unrepresentable in the 4:2:0              conformance-cropping window (offsets count SubWidthC/SubHeightC pairs)"
+        )));
+    }
+    Ok((w.div_ceil(8) * 8, h.div_ceil(8) * 8))
+}
+
+/// Edge-replicate `src` into the coded geometry (right columns / bottom
+/// rows repeat the last source sample — the padding never bleeds
+/// synthetic content into the cropped-out window's neighbours'
+/// prediction beyond what replication implies).
+fn pad_to_coded(src: &YuvPicture, coded_w: u32, coded_h: u32) -> Result<YuvPicture> {
+    let mut out = YuvPicture::new(coded_w, coded_h, src.chroma_format_idc, src.bit_depth)?;
+    let copy = |dst: &mut [u16],
+                dst_w: usize,
+                dst_h: usize,
+                srcp: &[u16],
+                src_w: usize,
+                src_h: usize,
+                src_stride: usize| {
+        for y in 0..dst_h {
+            let sy = y.min(src_h - 1);
+            for x in 0..dst_w {
+                let sx = x.min(src_w - 1);
+                dst[y * dst_w + x] = srcp[sy * src_stride + sx];
+            }
+        }
+    };
+    copy(
+        &mut out.y,
+        coded_w as usize,
+        coded_h as usize,
+        &src.y,
+        src.width as usize,
+        src.height as usize,
+        src.y_stride(),
+    );
+    let (cw, chh) = ((coded_w / 2) as usize, (coded_h / 2) as usize);
+    let (scw, sch) = (
+        src.width.div_ceil(2) as usize,
+        src.height.div_ceil(2) as usize,
+    );
+    copy(&mut out.cb, cw, chh, &src.cb, scw, sch, src.c_stride());
+    copy(&mut out.cr, cw, chh, &src.cr, scw, sch, src.c_stride());
+    Ok(out)
 }
 
 /// Encode one **P** access unit (round 431) — a single NonIDR NAL
@@ -162,6 +254,17 @@ pub fn encode_p_access_unit_opts(
     deblock: bool,
     cm_init: bool,
 ) -> Result<(Vec<u8>, YuvPicture, PEncStats)> {
+    // The reference is a reconstruction — already coded-geometry; pad
+    // the source up to it when the caller passes the display geometry.
+    let padded;
+    let src = if (ref_pic.width, ref_pic.height) != (src.width, src.height)
+        && (ref_pic.width, ref_pic.height) == coded_dims(src.width, src.height)?
+    {
+        padded = pad_to_coded(src, ref_pic.width, ref_pic.height)?;
+        &padded
+    } else {
+        src
+    };
     let (payload, recon, stats) =
         crate::slice_enc_p::encode_p_slice_data(src, ref_pic, slice_qp, deblock, cm_init)?;
     let mut slice_rbsp = write_p_slice_header(slice_qp as u32, deblock)?;
@@ -188,11 +291,11 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     let height = params
         .height
         .ok_or_else(|| Error::invalid("evc encoder: CodecParameters.height required"))?;
-    if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
-        return Err(Error::unsupported(format!(
-            "evc encoder: dimensions {width}x{height} must be non-zero multiples of 4"
-        )));
-    }
+    // Any non-zero even geometry is accepted: the coded picture is the
+    // §7.4.3.1 multiple-of-8 round-up and the conformance-cropping
+    // window restores the display size at output (round 452). Odd
+    // dimensions stay refused — see [`coded_dims`].
+    let (coded_w, coded_h) = coded_dims(width, height)?;
     let bit_depth = match params.pixel_format {
         None | Some(PixelFormat::Yuv420P) => 8,
         Some(PixelFormat::Yuv420P10Le) => 10,
@@ -262,6 +365,8 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         out_params,
         width,
         height,
+        coded_w,
+        coded_h,
         bit_depth,
         qp,
         deblock,
@@ -299,8 +404,14 @@ struct EncDpbPic {
 pub struct EvcEncoder {
     codec_id: CodecId,
     out_params: CodecParameters,
+    /// Display geometry (what the caller feeds and the decoder outputs).
     width: u32,
     height: u32,
+    /// Coded geometry: the §7.4.3.1 multiple-of-8 round-up; when it
+    /// differs from the display geometry the SPS carries the
+    /// conformance-cropping window.
+    coded_w: u32,
+    coded_h: u32,
     bit_depth: u32,
     qp: i32,
     deblock: bool,
@@ -441,11 +552,24 @@ impl Encoder for EvcEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
-        let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
+        let src = video_frame_to_picture(
+            v,
+            self.width,
+            self.height,
+            self.coded_w,
+            self.coded_h,
+            self.bit_depth,
+        )?;
         let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
         let data = if is_idr {
-            let (data, recon, _stats) =
-                encode_idr_access_unit_refs(&src, self.qp, self.deblock, self.cm_init, self.refs)?;
+            let (data, recon, _stats) = encode_idr_au_coded(
+                &src,
+                self.qp,
+                self.deblock,
+                self.cm_init,
+                self.refs,
+                (self.coded_w - self.width, self.coded_h - self.height),
+            )?;
             // §8.3.1 eqs. 155/156 + the IDR DPB flush.
             self.dpb.clear();
             self.dpb.push(EncDpbPic {
@@ -488,6 +612,8 @@ fn video_frame_to_picture(
     v: &oxideav_core::VideoFrame,
     width: u32,
     height: u32,
+    coded_w: u32,
+    coded_h: u32,
     bit_depth: u32,
 ) -> Result<YuvPicture> {
     let planes = v.image_planes();
@@ -497,31 +623,33 @@ fn video_frame_to_picture(
             planes.len()
         )));
     }
-    let mut pic = YuvPicture::new(width, height, 1, bit_depth)?;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
+    let mut pic = YuvPicture::new(coded_w, coded_h, 1, bit_depth)?;
     let bytes_per = if bit_depth > 8 { 2usize } else { 1 };
     let max_val = ((1u32 << bit_depth) - 1) as u16;
     let copy = |dst: &mut [u16],
                 dst_w: usize,
                 dst_h: usize,
+                src_w: usize,
+                src_h: usize,
                 plane: &oxideav_core::VideoPlane|
      -> Result<()> {
-        let row_bytes = dst_w * bytes_per;
-        if plane.stride < row_bytes || plane.data.len() < plane.stride * dst_h {
+        let row_bytes = src_w * bytes_per;
+        if plane.stride < row_bytes || plane.data.len() < plane.stride * src_h {
             return Err(Error::invalid(format!(
-                "evc encoder: plane too small (stride {}, len {}, need {dst_w}x{dst_h}x{bytes_per})",
+                "evc encoder: plane too small (stride {}, len {}, need {src_w}x{src_h}x{bytes_per})",
                 plane.stride,
                 plane.data.len()
             )));
         }
         for y in 0..dst_h {
-            let row = &plane.data[y * plane.stride..y * plane.stride + row_bytes];
+            let sy = y.min(src_h - 1);
+            let row = &plane.data[sy * plane.stride..sy * plane.stride + row_bytes];
             for (x, d) in dst[y * dst_w..(y + 1) * dst_w].iter_mut().enumerate() {
+                let sx = x.min(src_w - 1);
                 let s = if bytes_per == 2 {
-                    u16::from_le_bytes([row[2 * x], row[2 * x + 1]])
+                    u16::from_le_bytes([row[2 * sx], row[2 * sx + 1]])
                 } else {
-                    row[x] as u16
+                    row[sx] as u16
                 };
                 if s > max_val {
                     return Err(Error::invalid(format!(
@@ -533,9 +661,18 @@ fn video_frame_to_picture(
         }
         Ok(())
     };
-    copy(&mut pic.y, width as usize, height as usize, &planes[0])?;
-    copy(&mut pic.cb, cw, ch, &planes[1])?;
-    copy(&mut pic.cr, cw, ch, &planes[2])?;
+    copy(
+        &mut pic.y,
+        coded_w as usize,
+        coded_h as usize,
+        width as usize,
+        height as usize,
+        &planes[0],
+    )?;
+    let (cw, ch) = ((coded_w / 2) as usize, (coded_h / 2) as usize);
+    let (scw, sch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
+    copy(&mut pic.cb, cw, ch, scw, sch, &planes[1])?;
+    copy(&mut pic.cr, cw, ch, scw, sch, &planes[2])?;
     Ok(pic)
 }
 
@@ -593,7 +730,7 @@ mod tests {
 
         // Reference recon from the direct entry point (the registry
         // defaults `cm_init` on).
-        let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
+        let src = video_frame_to_picture(&frame, w, h, w, h, 8).unwrap();
         let (stream, recon, _stats) =
             encode_idr_access_unit_opts(&src, DEFAULT_QP, false, true).unwrap();
         assert_eq!(pkt.data, stream, "registry and direct paths must agree");
@@ -620,7 +757,7 @@ mod tests {
     /// the whole loop stays recon-exact through the registered decoder.
     #[test]
     fn cm_init_access_unit_reparses_and_round_trips() {
-        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 8).unwrap();
+        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 64, 48, 8).unwrap();
         let (stream, recon, _stats) = encode_idr_access_unit_opts(&src, 22, false, true).unwrap();
         let nals = crate::nal::iter_length_prefixed(&stream).unwrap();
         let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
@@ -647,7 +784,7 @@ mod tests {
     /// and the SPS/PPS parse to the encoder's declared configuration.
     #[test]
     fn access_unit_reparses_exactly() {
-        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 8).unwrap();
+        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 64, 48, 8).unwrap();
         let (stream, _recon, _stats) = encode_idr_access_unit(&src, 22).unwrap();
         let nals = crate::nal::iter_length_prefixed(&stream).unwrap();
         assert_eq!(nals.len(), 3);
@@ -736,7 +873,11 @@ mod tests {
         let mut nodims = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         nodims.pixel_format = Some(PixelFormat::Yuv420P);
         assert!(make_encoder(&nodims).is_err());
-        assert!(make_encoder(&params(66, 64)).is_err());
+        assert!(make_encoder(&params(65, 64)).is_err(), "odd width");
+        assert!(
+            make_encoder(&params(66, 64)).is_ok(),
+            "even width pads + crops"
+        );
     }
 
     /// 10-bit input (`Yuv420P10Le`, two LE bytes per sample): the whole
@@ -784,7 +925,7 @@ mod tests {
         let info = crate::probe(&pkt.data).unwrap();
         assert_eq!(info.bit_depth_luma, 10);
 
-        let src = video_frame_to_picture(&frame, w, h, 10).unwrap();
+        let src = video_frame_to_picture(&frame, w, h, w, h, 10).unwrap();
         let (stream, recon, _stats) = encode_idr_access_unit_opts(&src, 20, false, true).unwrap();
         assert_eq!(pkt.data, stream);
 
@@ -807,7 +948,7 @@ mod tests {
     /// decode to either a clean error or a frame — never a panic.
     #[test]
     fn mutation_gate_over_encoded_stream() {
-        let src = video_frame_to_picture(&synth_frame(48, 48), 48, 48, 8).unwrap();
+        let src = video_frame_to_picture(&synth_frame(48, 48), 48, 48, 48, 48, 8).unwrap();
         // The registry-default shape (cm_init on) — the widest context
         // surface the decoder can be driven across by a bit flip.
         let (stream, _recon, _stats) = encode_idr_access_unit_opts(&src, 42, false, true).unwrap();
@@ -868,7 +1009,7 @@ mod tests {
         enc.send_frame(&Frame::Video(frame.clone())).unwrap();
         let pkt = enc.receive_packet().unwrap();
         assert_eq!(crate::probe(&pkt.data).unwrap().bit_depth_luma, 12);
-        let src = video_frame_to_picture(&frame, w, h, 12).unwrap();
+        let src = video_frame_to_picture(&frame, w, h, w, h, 12).unwrap();
         let (stream, recon, _stats) =
             encode_idr_access_unit_opts(&src, DEFAULT_QP, false, true).unwrap();
         assert_eq!(pkt.data, stream);
@@ -903,7 +1044,7 @@ mod tests {
     fn deblock_on_round_trip_exact() {
         let (w, h) = (64u32, 64u32);
         let frame = synth_frame(w as usize, h as usize);
-        let src = video_frame_to_picture(&frame, w, h, 8).unwrap();
+        let src = video_frame_to_picture(&frame, w, h, w, h, 8).unwrap();
         let qp = 45;
         let (stream_db, recon_db, _) = encode_idr_access_unit_opts(&src, qp, true, true).unwrap();
         let (stream_no, recon_no, _) = encode_idr_access_unit_opts(&src, qp, false, true).unwrap();
@@ -973,7 +1114,7 @@ mod tests {
         let mut ref_recon: Option<crate::picture::YuvPicture> = None;
         let mut expected: Vec<(bool, Vec<u8>)> = Vec::new();
         for t in 0..8usize {
-            let src = video_frame_to_picture(&mk(t), w, h, 8).unwrap();
+            let src = video_frame_to_picture(&mk(t), w, h, w, h, 8).unwrap();
             let is_idr = t % 4 == 0;
             let recon = if is_idr {
                 let (_d, r, _s) = encode_idr_access_unit_opts(&src, 30, false, true).unwrap();
@@ -1054,8 +1195,8 @@ mod tests {
                 *v = v.wrapping_add(40);
             }
         }
-        let src0 = video_frame_to_picture(&f0, w, h, 8).unwrap();
-        let src1 = video_frame_to_picture(&f1, w, h, 8).unwrap();
+        let src0 = video_frame_to_picture(&f0, w, h, w, h, 8).unwrap();
+        let src1 = video_frame_to_picture(&f1, w, h, w, h, 8).unwrap();
         let (idr_au, recon0, _s) = encode_idr_access_unit_opts(&src0, 38, false, true).unwrap();
         let (p_au, _recon1, _s) =
             encode_p_access_unit_opts(&src1, &recon0, 38, false, true).unwrap();
@@ -1193,6 +1334,94 @@ mod tests {
         assert!(make_encoder(&bad_b).is_err());
     }
 
+    /// Round 452 — **conformance-window cropping**: a source whose
+    /// even geometry is not a multiple of 8 (§7.4.3.1 pins the SPS
+    /// dimensions to multiples of `Max( MinCbSizeY, 8 )`) is coded
+    /// edge-padded with `picture_cropping_flag = 1`, and the decoder's
+    /// output crop restores the display geometry — the decoded planes
+    /// equal the top-left window of the encoder's reconstruction, on
+    /// IDR and P/B pictures alike.
+    #[test]
+    fn cropped_dimensions_round_trip_exact() {
+        let (w, h) = (100u32, 60u32); // codes as 104×64 + (4, 4) crop
+        let mut p = params(w, h);
+        p.options.insert("gop", "4");
+        p.options.insert("qp", "26");
+        p.options.insert("b", "1");
+        p.options.insert("refs", "2");
+        let mut enc = make_evc_encoder(&p).unwrap();
+        let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+        for t in 0..4i64 {
+            let mut f = synth_frame(w as usize, h as usize);
+            for (i, v) in f.planes[0].data.iter_mut().enumerate() {
+                if (i as i64 + t * 31) % 17 == 0 {
+                    *v = v.wrapping_add(35);
+                }
+            }
+            f.pts = Some(t);
+            enc.send_frame(&Frame::Video(f)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            if t == 0 {
+                let info = crate::probe(&pkt.data).unwrap();
+                assert_eq!((info.width, info.height), (104, 64), "coded geometry");
+                let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                assert!(sps.picture_cropping_flag);
+                assert_eq!(
+                    (
+                        sps.picture_crop_left_offset,
+                        sps.picture_crop_right_offset,
+                        sps.picture_crop_top_offset,
+                        sps.picture_crop_bottom_offset
+                    ),
+                    (0, 2, 0, 2),
+                    "§7.4.3.1 offsets in SubWidthC/SubHeightC units"
+                );
+            }
+            dec.send_packet(&pkt).unwrap();
+            let vf = match dec.receive_frame().unwrap() {
+                Frame::Video(vf) => vf,
+                other => panic!("expected video frame, got {other:?}"),
+            };
+            // The decoder crops to the display window; the encoder's
+            // reconstruction is the full coded grid.
+            let recon = enc.last_recon().unwrap();
+            assert_eq!((recon.width, recon.height), (104, 64));
+            assert_eq!(vf.planes[0].stride, w as usize, "cropped output stride");
+            assert_eq!(vf.planes[0].data.len(), (w * h) as usize);
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    assert_eq!(
+                        vf.planes[0].data[y * w as usize + x],
+                        recon.y[y * recon.y_stride() + x] as u8,
+                        "t{t} luma ({x},{y})"
+                    );
+                }
+            }
+            let (cw, chh) = ((w / 2) as usize, (h / 2) as usize);
+            for y in 0..chh {
+                for x in 0..cw {
+                    assert_eq!(
+                        vf.planes[1].data[y * cw + x],
+                        recon.cb[y * recon.c_stride() + x] as u8,
+                        "t{t} cb ({x},{y})"
+                    );
+                }
+            }
+        }
+        // The multiple-of-8 shape stays uncropped and byte-identical to
+        // the historical stream (no picture_cropping_flag).
+        let src = video_frame_to_picture(&synth_frame(64, 48), 64, 48, 64, 48, 8).unwrap();
+        let (stream, _r, _s) = encode_idr_access_unit_opts(&src, 30, false, true).unwrap();
+        let nals = crate::nal::iter_length_prefixed(&stream).unwrap();
+        assert!(
+            !crate::sps::parse(nals[0].rbsp())
+                .unwrap()
+                .picture_cropping_flag
+        );
+    }
+
     /// Output params advertise the stream a muxer needs.
     #[test]
     fn output_params_shape() {
@@ -1209,7 +1438,7 @@ mod tests {
     /// state, no non-deterministic RD tie-breaks. Both entropy shapes.
     #[test]
     fn encode_is_deterministic() {
-        let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60, 8).unwrap();
+        let src = video_frame_to_picture(&synth_frame(100, 60), 100, 60, 100, 60, 8).unwrap();
         for &cm in &[false, true] {
             let (a, _, _) = encode_idr_access_unit_opts(&src, 33, false, cm).unwrap();
             let (b, _, _) = encode_idr_access_unit_opts(&src, 33, false, cm).unwrap();
@@ -1237,7 +1466,7 @@ mod tests {
                 }
             }
         }
-        let src = video_frame_to_picture(&f, w, h, 8).unwrap();
+        let src = video_frame_to_picture(&f, w, h, w, h, 8).unwrap();
         let pixels = (w * h) as f64;
         for &cm_init in &[false, true] {
             let mut prev_psnr = f64::INFINITY;
