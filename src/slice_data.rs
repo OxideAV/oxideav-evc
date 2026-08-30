@@ -5580,10 +5580,8 @@ fn decode_inter_coding_unit(
     };
     let cu_skip = eng.decode_decision(t, i)? != 0;
     stats.cu_skip_flag_bins += 1;
-    let pred_l0;
-    let pred_l1;
     let gates = inputs.inter_tool_gates;
-    if cu_skip && gates.sps_admvp_flag {
+    let (pred_l0, pred_l1) = if cu_skip && gates.sps_admvp_flag {
         // §7.3.8.4 Main-profile cu_skip merge tree (spec lines 2811-2832):
         // a skip CU is implicitly a merge CU. The [`read_cu_skip_main`]
         // syntax driver walks `mmvd_flag → affine_flag → merge_idx`, then
@@ -5671,8 +5669,7 @@ fn decode_inter_coding_unit(
         } else {
             None
         };
-        pred_l0 = Some((mv_l0, 0u32));
-        pred_l1 = mv_l1.map(|mv| (mv, 0u32));
+        (Some((mv_l0, 0u32)), mv_l1.map(|mv| (mv, 0u32)))
     } else {
         // pred_mode_flag (FL cMax=1) — 1 = MODE_INTRA, 0 = MODE_INTER (per
         // EVC convention: pred_mode_flag = 1 means INTRA). §7.3.8.4 lines
@@ -5870,8 +5867,8 @@ fn decode_inter_coding_unit(
                 // 674/675 deriving mvL1 unconditionally), so a direct
                 // CU is bi-predicted from RefPicList0[ 0 ] and
                 // RefPicList1[ 0 ] through eq. 988.
-                pred_l0 = Some((mv_l0, 0u32));
-                pred_l1 = Some((mv_l1, 0u32));
+                let pred_l0 = Some((mv_l0, 0u32));
+                let pred_l1 = Some((mv_l1, 0u32));
                 decode_inter_cu_residual_and_reconstruct(
                     eng,
                     pic,
@@ -6003,17 +6000,19 @@ fn decode_inter_coding_unit(
             );
             mvl1 = mvp.wrapping_add(&MotionVector::quarter_pel(mvd_x, mvd_y));
         }
-        pred_l0 = if use_l0 {
-            Some((mvl0, ref_idx_l0))
-        } else {
-            None
-        };
-        pred_l1 = if use_l1 {
-            Some((mvl1, ref_idx_l1))
-        } else {
-            None
-        };
-    }
+        (
+            if use_l0 {
+                Some((mvl0, ref_idx_l0))
+            } else {
+                None
+            },
+            if use_l1 {
+                Some((mvl1, ref_idx_l1))
+            } else {
+                None
+            },
+        )
+    };
     decode_inter_cu_residual_and_reconstruct(
         eng,
         pic,
