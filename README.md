@@ -3,9 +3,10 @@
 [![CI](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-evc/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-evc.svg)](https://crates.io/crates/oxideav-evc) [![docs.rs](https://docs.rs/oxideav-evc/badge.svg)](https://docs.rs/oxideav-evc) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **EVC** — MPEG-5 Essential Video Coding (ISO/IEC 23094-1)
-video decoder plus an **encoder** (intra + low-delay P GOPs, with
-`sps_cm_init_flag` context modelling). Zero C dependencies, zero FFI,
-zero `*-sys`.
+video decoder plus an **encoder** (intra + low-delay P/B GOPs with
+multi-reference `ref_idx`, `sps_cm_init_flag` context modelling,
+frame-level rate control and conformance-window cropping). Zero C
+dependencies, zero FFI, zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -20,7 +21,12 @@ prediction (8-tap luma / 4-tap chroma sub-pel interpolation, AMVP
 candidate construction, default-weighted bipred), deblocking (§8.8.2
 and the §8.8.3 ADDB flavours), a multi-reference DPB with POC
 reordering, spatial-neighbour MV grid AMVP, the HMVP candidate list, and
-reference-picture-list parsing for non-IDR slices — plus, as of round
+reference-picture-list handling for non-IDR slices (since round 452
+the printed §8.3 processes for `sps_rpl_flag == 0`: eqs. 155-163
+coding-order POC over the SubGopLength/TemporalId shape, the §8.3.3.2
+eq. 169/170 reference marking, and the §8.3.2.2 eq. 167/168 list
+construction — with the §8.5.2.5 direct mode bi-predicting per the
+in-repo errata-#313 resolution) — plus, as of round
 397, the whole **Main-profile** decode toolset (BTT/SUCO,
 ADMVP/affine/AMVR/MMVD/DMVR/HMVP, cm_init CABAC, DQUANT, EIPD, ADCC,
 ADDB, IBC, and — as of round 404 — ATS: no Main-profile decode tool
@@ -560,64 +566,88 @@ bypass-formulation asks, and the in-repo #213 (c)
 `sps_cm_init_flag == 0` context-topology entry (corpus-adjudicable
 per its own text) — see the CHANGELOG round-441/444 entries.
 
-## Encoder (round 429 bootstrap; round 431 context modelling + low-delay P)
+## Encoder (round 429 intra; round 431 low-delay P; round 452 B / multi-ref / rate control / cropping)
 
 The crate registers an **encoder** alongside the decoder (dual API:
 `register(&mut codecs)` wires both factories; `encoder::make_encoder`
-stays directly callable). Scope: intra pictures plus **low-delay P
-GOPs** — every GOP opens with a self-contained `[SPS][PPS][IDR]` key
+stays directly callable). Scope: intra pictures plus **low-delay P or
+B GOPs** — every GOP opens with a self-contained `[SPS][PPS][IDR]` key
 access unit in the Annex B length-prefixed framing, and with
-`gop = N > 1` the following frames are single-NAL NonIDR P pictures
-referencing the previous reconstruction (decode order == display
-order; the decoder's `sps_pocs_flag == 0` coding-order POC +
-implicit-RPL fallback resolves the reference). 4:2:0 input at 8 bits
-(`Yuv420P`), 10 bits (`Yuv420P10Le`) or 12 bits (`Yuv420P12Le`),
-dimensions multiples of 4. Options: `qp` 0..=51 (default 30), `gop`
-(default 1 = all-intra), `deblock` (default off), `cm_init` (default
-**on**).
+`gop = N > 1` the following frames are single-NAL NonIDR P (or, with
+`b=1`, low-delay B) pictures in coding order (the decoder's
+`sps_pocs_flag == 0` POC + §8.3.2.2 list construction resolve the
+references). 4:2:0 input at 8 bits (`Yuv420P`), 10 bits
+(`Yuv420P10Le`) or 12 bits (`Yuv420P12Le`); any non-zero **even**
+geometry (the coded picture is the §7.4.3.1 multiple-of-8 round-up
+with edge-replicated padding, and the SPS conformance-cropping window
+restores the display size at the decoder's output; odd dimensions are
+unrepresentable in 4:2:0 crop units and refused). Options: `qp`
+0..=51 (default 30), `gop` (default 1 = all-intra), `b` (low-delay B
+non-key pictures, default off), `refs` 1..=5 (the SPS
+`max_num_tid0_ref_pics` reference depth, default 1), `bitrate` +
+`fps` (frame-level rate control, default off / 30), `deblock`
+(default off), `cm_init` (default **on**).
 
 Pipeline: §7.3 header **writers** that are field-for-field duals of
 the crate's parsers (`bitwriter` + `headers_enc`, parse-back pinned);
 the exact carry-propagation **CABAC encoder** driving the §7.3.8
-`slice_data()` bin stream under **both entropy shapes** — the
-`sps_cm_init_flag == 1` §9.3.2.2 context-model init (Tables 40-90 at
-the slice QP) with the decoder's §9.3.4.2.1 `ctxIdxOffset + ctxInc`
-routing per syntax element, or the Baseline single-context collapse
-(`cm_init=0`; per Annex A.3.2 the cm_init stream declares
-`profile_idc = 1` with the Table A.6 binIdx-14 toolset bit); a
-**forward transform + quantizer** (`quant_enc`) built by linear
-inversion of the §8.7 decode chain; and true **RD decisions** running
-the decoder's own reconstruction pipeline under `SSE + λ·bits`.
+`slice_data()` bin stream under **both entropy shapes** (the
+`sps_cm_init_flag == 1` §9.3.2.2 context-model init at the slice QP,
+or the Baseline single-context collapse); a **forward transform +
+quantizer** (`quant_enc`) built by linear inversion of the §8.7
+decode chain; and true **RD decisions** running the decoder's own
+reconstruction pipeline under `SSE + λ·bits` (λ evaluated without
+transcendental calls, so the same source encodes to the same bytes on
+every platform — pinned by the MD5 stream fixtures in
+`tests/encoder_streams.rs`).
 
-The **P slice encoder** (`slice_enc_p`) decides a per-CU mode ladder:
-*skip* (`mvp_idx` off the §8.5.2.4 AMVP list — the decoder's own
-candidate function over a decode-order side-info grid + §8.5.2.7 HMVP
-list with the per-CTU-row reset), *explicit inter* (quarter-pel motion
-search against the decoder's §8.5.4 Baseline interpolation kernels —
-full-pel hill climb seeded from the AMVP candidates, then half-/
-quarter-pel refinement — with the `cbf_all`-gated residual and the
-§7.4.9.5 `cbf_luma` inference honoured on the write side), and *intra*
-(the 5-mode search in the single-tree P shape, chroma predicting with
-the luma mode). The decide pass commits reconstruction + grid + HMVP
-in decode order so the emit pass reproduces the decoder's exact bins,
-including the §9.3.4.2.4 neighbour ctxIncs under `cm_init`. With
-`deblock` the §8.8.2 pass is **pixel-effective on P pictures** (live
-inter/cbf edges — the r429 all-intra no-op finding inverted) and the
+The **P/B slice encoder** (`slice_enc_p`) decides a per-CU mode
+ladder: *skip* (`mvp_idx` off the §8.5.2.4 AMVP list at refIdx 0 —
+on B both lists' slots, eq. 988 bi-averaged), *direct* (B:
+`direct_mode_flag = 1`, the decoder's own §8.5.2.5 temporal
+derivation over the retained `RefPicList1[0]` motion field,
+bi-predicted per errata #313), *explicit inter* (`inter_pred_idc`
+electing PRED_L0 / PRED_L1 / PRED_BI; per used list the `ref_idx_lX`
+across every active reference — quarter-pel motion search per
+reference against the decoder's §8.5.4 kernels, the bi candidate
+pairing the best list-0 vector with a list-1 sub-pel re-fit on the
+averaged prediction — plus `mvp_idx` and the MVD pair, with the
+`cbf_all`-gated residual and the §7.4.9.5 `cbf_luma` inference
+honoured on the write side), and *intra* (the 5-mode search in the
+single-tree shape, chroma predicting with the luma mode). The decide
+pass commits reconstruction + both-list motion grid + HMVP in decode
+order so the emit pass reproduces the decoder's exact bins, including
+the §9.3.4.2.4 neighbour ctxIncs under `cm_init`. The registered
+encoder keeps a **mirror DPB** and runs the same `ref_lists`
+§8.3.1/§8.3.3.2/§8.3.2.2 derivations as the decoder, so every
+`ref_idx` addresses the picture the decoder resolves; each
+reconstruction's stamped motion field is retained as the §8.3.4
+collocated field the next B picture's direct mode reads. With
+`deblock` the §8.8.2 pass is pixel-effective on P/B pictures and the
 output remains byte-exact against the decoder's filtered picture.
+
+**Rate control** (`bitrate` + `fps`): a per-class (IDR vs inter)
+complexity model `bits ≈ X · 2^(−qp/6)` fed back from the actual
+access-unit sizes, with a leaky bit reservoir and a ±6 per-class QP
+clamp. Measured on the in-tree 96×64 noisy moving scene (24 frames,
+`gop=8`, `refs=2`): target 300 kb/s → 299.4 kb/s at 39.8 dB luma;
+target 600 kb/s → 595.6 kb/s at 41.2 dB.
 
 **Validation posture (stated plainly):** no external EVC validator
 binary is staged under `docs/video/evc/`, so the encoder's gates are
 (a) re-parse-exactness through this crate's own §7.3 parsers and
 (b) **byte-exact encode→decode == encoder-reconstruction** through the
 crate's registered decoder, pinned across a size × QP matrix on both
-entropy shapes, whole P GOPs (entropy × deblock × depth matrix),
-determinism, multi-frame sessions and single-byte mutation gates over
-both the IDR and P access units (every flip/invert decodes to a clean
-error or a frame, never a panic). Cross-implementation decode remains
-open until a validator lands in docs.
+entropy shapes, whole P and B GOPs (entropy × deblock matrix,
+multi-reference lists, the cropped-geometry loop), determinism,
+MD5-pinned stream fixtures, multi-frame sessions and single-byte
+mutation gates over the IDR and P access units (every flip/invert
+decodes to a clean error or a frame, never a panic).
+Cross-implementation decode remains open until a validator lands in
+docs.
 
 Measured on the in-tree busy synthetic QCIF frame (176×144), intra
-(round-444 re-measure after the single-tree/DM-chroma restructure):
+(round-452 re-measure — unchanged from round 444):
 
 | QP | cm_init=0 bytes | cm_init=1 bytes | saving | luma PSNR |
 |----|----------------|----------------|--------|-----------|
@@ -628,12 +658,15 @@ Measured on the in-tree busy synthetic QCIF frame (176×144), intra
 
 and on a moving-scene QCIF GOP at QP 30 (cm_init on): IDR 12 535
 bytes / 55.2 dB, then P frames of 69-875 bytes at 47.8-49.1 dB with
-93-99.5 % of leaves riding the skip ladder.
+93-99.5 % of leaves riding the skip ladder. Low-delay B on the same
+class of content sits within ±5 % of the P stream (it spends a
+`direct_mode_flag` per explicit CU and a second skip `mvp_idx`; the
+bi/direct wins pay for them on noisy content — measured at QP 12 on
+the 64×48 noisy scene: P 29 682 vs B 30 198 bytes).
 
-Encoder follow-ups, in priority order: B slices (bi-prediction +
-direct mode on the write side), multi-reference P (`ref_idx`
-signalling), rate control, arbitrary (non-multiple-of-4) dimensions
-via cropping.
+Encoder follow-ups: hierarchical (reordered) B sub-GOPs over the
+`log2_sub_gop_length > 0` POC shape, macroblock-level rate control,
+and a cross-implementation validator once one is staged in docs.
 
 ## Usage
 

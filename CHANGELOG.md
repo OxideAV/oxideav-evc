@@ -4,6 +4,76 @@
 
 ### Other
 
+- **§8.3 reference bookkeeping for `sps_rpl_flag == 0` (round 452).** The
+  round-9 placeholders give way to the printed processes, factored into the
+  new `ref_lists` module of pure functions over `(PicOrderCntVal,
+  TemporalId)` pairs shared verbatim between the decoder's DPB and the
+  encoder's mirror DPB: §8.3.1 eqs. 155-163 coding-order POC (the eq. 163
+  `PocOffset` quotient evaluated exactly — multiplication before the
+  divide-by-`2^TemporalId` — because the §5 truncating reading would
+  misplace every tid-1 picture of a sub-GOP), §8.3.3.2 eq. 169/170
+  reference marking ahead of every TemporalId-0 picture (unmarked pictures
+  leave the DPB), and §8.3.2.2 eq. 167/168 list construction
+  (lower-then-higher POC for L0, higher-then-lower for L1, the
+  `nextTemporalId` gate, and the step-3 `NumRefIdxActive` shrink).
+  `nuh_temporal_id` is threaded from the NAL header; the §7.4.5 PPS
+  `num_ref_idx_default_active_minus1` inference now applies when the
+  override flag is 0. **Errata #313** (docs 2026-07-31) is applied: the
+  §8.5.2.5 direct mode bi-predicts (`predFlagL1 = 1`; the printed eq. 664
+  `0` is the resolved typo), making eqs. 674/675 `mvL1` live. The
+  219-stream conformance gate is unchanged (0 passes, every stream still
+  blocked at the first IDR on the filed entropy-layer asks — identical
+  failure signatures before/after).
+- **Encoder: B slices + multi-reference P/B (round 452).** `slice_enc_p`
+  becomes the general P/B slice encoder (`encode_inter_slice_data` over
+  explicit `RefPicList0/1` + collocated motion): B skip (`mvp_idx_l0` +
+  `mvp_idx_l1`, eq. 988 bi-average), B direct (`direct_mode_flag = 1`
+  through the decoder's own §8.5.2.5 derivation, post-#313 bi-prediction),
+  explicit `inter_pred_idc` PRED_L0/L1/BI with per-list `ref_idx_lX`
+  (Table-72 TR dual), per-reference motion search and a bi candidate that
+  re-fits the list-1 vector on the averaged prediction (also across a
+  distinct reference picture). The registered encoder grows a mirror DPB
+  driven by the shared `ref_lists` derivations plus two options —
+  `refs` 1..=5 (SPS `max_num_tid0_ref_pics`) and `b` (low-delay B non-key
+  pictures); `refs=1` P streams stay byte-identical to round 431. RD λ is
+  now transcendental-free (exact power of two × cube-root constant), so
+  encodes are byte-identical across platforms — frozen by new MD5
+  stream-fixture integration tests (multi-ref P, low-delay B on both
+  entropy shapes + deblock). Encode statistics are tallied by the emit
+  pass over the *decided* tree and asserted against the decoder's bin
+  tallies.
+- **Encoder: arbitrary even dimensions via the §7.4.3.1
+  conformance-cropping window (round 452).** `pic_width/height_in_luma_samples`
+  must be multiples of `Max( MinCbSizeY, 8 ) = 8` — the historical
+  multiple-of-4 gate both under-constrained (a 100×60 SPS was
+  non-conforming) and over-constrained (66×64 refused) that. The encoder
+  now codes the multiple-of-8 round-up (edge-replicated padding) and
+  emits `picture_cropping_flag` with right/bottom offsets in
+  SubWidthC/SubHeightC units; the decoder's existing output crop restores
+  the display geometry (pinned on a 100×60 low-delay-B GOP). Odd
+  dimensions are refused with the 4:2:0-crop-units reason; multiple-of-8
+  sources keep the historical crop-free SPS byte for byte.
+- **Encoder: frame-level rate control (round 452).** `bitrate` + `fps`
+  options drive a per-class (IDR vs inter) `bits ≈ X · 2^(−qp/6)`
+  complexity model fed back from actual access-unit sizes, a leaky bit
+  reservoir, and a ±6 per-class QP clamp — deterministic across platforms
+  (`2^(qp/6)` via sixth-root constants). Measured (96×64 noisy moving
+  scene, 24 frames, gop 8, refs 2): target 300 kb/s → 299.4 kb/s at
+  39.8 dB; 600 kb/s → 595.6 kb/s at 41.2 dB.
+- **Round-452 finding (recorded, not yet acted on):** the crate's Baseline
+  AMVP (`baseline_amvp_select_with_grid_and_hmvp`, round 10) diverges
+  from the printed §8.5.2.4.3: eqs. 647-656 place the candidates at
+  `( xCb − 1, yCb )`, `( xCb, yCb − 1 )`, `( xCb + nCbW, yCb − 1 )` with
+  §6.4.1 availability (no ref-idx-match gate; `mvpList[ 3 ]` a temporal
+  slot from `RefPicListX[ 0 ]`'s stored motion), while the crate probes
+  `( xCb − 1, yCb + nCbH − 1 )` / `( xCb + nCbW − 1, yCb − 1 )` with a
+  strict ref-idx gate and an HMVP substitution. Encoder and decoder agree
+  (round trips are exact) and the conformance corpus cannot adjudicate the
+  reading yet (every stream is blocked earlier, at the filed
+  entropy-layer asks); the spec is also silent on `MvLX` of an
+  intra-coded neighbour that §6.4.1 marks available. Filed in the round
+  report as a clean-room-trace ask rather than churned blind.
+
 - **§7.3.8.3/§8.4.3 single-tree leaf + DM-chroma restructure (round 444)** — the
   round-441-staged re-reading lands as one decoder + encoder + fixture
   lockstep. §7.3.8.3 (spec lines 2788-2795) assigns `treeType` from the
