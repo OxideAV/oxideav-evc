@@ -36,20 +36,37 @@
 //!   frame indices `0, gop, 2·gop, …` are IDR access units, the rest
 //!   low-delay P pictures (skip / explicit-MV inter / intra mode
 //!   ladder per CU against the previous reconstruction).
+//! * `refs` — reference depth `1..=5` (default 1): the SPS
+//!   `max_num_tid0_ref_pics`, i.e. how many past reconstructions the
+//!   §8.3.3.2 marking keeps and the §8.3.2.2 lists expose to
+//!   `ref_idx_lX` (round 452).
+//! * `b` — `1`/`true` codes the non-key pictures as **low-delay B**
+//!   slices (both lists the §8.3.2.2 descending past; bi-prediction,
+//!   direct mode and the two-slot skip join the ladder) instead of P
+//!   (round 452).
+//!
+//! The encoder keeps a mirror DPB and runs the very same
+//! [`crate::ref_lists`] POC / marking / list-construction functions the
+//! decoder runs, so every `ref_idx` it writes addresses the picture the
+//! decoder resolves.
 
 use std::collections::VecDeque;
 
 use oxideav_core::format::PixelFormat;
 use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, TimeBase};
 
+use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
-    append_length_prefixed_nal, write_idr_slice_header, write_p_slice_header, write_pps_rbsp,
-    write_sps_rbsp, EncSequenceConfig,
+    append_length_prefixed_nal, write_idr_slice_header, write_inter_slice_header,
+    write_p_slice_header, write_pps_rbsp, write_sps_rbsp, EncSequenceConfig,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
+use crate::ref_lists::{
+    construct_ref_pic_lists_rpl_flag0, derive_poc_pocs_flag0, mark_references_rpl_flag0, RefPicInfo,
+};
 use crate::slice_enc::EncStats;
-use crate::slice_enc_p::PEncStats;
+use crate::slice_enc_p::{encode_inter_slice_data, ColMotion, InterEncInputs, PEncStats, RefEntry};
 use crate::CODEC_ID_STR;
 
 /// Default slice QP when the caller doesn't pass the `qp` option.
@@ -95,6 +112,20 @@ pub fn encode_idr_access_unit_opts(
     deblock: bool,
     cm_init: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_access_unit_refs(src, slice_qp, deblock, cm_init, 1)
+}
+
+/// [`encode_idr_access_unit_opts`] declaring `max_num_tid0_ref_pics =
+/// refs` in the SPS (round 452): the reference depth the following
+/// P/B pictures of the GOP may address. `refs = 1` is the historical
+/// stream byte for byte.
+pub fn encode_idr_access_unit_refs(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+    refs: u32,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     let (payload, recon, stats) =
         crate::slice_enc::encode_idr_slice_data_opts(src, slice_qp, deblock, cm_init)?;
     let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
@@ -106,6 +137,7 @@ pub fn encode_idr_access_unit_opts(
         level_idc: 51, // generous cap; no external constraint checking yet
         bit_depth: src.bit_depth,
         cm_init,
+        max_num_tid0_ref_pics: refs,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -143,6 +175,13 @@ pub fn encode_p_access_unit_opts(
 /// the historical direct constructor of the workspace dual-API
 /// convention.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    Ok(Box::new(make_evc_encoder(params)?))
+}
+
+/// [`make_encoder`] returning the concrete type — the in-tree tests
+/// read the mirror DPB through it.
+#[doc(hidden)]
+pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     let width = params
         .width
         .ok_or_else(|| Error::invalid("evc encoder: CodecParameters.width required"))?;
@@ -180,6 +219,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // rate win; identical reconstruction). `cm_init=0` selects the
     // historical Baseline-profile single-context stream.
     let cm_init = parse_bool("cm_init", true)?;
+    // Round 452: low-delay B pictures for the non-key frames.
+    let b_pictures = parse_bool("b", false)?;
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -200,11 +241,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             .filter(|&g| g >= 1)
             .ok_or_else(|| Error::invalid(format!("evc encoder: gop option {s:?} not >= 1")))?,
     };
+    // Round 452: reference depth (SPS max_num_tid0_ref_pics, §7.4.3.1
+    // bounds it to 5).
+    let refs = match params.options.get("refs") {
+        None => 1u32,
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&r| (1..=5).contains(&r))
+            .ok_or_else(|| {
+                Error::invalid(format!("evc encoder: refs option {s:?} not in 1..=5"))
+            })?,
+    };
     let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     out_params.width = Some(width);
     out_params.height = Some(height);
     out_params.pixel_format = Some(params.pixel_format.unwrap_or(PixelFormat::Yuv420P));
-    Ok(Box::new(EvcEncoder {
+    Ok(EvcEncoder {
         codec_id: CodecId::new(CODEC_ID_STR),
         out_params,
         width,
@@ -214,10 +267,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         deblock,
         cm_init,
         gop,
+        refs,
+        b_pictures,
         frame_idx: 0,
-        ref_recon: None,
+        dpb: Vec::new(),
+        prev_tid0_poc: 0,
+        prev_doc_offset: -1,
         queue: VecDeque::new(),
-    }))
+    })
+}
+
+/// A picture in the encoder's mirror DPB — what the decoder holds for
+/// the same POC: the reconstruction (post-§8.8.2 when deblocking is
+/// on), the stamped motion field (`None` for an IDR: all-intra, no
+/// collocated motion) and the POCs of its own list 0 (the §8.5.2.5
+/// `refPicListTemp[ 0 ]` table).
+struct EncDpbPic {
+    recon: YuvPicture,
+    side_info: Option<SideInfoGrid>,
+    poc: i32,
+    ref_pocs_l0: Vec<i32>,
 }
 
 /// The registered encoder. With `gop = 1` (the default) every frame is
@@ -237,13 +306,125 @@ pub struct EvcEncoder {
     deblock: bool,
     cm_init: bool,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
-    /// units, the rest low-delay P pictures.
+    /// units, the rest low-delay P/B pictures.
     gop: u32,
+    /// `max_num_tid0_ref_pics` — the reference depth.
+    refs: u32,
+    /// Non-key pictures are low-delay B slices.
+    b_pictures: bool,
     frame_idx: u64,
-    /// The previous reconstruction — the decoder's DPB picture the next
-    /// P frame references (post-deblock when the option is on).
-    ref_recon: Option<YuvPicture>,
+    /// The mirror DPB: every reconstruction still marked "used for
+    /// reference" by the §8.3.3.2 walk, exactly as the decoder's.
+    dpb: Vec<EncDpbPic>,
+    /// §8.3.1 `sps_pocs_flag == 0` trackers (all pictures TemporalId 0).
+    prev_tid0_poc: i32,
+    prev_doc_offset: i32,
     queue: VecDeque<Packet>,
+}
+
+impl EvcEncoder {
+    /// The reconstruction of the most recently encoded picture — what
+    /// the decoder emits for it, byte for byte.
+    #[doc(hidden)]
+    pub fn last_recon(&self) -> Option<&YuvPicture> {
+        self.dpb.iter().max_by_key(|e| e.poc).map(|e| &e.recon)
+    }
+
+    /// Encode one non-key picture against the mirror DPB: the §8.3.3.2
+    /// marking, the §8.3.2.2 lists, the P/B slice encode, the header,
+    /// and the DPB update — every step the decoder repeats on its side.
+    fn encode_inter_picture(&mut self, src: &YuvPicture) -> Result<Vec<u8>> {
+        let (poc, doc_offset) =
+            derive_poc_pocs_flag0(self.prev_tid0_poc, self.prev_doc_offset, 0, 1);
+        // §8.3.3.2 (TemporalId 0, log2_sub_gop_length 0, RefPicGapLength 1).
+        let infos: Vec<RefPicInfo> = self
+            .dpb
+            .iter()
+            .map(|e| RefPicInfo {
+                poc: e.poc,
+                temporal_id: 0,
+            })
+            .collect();
+        let keep = mark_references_rpl_flag0(&infos, poc, 0, 1, self.refs);
+        let mut k = keep.iter();
+        self.dpb.retain(|_| *k.next().unwrap_or(&true));
+        let infos: Vec<RefPicInfo> = self
+            .dpb
+            .iter()
+            .map(|e| RefPicInfo {
+                poc: e.poc,
+                temporal_id: 0,
+            })
+            .collect();
+        let is_b = self.b_pictures;
+        let n = self.refs as usize;
+        let [pocs_l0, pocs_l1] = construct_ref_pic_lists_rpl_flag0(&infos, poc, 0, [n, n], is_b);
+        let find = |p: i32| -> Result<&EncDpbPic> {
+            self.dpb
+                .iter()
+                .find(|e| e.poc == p)
+                .ok_or_else(|| Error::invalid("evc encoder: mirror DPB lost a reference"))
+        };
+        let mut refs_l0 = Vec::with_capacity(pocs_l0.len());
+        for &p in &pocs_l0 {
+            let e = find(p)?;
+            refs_l0.push(RefEntry {
+                pic: &e.recon,
+                poc: e.poc,
+            });
+        }
+        let mut refs_l1 = Vec::with_capacity(pocs_l1.len());
+        for &p in &pocs_l1 {
+            let e = find(p)?;
+            refs_l1.push(RefEntry {
+                pic: &e.recon,
+                poc: e.poc,
+            });
+        }
+        // §8.3.4 with the inferred `col_pic_list_idx = 1`,
+        // `col_pic_ref_idx = 0`: ColPic = RefPicList1[ 0 ].
+        let col = if is_b {
+            let e = find(pocs_l1[0])?;
+            e.side_info.as_ref().map(|grid| ColMotion {
+                grid,
+                poc: e.poc,
+                ref_pocs_l0: &e.ref_pocs_l0,
+            })
+        } else {
+            None
+        };
+        let out = encode_inter_slice_data(
+            src,
+            InterEncInputs {
+                refs_l0: &refs_l0,
+                refs_l1: &refs_l1,
+                slice_is_b: is_b,
+                curr_poc: poc,
+                col,
+                slice_qp: self.qp,
+                deblock: self.deblock,
+                cm_init: self.cm_init,
+            },
+        )?;
+        let mut slice_rbsp = write_inter_slice_header(
+            is_b,
+            [refs_l0.len() as u32, refs_l1.len() as u32],
+            self.qp as u32,
+            self.deblock,
+        )?;
+        slice_rbsp.extend_from_slice(&out.payload);
+        let mut data = Vec::new();
+        append_length_prefixed_nal(&mut data, NalUnitType::NonIdr, &slice_rbsp);
+        self.dpb.push(EncDpbPic {
+            recon: out.recon,
+            side_info: Some(out.side_info),
+            poc,
+            ref_pocs_l0: pocs_l0,
+        });
+        self.prev_tid0_poc = poc;
+        self.prev_doc_offset = doc_offset;
+        Ok(data)
+    }
 }
 
 impl Encoder for EvcEncoder {
@@ -262,20 +443,23 @@ impl Encoder for EvcEncoder {
         };
         let src = video_frame_to_picture(v, self.width, self.height, self.bit_depth)?;
         let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
-        let (data, recon) = if is_idr {
+        let data = if is_idr {
             let (data, recon, _stats) =
-                encode_idr_access_unit_opts(&src, self.qp, self.deblock, self.cm_init)?;
-            (data, recon)
+                encode_idr_access_unit_refs(&src, self.qp, self.deblock, self.cm_init, self.refs)?;
+            // §8.3.1 eqs. 155/156 + the IDR DPB flush.
+            self.dpb.clear();
+            self.dpb.push(EncDpbPic {
+                recon,
+                side_info: None,
+                poc: 0,
+                ref_pocs_l0: Vec::new(),
+            });
+            self.prev_tid0_poc = 0;
+            self.prev_doc_offset = -1;
+            data
         } else {
-            let refp = self
-                .ref_recon
-                .as_ref()
-                .expect("non-IDR frame always follows a reconstructed frame");
-            let (data, recon, _stats) =
-                encode_p_access_unit_opts(&src, refp, self.qp, self.deblock, self.cm_init)?;
-            (data, recon)
+            self.encode_inter_picture(&src)?
         };
-        self.ref_recon = Some(recon);
         self.frame_idx += 1;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
@@ -890,6 +1074,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 452 — the registry GOP loop with **multi-reference P** and
+    /// **low-delay B** pictures: `gop=6`, `refs=3`, both entropy
+    /// shapes, deblocking on. Every decoded frame must be byte-identical
+    /// to the encoder's mirror-DPB reconstruction (the §8.3 marking /
+    /// list construction on both sides agree, or the decoder would
+    /// resolve a different picture for some `ref_idx`), the slice
+    /// headers must carry the override the deeper lists need, and the
+    /// B stream must undercut the P stream on content where averaging
+    /// two references pays.
+    #[test]
+    fn registry_multi_ref_p_and_b_round_trip_exact() {
+        let (w, h) = (64u32, 48u32);
+        let mk = |t: usize| -> VideoFrame {
+            let mut f = synth_frame(w as usize, h as usize);
+            let mut s = 0x2545_F491u32 ^ (t as u32).wrapping_mul(0x9E37_79B9);
+            for yy in 0..h as usize {
+                for xx in 0..w as usize {
+                    let bx = 4 + 3 * (t % 4);
+                    let by = 4 + 2 * (t % 4);
+                    let v = &mut f.planes[0].data[yy * w as usize + xx];
+                    if xx >= bx && xx < bx + 10 && yy >= by && yy < by + 8 {
+                        *v = 230;
+                    }
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let n = ((s >> 24) % 11) as i32 - 5;
+                    *v = (*v as i32 + n).clamp(0, 255) as u8;
+                }
+            }
+            f.pts = Some(t as i64 * 3000);
+            f
+        };
+        let mut sizes = [0usize; 2];
+        for (bi, &b) in [false, true].iter().enumerate() {
+            for &cm in &[false, true] {
+                let mut p = params(w, h);
+                p.options.insert("gop", "6");
+                p.options.insert("refs", "3");
+                p.options.insert("qp", "12");
+                p.options.insert("deblock", "1");
+                p.options.insert("cm_init", if cm { "1" } else { "0" });
+                p.options.insert("b", if b { "1" } else { "0" });
+                let mut enc = make_evc_encoder(&p).unwrap();
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                for t in 0..9usize {
+                    enc.send_frame(&Frame::Video(mk(t))).unwrap();
+                    let pkt = enc.receive_packet().unwrap();
+                    assert_eq!(pkt.flags.keyframe, t % 6 == 0);
+                    if cm {
+                        sizes[bi] += pkt.data.len();
+                    }
+                    let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                    if t % 6 == 0 {
+                        let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                        assert_eq!(sps.max_num_tid0_ref_pics, 3);
+                    } else {
+                        assert_eq!(nals[0].header.nal_unit_type, NalUnitType::NonIdr);
+                        // Slice type + the active-count override.
+                        let mut br = crate::bitreader::BitReader::new(nals[0].rbsp());
+                        assert_eq!(br.ue().unwrap(), 0, "pps id");
+                        let slice_type = br.ue().unwrap();
+                        assert_eq!(slice_type, if b { 0 } else { 1 }, "Table 8 slice_type");
+                        let avail = (t % 6).min(3) as u32; // pictures since the IDR
+                        let override_flag = br.u1().unwrap() != 0;
+                        assert_eq!(override_flag, avail > 1, "frame {t}: override");
+                        if override_flag {
+                            assert_eq!(
+                                br.ue().unwrap() + 1,
+                                avail,
+                                "frame {t}: NumRefIdxActive[0]"
+                            );
+                            if b {
+                                assert_eq!(
+                                    br.ue().unwrap() + 1,
+                                    avail,
+                                    "frame {t}: NumRefIdxActive[1]"
+                                );
+                            }
+                        }
+                    }
+                    dec.send_packet(&pkt).unwrap();
+                    let vf = match dec.receive_frame().unwrap() {
+                        Frame::Video(vf) => vf,
+                        other => panic!("expected video frame, got {other:?}"),
+                    };
+                    let recon = enc.last_recon().unwrap();
+                    let y8: Vec<u8> = recon.y.iter().map(|&v| v as u8).collect();
+                    let cb8: Vec<u8> = recon.cb.iter().map(|&v| v as u8).collect();
+                    let cr8: Vec<u8> = recon.cr.iter().map(|&v| v as u8).collect();
+                    assert_eq!(vf.planes[0].data, y8, "b{b} cm{cm} frame {t}: luma");
+                    assert_eq!(vf.planes[1].data, cb8, "b{b} cm{cm} frame {t}: cb");
+                    assert_eq!(vf.planes[2].data, cr8, "b{b} cm{cm} frame {t}: cr");
+                }
+            }
+        }
+        // Low-delay B spends a `direct_mode_flag` per explicit CU and a
+        // second `mvp_idx` per skip CU; on this small noisy scene the
+        // bi/direct wins roughly pay for them (measured: within ±5 %
+        // of the P stream — the tools are exercised, not a rate claim).
+        eprintln!(
+            "gop6 refs3 qp12 cm_init: P {} bytes, low-delay B {} bytes",
+            sizes[0], sizes[1]
+        );
+        assert!(
+            sizes[1] * 100 <= sizes[0] * 105 && sizes[0] * 100 <= sizes[1] * 105,
+            "low-delay B ({}) and P ({}) sizes must sit within 5 % of each other",
+            sizes[1],
+            sizes[0]
+        );
+        let mut bad = params(w, h);
+        bad.options.insert("refs", "6");
+        assert!(make_encoder(&bad).is_err());
+        let mut bad_b = params(w, h);
+        bad_b.options.insert("b", "later");
+        assert!(make_encoder(&bad_b).is_err());
     }
 
     /// Output params advertise the stream a muxer needs.

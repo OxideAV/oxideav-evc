@@ -35,6 +35,12 @@ pub struct EncSequenceConfig {
     /// by the zero upper bound, and `toolset_idc_l = 0` keeps the
     /// lower bound permissive).
     pub cm_init: bool,
+    /// `max_num_tid0_ref_pics` (§7.4.3.1, `sps_rpl_flag == 0`): how many
+    /// past pictures the §8.3.3.2 marking keeps "used for reference"
+    /// ahead of every picture — the reference-list depth a P/B slice can
+    /// address. 1 is the round-431 single-reference stream; the value is
+    /// bounded by 5.
+    pub max_num_tid0_ref_pics: u32,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -59,6 +65,12 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         return Err(Error::invalid(format!(
             "evc enc sps: bit depth {} outside 8..=16",
             cfg.bit_depth
+        )));
+    }
+    if cfg.max_num_tid0_ref_pics > 5 {
+        return Err(Error::invalid(format!(
+            "evc enc sps: max_num_tid0_ref_pics {} outside 0..=5 (§7.4.3.1)",
+            cfg.max_num_tid0_ref_pics
         )));
     }
     let mut w = BitWriter::new();
@@ -92,8 +104,10 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
                  // log2_ref_pic_gap_length (all-intra stream: sub-GOP length 1).
     w.ue(0); // log2_sub_gop_length = 0
     w.ue(0); // log2_ref_pic_gap_length
-             // !sps_rpl_flag → max_num_tid0_ref_pics
-    w.ue(1);
+             // !sps_rpl_flag → max_num_tid0_ref_pics: the §8.3.3.2
+             // marking depth (eq. 170 with RefPicGapLength 1 keeps the
+             // most recent max_num_tid0_ref_pics pictures).
+    w.ue(cfg.max_num_tid0_ref_pics);
     w.u1(false); // picture_cropping_flag
     w.u1(false); // chroma_qp_table_present_flag (chroma_format_idc != 0)
     w.u1(false); // vui_parameters_present_flag
@@ -156,15 +170,48 @@ pub fn write_idr_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
 /// the deblocking flag, `slice_qp` and the chroma QP offsets, padded to
 /// the byte boundary (§7.4.5: `slice_data()` starts byte-aligned).
 pub fn write_p_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
+    write_inter_slice_header(false, [1, 0], slice_qp, deblock)
+}
+
+/// Write the §7.3.4 slice header for a Baseline **P or B** slice with
+/// `num_active[ i ]` pictures in `RefPicList[ i ]` (round 452). The
+/// PPS defaults are `num_ref_idx_default_active_minus1[ i ] = 0`, so
+/// a single-picture list rides `num_ref_idx_active_override_flag = 0`
+/// (the byte-identical round-431 P header) and a deeper list sets the
+/// override with `num_ref_idx_active_minus1[ i ] = num_active[ i ] − 1`
+/// (both lists for B, list 0 only for P). Under `sps_admvp_flag == 0`
+/// no `temporal_mvp_assigned_flag` group follows: `col_pic_list_idx`
+/// is inferred 0 (P) / 1 (B) and `col_pic_ref_idx` 0 (§7.4.5), i.e.
+/// `ColPic = RefPicList1[ 0 ]` on a B slice.
+pub fn write_inter_slice_header(
+    slice_is_b: bool,
+    num_active: [u32; 2],
+    slice_qp: u32,
+    deblock: bool,
+) -> Result<Vec<u8>> {
     if slice_qp > 51 {
         return Err(Error::invalid(format!(
             "evc enc slice header: slice_qp {slice_qp} > 51"
         )));
     }
+    let lists = if slice_is_b { 2 } else { 1 };
+    for &n in num_active.iter().take(lists) {
+        if !(1..=15).contains(&n) {
+            return Err(Error::invalid(format!(
+                "evc enc slice header: NumRefIdxActive {n} outside 1..=15 (§7.4.5)"
+            )));
+        }
+    }
     let mut w = BitWriter::new();
     w.ue(0); // slice_pic_parameter_set_id
-    w.ue(1); // slice_type = P (§7.4.5)
-    w.u1(false); // num_ref_idx_active_override_flag
+    w.ue(if slice_is_b { 0 } else { 1 }); // slice_type: B = 0, P = 1 (Table 8)
+    let override_flag = num_active.iter().take(lists).any(|&n| n > 1);
+    w.u1(override_flag); // num_ref_idx_active_override_flag
+    if override_flag {
+        for &n in num_active.iter().take(lists) {
+            w.ue(n - 1); // num_ref_idx_active_minus1[ i ]
+        }
+    }
     w.u1(deblock); // slice_deblocking_filter_flag
     w.u(6, slice_qp); // slice_qp
     w.se(0); // slice_cb_qp_offset
@@ -203,6 +250,7 @@ mod tests {
             level_idc: 30,
             bit_depth: 8,
             cm_init: false,
+            max_num_tid0_ref_pics: 1,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -249,6 +297,7 @@ mod tests {
             level_idc: 30,
             bit_depth: 10,
             cm_init: false,
+            max_num_tid0_ref_pics: 1,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -286,6 +335,7 @@ mod tests {
             level_idc: 30,
             bit_depth: 8,
             cm_init: false,
+            max_num_tid0_ref_pics: 1,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -346,6 +396,7 @@ mod tests {
             level_idc: 30,
             bit_depth: 8,
             cm_init: false,
+            max_num_tid0_ref_pics: 1,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

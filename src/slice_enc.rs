@@ -192,7 +192,7 @@ pub fn encode_idr_slice_data_opts(
         src,
         recon,
         qp: slice_qp,
-        lambda: 0.57 * 2f64.powf((slice_qp as f64 - 12.0) / 3.0),
+        lambda: rd_lambda(slice_qp),
         bit_depth: src.bit_depth,
         pic_w: src.width,
         pic_h: src.height,
@@ -479,6 +479,20 @@ fn decide_leaf(
 /// Predict + transform + quantize + reconstruct one candidate block
 /// through the decoder's pipeline; returns (levels, cbf, recon
 /// residual, SSE distortion).
+/// The RD Lagrange multiplier `λ = 0.57 · 2^((qp − 12) / 3)`, evaluated
+/// without a transcendental call: `2^((qp − 12) / 3)` splits into an
+/// exact power of two times one of `{1, ∛2, ∛4}`, so every platform's
+/// encoder lands on bit-identical costs (the same source encodes to the
+/// same bytes on every CI host — the MD5-pinned stream fixtures rely
+/// on it).
+pub(crate) fn rd_lambda(qp: i32) -> f64 {
+    const CBRT: [f64; 3] = [1.0, 1.259_921_049_894_873_2, 1.587_401_051_968_199_4];
+    let e = qp - 12;
+    let q = e.div_euclid(3);
+    let r = e.rem_euclid(3) as usize;
+    0.57 * 2f64.powi(q) * CBRT[r]
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_block(
     refs: &RefSamples,

@@ -1,27 +1,39 @@
-//! **Low-delay P slice encoder** (round 431): the write-side dual of
-//! the §7.3.8 P-slice `slice_data()` walker in
+//! **P / B slice encoder** (round 431 low-delay P; round 452 B slices +
+//! multi-reference): the write-side dual of the §7.3.8 P/B-slice
+//! `slice_data()` walker in
 //! [`crate::slice_data::decode_baseline_inter_slice`] under the
-//! Baseline toolset (`sps_admvp_flag == 0`, single reference,
-//! `num_ref_idx_active_minus1[0] == 0`).
+//! Baseline toolset (`sps_admvp_flag == 0`).
 //!
 //! ## Mode ladder (per leaf, RD over the decoder's own reconstruction)
 //!
-//! * **skip** — `cu_skip_flag = 1` + `mvp_idx_l0` (TR cMax 3): the MV
-//!   comes straight from the §8.5.2.4 AMVP candidate list (the same
+//! * **skip** — `cu_skip_flag = 1` + `mvp_idx_l0` (TR cMax 3; on a B
+//!   slice also `mvp_idx_l1`): the MVs come straight from the §8.5.2.4
+//!   AMVP candidate lists (the same
 //!   [`crate::slice_data::baseline_amvp_select_with_grid_and_hmvp`]
 //!   the decoder runs, over the encoder's decode-order side-info grid
-//!   and §8.5.2.7 HMVP list), no MVD, **no residual syntax** (§7.3.8.4:
-//!   the `cbf_all` block lives in the non-skip branch);
-//! * **explicit inter** — `cu_skip_flag = 0`, `pred_mode_flag = 0`,
-//!   `mvp_idx_l0` + the `abs_mvd`/sign pair: quarter-pel motion search
-//!   against the decoder's §8.5.4 Baseline interpolation kernels
-//!   (full-pel hill climb from the AMVP candidates, then half- and
-//!   quarter-pel refinement through
-//!   [`crate::inter::interpolate_luma_block`]), residual through the
-//!   §8.7-inverted [`crate::quant_enc::forward_quantize`]; the CU
-//!   signals `cbf_all` (line 3028) — 0 elides the whole
-//!   `transform_unit()`, and with quiet chroma `cbf_luma` is inferred
-//!   1 (§7.4.9.5), exactly the decoder's read;
+//!   + §8.5.2.7 HMVP list) at `refIdx = 0` (§8.5.2.2 eqs. 445/448), a
+//!   B skip being the eq. 988 bi-average, no MVD, **no residual
+//!   syntax** (§7.3.8.4: the `cbf_all` block lives in the non-skip
+//!   branch);
+//! * **direct** (B only) — `direct_mode_flag = 1`: the §8.5.2.5
+//!   temporal derivation (the decoder's own
+//!   [`crate::slice_data::derive_direct_mode_mvs`] over the retained
+//!   `RefPicList1[ 0 ]` motion field), bi-predicted per errata #313,
+//!   then the `cbf_all`-gated residual;
+//! * **explicit inter** — `cu_skip_flag = 0`, `pred_mode_flag = 0`
+//!   (`direct_mode_flag = 0` on B), on B the `inter_pred_idc` list
+//!   choice (PRED_L0 / PRED_L1 / PRED_BI), and per used list the
+//!   `ref_idx_lX` (TR, present when `num_ref_idx_active_minus1[ X ] >
+//!   0`), `mvp_idx_lX` and the `abs_mvd`/sign pair: quarter-pel motion
+//!   search against every active reference through the decoder's
+//!   §8.5.4 Baseline interpolation kernels (full-pel hill climb seeded
+//!   from that reference's AMVP candidates, then half-/quarter-pel
+//!   refinement), the bi-prediction candidate pairing the best list-0
+//!   and list-1 vectors with one list-1 sub-pel re-fit against the
+//!   averaged prediction; residual through the §8.7-inverted
+//!   [`crate::quant_enc::forward_quantize`]; the CU signals `cbf_all`
+//!   (line 3028) — 0 elides the whole `transform_unit()`, and with
+//!   quiet chroma `cbf_luma` is inferred 1 (§7.4.9.5);
 //! * **intra** — `pred_mode_flag = 1` + the Baseline 5-mode search
 //!   (single tree: chroma predicts with the luma mode, mirroring the
 //!   decoder's `decode_inter_intra_cu`).
@@ -29,17 +41,20 @@
 //! The coding tree is the same bottom-up quad `split_unit()` RD of the
 //! IDR encoder. The decide pass runs in decode order, committing the
 //! chosen reconstruction *and* the decoder-visible state (side-info
-//! stamps, `cu_skip` cell marks, HMVP updates — reset at each CTU row
-//! per §7.3.8.2) so every AMVP list the encoder consults is exactly
-//! the list the decoder will build. The emit pass replays the decided
-//! tree bin for bin (initType 1 contexts; under `sps_cm_init_flag == 1`
-//! the §9.3.4.2.4 neighbour ctxIncs are re-derived over an emit-side
-//! grid stamped in the same order).
+//! stamps for both lists, `cu_skip` cell marks, HMVP updates — reset
+//! at each CTU row per §7.3.8.2) so every AMVP list the encoder
+//! consults is exactly the list the decoder will build. The emit pass
+//! replays the decided tree bin for bin (initType 1 contexts; under
+//! `sps_cm_init_flag == 1` the §9.3.4.2.4 neighbour ctxIncs are
+//! re-derived over an emit-side grid stamped in the same order).
 //!
 //! With `deblock` the §8.8.2 post-pass runs over the recon with the
-//! stamped side info — on a P picture the inter/cbf edges carry live
-//! boundary strengths (unlike the r429 all-intra no-op), so the
-//! returned picture is the decoder's filtered output byte for byte.
+//! stamped side info — on a P/B picture the inter/cbf edges carry live
+//! boundary strengths, so the returned picture is the decoder's
+//! filtered output byte for byte. The stamped motion field is returned
+//! too: it is the §8.3.4 collocated field a later B picture's direct
+//! mode reads, so the encoder's DPB keeps it beside the picture exactly
+//! as the decoder's does.
 
 use oxideav_core::{Error, Result};
 
@@ -49,14 +64,14 @@ use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
 use crate::hmvp::{HmvpCandList, HmvpCandidate};
 use crate::inter::{
-    derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block, MotionVector,
-    RefPictureView,
+    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
+    MotionVector, RefPictureView,
 };
 use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
 use crate::quant_enc::forward_quantize;
 use crate::slice_data::{
-    baseline_amvp_select_with_grid_and_hmvp, ctx_inc_neighbour_cells, mark_cu_skip_cells,
-    SliceWalkInputs,
+    baseline_amvp_select_with_grid_and_hmvp, ctx_inc_neighbour_cells, derive_direct_mode_mvs,
+    mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
 };
 use crate::slice_enc::{
     emit_residual_rle, gather_block, quantize_block, restore_region, rle_bits_estimate,
@@ -70,49 +85,141 @@ use crate::slice_enc::{
 const CTB_LOG2: u32 = 6;
 const MIN_CB_LOG2: u32 = 2;
 
-/// Per-picture P-encode statistics.
+/// Per-picture P/B-encode statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PEncStats {
     pub ctus: u32,
     pub leaves: u32,
     /// Leaves coded `cu_skip_flag = 1`.
     pub skip_cus: u32,
-    /// Non-skip MODE_INTER leaves (explicit MV).
+    /// Non-skip MODE_INTER leaves (explicit MV, or direct on B).
     pub inter_cus: u32,
-    /// Explicit inter leaves whose `cbf_all` was signalled 0.
+    /// Explicit/direct inter leaves whose `cbf_all` was signalled 0.
     pub cbf_all_zero_cus: u32,
     /// MODE_INTRA leaves.
     pub intra_cus: u32,
     /// `split_cu_flag` bins emitted.
     pub split_flag_bins: u32,
+    /// B-slice leaves coded `direct_mode_flag = 1` (subset of
+    /// `inter_cus`).
+    pub direct_cus: u32,
+    /// Explicit leaves signalling `inter_pred_idc = PRED_BI` (subset of
+    /// `inter_cus`).
+    pub bi_cus: u32,
+    /// Explicit leaves signalling `inter_pred_idc = PRED_L1` (subset of
+    /// `inter_cus`).
+    pub l1_only_cus: u32,
+    /// Explicit leaves with a non-zero `ref_idx_lX` on some list.
+    pub multi_ref_cus: u32,
+}
+
+/// One active reference picture as the slice encoder addresses it —
+/// the DPB picture (post-§8.8.2 when deblocking is on) and its
+/// `PicOrderCntVal`.
+#[derive(Clone, Copy)]
+pub struct RefEntry<'a> {
+    pub pic: &'a YuvPicture,
+    pub poc: i32,
+}
+
+/// The §8.3.4 collocated motion field a B slice's direct mode reads:
+/// `RefPicList1[ 0 ]`'s stamped side-info grid, its POC and the POCs of
+/// its own list 0 (eq. 665 `refPicListTemp[ 0 ]`).
+#[derive(Clone, Copy)]
+pub struct ColMotion<'a> {
+    pub grid: &'a SideInfoGrid,
+    pub poc: i32,
+    pub ref_pocs_l0: &'a [i32],
+}
+
+/// Inputs to [`encode_inter_slice_data`].
+#[derive(Clone, Copy)]
+pub struct InterEncInputs<'a> {
+    /// `RefPicList0` in `ref_idx` order (the §8.3.2.2 list the decoder
+    /// rebuilds from its DPB; at least one entry).
+    pub refs_l0: &'a [RefEntry<'a>],
+    /// `RefPicList1` for a B slice (empty for P).
+    pub refs_l1: &'a [RefEntry<'a>],
+    /// `slice_type == B`.
+    pub slice_is_b: bool,
+    /// `PicOrderCntVal` of the picture being coded.
+    pub curr_poc: i32,
+    /// The collocated motion field (B slices; `None` degrades direct
+    /// mode to the eq. 668-671 zero vectors exactly like the decoder).
+    pub col: Option<ColMotion<'a>>,
+    pub slice_qp: i32,
+    pub deblock: bool,
+    pub cm_init: bool,
+}
+
+/// Output of [`encode_inter_slice_data`].
+pub struct InterEncOutput {
+    /// The CABAC `slice_data()` payload.
+    pub payload: Vec<u8>,
+    /// The reconstruction the decoder reproduces byte for byte
+    /// (post-§8.8.2 when `deblock`).
+    pub recon: YuvPicture,
+    /// The stamped per-4×4 motion field (the picture's §8.3.4
+    /// collocated field for later slices).
+    pub side_info: SideInfoGrid,
+    pub stats: PEncStats,
+}
+
+/// Per-list explicit prediction of a decided leaf.
+#[derive(Clone, Copy)]
+struct ListPred {
+    ref_idx: u32,
+    mvp_idx: u32,
+    mv: MotionVector,
+    mvd: MotionVector,
+}
+
+/// Quantized residual of a decided leaf (levels + cbfs per plane).
+#[derive(Clone, Default)]
+struct Residual {
+    levels_y: Vec<i32>,
+    cbf_y: bool,
+    levels_cb: Vec<i32>,
+    cbf_cb: bool,
+    levels_cr: Vec<i32>,
+    cbf_cr: bool,
+}
+
+impl Residual {
+    fn any(&self) -> bool {
+        self.cbf_y || self.cbf_cb || self.cbf_cr
+    }
 }
 
 /// One decided leaf.
 enum PLeaf {
     Skip {
-        mvp_idx: u32,
-        mv: MotionVector,
+        mvp_idx: [u32; 2],
+        mv: [MotionVector; 2],
+    },
+    Direct {
+        mv: [MotionVector; 2],
+        res: Residual,
     },
     Inter {
-        mvp_idx: u32,
-        mv: MotionVector,
-        mvd: MotionVector,
-        levels_y: Vec<i32>,
-        cbf_y: bool,
-        levels_cb: Vec<i32>,
-        cbf_cb: bool,
-        levels_cr: Vec<i32>,
-        cbf_cr: bool,
+        l0: Option<ListPred>,
+        l1: Option<ListPred>,
+        res: Residual,
     },
     Intra {
         mode_idx: usize,
-        levels_y: Vec<i32>,
-        cbf_y: bool,
-        levels_cb: Vec<i32>,
-        cbf_cb: bool,
-        levels_cr: Vec<i32>,
-        cbf_cr: bool,
+        res: Residual,
     },
+}
+
+/// The best explicit-inter candidate of a leaf under evaluation.
+struct Explicit {
+    l0: Option<ListPred>,
+    l1: Option<ListPred>,
+    pred: Pred,
+    res: Residual,
+    planes: Pred,
+    cost: f64,
 }
 
 /// A decided `split_unit()` subtree.
@@ -124,7 +231,11 @@ enum Node {
 struct PCtx<'a> {
     src: &'a YuvPicture,
     recon: YuvPicture,
-    refp: &'a YuvPicture,
+    refs: [Vec<RefPictureView<'a>>; 2],
+    ref_pocs: [Vec<i32>; 2],
+    col: Option<ColPicInputs<'a>>,
+    slice_is_b: bool,
+    curr_poc: i32,
     qp: i32,
     lambda: f64,
     bit_depth: u32,
@@ -138,26 +249,42 @@ struct PCtx<'a> {
     walk: SliceWalkInputs,
 }
 
-impl PCtx<'_> {
-    fn ref_view(&self) -> RefPictureView<'_> {
-        RefPictureView {
-            y: &self.refp.y,
-            cb: &self.refp.cb,
-            cr: &self.refp.cr,
-            width: self.refp.width,
-            height: self.refp.height,
-            y_stride: self.refp.y_stride(),
-            c_stride: self.refp.c_stride(),
-            chroma_format_idc: self.refp.chroma_format_idc,
+impl<'a> PCtx<'a> {
+    fn ref_view(&self, list: usize, ref_idx: u32) -> RefPictureView<'a> {
+        self.refs[list][ref_idx as usize]
+    }
+
+    fn n_refs(&self, list: usize) -> u32 {
+        self.refs[list].len() as u32
+    }
+
+    fn pocs(&self) -> InterPocs<'_> {
+        InterPocs {
+            curr_poc: self.curr_poc,
+            ref_pocs_l0: &self.ref_pocs[0],
+            ref_pocs_l1: &self.ref_pocs[1],
         }
     }
 }
 
-/// Encode one Baseline P picture's `slice_data()` payload against
-/// `ref_pic` (the previous picture exactly as the decoder holds it in
-/// the DPB — i.e. post-deblock when deblocking is on). Returns the
-/// CABAC payload, the reconstruction the decoder reproduces byte for
-/// byte (post-§8.8.2 when `deblock`), and the statistics.
+fn view_of(p: &YuvPicture) -> RefPictureView<'_> {
+    RefPictureView {
+        y: &p.y,
+        cb: &p.cb,
+        cr: &p.cr,
+        width: p.width,
+        height: p.height,
+        y_stride: p.y_stride(),
+        c_stride: p.c_stride(),
+        chroma_format_idc: p.chroma_format_idc,
+    }
+}
+
+/// Encode one Baseline **P** picture's `slice_data()` payload against
+/// `ref_pic` as the single list-0 reference (the round-431 shape:
+/// `RefPicList0 = [ ref_pic ]`, POC distance 1). Returns the CABAC
+/// payload, the reconstruction the decoder reproduces byte for byte
+/// (post-§8.8.2 when `deblock`), and the statistics.
 pub fn encode_p_slice_data(
     src: &YuvPicture,
     ref_pic: &YuvPicture,
@@ -165,6 +292,33 @@ pub fn encode_p_slice_data(
     deblock: bool,
     cm_init: bool,
 ) -> Result<(Vec<u8>, YuvPicture, PEncStats)> {
+    let refs = [RefEntry {
+        pic: ref_pic,
+        poc: 0,
+    }];
+    let out = encode_inter_slice_data(
+        src,
+        InterEncInputs {
+            refs_l0: &refs,
+            refs_l1: &[],
+            slice_is_b: false,
+            curr_poc: 1,
+            col: None,
+            slice_qp,
+            deblock,
+            cm_init,
+        },
+    )?;
+    Ok((out.payload, out.recon, out.stats))
+}
+
+/// Encode one Baseline P or B picture's `slice_data()` payload against
+/// the given reference lists (each entry exactly as the decoder holds it
+/// in the DPB — post-§8.8.2 when deblocking is on).
+pub fn encode_inter_slice_data(
+    src: &YuvPicture,
+    inputs: InterEncInputs<'_>,
+) -> Result<InterEncOutput> {
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
             "evc p encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
@@ -176,26 +330,58 @@ pub fn encode_p_slice_data(
             src.width, src.height
         )));
     }
-    if !(0..=51).contains(&slice_qp) {
+    if !(0..=51).contains(&inputs.slice_qp) {
         return Err(Error::invalid(format!(
-            "evc p encoder: slice_qp {slice_qp} out of range [0, 51]"
+            "evc p encoder: slice_qp {} out of range [0, 51]",
+            inputs.slice_qp
         )));
     }
-    if ref_pic.width != src.width
-        || ref_pic.height != src.height
-        || ref_pic.bit_depth != src.bit_depth
-    {
+    if inputs.refs_l0.is_empty() || (inputs.slice_is_b && inputs.refs_l1.is_empty()) {
         return Err(Error::invalid(
-            "evc p encoder: reference geometry must match the source",
+            "evc p encoder: every active reference list needs at least one picture",
         ));
     }
+    if inputs.refs_l0.len() > 15 || inputs.refs_l1.len() > 15 {
+        return Err(Error::invalid(
+            "evc p encoder: num_ref_idx_active_minus1 is bounded by 14 (§7.4.5)",
+        ));
+    }
+    for r in inputs.refs_l0.iter().chain(inputs.refs_l1.iter()) {
+        if r.pic.width != src.width
+            || r.pic.height != src.height
+            || r.pic.bit_depth != src.bit_depth
+        {
+            return Err(Error::invalid(
+                "evc p encoder: reference geometry must match the source",
+            ));
+        }
+    }
+    let slice_qp = inputs.slice_qp;
     let recon = YuvPicture::new(src.width, src.height, 1, src.bit_depth)?;
+    let refs = [
+        inputs.refs_l0.iter().map(|r| view_of(r.pic)).collect(),
+        inputs.refs_l1.iter().map(|r| view_of(r.pic)).collect(),
+    ];
+    let ref_pocs = [
+        inputs.refs_l0.iter().map(|r| r.poc).collect(),
+        inputs.refs_l1.iter().map(|r| r.poc).collect(),
+    ];
+    let col = inputs.col.map(|c| ColPicInputs {
+        grid: c.grid,
+        col_poc: c.poc,
+        ref_pocs_l0: c.ref_pocs_l0,
+        ref_pocs_l1: &[],
+    });
     let mut ctx = PCtx {
         src,
         recon,
-        refp: ref_pic,
+        refs,
+        ref_pocs,
+        col,
+        slice_is_b: inputs.slice_is_b,
+        curr_poc: inputs.curr_poc,
         qp: slice_qp,
-        lambda: 0.57 * 2f64.powf((slice_qp as f64 - 12.0) / 3.0),
+        lambda: crate::slice_enc::rd_lambda(slice_qp),
         bit_depth: src.bit_depth,
         pic_w: src.width,
         pic_h: src.height,
@@ -235,6 +421,7 @@ pub fn encode_p_slice_data(
 
     // Emit pass — decoder-exact bin order over a replayed grid (the
     // §9.3.4.2.4 neighbour ctxIncs probe decode-time state).
+    let cm_init = inputs.cm_init;
     let sel = CtxSel::new(cm_init, InitType::Pb);
     let mut enc = CabacEncoder::new();
     if cm_init {
@@ -257,16 +444,21 @@ pub fn encode_p_slice_data(
     }
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
 
-    if deblock {
+    if inputs.deblock {
         // The decoder's own §8.8.2 post-pass over the stamped grid —
-        // inter/cbf edges are live on a P picture.
+        // inter/cbf edges are live on a P/B picture.
         let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
         ctx.side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
         crate::deblock::deblock_luma(&mut ctx.recon, &ctx.side_info, slice_qp)?;
         crate::deblock::deblock_chroma(&mut ctx.recon, &ctx.side_info, slice_qp, 0, 1)?;
         crate::deblock::deblock_chroma(&mut ctx.recon, &ctx.side_info, slice_qp, 0, 2)?;
     }
-    Ok((enc.finish(), ctx.recon, stats))
+    Ok(InterEncOutput {
+        payload: enc.finish(),
+        recon: ctx.recon,
+        side_info: ctx.side_info,
+        stats,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -295,7 +487,7 @@ fn decide_split_unit(
         return Ok((Node::Split(children), cost));
     }
     if !flag_present {
-        let (plan, cost) = decide_leaf(ctx, stats, x0, y0, log2_w, log2_h)?;
+        let (plan, cost) = decide_leaf(ctx, x0, y0, log2_w, log2_h)?;
         return Ok((Node::Leaf(plan), cost + ctx.lambda));
     }
 
@@ -305,7 +497,7 @@ fn decide_split_unit(
     let before_grid = ctx.side_info.clone();
     let before_hmvp = ctx.hmvp.clone();
 
-    let (leaf_plan, leaf_cost) = decide_leaf(ctx, stats, x0, y0, log2_w, log2_h)?;
+    let (leaf_plan, leaf_cost) = decide_leaf(ctx, x0, y0, log2_w, log2_h)?;
     let leaf_cost = leaf_cost + ctx.lambda; // split_cu_flag = 0 bin
     let after_leaf_pix = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
     let after_leaf_grid = ctx.side_info.clone();
@@ -355,18 +547,25 @@ fn decide_children(
     Ok((out, cost))
 }
 
-/// Motion-compensated L0 prediction for one CU — the exact uni-pred
-/// shape of the decoder's `apply_inter_prediction` (Baseline
-/// interpolation tables, §8.5.2.6 chroma MV).
+/// Motion-compensated prediction planes of one CU: `(Y, Cb, Cr)`.
+type Pred = (Vec<i32>, Vec<i32>, Vec<i32>);
+
+/// Uni-directional motion-compensated prediction for one CU from
+/// `(list, ref_idx)` — the exact single-list shape of the decoder's
+/// `apply_inter_prediction` (Baseline interpolation tables, §8.5.2.6
+/// chroma MV).
+#[allow(clippy::too_many_arguments)]
 fn mc_pred(
     ctx: &PCtx<'_>,
+    list: usize,
+    ref_idx: u32,
     x0: u32,
     y0: u32,
     w: usize,
     h: usize,
     mv: MotionVector,
-) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
-    let rv = ctx.ref_view();
+) -> Result<Pred> {
+    let rv = ctx.ref_view(list, ref_idx);
     let mv16 = mv.quarter_to_sixteenth();
     let mut py = vec![0i32; w * h];
     interpolate_luma_block(rv, x0 as i32, y0 as i32, mv16, w, h, ctx.bit_depth, &mut py)?;
@@ -399,11 +598,45 @@ fn mc_pred(
     Ok((py, pcb, pcr))
 }
 
+/// eq. 988 bi-average of two prediction triples.
+fn bi_average(a: &Pred, b: &Pred) -> Pred {
+    let mut y = vec![0i32; a.0.len()];
+    let mut cb = vec![0i32; a.1.len()];
+    let mut cr = vec![0i32; a.2.len()];
+    average_bipred(&a.0, &b.0, &mut y);
+    average_bipred(&a.1, &b.1, &mut cb);
+    average_bipred(&a.2, &b.2, &mut cr);
+    (y, cb, cr)
+}
+
+/// Prediction for a `(l0, l1)` pair — uni or the eq. 988 average.
+#[allow(clippy::too_many_arguments)]
+fn mc_pred_pair(
+    ctx: &PCtx<'_>,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+    l0: Option<(u32, MotionVector)>,
+    l1: Option<(u32, MotionVector)>,
+) -> Result<Pred> {
+    match (l0, l1) {
+        (Some((r0, m0)), Some((r1, m1))) => {
+            let a = mc_pred(ctx, 0, r0, x0, y0, w, h, m0)?;
+            let b = mc_pred(ctx, 1, r1, x0, y0, w, h, m1)?;
+            Ok(bi_average(&a, &b))
+        }
+        (Some((r0, m0)), None) => mc_pred(ctx, 0, r0, x0, y0, w, h, m0),
+        (None, Some((r1, m1))) => mc_pred(ctx, 1, r1, x0, y0, w, h, m1),
+        (None, None) => Err(Error::invalid("evc p encoder: prediction with no list")),
+    }
+}
+
 /// Full-pel SAD with the interpolator's clamped reference fetch —
 /// the integer-search metric.
 #[allow(clippy::too_many_arguments)]
 fn sad_full_pel(
-    ctx: &PCtx<'_>,
+    rv: RefPictureView<'_>,
     x0: u32,
     y0: u32,
     w: usize,
@@ -412,15 +645,15 @@ fn sad_full_pel(
     fx: i32,
     fy: i32,
 ) -> u64 {
-    let rw = ctx.refp.width as i32;
-    let rh = ctx.refp.height as i32;
-    let stride = ctx.refp.y_stride();
+    let rw = rv.width as i32;
+    let rh = rv.height as i32;
+    let stride = rv.y_stride;
     let mut sad = 0u64;
     for j in 0..h {
         let yy = (y0 as i32 + j as i32 + fy).clamp(0, rh - 1) as usize;
         for i in 0..w {
             let xx = (x0 as i32 + i as i32 + fx).clamp(0, rw - 1) as usize;
-            let r = ctx.refp.y[yy * stride + xx] as i32;
+            let r = rv.y[yy * stride + xx] as i32;
             sad += (src[j * w + i] - r).unsigned_abs() as u64;
         }
     }
@@ -428,16 +661,17 @@ fn sad_full_pel(
 }
 
 /// Quarter-pel SAD through the decoder's own interpolation kernel.
+#[allow(clippy::too_many_arguments)]
 fn sad_quarter(
-    ctx: &PCtx<'_>,
+    rv: RefPictureView<'_>,
     x0: u32,
     y0: u32,
     w: usize,
     h: usize,
     src: &[i32],
     mv: MotionVector,
+    bit_depth: u32,
 ) -> Result<u64> {
-    let rv = ctx.ref_view();
     let mut buf = vec![0i32; w * h];
     interpolate_luma_block(
         rv,
@@ -446,10 +680,10 @@ fn sad_quarter(
         mv.quarter_to_sixteenth(),
         w,
         h,
-        ctx.bit_depth,
+        bit_depth,
         &mut buf,
     )?;
-    let max_val = (1i32 << ctx.bit_depth) - 1;
+    let max_val = (1i32 << bit_depth) - 1;
     Ok(src
         .iter()
         .zip(buf.iter())
@@ -457,11 +691,14 @@ fn sad_quarter(
         .sum())
 }
 
-/// Quarter-pel motion search: full-pel hill climb seeded from the AMVP
-/// candidates (+ zero), then half- and quarter-pel refinement through
-/// the §8.5.4 interpolation. Returns the best quarter-pel MV.
+/// Quarter-pel motion search against one reference picture: full-pel
+/// hill climb seeded from the AMVP candidates (+ zero), then half- and
+/// quarter-pel refinement through the §8.5.4 interpolation. Returns
+/// the best quarter-pel MV.
+#[allow(clippy::too_many_arguments)]
 fn motion_search(
-    ctx: &PCtx<'_>,
+    rv: RefPictureView<'_>,
+    bit_depth: u32,
     x0: u32,
     y0: u32,
     w: usize,
@@ -472,21 +709,20 @@ fn motion_search(
     // Full-pel stage.
     let mut best_f = (0i32, 0i32);
     let mut best_sad = u64::MAX;
-    let consider =
-        |fx: i32, fy: i32, best_f: &mut (i32, i32), best_sad: &mut u64, ctx: &PCtx<'_>| {
-            // Bound the search so MVs stay sane (±64 full-pel).
-            if !(-64..=64).contains(&fx) || !(-64..=64).contains(&fy) {
-                return;
-            }
-            let s = sad_full_pel(ctx, x0, y0, w, h, src, fx, fy);
-            if s < *best_sad {
-                *best_sad = s;
-                *best_f = (fx, fy);
-            }
-        };
-    consider(0, 0, &mut best_f, &mut best_sad, ctx);
+    let consider = |fx: i32, fy: i32, best_f: &mut (i32, i32), best_sad: &mut u64| {
+        // Bound the search so MVs stay sane (±64 full-pel).
+        if !(-64..=64).contains(&fx) || !(-64..=64).contains(&fy) {
+            return;
+        }
+        let s = sad_full_pel(rv, x0, y0, w, h, src, fx, fy);
+        if s < *best_sad {
+            *best_sad = s;
+            *best_f = (fx, fy);
+        }
+    };
+    consider(0, 0, &mut best_f, &mut best_sad);
     for s in seeds {
-        consider(s.x >> 2, s.y >> 2, &mut best_f, &mut best_sad, ctx);
+        consider(s.x >> 2, s.y >> 2, &mut best_f, &mut best_sad);
     }
     for _ in 0..32 {
         let (cx, cy) = best_f;
@@ -501,7 +737,7 @@ fn motion_search(
             (-1, 1),
             (1, 1),
         ] {
-            consider(cx + dx, cy + dy, &mut best_f, &mut best_sad, ctx);
+            consider(cx + dx, cy + dy, &mut best_f, &mut best_sad);
         }
         if best_sad == before {
             break;
@@ -509,7 +745,7 @@ fn motion_search(
     }
     // Sub-pel stage: half then quarter steps around the best.
     let mut best_mv = MotionVector::quarter_pel(best_f.0 << 2, best_f.1 << 2);
-    let mut best_sub = sad_quarter(ctx, x0, y0, w, h, src, best_mv)?;
+    let mut best_sub = sad_quarter(rv, x0, y0, w, h, src, best_mv, bit_depth)?;
     for step in [2i32, 1] {
         let center = best_mv;
         for (dx, dy) in [
@@ -523,7 +759,7 @@ fn motion_search(
             (step, step),
         ] {
             let cand = MotionVector::quarter_pel(center.x + dx, center.y + dy);
-            let s = sad_quarter(ctx, x0, y0, w, h, src, cand)?;
+            let s = sad_quarter(rv, x0, y0, w, h, src, cand, bit_depth)?;
             if s < best_sub {
                 best_sub = s;
                 best_mv = cand;
@@ -545,6 +781,26 @@ fn eg0_bits(v: u32) -> f64 {
 /// TR (cMax 3) bin count of an `mvp_idx`.
 fn tr3_bits(v: u32) -> f64 {
     (v + u32::from(v < 3)) as f64
+}
+
+/// TR bin count of a `ref_idx_lX` (`cMax = num_ref_idx_active_minus1`;
+/// absent — zero bins — when the list holds a single picture).
+fn ref_idx_bits(v: u32, n_refs: u32) -> f64 {
+    if n_refs <= 1 {
+        return 0.0;
+    }
+    let c_max = n_refs - 1;
+    (v + u32::from(v < c_max)) as f64
+}
+
+/// `inter_pred_idc` TR (cMax 2) bin count: PRED_L0 → `0`, PRED_L1 →
+/// `10`, PRED_BI → `11`.
+fn inter_pred_idc_bits(idc: u32) -> f64 {
+    if idc == 0 {
+        1.0
+    } else {
+        2.0
+    }
 }
 
 /// Quantize one inter residual plane through the decoder's §8.7 chain;
@@ -586,6 +842,62 @@ fn sse_pred(src: &[i32], pred: &[i32], max_val: i32) -> f64 {
         .sum()
 }
 
+/// Quantized residual of an inter prediction against the source, with
+/// the §7.4.9.5-aware distortion + bit estimate: the `cbf_all` bin
+/// (1), then with any content `cbf_cb` + `cbf_cr`, the `cbf_luma` bin
+/// only when chroma carries something (quiet chroma infers it 1 — the
+/// all-quiet shape is exactly `cbf_all = 0`), and the RLE estimates.
+/// Returns `(residual, reconstructed residual planes, distortion, bits)`.
+#[allow(clippy::type_complexity)]
+fn quantize_inter_residual(
+    ctx: &PCtx<'_>,
+    src: (&[i32], &[i32], &[i32]),
+    pred: &Pred,
+    w: usize,
+    h: usize,
+) -> Result<(Residual, Pred, f64, f64)> {
+    let bd = ctx.bit_depth;
+    let max_val = (1i32 << bd) - 1;
+    let (wc, hc) = (w / 2, h / 2);
+    // §8.7.1: quantize at qP = Qp′ (eqs. 1050-1052).
+    let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
+    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
+    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(src.0, &pred.0, w, h, qp_y, bd)?;
+    let (levels_cb, cbf_cb, res_cb, dist_cb) =
+        quantize_inter_plane(src.1, &pred.1, wc, hc, qp_c, bd)?;
+    let (levels_cr, cbf_cr, res_cr, dist_cr) =
+        quantize_inter_plane(src.2, &pred.2, wc, hc, qp_c, bd)?;
+    let res = Residual {
+        levels_y,
+        cbf_y,
+        levels_cb,
+        cbf_cb,
+        levels_cr,
+        cbf_cr,
+    };
+    let mut bits = 1.0; // cbf_all
+    let dist = if res.any() {
+        bits += 2.0; // cbf_cb + cbf_cr
+        if cbf_cb || cbf_cr {
+            bits += 1.0; // cbf_luma present
+        }
+        bits += rle_bits_estimate(&res.levels_y, cbf_y)
+            + rle_bits_estimate(&res.levels_cb, cbf_cb)
+            + rle_bits_estimate(&res.levels_cr, cbf_cr);
+        dist_y + dist_cb + dist_cr
+    } else {
+        sse_pred(src.0, &pred.0, max_val)
+            + sse_pred(src.1, &pred.1, max_val)
+            + sse_pred(src.2, &pred.2, max_val)
+    };
+    let planes = if res.any() {
+        (res_y, res_cb, res_cr)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    Ok((res, planes, dist, bits))
+}
+
 /// Store `pred + res` (res may be empty ⇒ pure prediction) clipped into
 /// the recon plane — the encoder-side mirror of the decoder's
 /// `store_block` composition.
@@ -610,8 +922,16 @@ fn store_recon(
 }
 
 /// The four §8.5.2.4 AMVP candidates for this block over the current
-/// decode-order state (`ref_idx = 0`, list 0).
-fn amvp_candidates(ctx: &PCtx<'_>, x0: u32, y0: u32, w: usize, h: usize) -> [MotionVector; 4] {
+/// decode-order state, for `(list, ref_idx)`.
+fn amvp_candidates(
+    ctx: &PCtx<'_>,
+    list: usize,
+    ref_idx: u32,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+) -> [MotionVector; 4] {
     core::array::from_fn(|k| {
         baseline_amvp_select_with_grid_and_hmvp(
             k as u32,
@@ -621,15 +941,47 @@ fn amvp_candidates(ctx: &PCtx<'_>, x0: u32, y0: u32, w: usize, h: usize) -> [Mot
             y0 as i32,
             w as i32,
             h as i32,
-            0,
-            0,
+            ref_idx as i8,
+            list as u8,
         )
     })
 }
 
-/// Commit an inter (skip or explicit) leaf into the decode-order state:
-/// recon, side-info stamp, HMVP update, and the skip cell marks — the
-/// exact order of the decoder's shared tail.
+/// Motion of a committed inter leaf per list: `(ref_idx, mv)`.
+type ListMotion = Option<(u32, MotionVector)>;
+
+#[allow(clippy::too_many_arguments)]
+fn inter_side_info(
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+    l0: ListMotion,
+    l1: ListMotion,
+    cbf_y: bool,
+    qp: i32,
+) -> CuSideInfo {
+    CuSideInfo {
+        pred_mode: CuPredMode::Inter,
+        cbf_luma: u8::from(cbf_y),
+        mv_l0_x: l0.map(|(_, m)| m.x).unwrap_or(0),
+        mv_l0_y: l0.map(|(_, m)| m.y).unwrap_or(0),
+        mv_l1_x: l1.map(|(_, m)| m.x).unwrap_or(0),
+        mv_l1_y: l1.map(|(_, m)| m.y).unwrap_or(0),
+        ref_idx_l0: l0.map(|(r, _)| r as i8).unwrap_or(-1),
+        ref_idx_l1: l1.map(|(r, _)| r as i8).unwrap_or(-1),
+        cu_x0: x0 as u16,
+        cu_y0: y0 as u16,
+        cu_log2_w: log2_w as u8,
+        cu_log2_h: log2_h as u8,
+        qp_y: qp.clamp(0, 51) as u8,
+        ..Default::default()
+    }
+}
+
+/// Commit an inter (skip / direct / explicit) leaf into the
+/// decode-order state: recon, side-info stamp, HMVP update, and the
+/// skip cell marks — the exact order of the decoder's shared tail.
 #[allow(clippy::too_many_arguments)]
 fn commit_inter(
     ctx: &mut PCtx<'_>,
@@ -637,11 +989,12 @@ fn commit_inter(
     y0: u32,
     log2_w: u32,
     log2_h: u32,
-    mv: MotionVector,
+    l0: ListMotion,
+    l1: ListMotion,
     cbf_y: bool,
     skip: bool,
-    pred: (&[i32], &[i32], &[i32]),
-    res: (&[i32], &[i32], &[i32]),
+    pred: &Pred,
+    res: &Pred,
 ) {
     let (w, h) = (1usize << log2_w, 1usize << log2_h);
     ctx.side_info.stamp_block(
@@ -649,28 +1002,15 @@ fn commit_inter(
         y0,
         w as u32,
         h as u32,
-        CuSideInfo {
-            pred_mode: CuPredMode::Inter,
-            cbf_luma: u8::from(cbf_y),
-            mv_l0_x: mv.x,
-            mv_l0_y: mv.y,
-            ref_idx_l0: 0,
-            ref_idx_l1: -1,
-            cu_x0: x0 as u16,
-            cu_y0: y0 as u16,
-            cu_log2_w: log2_w as u8,
-            cu_log2_h: log2_h as u8,
-            qp_y: ctx.qp.clamp(0, 51) as u8,
-            ..Default::default()
-        },
+        inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, ctx.qp),
     );
     ctx.hmvp.update(HmvpCandidate {
-        mv_l0: mv,
-        mv_l1: MotionVector::default(),
-        ref_idx_l0: 0,
-        ref_idx_l1: -1,
+        mv_l0: l0.map(|(_, m)| m).unwrap_or_default(),
+        mv_l1: l1.map(|(_, m)| m).unwrap_or_default(),
+        ref_idx_l0: l0.map(|(r, _)| r as i8).unwrap_or(-1),
+        ref_idx_l1: l1.map(|(r, _)| r as i8).unwrap_or(-1),
     });
-    store_recon(&mut ctx.recon, x0, y0, w, h, 0, pred.0, res.0);
+    store_recon(&mut ctx.recon, x0, y0, w, h, 0, &pred.0, &res.0);
     store_recon(
         &mut ctx.recon,
         x0 / 2,
@@ -678,8 +1018,8 @@ fn commit_inter(
         w / 2,
         h / 2,
         1,
-        pred.1,
-        res.1,
+        &pred.1,
+        &res.1,
     );
     store_recon(
         &mut ctx.recon,
@@ -688,17 +1028,141 @@ fn commit_inter(
         w / 2,
         h / 2,
         2,
-        pred.2,
-        res.2,
+        &pred.2,
+        &res.2,
     );
     if skip {
         mark_cu_skip_cells(&mut ctx.side_info, x0, y0, w as u32, h as u32);
     }
 }
 
+/// Explicit uni-prediction on one list, per active reference: motion
+/// search against the reference, the AMVP slot minimizing the MVD
+/// cost, and the full residual RD. Returns one `(ListPred, cost)` per
+/// `ref_idx`, in list order (`cost = SSE + λ·bits` of the uni CU).
+#[allow(clippy::too_many_arguments)]
+fn uni_per_ref(
+    ctx: &PCtx<'_>,
+    list: usize,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+    src: (&[i32], &[i32], &[i32]),
+) -> Result<Vec<(ListPred, f64)>> {
+    let n_refs = ctx.n_refs(list);
+    let mut out = Vec::with_capacity(n_refs as usize);
+    for r in 0..n_refs {
+        let cands = amvp_candidates(ctx, list, r, x0, y0, w, h);
+        let rv = ctx.ref_view(list, r);
+        let mv = motion_search(rv, ctx.bit_depth, x0, y0, w, h, src.0, &cands)?;
+        let lp = fit_mvp(&cands, r, mv);
+        let pred = mc_pred(ctx, list, r, x0, y0, w, h, mv)?;
+        let (_res, _planes, dist, res_bits) = quantize_inter_residual(ctx, src, &pred, w, h)?;
+        let bits = ref_idx_bits(r, n_refs) + list_pred_bits(&lp) + res_bits;
+        out.push((lp, dist + ctx.lambda * bits));
+    }
+    Ok(out)
+}
+
+/// The cheapest entry of a [`uni_per_ref`] result.
+fn best_of(per_ref: &[(ListPred, f64)]) -> ListPred {
+    per_ref
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .expect("at least one reference")
+        .0
+}
+
+/// Choose the AMVP slot minimizing the MVD signalling of `mv`.
+fn fit_mvp(cands: &[MotionVector; 4], ref_idx: u32, mv: MotionVector) -> ListPred {
+    let (k, _) = cands
+        .iter()
+        .enumerate()
+        .map(|(k, &p)| {
+            let mvd = MotionVector::quarter_pel(mv.x - p.x, mv.y - p.y);
+            let bits = tr3_bits(k as u32)
+                + eg0_bits(mvd.x.unsigned_abs())
+                + eg0_bits(mvd.y.unsigned_abs());
+            (k as u32, bits)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .expect("4 candidates");
+    let p = cands[k as usize];
+    ListPred {
+        ref_idx,
+        mvp_idx: k,
+        mv,
+        mvd: MotionVector::quarter_pel(mv.x - p.x, mv.y - p.y),
+    }
+}
+
+/// `mvp_idx` + `abs_mvd`/sign bins of one list's explicit motion.
+fn list_pred_bits(lp: &ListPred) -> f64 {
+    tr3_bits(lp.mvp_idx) + eg0_bits(lp.mvd.x.unsigned_abs()) + eg0_bits(lp.mvd.y.unsigned_abs())
+}
+
+/// One sub-pel re-fit of the list-1 vector against the averaged
+/// prediction (the list-0 half fixed): half- then quarter-pel
+/// neighbours, picking the pair minimizing the luma SSE of the eq. 988
+/// average.
+#[allow(clippy::too_many_arguments)]
+fn refine_bi_l1(
+    ctx: &PCtx<'_>,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+    src_y: &[i32],
+    pred_l0_y: &[i32],
+    r1: u32,
+    mv1: MotionVector,
+) -> Result<MotionVector> {
+    let rv = ctx.ref_view(1, r1);
+    let max_val = (1i32 << ctx.bit_depth) - 1;
+    let mut buf = vec![0i32; w * h];
+    let mut avg = vec![0i32; w * h];
+    let mut eval = |mv: MotionVector| -> Result<f64> {
+        interpolate_luma_block(
+            rv,
+            x0 as i32,
+            y0 as i32,
+            mv.quarter_to_sixteenth(),
+            w,
+            h,
+            ctx.bit_depth,
+            &mut buf,
+        )?;
+        average_bipred(pred_l0_y, &buf, &mut avg);
+        Ok(sse_pred(src_y, &avg, max_val))
+    };
+    let mut best = mv1;
+    let mut best_cost = eval(mv1)?;
+    for step in [2i32, 1] {
+        let center = best;
+        for (dx, dy) in [
+            (-step, 0),
+            (step, 0),
+            (0, -step),
+            (0, step),
+            (-step, -step),
+            (step, -step),
+            (-step, step),
+            (step, step),
+        ] {
+            let cand = MotionVector::quarter_pel(center.x + dx, center.y + dy);
+            let c = eval(cand)?;
+            if c < best_cost {
+                best_cost = c;
+                best = cand;
+            }
+        }
+    }
+    Ok(best)
+}
+
 fn decide_leaf(
     ctx: &mut PCtx<'_>,
-    stats: &mut PEncStats,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -709,90 +1173,177 @@ fn decide_leaf(
     let (wc, hc) = (w / 2, h / 2);
     let bd = ctx.bit_depth;
     let max_val = (1i32 << bd) - 1;
+    let is_b = ctx.slice_is_b;
     let src_y = gather_block(&ctx.src.y, ctx.src.y_stride(), x0, y0, w, h);
     let src_cb = gather_block(&ctx.src.cb, ctx.src.c_stride(), x0 / 2, y0 / 2, wc, hc);
     let src_cr = gather_block(&ctx.src.cr, ctx.src.c_stride(), x0 / 2, y0 / 2, wc, hc);
+    let src = (&src_y[..], &src_cb[..], &src_cr[..]);
+    let sse_all = |p: &Pred| -> f64 {
+        sse_pred(&src_y, &p.0, max_val)
+            + sse_pred(&src_cb, &p.1, max_val)
+            + sse_pred(&src_cr, &p.2, max_val)
+    };
 
-    let cands = amvp_candidates(ctx, x0, y0, w, h);
-
-    // ---- skip ladder: 4 mvp slots, whole-CU prediction, no residual.
-    type SkipChoice = (u32, MotionVector, Vec<i32>, Vec<i32>, Vec<i32>);
-    let mut best_skip: Option<SkipChoice> = None;
-    let mut best_skip_cost = f64::INFINITY;
-    for (k, &mv) in cands.iter().enumerate() {
-        let (py, pcb, pcr) = mc_pred(ctx, x0, y0, w, h, mv)?;
-        let dist = sse_pred(&src_y, &py, max_val)
-            + sse_pred(&src_cb, &pcb, max_val)
-            + sse_pred(&src_cr, &pcr, max_val);
-        let bits = 1.0 + tr3_bits(k as u32); // cu_skip + mvp_idx
-        let cost = dist + ctx.lambda * bits;
-        if cost < best_skip_cost {
-            best_skip_cost = cost;
-            best_skip = Some((k as u32, mv, py, pcb, pcr));
-        }
-    }
-
-    // ---- explicit inter: ME + residual.
-    let me_mv = motion_search(ctx, x0, y0, w, h, &src_y, &cands)?;
-    // Choose the mvp minimizing the signalling cost of this MV.
-    let (best_mvp_idx, _) = cands
-        .iter()
-        .enumerate()
-        .map(|(k, &p)| {
-            let mvd = MotionVector::quarter_pel(me_mv.x - p.x, me_mv.y - p.y);
-            let bits = tr3_bits(k as u32)
-                + eg0_bits(mvd.x.unsigned_abs())
-                + eg0_bits(mvd.y.unsigned_abs());
-            (k as u32, bits)
-        })
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .expect("4 candidates");
-    let mvp = cands[best_mvp_idx as usize];
-    let mvd = MotionVector::quarter_pel(me_mv.x - mvp.x, me_mv.y - mvp.y);
-    let (py, pcb, pcr) = mc_pred(ctx, x0, y0, w, h, me_mv)?;
-    // §8.7.1: quantize at qP = Qp′ (eqs. 1050-1052) — see the IDR
-    // encoder's derivation.
-    let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
-    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
-    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(&src_y, &py, w, h, qp_y, bd)?;
-    let (levels_cb, cbf_cb, res_cb, dist_cb) =
-        quantize_inter_plane(&src_cb, &pcb, wc, hc, qp_c, bd)?;
-    let (levels_cr, cbf_cr, res_cr, dist_cr) =
-        quantize_inter_plane(&src_cr, &pcr, wc, hc, qp_c, bd)?;
-    // §7.4.9.5: with quiet chroma cbf_luma is inferred 1, so an
-    // "explicit CU with luma-only-zero residual" collapses to
-    // cbf_all = 0 (drop the chroma residuals too if luma is quiet and
-    // they are the only content — cheaper to keep them; the inference
-    // only bites when cbf_y == false && !cbf_cb && !cbf_cr, which IS
-    // representable as cbf_all = 0).
-    let any_cbf = cbf_y || cbf_cb || cbf_cr;
-    let mut inter_bits = 1.0 // cu_skip = 0
-        + 1.0 // pred_mode_flag = 0
-        + tr3_bits(best_mvp_idx)
-        + eg0_bits(mvd.x.unsigned_abs())
-        + eg0_bits(mvd.y.unsigned_abs())
-        + 1.0; // cbf_all
-    let mut inter_dist = 0f64;
-    if any_cbf {
-        inter_bits += 2.0; // cbf_cb + cbf_cr
-        if cbf_cb || cbf_cr {
-            inter_bits += 1.0; // cbf_luma present
-        }
-        inter_bits += rle_bits_estimate(&levels_y, cbf_y)
-            + rle_bits_estimate(&levels_cb, cbf_cb)
-            + rle_bits_estimate(&levels_cr, cbf_cr);
-        inter_dist += dist_y + dist_cb + dist_cr;
+    // ---- skip ladder: mvp slots at refIdx 0 (eqs. 445/448), whole-CU
+    // prediction, no residual. A B skip pairs a list-0 and a list-1
+    // slot (bi-average).
+    let cands0 = amvp_candidates(ctx, 0, 0, x0, y0, w, h);
+    let cands1 = if is_b {
+        amvp_candidates(ctx, 1, 0, x0, y0, w, h)
     } else {
-        inter_dist += sse_pred(&src_y, &py, max_val)
-            + sse_pred(&src_cb, &pcb, max_val)
-            + sse_pred(&src_cr, &pcr, max_val);
+        [MotionVector::default(); 4]
+    };
+    let mut best_skip: Option<([u32; 2], [MotionVector; 2], Pred)> = None;
+    let mut best_skip_cost = f64::INFINITY;
+    let preds0: Vec<Pred> = cands0
+        .iter()
+        .map(|&mv| mc_pred(ctx, 0, 0, x0, y0, w, h, mv))
+        .collect::<Result<_>>()?;
+    if is_b {
+        let preds1: Vec<Pred> = cands1
+            .iter()
+            .map(|&mv| mc_pred(ctx, 1, 0, x0, y0, w, h, mv))
+            .collect::<Result<_>>()?;
+        for (k0, p0) in preds0.iter().enumerate() {
+            for (k1, p1) in preds1.iter().enumerate() {
+                let avg = bi_average(p0, p1);
+                let bits = 1.0 + tr3_bits(k0 as u32) + tr3_bits(k1 as u32);
+                let cost = sse_all(&avg) + ctx.lambda * bits;
+                if cost < best_skip_cost {
+                    best_skip_cost = cost;
+                    best_skip = Some(([k0 as u32, k1 as u32], [cands0[k0], cands1[k1]], avg));
+                }
+            }
+        }
+    } else {
+        for (k0, p0) in preds0.into_iter().enumerate() {
+            let bits = 1.0 + tr3_bits(k0 as u32); // cu_skip + mvp_idx
+            let cost = sse_all(&p0) + ctx.lambda * bits;
+            if cost < best_skip_cost {
+                best_skip_cost = cost;
+                best_skip = Some(([k0 as u32, 0], [cands0[k0], MotionVector::default()], p0));
+            }
+        }
     }
-    // Representability guard (§7.4.9.5): cbf_all = 1 with quiet chroma
-    // infers cbf_luma = 1 — if luma quantized to zero while a chroma
-    // plane carries content, that is representable (cbf_luma bin = 0);
-    // the impossible shape (all three quiet under cbf_all = 1) is
-    // exactly `!any_cbf`, which we signal as cbf_all = 0.
-    let inter_cost = inter_dist + ctx.lambda * inter_bits;
+
+    // ---- direct (B): the §8.5.2.5 pair, bi-predicted, cbf_all-gated
+    // residual. Bits: cu_skip 0, pred_mode 0, direct 1, + residual.
+    let mut direct: Option<([MotionVector; 2], Pred, Residual, Pred, f64)> = None;
+    if is_b {
+        let (mv0, mv1) =
+            derive_direct_mode_mvs(&ctx.pocs(), ctx.col.as_ref(), x0, y0, w as u32, h as u32);
+        let pred = mc_pred_pair(ctx, x0, y0, w, h, Some((0, mv0)), Some((0, mv1)))?;
+        let (res, planes, dist, res_bits) = quantize_inter_residual(ctx, src, &pred, w, h)?;
+        let cost = dist + ctx.lambda * (3.0 + res_bits);
+        direct = Some(([mv0, mv1], pred, res, planes, cost));
+    }
+
+    // ---- explicit inter: per-list ME (every reference) + residual;
+    // on B also the bi-prediction pairing.
+    let head_bits = 2.0 + if is_b { 1.0 } else { 0.0 }; // cu_skip, pred_mode, [direct = 0]
+    let mut explicit = {
+        let lp0 = best_of(&uni_per_ref(ctx, 0, x0, y0, w, h, src)?);
+        let pred0 = mc_pred(ctx, 0, lp0.ref_idx, x0, y0, w, h, lp0.mv)?;
+        let (res0, planes0, dist0, rbits0) = quantize_inter_residual(ctx, src, &pred0, w, h)?;
+        let bits0 = head_bits
+            + if is_b { inter_pred_idc_bits(0) } else { 0.0 }
+            + ref_idx_bits(lp0.ref_idx, ctx.n_refs(0))
+            + list_pred_bits(&lp0)
+            + rbits0;
+        Explicit {
+            l0: Some(lp0),
+            l1: None,
+            pred: pred0,
+            res: res0,
+            planes: planes0,
+            cost: dist0 + ctx.lambda * bits0,
+        }
+    };
+    {
+        let lp0 = explicit.l0.expect("list-0 candidate");
+        if is_b {
+            let per_ref1 = uni_per_ref(ctx, 1, x0, y0, w, h, src)?;
+            let lp1 = best_of(&per_ref1);
+            let pred1 = mc_pred(ctx, 1, lp1.ref_idx, x0, y0, w, h, lp1.mv)?;
+            let (res1, planes1, dist1, rbits1) = quantize_inter_residual(ctx, src, &pred1, w, h)?;
+            let bits1 = head_bits
+                + inter_pred_idc_bits(1)
+                + ref_idx_bits(lp1.ref_idx, ctx.n_refs(1))
+                + list_pred_bits(&lp1)
+                + rbits1;
+            let cost1 = dist1 + ctx.lambda * bits1;
+            if cost1 < explicit.cost {
+                explicit = Explicit {
+                    l0: None,
+                    l1: Some(lp1),
+                    pred: pred1,
+                    res: res1,
+                    planes: planes1,
+                    cost: cost1,
+                };
+            }
+            // Bi: list-0 half fixed, list-1 vector re-fit on the average.
+            // Two pairings: the best list-1 reference, and — when that
+            // is the very picture list 0 already predicts from — the
+            // best list-1 reference that is a *different* picture (the
+            // averaging gain comes from independent reconstructions).
+            let pred_l0 = mc_pred(ctx, 0, lp0.ref_idx, x0, y0, w, h, lp0.mv)?;
+            let poc0 = ctx.ref_pocs[0][lp0.ref_idx as usize];
+            let mut pairings = vec![lp1];
+            if ctx.ref_pocs[1][lp1.ref_idx as usize] == poc0 {
+                let other = per_ref1
+                    .iter()
+                    .filter(|(p, _)| ctx.ref_pocs[1][p.ref_idx as usize] != poc0)
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                if let Some((p, _)) = other {
+                    pairings.push(*p);
+                }
+            }
+            for lp1 in pairings {
+                let mv1b =
+                    refine_bi_l1(ctx, x0, y0, w, h, &src_y, &pred_l0.0, lp1.ref_idx, lp1.mv)?;
+                let cands1b = amvp_candidates(ctx, 1, lp1.ref_idx, x0, y0, w, h);
+                let lp1b = fit_mvp(&cands1b, lp1.ref_idx, mv1b);
+                let predb = mc_pred_pair(
+                    ctx,
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    Some((lp0.ref_idx, lp0.mv)),
+                    Some((lp1b.ref_idx, lp1b.mv)),
+                )?;
+                let (resb, planesb, distb, rbitsb) =
+                    quantize_inter_residual(ctx, src, &predb, w, h)?;
+                let bitsb = head_bits
+                    + inter_pred_idc_bits(2)
+                    + ref_idx_bits(lp0.ref_idx, ctx.n_refs(0))
+                    + list_pred_bits(&lp0)
+                    + ref_idx_bits(lp1b.ref_idx, ctx.n_refs(1))
+                    + list_pred_bits(&lp1b)
+                    + rbitsb;
+                let costb = distb + ctx.lambda * bitsb;
+                if costb < explicit.cost {
+                    explicit = Explicit {
+                        l0: Some(lp0),
+                        l1: Some(lp1b),
+                        pred: predb,
+                        res: resb,
+                        planes: planesb,
+                        cost: costb,
+                    };
+                }
+            }
+        }
+    }
+    let Explicit {
+        l0: ex_l0,
+        l1: ex_l1,
+        pred: ex_pred,
+        res: ex_res,
+        planes: ex_planes,
+        cost: inter_cost,
+    } = explicit;
 
     // ---- intra (single tree, chroma follows the luma mode).
     let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
@@ -849,123 +1400,127 @@ fn decide_leaf(
                 + rle_bits_estimate(&i_levels_cb, i_cbf_cb)
                 + rle_bits_estimate(&i_levels_cr, i_cbf_cr));
 
-    stats.leaves += 1;
-
-    // ---- choose and commit.
-    if best_skip_cost <= inter_cost && best_skip_cost <= intra_cost {
-        let (k, mv, py, pcb, pcr) = best_skip.expect("skip ladder evaluated");
-        commit_inter(
-            ctx,
-            x0,
-            y0,
-            log2_w,
-            log2_h,
-            mv,
-            false,
-            true,
-            (&py, &pcb, &pcr),
-            (&[], &[], &[]),
-        );
-        stats.skip_cus += 1;
-        Ok((PLeaf::Skip { mvp_idx: k, mv }, best_skip_cost))
-    } else if inter_cost <= intra_cost {
-        commit_inter(
-            ctx,
-            x0,
-            y0,
-            log2_w,
-            log2_h,
-            me_mv,
-            cbf_y,
-            false,
-            (&py, &pcb, &pcr),
-            (&res_y, &res_cb, &res_cr),
-        );
-        stats.inter_cus += 1;
-        if !any_cbf {
-            stats.cbf_all_zero_cus += 1;
+    // ---- choose and commit (the statistics are tallied by the emit
+    // pass over the *decided* tree — the decide pass trials leaves that
+    // a split later discards).
+    let direct_cost = direct.as_ref().map_or(f64::INFINITY, |d| d.4);
+    let best = [best_skip_cost, direct_cost, inter_cost, intra_cost]
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .expect("4 costs");
+    match best {
+        0 => {
+            let (k, mv, pred) = best_skip.expect("skip ladder evaluated");
+            let l1 = if is_b { Some((0, mv[1])) } else { None };
+            commit_inter(
+                ctx,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                Some((0, mv[0])),
+                l1,
+                false,
+                true,
+                &pred,
+                &(Vec::new(), Vec::new(), Vec::new()),
+            );
+            Ok((PLeaf::Skip { mvp_idx: k, mv }, best_skip_cost))
         }
-        Ok((
-            PLeaf::Inter {
-                mvp_idx: best_mvp_idx,
-                mv: me_mv,
-                mvd,
-                levels_y,
+        1 => {
+            let (mv, pred, res, planes, cost) = direct.expect("direct evaluated");
+            let cbf_y = res.cbf_y;
+            commit_inter(
+                ctx,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                Some((0, mv[0])),
+                Some((0, mv[1])),
                 cbf_y,
-                levels_cb,
-                cbf_cb,
-                levels_cr,
-                cbf_cr,
-            },
-            inter_cost,
-        ))
-    } else {
-        // Commit the intra reconstruction through the decoder's own
-        // kernels (luma then chroma, both with the luma mode), then
-        // stamp — the same aggregate the decoder records.
-        ctx.side_info.stamp_block(
-            x0,
-            y0,
-            w as u32,
-            h as u32,
-            CuSideInfo {
-                pred_mode: CuPredMode::Intra,
-                cbf_luma: u8::from(i_cbf_y),
-                cu_x0: x0 as u16,
-                cu_y0: y0 as u16,
-                cu_log2_w: log2_w as u8,
-                cu_log2_h: log2_h as u8,
-                intra_luma_mode: i_mode as u8,
-                qp_y: ctx.qp.clamp(0, 51) as u8,
-                ..Default::default()
-            },
-        );
-        intra_reconstruct_cb_in_tile(
-            &mut ctx.recon,
-            x0,
-            y0,
-            log2_w,
-            log2_h,
-            mode,
-            0,
-            &i_res_y,
-            None,
-        )?;
-        intra_reconstruct_cb_in_tile(
-            &mut ctx.recon,
-            x0,
-            y0,
-            log2_w,
-            log2_h,
-            mode,
-            1,
-            &i_res_cb,
-            None,
-        )?;
-        intra_reconstruct_cb_in_tile(
-            &mut ctx.recon,
-            x0,
-            y0,
-            log2_w,
-            log2_h,
-            mode,
-            2,
-            &i_res_cr,
-            None,
-        )?;
-        stats.intra_cus += 1;
-        Ok((
-            PLeaf::Intra {
-                mode_idx: i_mode,
-                levels_y: i_levels_y,
-                cbf_y: i_cbf_y,
-                levels_cb: i_levels_cb,
-                cbf_cb: i_cbf_cb,
-                levels_cr: i_levels_cr,
-                cbf_cr: i_cbf_cr,
-            },
-            intra_cost,
-        ))
+                false,
+                &pred,
+                &planes,
+            );
+            Ok((PLeaf::Direct { mv, res }, cost))
+        }
+        2 => {
+            let l0 = ex_l0.map(|p| (p.ref_idx, p.mv));
+            let l1 = ex_l1.map(|p| (p.ref_idx, p.mv));
+            commit_inter(
+                ctx,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                l0,
+                l1,
+                ex_res.cbf_y,
+                false,
+                &ex_pred,
+                &ex_planes,
+            );
+            Ok((
+                PLeaf::Inter {
+                    l0: ex_l0,
+                    l1: ex_l1,
+                    res: ex_res,
+                },
+                inter_cost,
+            ))
+        }
+        _ => {
+            // Commit the intra reconstruction through the decoder's own
+            // kernels (luma then chroma, both with the luma mode), then
+            // stamp — the same aggregate the decoder records.
+            ctx.side_info.stamp_block(
+                x0,
+                y0,
+                w as u32,
+                h as u32,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Intra,
+                    cbf_luma: u8::from(i_cbf_y),
+                    cu_x0: x0 as u16,
+                    cu_y0: y0 as u16,
+                    cu_log2_w: log2_w as u8,
+                    cu_log2_h: log2_h as u8,
+                    intra_luma_mode: i_mode as u8,
+                    qp_y: ctx.qp.clamp(0, 51) as u8,
+                    ..Default::default()
+                },
+            );
+            for (c_idx, res) in [(0u32, &i_res_y), (1, &i_res_cb), (2, &i_res_cr)] {
+                intra_reconstruct_cb_in_tile(
+                    &mut ctx.recon,
+                    x0,
+                    y0,
+                    log2_w,
+                    log2_h,
+                    mode,
+                    c_idx,
+                    res,
+                    None,
+                )?;
+            }
+            Ok((
+                PLeaf::Intra {
+                    mode_idx: i_mode,
+                    res: Residual {
+                        levels_y: i_levels_y,
+                        cbf_y: i_cbf_y,
+                        levels_cb: i_levels_cb,
+                        cbf_cb: i_cbf_cb,
+                        levels_cr: i_levels_cr,
+                        cbf_cr: i_cbf_cr,
+                    },
+                },
+                intra_cost,
+            ))
+        }
     }
 }
 
@@ -1004,7 +1559,7 @@ fn emit_split_unit(
                 enc.encode_decision(split_t, split_i, 0);
                 stats.split_flag_bins += 1;
             }
-            emit_leaf(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, plan);
+            emit_leaf(enc, stats, ctx, sel, grid, x0, y0, log2_w, log2_h, plan);
         }
     }
 }
@@ -1052,7 +1607,7 @@ fn pred_mode_flag_ctx(
     }
 }
 
-/// TR cMax 3 write for `mvp_idx_l0` — the dual of the decoder's
+/// TR cMax 3 write for `mvp_idx_lX` — the dual of the decoder's
 /// `decode_tr_regular(3, 0, …)` with the Table 48 per-bin ctxInc.
 fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
     // Table 95: per-bin ctxInc 0,1,2 under both entropy shapes.
@@ -1071,6 +1626,50 @@ fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
     }
 }
 
+/// TR cMax 2 write for `inter_pred_idc` — the dual of the decoder's
+/// `decode_tr_regular(2, 0, …)` over Table 69 (per-bin ctxInc 0, 1).
+fn emit_inter_pred_idc(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
+    let table = MainCtxTable::InterPredIdc;
+    let (t, off) = if sel.cm_init {
+        (table.as_usize(), table.ctx_idx_offset(sel.init_type))
+    } else {
+        (0, table.cm0_ctx_idx_offset(sel.init_type))
+    };
+    let idx = |b: u32| -> usize { off + (b as usize).min(1) };
+    for b in 0..v {
+        enc.encode_decision(t, idx(b), 1);
+    }
+    if v < 2 {
+        enc.encode_decision(t, idx(v), 0);
+    }
+}
+
+/// TR (`cMax = num_ref_idx_active_minus1`) write for `ref_idx_lX` —
+/// the dual of the decoder's `decode_ref_idx_tr`: under
+/// `sps_cm_init_flag == 1` bins 0/1 regular on Table 72 (ctxInc 0, 1),
+/// later bins bypass; under the Baseline collapse every bin is the
+/// `(0, 0)` regular context. Writes nothing when the list holds one
+/// picture (the element is absent).
+fn emit_ref_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32, n_refs: u32) {
+    if n_refs <= 1 {
+        return;
+    }
+    let c_max = n_refs - 1;
+    let n_bins = v + u32::from(v < c_max);
+    for b in 0..n_bins {
+        let bin = u8::from(b < v);
+        if !sel.cm_init {
+            enc.encode_decision(0, 0, bin);
+        } else if b < 2 {
+            let table = MainCtxTable::RefIdx;
+            let off = table.ctx_idx_offset(InitType::Pb);
+            enc.encode_decision(table.as_usize(), off + b as usize, bin);
+        } else {
+            enc.encode_bypass(bin);
+        }
+    }
+}
+
 /// Signed `abs_mvd` + `mvd_sign_flag` write — the dual of the decoder's
 /// `decode_signed_mvd` (EG0 bin0 regular on Table 73 under cm_init,
 /// all-bypass otherwise; sign bypass when non-zero).
@@ -1086,9 +1685,54 @@ fn emit_signed_mvd(enc: &mut CabacEncoder, sel: CtxSel, v: i32) {
     }
 }
 
+/// One list's explicit motion syntax: `ref_idx_lX` (when present),
+/// `mvp_idx_lX`, `abs_mvd_lX` + signs.
+fn emit_list_pred(enc: &mut CabacEncoder, sel: CtxSel, lp: &ListPred, n_refs: u32) {
+    emit_ref_idx(enc, sel, lp.ref_idx, n_refs);
+    emit_mvp_idx(enc, sel, lp.mvp_idx);
+    emit_signed_mvd(enc, sel, lp.mvd.x);
+    emit_signed_mvd(enc, sel, lp.mvd.y);
+}
+
+/// The inter `transform_unit()` presence + body: `cbf_all`, then
+/// `cbf_cb` / `cbf_cr` / (presence-gated) `cbf_luma` and the residuals.
+fn emit_inter_residual(
+    enc: &mut CabacEncoder,
+    sel: CtxSel,
+    res: &Residual,
+    log2_w: u32,
+    log2_h: u32,
+) {
+    let any = res.any();
+    let (t, i) = sel.ctx(MainCtxTable::CbfAll, 0);
+    enc.encode_decision(t, i, u8::from(any)); // cbf_all
+    if any {
+        let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+        enc.encode_decision(t, i, u8::from(res.cbf_cb));
+        let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+        enc.encode_decision(t, i, u8::from(res.cbf_cr));
+        if res.cbf_cb || res.cbf_cr {
+            let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+            enc.encode_decision(t, i, u8::from(res.cbf_y));
+        } else {
+            debug_assert!(res.cbf_y, "quiet chroma infers cbf_luma = 1 (§7.4.9.5)");
+        }
+        if res.cbf_y {
+            emit_residual_rle(enc, sel, 0, &res.levels_y, log2_w, log2_h);
+        }
+        if res.cbf_cb {
+            emit_residual_rle(enc, sel, 1, &res.levels_cb, log2_w - 1, log2_h - 1);
+        }
+        if res.cbf_cr {
+            emit_residual_rle(enc, sel, 2, &res.levels_cr, log2_w - 1, log2_h - 1);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_leaf(
     enc: &mut CabacEncoder,
+    stats: &mut PEncStats,
     ctx: &PCtx<'_>,
     sel: CtxSel,
     grid: &mut SideInfoGrid,
@@ -1099,90 +1743,89 @@ fn emit_leaf(
     plan: &PLeaf,
 ) {
     let (w, h) = (1u32 << log2_w, 1u32 << log2_h);
-    let stamp_inter = |grid: &mut SideInfoGrid, mv: MotionVector, cbf_y: bool| {
+    let is_b = ctx.slice_is_b;
+    let stamp_inter = |grid: &mut SideInfoGrid, l0: ListMotion, l1: ListMotion, cbf_y: bool| {
         grid.stamp_block(
             x0,
             y0,
             w,
             h,
-            CuSideInfo {
-                pred_mode: CuPredMode::Inter,
-                cbf_luma: u8::from(cbf_y),
-                mv_l0_x: mv.x,
-                mv_l0_y: mv.y,
-                ref_idx_l0: 0,
-                ref_idx_l1: -1,
-                cu_x0: x0 as u16,
-                cu_y0: y0 as u16,
-                cu_log2_w: log2_w as u8,
-                cu_log2_h: log2_h as u8,
-                qp_y: ctx.qp.clamp(0, 51) as u8,
-                ..Default::default()
-            },
+            inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, ctx.qp),
         );
     };
+    stats.leaves += 1;
     match plan {
         PLeaf::Skip { mvp_idx, mv } => {
+            stats.skip_cus += 1;
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 1); // cu_skip_flag = 1
-            emit_mvp_idx(enc, sel, *mvp_idx);
+            emit_mvp_idx(enc, sel, mvp_idx[0]);
+            if is_b {
+                emit_mvp_idx(enc, sel, mvp_idx[1]);
+            }
             // No residual syntax (§7.3.8.4).
-            stamp_inter(grid, *mv, false);
+            let l1 = if is_b { Some((0, mv[1])) } else { None };
+            stamp_inter(grid, Some((0, mv[0])), l1, false);
             mark_cu_skip_cells(grid, x0, y0, w, h);
         }
-        PLeaf::Inter {
-            mvp_idx,
-            mv,
-            mvd,
-            levels_y,
-            cbf_y,
-            levels_cb,
-            cbf_cb,
-            levels_cr,
-            cbf_cr,
-        } => {
+        PLeaf::Direct { mv, res } => {
+            stats.inter_cus += 1;
+            stats.direct_cus += 1;
+            if !res.any() {
+                stats.cbf_all_zero_cus += 1;
+            }
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 0); // cu_skip_flag = 0
             let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 0); // pred_mode_flag = 0 (MODE_INTER)
-            emit_mvp_idx(enc, sel, *mvp_idx);
-            emit_signed_mvd(enc, sel, mvd.x);
-            emit_signed_mvd(enc, sel, mvd.y);
-            let any = *cbf_y || *cbf_cb || *cbf_cr;
-            let (t, i) = sel.ctx(MainCtxTable::CbfAll, 0);
-            enc.encode_decision(t, i, u8::from(any)); // cbf_all
-            if any {
-                let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
-                enc.encode_decision(t, i, u8::from(*cbf_cb));
-                let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
-                enc.encode_decision(t, i, u8::from(*cbf_cr));
-                if *cbf_cb || *cbf_cr {
-                    let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-                    enc.encode_decision(t, i, u8::from(*cbf_y));
-                } else {
-                    debug_assert!(*cbf_y, "quiet chroma infers cbf_luma = 1 (§7.4.9.5)");
-                }
-                if *cbf_y {
-                    emit_residual_rle(enc, sel, 0, levels_y, log2_w, log2_h);
-                }
-                if *cbf_cb {
-                    emit_residual_rle(enc, sel, 1, levels_cb, log2_w - 1, log2_h - 1);
-                }
-                if *cbf_cr {
-                    emit_residual_rle(enc, sel, 2, levels_cr, log2_w - 1, log2_h - 1);
-                }
-            }
-            stamp_inter(grid, *mv, *cbf_y);
+            let (t, i) = sel.ctx(MainCtxTable::DirectModeFlag, 0);
+            enc.encode_decision(t, i, 1); // direct_mode_flag = 1
+            emit_inter_residual(enc, sel, res, log2_w, log2_h);
+            stamp_inter(grid, Some((0, mv[0])), Some((0, mv[1])), res.cbf_y);
         }
-        PLeaf::Intra {
-            mode_idx,
-            levels_y,
-            cbf_y,
-            levels_cb,
-            cbf_cb,
-            levels_cr,
-            cbf_cr,
-        } => {
+        PLeaf::Inter { l0, l1, res } => {
+            stats.inter_cus += 1;
+            if !res.any() {
+                stats.cbf_all_zero_cus += 1;
+            }
+            match (l0, l1) {
+                (Some(_), Some(_)) => stats.bi_cus += 1,
+                (None, Some(_)) => stats.l1_only_cus += 1,
+                _ => {}
+            }
+            if l0.is_some_and(|p| p.ref_idx > 0) || l1.is_some_and(|p| p.ref_idx > 0) {
+                stats.multi_ref_cus += 1;
+            }
+            let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
+            enc.encode_decision(t, i, 0); // cu_skip_flag = 0
+            let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
+            enc.encode_decision(t, i, 0); // pred_mode_flag = 0 (MODE_INTER)
+            if is_b {
+                let (t, i) = sel.ctx(MainCtxTable::DirectModeFlag, 0);
+                enc.encode_decision(t, i, 0); // direct_mode_flag = 0
+                let idc = match (l0.is_some(), l1.is_some()) {
+                    (true, false) => 0,
+                    (false, true) => 1,
+                    _ => 2,
+                };
+                emit_inter_pred_idc(enc, sel, idc);
+            }
+            if let Some(lp) = l0 {
+                emit_list_pred(enc, sel, lp, ctx.n_refs(0));
+            }
+            if let Some(lp) = l1 {
+                emit_list_pred(enc, sel, lp, ctx.n_refs(1));
+            }
+            emit_inter_residual(enc, sel, res, log2_w, log2_h);
+            stamp_inter(
+                grid,
+                l0.map(|p| (p.ref_idx, p.mv)),
+                l1.map(|p| (p.ref_idx, p.mv)),
+                res.cbf_y,
+            );
+        }
+        PLeaf::Intra { mode_idx, res } => {
+            stats.intra_cus += 1;
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 0); // cu_skip_flag = 0
             let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
@@ -1200,19 +1843,19 @@ fn emit_leaf(
             // Single-tree intra TU: cbf_cb, cbf_cr, then cbf_luma
             // (always present — MODE_INTRA), then luma/cb/cr residuals.
             let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
-            enc.encode_decision(t, i, u8::from(*cbf_cb));
+            enc.encode_decision(t, i, u8::from(res.cbf_cb));
             let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
-            enc.encode_decision(t, i, u8::from(*cbf_cr));
+            enc.encode_decision(t, i, u8::from(res.cbf_cr));
             let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-            enc.encode_decision(t, i, u8::from(*cbf_y));
-            if *cbf_y {
-                emit_residual_rle(enc, sel, 0, levels_y, log2_w, log2_h);
+            enc.encode_decision(t, i, u8::from(res.cbf_y));
+            if res.cbf_y {
+                emit_residual_rle(enc, sel, 0, &res.levels_y, log2_w, log2_h);
             }
-            if *cbf_cb {
-                emit_residual_rle(enc, sel, 1, levels_cb, log2_w - 1, log2_h - 1);
+            if res.cbf_cb {
+                emit_residual_rle(enc, sel, 1, &res.levels_cb, log2_w - 1, log2_h - 1);
             }
-            if *cbf_cr {
-                emit_residual_rle(enc, sel, 2, levels_cr, log2_w - 1, log2_h - 1);
+            if res.cbf_cr {
+                emit_residual_rle(enc, sel, 2, &res.levels_cr, log2_w - 1, log2_h - 1);
             }
             grid.stamp_block(
                 x0,
@@ -1221,7 +1864,7 @@ fn emit_leaf(
                 h,
                 CuSideInfo {
                     pred_mode: CuPredMode::Intra,
-                    cbf_luma: u8::from(*cbf_y),
+                    cbf_luma: u8::from(res.cbf_y),
                     cu_x0: x0 as u16,
                     cu_y0: y0 as u16,
                     cu_log2_w: log2_w as u8,
@@ -1259,23 +1902,14 @@ mod tests {
     }
 
     fn ref_view(p: &YuvPicture) -> RefPictureView<'_> {
-        RefPictureView {
-            y: &p.y,
-            cb: &p.cb,
-            cr: &p.cr,
-            width: p.width,
-            height: p.height,
-            y_stride: p.y_stride(),
-            c_stride: p.c_stride(),
-            chroma_format_idc: p.chroma_format_idc,
-        }
+        view_of(p)
     }
 
     /// Deterministic pseudo-natural frame `t` of a moving-scene GOP:
     /// a diagonal gradient plus a bright square translating (3, 2)
     /// pixels per frame and a noise band, so P frames exercise real
     /// motion (skip / non-zero-MV inter / intra refresh all appear).
-    fn synth_moving(w: u32, h: u32, t: u32, bit_depth: u32) -> YuvPicture {
+    pub(crate) fn synth_moving(w: u32, h: u32, t: u32, bit_depth: u32) -> YuvPicture {
         let mut pic = YuvPicture::new(w, h, 1, bit_depth).unwrap();
         let scale = 1u32 << (bit_depth - 8);
         let mut s = 0x1234_5678u32 ^ (t * 0x9E37);
@@ -1307,6 +1941,7 @@ mod tests {
         pic
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_p(
         payload: &[u8],
         refp: &YuvPicture,
@@ -1336,6 +1971,61 @@ mod tests {
             col_pic: None,
         };
         decode_baseline_inter_slice(payload, inputs).expect("p slice must decode")
+    }
+
+    /// Decode a payload against explicit reference lists (the decoder's
+    /// own §7.3.8 walker with the lists a DPB would resolve).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_lists(
+        payload: &[u8],
+        refs_l0: &[RefEntry<'_>],
+        refs_l1: &[RefEntry<'_>],
+        slice_is_b: bool,
+        curr_poc: i32,
+        col: Option<ColMotion<'_>>,
+        w: u32,
+        h: u32,
+        qp: i32,
+        deblock: bool,
+        cm_init: bool,
+    ) -> (YuvPicture, crate::slice_data::InterDecodeStats) {
+        let v0: Vec<RefPictureView<'_>> = refs_l0.iter().map(|r| ref_view(r.pic)).collect();
+        let v1: Vec<RefPictureView<'_>> = refs_l1.iter().map(|r| ref_view(r.pic)).collect();
+        let p0: Vec<i32> = refs_l0.iter().map(|r| r.poc).collect();
+        let p1: Vec<i32> = refs_l1.iter().map(|r| r.poc).collect();
+        let bd = refs_l0[0].pic.bit_depth;
+        let inputs = InterDecodeInputs {
+            walk: walk_inputs(w, h, cm_init),
+            decode: SliceDecodeInputs {
+                slice_qp: qp,
+                bit_depth_luma: bd,
+                bit_depth_chroma: bd,
+                enable_deblock: deblock,
+                ..Default::default()
+            },
+            slice_is_b,
+            num_ref_idx_active_minus1_l0: refs_l0.len() as u32 - 1,
+            num_ref_idx_active_minus1_l1: if slice_is_b {
+                refs_l1.len() as u32 - 1
+            } else {
+                0
+            },
+            ref_list_l0: &v0,
+            ref_list_l1: &v1,
+            inter_tool_gates: Default::default(),
+            pocs: InterPocs {
+                curr_poc,
+                ref_pocs_l0: &p0,
+                ref_pocs_l1: &p1,
+            },
+            col_pic: col.map(|c| ColPicInputs {
+                grid: c.grid,
+                col_poc: c.poc,
+                ref_pocs_l0: c.ref_pocs_l0,
+                ref_pocs_l1: &[],
+            }),
+        };
+        decode_baseline_inter_slice(payload, inputs).expect("inter slice must decode")
     }
 
     /// THE core pin: a whole GOP (IDR + 4 P) must run the
@@ -1627,5 +2317,364 @@ mod tests {
         assert!(encode_p_slice_data(&src, &refp, 52, false, false).is_err());
         let small_ref = YuvPicture::new(32, 32, 1, 8).unwrap();
         assert!(encode_p_slice_data(&src, &small_ref, 30, false, false).is_err());
+        // An empty list, or a B slice without list 1, is refused.
+        let bad = encode_inter_slice_data(
+            &src,
+            InterEncInputs {
+                refs_l0: &[],
+                refs_l1: &[],
+                slice_is_b: false,
+                curr_poc: 1,
+                col: None,
+                slice_qp: 30,
+                deblock: false,
+                cm_init: true,
+            },
+        );
+        assert!(bad.is_err());
+        let refs = [RefEntry { pic: &refp, poc: 0 }];
+        let bad_b = encode_inter_slice_data(
+            &src,
+            InterEncInputs {
+                refs_l0: &refs,
+                refs_l1: &[],
+                slice_is_b: true,
+                curr_poc: 1,
+                col: None,
+                slice_qp: 30,
+                deblock: false,
+                cm_init: true,
+            },
+        );
+        assert!(bad_b.is_err());
+    }
+
+    /// Round 452 — **multi-reference P**: a two-picture `RefPicList0`
+    /// (POC 1 then POC 0 — the §8.3.2.2 descending order). The ladder
+    /// must address `ref_idx_l0 = 1` where the older picture predicts
+    /// better, the `ref_idx` TR bins must replay through the decoder,
+    /// and the loop stays recon-exact on both entropy shapes.
+    #[test]
+    fn multi_ref_p_uses_older_reference_and_round_trips() {
+        let (w, h) = (64u32, 64u32);
+        let qp = 28;
+        // Frame 2 is a copy of frame 0 (the older reference), so the
+        // best predictor of most CUs is ref_idx 1.
+        let f0 = synth_moving(w, h, 0, 8);
+        let f1 = synth_moving(w, h, 5, 8);
+        let f2 = synth_moving(w, h, 0, 8);
+        for &cm_init in &[false, true] {
+            let (_ip, r0, _s) =
+                crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, false, cm_init).unwrap();
+            let (_pp, r1, _s) = encode_p_slice_data(&f1, &r0, qp, false, cm_init).unwrap();
+            let refs = [RefEntry { pic: &r1, poc: 1 }, RefEntry { pic: &r0, poc: 0 }];
+            let out = encode_inter_slice_data(
+                &f2,
+                InterEncInputs {
+                    refs_l0: &refs,
+                    refs_l1: &[],
+                    slice_is_b: false,
+                    curr_poc: 2,
+                    col: None,
+                    slice_qp: qp,
+                    deblock: false,
+                    cm_init,
+                },
+            )
+            .unwrap();
+            assert!(
+                out.stats.multi_ref_cus > 0,
+                "cm{cm_init}: the older reference must be addressed: {:?}",
+                out.stats
+            );
+            let (dec, dec_stats) = decode_lists(
+                &out.payload,
+                &refs,
+                &[],
+                false,
+                2,
+                None,
+                w,
+                h,
+                qp,
+                false,
+                cm_init,
+            );
+            assert!(
+                dec_stats.ref_idx_bins > 0,
+                "ref_idx syntax reached the decoder"
+            );
+            assert_eq!(dec.y, out.recon.y, "cm{cm_init}: luma");
+            assert_eq!(dec.cb, out.recon.cb, "cm{cm_init}: cb");
+            assert_eq!(dec.cr, out.recon.cr, "cm{cm_init}: cr");
+            // The two-reference encode must not lose to the
+            // single-reference one on this content.
+            let (single, _, _) = encode_p_slice_data(&f2, &r1, qp, false, cm_init).unwrap();
+            assert!(
+                out.payload.len() < single.len(),
+                "cm{cm_init}: two refs {} vs one ref {}",
+                out.payload.len(),
+                single.len()
+            );
+        }
+    }
+
+    /// Round 452 — **low-delay B**: both lists resolve to the same
+    /// descending past (§8.3.2.2 with nothing above the current POC),
+    /// the collocated field is the previous P/B picture's grid. Every
+    /// B tool must appear and the loop stays recon-exact on both
+    /// entropy shapes and both deblock settings.
+    #[test]
+    fn low_delay_b_round_trips_with_every_tool() {
+        let (w, h) = (96u32, 64u32);
+        // A low QP keeps the per-frame noise in the reconstructions
+        // (it would quantize away at QP 30, leaving skip to win).
+        let qp = 14;
+        // Independent per-frame noise on top of the moving scene: the
+        // eq. 988 average of two past pictures halves the noise
+        // variance, which is what makes explicit bi-prediction win
+        // leaves against uni-prediction on a low-delay B picture.
+        let synth_noisy = |t: u32| -> YuvPicture {
+            let mut pic = synth_moving(w, h, t, 8);
+            let mut s = 0x2545_F491u32 ^ t.wrapping_mul(0x9E37_79B9);
+            for v in pic.y.iter_mut() {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = ((s >> 24) % 13) as i32 - 6;
+                *v = (*v as i32 + n).clamp(0, 255) as u16;
+            }
+            pic
+        };
+        for &cm_init in &[false, true] {
+            for &deblock in &[false, true] {
+                let f0 = synth_noisy(0);
+                let (_ip, r0, _s) =
+                    crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, deblock, cm_init)
+                        .unwrap();
+                let f1 = synth_noisy(1);
+                let (_pp, r1, _s) = encode_p_slice_data(&f1, &r0, qp, deblock, cm_init).unwrap();
+                // The P picture's motion field must come from the same
+                // encoder path — re-run through the general entry to
+                // capture the grid (identical payload).
+                let refs1 = [RefEntry { pic: &r0, poc: 0 }];
+                let p_out = encode_inter_slice_data(
+                    &f1,
+                    InterEncInputs {
+                        refs_l0: &refs1,
+                        refs_l1: &[],
+                        slice_is_b: false,
+                        curr_poc: 1,
+                        col: None,
+                        slice_qp: qp,
+                        deblock,
+                        cm_init,
+                    },
+                )
+                .unwrap();
+                assert_eq!(p_out.recon.y, r1.y);
+                let mut totals = PEncStats::default();
+                let mut dpb: Vec<(YuvPicture, SideInfoGrid, i32, Vec<i32>)> = vec![
+                    (r0.clone(), SideInfoGrid::new(w, h), 0, vec![]),
+                    (r1.clone(), p_out.side_info, 1, vec![0]),
+                ];
+                for t in 2..=4u32 {
+                    let src = synth_noisy(t);
+                    let curr_poc = t as i32;
+                    // §8.3.2.2 low-delay: L0 = L1 = descending POCs.
+                    let mut order: Vec<usize> = (0..dpb.len()).collect();
+                    order.sort_by_key(|&i| -dpb[i].2);
+                    let refs: Vec<RefEntry<'_>> = order
+                        .iter()
+                        .take(2)
+                        .map(|&i| RefEntry {
+                            pic: &dpb[i].0,
+                            poc: dpb[i].2,
+                        })
+                        .collect();
+                    let col_i = order[0];
+                    let col = ColMotion {
+                        grid: &dpb[col_i].1,
+                        poc: dpb[col_i].2,
+                        ref_pocs_l0: &dpb[col_i].3,
+                    };
+                    let out = encode_inter_slice_data(
+                        &src,
+                        InterEncInputs {
+                            refs_l0: &refs,
+                            refs_l1: &refs,
+                            slice_is_b: true,
+                            curr_poc,
+                            col: Some(col),
+                            slice_qp: qp,
+                            deblock,
+                            cm_init,
+                        },
+                    )
+                    .unwrap();
+                    let (dec, dec_stats) = decode_lists(
+                        &out.payload,
+                        &refs,
+                        &refs,
+                        true,
+                        curr_poc,
+                        Some(col),
+                        w,
+                        h,
+                        qp,
+                        deblock,
+                        cm_init,
+                    );
+                    assert_eq!(dec.y, out.recon.y, "t{t} cm{cm_init} db{deblock}: luma");
+                    assert_eq!(dec.cb, out.recon.cb, "t{t} cm{cm_init} db{deblock}: cb");
+                    assert_eq!(dec.cr, out.recon.cr, "t{t} cm{cm_init} db{deblock}: cr");
+                    assert_eq!(dec_stats.direct_cus, out.stats.direct_cus);
+                    assert_eq!(
+                        dec_stats.bi_pred_cus > 0,
+                        out.stats.bi_cus + out.stats.direct_cus + out.stats.skip_cus > 0
+                    );
+                    let s = out.stats;
+                    totals.skip_cus += s.skip_cus;
+                    totals.direct_cus += s.direct_cus;
+                    totals.bi_cus += s.bi_cus;
+                    totals.l1_only_cus += s.l1_only_cus;
+                    totals.multi_ref_cus += s.multi_ref_cus;
+                    totals.inter_cus += s.inter_cus;
+                    let ref_pocs: Vec<i32> = refs.iter().map(|r| r.poc).collect();
+                    dpb.push((out.recon, out.side_info, curr_poc, ref_pocs));
+                }
+                assert!(
+                    totals.skip_cus > 0,
+                    "cm{cm_init} db{deblock}: B skip: {totals:?}"
+                );
+                assert!(
+                    totals.direct_cus > 0,
+                    "cm{cm_init} db{deblock}: direct: {totals:?}"
+                );
+                assert!(
+                    totals.bi_cus > 0,
+                    "cm{cm_init} db{deblock}: explicit bi: {totals:?}"
+                );
+            }
+        }
+    }
+
+    /// Round 452 — the B ladder's syntax duals are exercised one by one
+    /// through the decoder's bin tallies: `inter_pred_idc` (PRED_L1 and
+    /// PRED_BI), `direct_mode_flag`, the second skip `mvp_idx`, and
+    /// `ref_idx` on both lists.
+    #[test]
+    fn b_syntax_duals_reach_the_decoder() {
+        let (w, h) = (64u32, 48u32);
+        let qp = 34;
+        let f0 = synth_moving(w, h, 0, 8);
+        let (_ip, r0, _s) =
+            crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, false, true).unwrap();
+        let f1 = synth_moving(w, h, 2, 8);
+        let refs1 = [RefEntry { pic: &r0, poc: 0 }];
+        let p1 = encode_inter_slice_data(
+            &f1,
+            InterEncInputs {
+                refs_l0: &refs1,
+                refs_l1: &[],
+                slice_is_b: false,
+                curr_poc: 1,
+                col: None,
+                slice_qp: qp,
+                deblock: false,
+                cm_init: true,
+            },
+        )
+        .unwrap();
+        // Frame 2 shares content with both references.
+        let f2 = synth_moving(w, h, 1, 8);
+        let refs = [
+            RefEntry {
+                pic: &p1.recon,
+                poc: 1,
+            },
+            RefEntry { pic: &r0, poc: 0 },
+        ];
+        let col = ColMotion {
+            grid: &p1.side_info,
+            poc: 1,
+            ref_pocs_l0: &[0],
+        };
+        let out = encode_inter_slice_data(
+            &f2,
+            InterEncInputs {
+                refs_l0: &refs,
+                refs_l1: &refs,
+                slice_is_b: true,
+                curr_poc: 2,
+                col: Some(col),
+                slice_qp: qp,
+                deblock: false,
+                cm_init: true,
+            },
+        )
+        .unwrap();
+        let (dec, st) = decode_lists(
+            &out.payload,
+            &refs,
+            &refs,
+            true,
+            2,
+            Some(col),
+            w,
+            h,
+            qp,
+            false,
+            true,
+        );
+        assert_eq!(dec.y, out.recon.y);
+        assert_eq!(dec.cb, out.recon.cb);
+        assert_eq!(dec.cr, out.recon.cr);
+        assert_eq!(
+            st.direct_mode_flag_bins, out.stats.inter_cus,
+            "one direct flag per non-skip inter CU"
+        );
+        assert_eq!(st.direct_cus, out.stats.direct_cus);
+        assert_eq!(
+            st.inter_pred_idc_bins,
+            out.stats.inter_cus - out.stats.direct_cus,
+            "inter_pred_idc on every explicit CU"
+        );
+        assert_eq!(
+            st.bi_pred_cus,
+            out.stats.bi_cus + out.stats.direct_cus + out.stats.skip_cus
+        );
+        assert!(st.ref_idx_bins > 0);
+        assert!(
+            st.mvp_idx_bins >= 2 * out.stats.skip_cus,
+            "two skip mvp indices"
+        );
+    }
+
+    /// Determinism of the B pipeline.
+    #[test]
+    fn b_encode_is_deterministic() {
+        let (w, h) = (48u32, 48u32);
+        let f0 = synth_moving(w, h, 0, 8);
+        let (_ip, r0, _s) =
+            crate::slice_enc::encode_idr_slice_data_opts(&f0, 33, false, true).unwrap();
+        let f1 = synth_moving(w, h, 3, 8);
+        let refs = [RefEntry { pic: &r0, poc: 0 }];
+        let run = || {
+            encode_inter_slice_data(
+                &f1,
+                InterEncInputs {
+                    refs_l0: &refs,
+                    refs_l1: &refs,
+                    slice_is_b: true,
+                    curr_poc: 1,
+                    col: None,
+                    slice_qp: 33,
+                    deblock: false,
+                    cm_init: true,
+                },
+            )
+            .unwrap()
+            .payload
+        };
+        assert_eq!(run(), run());
     }
 }
