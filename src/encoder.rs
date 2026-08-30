@@ -45,6 +45,15 @@
 //!   direct mode and the two-slot skip join the ladder) instead of P
 //!   (round 452).
 //!
+//! * `bitrate` — target bit rate in bits/s (round 452): enables
+//!   frame-level rate control. Each frame's slice QP is chosen from a
+//!   per-class (IDR vs inter) `bits ≈ X · 2^(−qp/6)` complexity model,
+//!   fed back from the actual sizes, with a leaky bit-reservoir pulling
+//!   the running average toward `bitrate / fps`. The `qp` option
+//!   becomes the starting point.
+//! * `fps` — frames per second for the rate-control budget (default
+//!   30; only meaningful with `bitrate`).
+//!
 //! The encoder keeps a mirror DPB and runs the very same
 //! [`crate::ref_lists`] POC / marking / list-construction functions the
 //! decoder runs, so every `ref_idx` it writes addresses the picture the
@@ -344,6 +353,26 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
             .filter(|&g| g >= 1)
             .ok_or_else(|| Error::invalid(format!("evc encoder: gop option {s:?} not >= 1")))?,
     };
+    // Round 452: frame-level rate control.
+    let fps = match params.options.get("fps") {
+        None => 30u32,
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&f| f >= 1)
+            .ok_or_else(|| Error::invalid(format!("evc encoder: fps option {s:?} not >= 1")))?,
+    };
+    let rc = match params.options.get("bitrate") {
+        None => None,
+        Some(s) => {
+            let br = s.parse::<u64>().ok().filter(|&b| b > 0).ok_or_else(|| {
+                Error::invalid(format!(
+                    "evc encoder: bitrate option {s:?} not a positive bit/s count"
+                ))
+            })?;
+            Some(RateControl::new(br, fps, qp))
+        }
+    };
     // Round 452: reference depth (SPS max_num_tid0_ref_pics, §7.4.3.1
     // bounds it to 5).
     let refs = match params.options.get("refs") {
@@ -374,12 +403,92 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         gop,
         refs,
         b_pictures,
+        rc,
         frame_idx: 0,
         dpb: Vec::new(),
         prev_tid0_poc: 0,
         prev_doc_offset: -1,
         queue: VecDeque::new(),
     })
+}
+
+/// `2^(qp / 6)` evaluated deterministically (an exact power of two
+/// times a sixth-root-of-two constant — no transcendental call, so the
+/// rate-controlled encode is byte-identical on every platform).
+fn pow2_qp_over6(qp: i32) -> f64 {
+    const SIXTH: [f64; 6] = [
+        1.0,
+        1.122_462_048_309_373,
+        1.259_921_049_894_873_2,
+        std::f64::consts::SQRT_2,
+        1.587_401_051_968_199_4,
+        1.781_797_436_280_678_6,
+    ];
+    2f64.powi(qp.div_euclid(6)) * SIXTH[qp.rem_euclid(6) as usize]
+}
+
+/// Frame-level rate control (round 452): a per-class complexity model
+/// `bits(qp) ≈ X · 2^(−qp / 6)` (class 0 = IDR, class 1 = P/B), fed
+/// back from the measured access-unit sizes, plus a leaky reservoir
+/// (`debt`) that steers the per-frame bit target toward the long-run
+/// average. Everything is evaluated without transcendental calls so
+/// the chosen QPs are identical on every platform.
+struct RateControl {
+    /// `bitrate / fps` — the average bits available per frame.
+    base: f64,
+    /// Reservoir: `Σ (actual − base)` so far; an eighth of it is paid
+    /// back per frame.
+    debt: f64,
+    /// Per-class complexity `X = bits · 2^(qp / 6)` (EMA), `None`
+    /// until the class has been observed.
+    x: [Option<f64>; 2],
+    /// Per-class previous QP (rate-of-change clamp ±6).
+    prev_qp: [i32; 2],
+    /// The `qp` option — the first frame of each class runs on it.
+    init_qp: i32,
+}
+
+impl RateControl {
+    fn new(bitrate: u64, fps: u32, init_qp: i32) -> Self {
+        Self {
+            base: bitrate as f64 / fps.max(1) as f64,
+            debt: 0.0,
+            x: [None, None],
+            prev_qp: [init_qp, init_qp],
+            init_qp,
+        }
+    }
+
+    /// The QP for the next frame of `class`: the smallest QP whose
+    /// predicted size fits the reservoir-adjusted per-frame target,
+    /// clamped to ±6 of the class's previous QP.
+    fn pick_qp(&self, class: usize) -> i32 {
+        let Some(x) = self.x[class] else {
+            return self.init_qp;
+        };
+        let target = (self.base - self.debt / 8.0).clamp(self.base / 8.0, self.base * 8.0);
+        let mut qp = 51;
+        for q in 0..=51 {
+            if x / pow2_qp_over6(q) <= target {
+                qp = q;
+                break;
+            }
+        }
+        qp.clamp(self.prev_qp[class] - 6, self.prev_qp[class] + 6)
+            .clamp(0, 51)
+    }
+
+    /// Feed back one encoded frame: actual access-unit size + the QP
+    /// it ran at.
+    fn update(&mut self, class: usize, qp: i32, bits: f64) {
+        let x_new = bits * pow2_qp_over6(qp);
+        self.x[class] = Some(match self.x[class] {
+            Some(x) => (3.0 * x + x_new) / 4.0,
+            None => x_new,
+        });
+        self.prev_qp[class] = qp;
+        self.debt += bits - self.base;
+    }
 }
 
 /// A picture in the encoder's mirror DPB — what the decoder holds for
@@ -423,6 +532,9 @@ pub struct EvcEncoder {
     refs: u32,
     /// Non-key pictures are low-delay B slices.
     b_pictures: bool,
+    /// Frame-level rate control (the `bitrate` option); `None` = the
+    /// historical constant-QP shape.
+    rc: Option<RateControl>,
     frame_idx: u64,
     /// The mirror DPB: every reconstruction still marked "used for
     /// reference" by the §8.3.3.2 walk, exactly as the decoder's.
@@ -444,7 +556,7 @@ impl EvcEncoder {
     /// Encode one non-key picture against the mirror DPB: the §8.3.3.2
     /// marking, the §8.3.2.2 lists, the P/B slice encode, the header,
     /// and the DPB update — every step the decoder repeats on its side.
-    fn encode_inter_picture(&mut self, src: &YuvPicture) -> Result<Vec<u8>> {
+    fn encode_inter_picture(&mut self, src: &YuvPicture, frame_qp: i32) -> Result<Vec<u8>> {
         let (poc, doc_offset) =
             derive_poc_pocs_flag0(self.prev_tid0_poc, self.prev_doc_offset, 0, 1);
         // §8.3.3.2 (TemporalId 0, log2_sub_gop_length 0, RefPicGapLength 1).
@@ -512,7 +624,7 @@ impl EvcEncoder {
                 slice_is_b: is_b,
                 curr_poc: poc,
                 col,
-                slice_qp: self.qp,
+                slice_qp: frame_qp,
                 deblock: self.deblock,
                 cm_init: self.cm_init,
             },
@@ -520,7 +632,7 @@ impl EvcEncoder {
         let mut slice_rbsp = write_inter_slice_header(
             is_b,
             [refs_l0.len() as u32, refs_l1.len() as u32],
-            self.qp as u32,
+            frame_qp as u32,
             self.deblock,
         )?;
         slice_rbsp.extend_from_slice(&out.payload);
@@ -561,10 +673,15 @@ impl Encoder for EvcEncoder {
             self.bit_depth,
         )?;
         let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
+        let class = usize::from(!is_idr);
+        let frame_qp = match &self.rc {
+            Some(rc) => rc.pick_qp(class),
+            None => self.qp,
+        };
         let data = if is_idr {
             let (data, recon, _stats) = encode_idr_au_coded(
                 &src,
-                self.qp,
+                frame_qp,
                 self.deblock,
                 self.cm_init,
                 self.refs,
@@ -582,8 +699,11 @@ impl Encoder for EvcEncoder {
             self.prev_doc_offset = -1;
             data
         } else {
-            self.encode_inter_picture(&src)?
+            self.encode_inter_picture(&src, frame_qp)?
         };
+        if let Some(rc) = &mut self.rc {
+            rc.update(class, frame_qp, data.len() as f64 * 8.0);
+        }
         self.frame_idx += 1;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
         pkt.pts = v.pts;
@@ -1332,6 +1452,84 @@ mod tests {
         let mut bad_b = params(w, h);
         bad_b.options.insert("b", "later");
         assert!(make_encoder(&bad_b).is_err());
+    }
+
+    /// Round 452 — **frame-level rate control**: with `bitrate` the
+    /// per-frame QP walks toward the budget. Pins: the long-run rate
+    /// lands within ±20 % of the target once the model has one GOP of
+    /// feedback, a doubled bitrate spends more bits and reconstructs
+    /// closer to the source, and the QP sequence is deterministic.
+    #[test]
+    fn rate_control_converges_to_target() {
+        let (w, h) = (96u32, 64u32);
+        let fps = 30u64;
+        let frames = 24usize;
+        let run = |bitrate: u64| -> (usize, f64) {
+            let mut p = params(w, h);
+            p.options.insert("gop", "8");
+            p.options.insert("refs", "2");
+            let bs = bitrate.to_string();
+            p.options.insert("bitrate", Box::leak(bs.into_boxed_str()));
+            let mut enc = make_evc_encoder(&p).unwrap();
+            let mut total = 0usize;
+            let mut sse = 0f64;
+            for t in 0..frames {
+                let mut f = synth_frame(w as usize, h as usize);
+                let mut s = 0x1357_9BDFu32 ^ (t as u32).wrapping_mul(0x9E37_79B9);
+                for (i, v) in f.planes[0].data.iter_mut().enumerate() {
+                    let bx = 6 + 2 * (t % 8);
+                    if (i % w as usize) >= bx && (i % w as usize) < bx + 12 {
+                        *v = v.wrapping_add(60);
+                    }
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *v = (*v as i32 + ((s >> 24) % 7) as i32 - 3).clamp(0, 255) as u8;
+                }
+                f.pts = Some(t as i64);
+                let src = video_frame_to_picture(&f, w, h, w, h, 8).unwrap();
+                enc.send_frame(&Frame::Video(f)).unwrap();
+                let pkt = enc.receive_packet().unwrap();
+                total += pkt.data.len();
+                let recon = enc.last_recon().unwrap();
+                sse += src
+                    .y
+                    .iter()
+                    .zip(recon.y.iter())
+                    .map(|(&a, &b)| {
+                        let d = a as f64 - b as f64;
+                        d * d
+                    })
+                    .sum::<f64>();
+            }
+            let mse = sse / (frames as f64 * (w * h) as f64);
+            let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+            (total, psnr)
+        };
+        for &bitrate in &[300_000u64, 600_000] {
+            let (total, psnr) = run(bitrate);
+            let achieved = total as u64 * 8 * fps / frames as u64;
+            eprintln!(
+                "rc target {bitrate} b/s: achieved {achieved} b/s ({total} bytes / {frames} frames), luma {psnr:.2} dB"
+            );
+            assert!(
+                achieved as f64 >= bitrate as f64 * 0.8 && achieved as f64 <= bitrate as f64 * 1.2,
+                "achieved {achieved} b/s vs target {bitrate} b/s"
+            );
+        }
+        let (lo_total, lo_psnr) = run(300_000);
+        let (hi_total, hi_psnr) = run(600_000);
+        assert!(
+            hi_total > lo_total,
+            "double the budget must spend more bits"
+        );
+        assert!(hi_psnr > lo_psnr, "and reconstruct closer to the source");
+        // Determinism of the whole rate-controlled session.
+        assert_eq!(run(300_000).0, lo_total);
+        let mut bad = params(w, h);
+        bad.options.insert("bitrate", "0");
+        assert!(make_encoder(&bad).is_err());
+        let mut bad_fps = params(w, h);
+        bad_fps.options.insert("fps", "0");
+        assert!(make_encoder(&bad_fps).is_err());
     }
 
     /// Round 452 — **conformance-window cropping**: a source whose
