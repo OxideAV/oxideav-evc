@@ -5855,14 +5855,23 @@ fn decode_inter_coding_unit(
             stats.direct_mode_flag_bins += 1;
             if direct_bin != 0 {
                 stats.direct_cus += 1;
-                let (mv_l0, _mv_l1) = derive_direct_mode_mvs(inputs, x0, y0, n_cb_w, n_cb_h);
-                // §8.5.2.5 eqs. 657-664 taken literally: refIdxL0 = 0,
-                // predFlagL0 = 1 and predFlagL1 = 0 — the printed
-                // eq. 664 disables list 1 even though eqs. 674/675
-                // still derive mvL1 (flagged as a docs ambiguity; the
-                // predFlag output governs prediction here).
+                let (mv_l0, mv_l1) = derive_direct_mode_mvs(
+                    &inputs.pocs,
+                    inputs.col_pic.as_ref(),
+                    x0,
+                    y0,
+                    n_cb_w,
+                    n_cb_h,
+                );
+                // §8.5.2.5 eqs. 657-664 with the errata #313 reading:
+                // refIdxL0 = refIdxL1 = 0, predFlagL0 = predFlagL1 = 1 —
+                // the printed eq. 664 `predFlagL1 = 0` is a typo for 1
+                // (the refIdx/predFlag pairing invariant, and eqs.
+                // 674/675 deriving mvL1 unconditionally), so a direct
+                // CU is bi-predicted from RefPicList0[ 0 ] and
+                // RefPicList1[ 0 ] through eq. 988.
                 pred_l0 = Some((mv_l0, 0u32));
-                pred_l1 = None;
+                pred_l1 = Some((mv_l1, 0u32));
                 decode_inter_cu_residual_and_reconstruct(
                     eng,
                     pic,
@@ -6052,23 +6061,24 @@ fn decode_inter_coding_unit(
 /// covering cell carries no list-0 motion — `mvTemp` degrades to zero,
 /// which collapses eqs. 672-675 to the zero vectors of the
 /// `diffPocDeNorm == 0` branch.
-fn derive_direct_mode_mvs(
-    inputs: &InterDecodeInputs<'_, '_>,
+pub(crate) fn derive_direct_mode_mvs(
+    pocs: &InterPocs<'_>,
+    col_pic: Option<&ColPicInputs<'_>>,
     x0: u32,
     y0: u32,
     n_cb_w: u32,
     n_cb_h: u32,
 ) -> (MotionVector, MotionVector) {
     let zero = (MotionVector::default(), MotionVector::default());
-    let Some(&temp_poc) = inputs.pocs.ref_pocs_l1.first() else {
+    let Some(&temp_poc) = pocs.ref_pocs_l1.first() else {
         return zero;
     };
-    let Some(&ref0_l0_poc) = inputs.pocs.ref_pocs_l0.first() else {
+    let Some(&ref0_l0_poc) = pocs.ref_pocs_l0.first() else {
         return zero;
     };
     let mut mv_temp = MotionVector::default();
     let mut diff_poc_denorm = 0i32;
-    if let Some(col) = inputs.col_pic.as_ref() {
+    if let Some(col) = col_pic {
         if col.col_poc == temp_poc {
             let xc = ((x0 + n_cb_w - 1) >> 2) as usize;
             let yc = ((y0 + n_cb_h - 1) >> 2) as usize;
@@ -6094,8 +6104,8 @@ fn derive_direct_mode_mvs(
         return zero;
     }
     // eqs. 666/667.
-    let diff_poc_norm_l0 = inputs.pocs.curr_poc - ref0_l0_poc;
-    let diff_poc_norm_l1 = temp_poc - inputs.pocs.curr_poc;
+    let diff_poc_norm_l0 = pocs.curr_poc - ref0_l0_poc;
+    let diff_poc_norm_l1 = temp_poc - pocs.curr_poc;
     // eqs. 672-675 (§5 division truncates toward zero — Rust `/`).
     let mv_l0 = MotionVector {
         x: diff_poc_norm_l0 * mv_temp.x / diff_poc_denorm,
@@ -9382,9 +9392,8 @@ mod tests {
     /// no usable TempPic motion → the zero-vector branch), reads none
     /// of the explicit inter_pred_idc/mvp/mvd body, and the CU signals
     /// `cbf_all = 0` (merge_mode_flag stays inferred 0). Prediction is
-    /// list-0-only per the eq. 657-664 output (`predFlagL1 = 0` taken
-    /// literally — the printed eq. 664 disables L1 even though eqs.
-    /// 674/675 derive mvL1; flagged as a docs ambiguity).
+    /// **bi-directional** (errata #313: eq. 664 reads `predFlagL1 = 1`),
+    /// so the zero-vector branch averages L0[0] and L1[0] (eq. 988).
     #[test]
     fn round431_b_slice_direct_mode_zero_fallback() {
         use crate::cabac::CabacEncoder;
@@ -9457,8 +9466,14 @@ mod tests {
         );
         assert_eq!(stats.mvp_idx_bins, 0);
         assert_eq!(stats.abs_mvd_egk_bins, 0);
-        assert_eq!(stats.uni_pred_cus, 1, "eq. 664 literal: L0-only");
-        assert!(pic.y.iter().all(|&v| v == 90), "zero-MV copy of L0[0]");
+        assert_eq!(
+            stats.bi_pred_cus, 1,
+            "errata #313: direct mode is bi-predictive"
+        );
+        assert!(
+            pic.y.iter().all(|&v| v == (90 + 210 + 1) >> 1),
+            "eq. 988 average of the zero-MV L0[0] / L1[0] copies"
+        );
     }
 
     /// Round 431 — §8.5.2.5 POC-ratio scaling: with `ColPic ==
@@ -9555,7 +9570,16 @@ mod tests {
             (4, 2),
             "eq. 672/673: diffPocNormL0 * mvTemp / diffPocDeNorm"
         );
-        assert_eq!(cell.ref_idx_l1, -1, "predFlagL1 = 0 (eq. 664 literal)");
+        assert_eq!(
+            cell.ref_idx_l1, 0,
+            "errata #313: refIdxL1 = 0 with predFlagL1 = 1"
+        );
+        assert_eq!(
+            (cell.mv_l1_x, cell.mv_l1_y),
+            (-4, -2),
+            "eq. 674/675: −diffPocNormL1 * mvTemp / diffPocDeNorm"
+        );
+        assert_eq!(stats.bi_pred_cus, 1);
     }
 
     /// Round 431 — §7.4.9.5 cbf_luma inference on a non-split inter TU:

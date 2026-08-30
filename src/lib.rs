@@ -154,6 +154,7 @@ pub mod pps;
 #[doc(hidden)]
 pub mod quant_enc;
 #[doc(hidden)]
+pub mod ref_lists;
 pub mod rpl;
 #[doc(hidden)]
 pub mod scan;

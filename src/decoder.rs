@@ -92,13 +92,16 @@ struct DpbEntry {
     pic: YuvPicture,
     poc: i32,
     pts: Option<i64>,
-    /// `true` while the picture is still needed as a reference. Round-9
-    /// keeps every IDR + short-term ref alive until a fresh IDR flushes
-    /// the buffer. Long-term references and explicit RPL-driven
-    /// removal are deferred — the field is parked here for round-11's
-    /// sliding-window unmark step.
-    #[allow(dead_code)]
+    /// `true` while the picture is marked "used for reference". Under
+    /// `sps_rpl_flag == 0` the §8.3.3.2 marking (run before every
+    /// `TemporalId == 0` picture's list construction) clears it and the
+    /// entry leaves the buffer; under `sps_rpl_flag == 1` every entry
+    /// stays marked until the next IDR flush (explicit-RPL unmarking is
+    /// still a follow-up).
     used_for_reference: bool,
+    /// `TemporalId` of the picture — the §8.3.1 / §8.3.2.2 / §8.3.3.2
+    /// derivations gate on it.
+    temporal_id: u8,
     /// Round-10: whether this DPB entry has already been pushed to the
     /// `out` output queue. Stops `flush()` from re-emitting frames the
     /// caller has already received.
@@ -178,6 +181,11 @@ pub struct EvcDecoder {
     /// `prevPicOrderCntLsb` from §8.3.1: the POC LSB of the most
     /// recently decoded reference picture in coding order.
     prev_poc_lsb: i32,
+    /// §8.3.1 `sps_pocs_flag == 0` state: `PicOrderCntVal` of
+    /// `prevTid0Pic` and the previous picture's `DocOffset` (eq. 156:
+    /// −1 after an IDR).
+    prev_tid0_poc: i32,
+    prev_doc_offset: i32,
     /// Round-126: ALF APS cache keyed by `adaptation_parameter_set_id`
     /// (5-bit, 0..=31). A slot is `Some(data)` only when an APS NAL with
     /// `aps_params_type == 0` and that id has been parsed; replacing an
@@ -251,6 +259,8 @@ impl EvcDecoder {
             dpb: Vec::new(),
             poc_msb: 0,
             prev_poc_lsb: 0,
+            prev_tid0_poc: 0,
+            prev_doc_offset: -1,
             alf_aps: std::array::from_fn(|_| None),
             last_alf_aps_id: None,
             dra_aps: std::array::from_fn(|_| None),
@@ -369,6 +379,8 @@ impl EvcDecoder {
         self.dpb.clear();
         self.poc_msb = 0;
         self.prev_poc_lsb = 0;
+        self.prev_tid0_poc = 0;
+        self.prev_doc_offset = -1;
     }
 
     /// Compute a full POC from a slice's `slice_pic_order_cnt_lsb` per
@@ -481,6 +493,7 @@ impl Decoder for EvcDecoder {
                         poc: 0,
                         pts: packet.pts,
                         used_for_reference: true,
+                        temporal_id: nal.header.nuh_temporal_id,
                         output_emitted: false,
                         side_info: None,
                         ref_pocs_l0: Vec::new(),
@@ -516,7 +529,7 @@ impl Decoder for EvcDecoder {
                         ref_pocs_l0,
                         ref_pocs_l1,
                         tile_layout,
-                    } = self.decode_non_idr(&sps, &pps, nal.rbsp())?;
+                    } = self.decode_non_idr(&sps, &pps, nal.rbsp(), nal.header.nuh_temporal_id)?;
                     // Round-11: ALF + DRA post-filter pass. Round 113: the
                     // §7.3.8.2 per-CTU ALF map masks the §8.9 luma apply.
                     // Round 126: route ALF + DRA APS lookups through the
@@ -558,6 +571,7 @@ impl Decoder for EvcDecoder {
                         poc,
                         pts: packet.pts,
                         used_for_reference: true,
+                        temporal_id: nal.header.nuh_temporal_id,
                         output_emitted: false,
                         side_info: Some(side_info),
                         ref_pocs_l0,
@@ -695,6 +709,7 @@ impl EvcDecoder {
         sps: &Sps,
         pps: &Pps,
         slice_nal_rbsp: &[u8],
+        temporal_id: u8,
     ) -> Result<NonIdrDecodeResult> {
         // Round 384: sps_admvp_flag is lifted from the unsupported gate —
         // P/B slices route each coding unit through the §7.3.8.4
@@ -761,8 +776,22 @@ impl EvcDecoder {
                 ));
             }
         };
-        let num_ref_idx_active_minus1_l0 = header.num_ref_idx_active_minus1[0];
-        let num_ref_idx_active_minus1_l1 = header.num_ref_idx_active_minus1[1];
+        // §7.4.5: with `num_ref_idx_active_override_flag == 0`
+        // NumRefIdxActive[ i ] is the PPS default
+        // (`num_ref_idx_default_active_minus1[ i ] + 1`); a P slice
+        // infers NumRefIdxActive[ 1 ] = 0.
+        let (num_ref_idx_active_minus1_l0, num_ref_idx_active_minus1_l1) =
+            if header.num_ref_idx_active_override_flag {
+                (
+                    header.num_ref_idx_active_minus1[0],
+                    header.num_ref_idx_active_minus1[1],
+                )
+            } else {
+                (
+                    pps.num_ref_idx_default_active_minus1[0],
+                    pps.num_ref_idx_default_active_minus1[1],
+                )
+            };
         let slice_deblocking_filter_flag = header.slice_deblocking_filter_flag;
         let slice_qp = header.slice_qp;
         let slice_cb_qp_offset = header.slice_cb_qp_offset;
@@ -775,12 +804,44 @@ impl EvcDecoder {
             1
         };
         let slice_poc_lsb = header.slice_pic_order_cnt_lsb as i32;
-        let poc = if sps.sps_pocs_flag {
-            self.derive_poc(slice_poc_lsb, max_poc_lsb)
+        let sub_gop_length = 1i32 << sps.log2_sub_gop_length.min(5);
+        let (poc, doc_offset) = if sps.sps_pocs_flag {
+            (self.derive_poc(slice_poc_lsb, max_poc_lsb), 0)
         } else {
-            // No POC signalling — fall back to coding-order as POC.
-            self.dpb.iter().map(|e| e.poc).max().unwrap_or(0) + 1
+            // §8.3.1 eqs. 157-163: coding-order POC over the sub-GOP
+            // shape (`SubGopLength`, `TemporalId`, `DocOffset`).
+            crate::ref_lists::derive_poc_pocs_flag0(
+                self.prev_tid0_poc,
+                self.prev_doc_offset,
+                temporal_id,
+                sub_gop_length,
+            )
         };
+        // §8.3.3.2: under `sps_rpl_flag == 0` a `TemporalId == 0`
+        // picture re-marks the DPB before its lists are built — the
+        // pictures the eq. 169/170 walk marks "unused for reference"
+        // leave the buffer (their output already went out at insert).
+        if !sps.sps_rpl_flag && temporal_id == 0 {
+            let infos: Vec<crate::ref_lists::RefPicInfo> = self
+                .dpb
+                .iter()
+                .map(|e| crate::ref_lists::RefPicInfo {
+                    poc: e.poc,
+                    temporal_id: e.temporal_id,
+                })
+                .collect();
+            let keep = crate::ref_lists::mark_references_rpl_flag0(
+                &infos,
+                poc,
+                sps.log2_sub_gop_length,
+                1i32 << sps.log2_ref_pic_gap_length.min(5),
+                sps.max_num_tid0_ref_pics,
+            );
+            for (e, k) in self.dpb.iter_mut().zip(keep.iter()) {
+                e.used_for_reference = *k;
+            }
+            self.dpb.retain(|e| e.used_for_reference);
+        }
 
         // Round-9 reference-list construction. Per §8.3.5: for each list
         // i ∈ {0, 1}, walk the RPL entries (either inline or SPS-resident);
@@ -794,24 +855,23 @@ impl EvcDecoder {
         } else {
             0
         };
-        let pocs_l0 = if sps.sps_rpl_flag {
+        let (pocs_l0, pocs_l1) = if sps.sps_rpl_flag {
             let rpl_l0 = self.resolve_slice_rpl(&header, sps, 0)?;
-            self.build_ref_pocs(&rpl_l0, poc, n_active_l0, max_poc_lsb)?
-        } else {
-            // §8.3.5 round-9 implicit fallback: with no per-slice or
-            // SPS RPL signalling, use the highest-POC decoded picture
-            // as the single L0 entry (low-delay coding-order GOP).
-            self.implicit_ref_pocs(n_active_l0)?
-        };
-        let pocs_l1 = if slice_is_b {
-            if sps.sps_rpl_flag {
+            let l0 = self.build_ref_pocs(&rpl_l0, poc, n_active_l0, max_poc_lsb)?;
+            let l1 = if slice_is_b {
                 let rpl_l1 = self.resolve_slice_rpl(&header, sps, 1)?;
                 self.build_ref_pocs(&rpl_l1, poc, n_active_l1, max_poc_lsb)?
             } else {
-                self.implicit_ref_pocs(n_active_l1)?
-            }
+                Vec::new()
+            };
+            (l0, l1)
         } else {
-            Vec::new()
+            // §8.3.2.2: lists built from the marked DPB pictures by
+            // POC distance and TemporalId (eqs. 167/168); a list that
+            // cannot be filled shrinks NumRefIdxActive (step 3).
+            let [l0, l1] =
+                self.implicit_ref_pocs(poc, temporal_id, n_active_l0, n_active_l1, slice_is_b)?;
+            (l0, l1)
         };
 
         // Re-run the parse on a counting BitReader to discover where the
@@ -961,6 +1021,12 @@ impl EvcDecoder {
             self.poc_msb = poc - lsb;
             self.prev_poc_lsb = lsb;
         }
+        // §8.3.1 `sps_pocs_flag == 0` trackers: prevTid0Pic and the
+        // previous picture's DocOffset.
+        if temporal_id == 0 {
+            self.prev_tid0_poc = poc;
+        }
+        self.prev_doc_offset = doc_offset;
 
         Ok(NonIdrDecodeResult {
             pic,
@@ -1010,18 +1076,43 @@ impl EvcDecoder {
         })
     }
 
-    /// Implicit-RPL fallback for streams with `sps_rpl_flag == 0`:
-    /// repeat the highest-POC DPB entry `n_active` times. This matches
-    /// the low-delay coding-order GOP (one reference, no reordering)
-    /// that round-4 fixtures use.
-    fn implicit_ref_pocs(&self, n_active: usize) -> Result<Vec<i32>> {
-        let max_poc = self
+    /// §8.3.2.2 reference picture list construction for
+    /// `sps_rpl_flag == 0` streams over the DPB pictures marked "used
+    /// for reference" (the shared [`crate::ref_lists`] derivation the
+    /// encoder's mirror DPB runs too).
+    fn implicit_ref_pocs(
+        &self,
+        curr_poc: i32,
+        temporal_id: u8,
+        n_active_l0: usize,
+        n_active_l1: usize,
+        slice_is_b: bool,
+    ) -> Result<[Vec<i32>; 2]> {
+        let refs: Vec<crate::ref_lists::RefPicInfo> = self
             .dpb
             .iter()
-            .map(|e| e.poc)
-            .max()
-            .ok_or_else(|| Error::invalid("evc decoder: P/B slice with empty DPB"))?;
-        Ok(vec![max_poc; n_active])
+            .filter(|e| e.used_for_reference)
+            .map(|e| crate::ref_lists::RefPicInfo {
+                poc: e.poc,
+                temporal_id: e.temporal_id,
+            })
+            .collect();
+        if refs.is_empty() {
+            return Err(Error::invalid("evc decoder: P/B slice with empty DPB"));
+        }
+        let lists = crate::ref_lists::construct_ref_pic_lists_rpl_flag0(
+            &refs,
+            curr_poc,
+            temporal_id,
+            [n_active_l0, n_active_l1],
+            slice_is_b,
+        );
+        if lists[0].is_empty() || (slice_is_b && lists[1].is_empty()) {
+            return Err(Error::invalid(
+                "evc decoder: §8.3.2.2 reference picture list construction found no usable picture",
+            ));
+        }
+        Ok(lists)
     }
 
     /// Convert a list of resolved POCs into borrowed [`RefPictureView`]s
@@ -1424,6 +1515,7 @@ mod tests {
                 poc: i as i32,
                 pts: None,
                 used_for_reference: true,
+                temporal_id: 0,
                 output_emitted: false,
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
@@ -1449,6 +1541,7 @@ mod tests {
             poc: 5,
             pts: None,
             used_for_reference: true,
+            temporal_id: 0,
             output_emitted: false,
             side_info: None,
             ref_pocs_l0: Vec::new(),
@@ -1481,6 +1574,7 @@ mod tests {
             poc: 1,
             pts: None,
             used_for_reference: true,
+            temporal_id: 0,
             output_emitted: true,
             side_info: None,
             ref_pocs_l0: Vec::new(),
@@ -1492,6 +1586,7 @@ mod tests {
             poc: 0,
             pts: None,
             used_for_reference: true,
+            temporal_id: 0,
             output_emitted: false,
             side_info: None,
             ref_pocs_l0: Vec::new(),
@@ -1503,6 +1598,7 @@ mod tests {
             poc: 2,
             pts: None,
             used_for_reference: true,
+            temporal_id: 0,
             output_emitted: false,
             side_info: None,
             ref_pocs_l0: Vec::new(),
@@ -1538,6 +1634,7 @@ mod tests {
                 poc: p,
                 pts: None,
                 used_for_reference: true,
+                temporal_id: 0,
                 output_emitted: true,
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
@@ -1583,6 +1680,7 @@ mod tests {
                 poc: p,
                 pts: None,
                 used_for_reference: true,
+                temporal_id: 0,
                 output_emitted: true,
                 side_info: None,
                 ref_pocs_l0: Vec::new(),
