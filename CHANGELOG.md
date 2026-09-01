@@ -2,6 +2,156 @@
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-evc/compare/v0.0.3...v0.0.4) - 2026-08-30
+
+### Other
+
+- single-byte mutation gate over a B access unit
+- README encoder-section rewrite + round-452 CHANGELOG
+- frame-level rate control — bitrate/fps options with a deterministic per-class QP walk
+- hoist the P/B CU list-prediction bindings into expression form
+- arbitrary even dimensions via the §7.4.3.1 conformance-cropping window
+- encoder B slices + multi-reference P/B — the §7.3.8.4 write-side ladder grows direct/bi/ref_idx
+- §8.3 slice-level reference bookkeeping for sps_rpl_flag == 0 + errata #313 direct-mode bi-prediction
+- README — round-444 QCIF rate/PSNR re-measure; §7.3.8.3 leaf-reassignment doc sharpened
+- CHANGELOG — the corpus failure-mode shift is element-level evidence for the filed Table-91 truncation ask
+- stream-level pins for the single-tree paths — cbf_all on IBC, DM chroma to pixels; two exposed defects fixed
+- §7.3.8.3/§8.4.3 single-tree leaf + DM-chroma restructure — decoder/encoder/fixture lockstep
+- round-441 conformance triage — corpus anchors verified bit-exactly, divergence localized, single-tree/DM-chroma re-reading staged
+- README — the cm_init == 0 collapse note updated to the round-437 shared-ctxTable-0 mapping
+- README/CHANGELOG — round 437 conformance-corpus triage documented
+- §8.7 quantization-domain conformance — IQT branches, Qp' bit-depth offsets, ChromaQpTable mapping
+- sps_cm_init_flag == 0 entropy shape — the spec-literal shared-ctxTable-0 mapping
+- ISO/IEC 23094-4 conformance gate — docs-staged corpus vs per-plane .opl hashes
+- Annex-B length-prefix byte-order auto-detection + §7.4.3.1 output cropping
+- P encoder — implicit boundary splits + QP extremes pinned
+- P-encoder depth + scene-cut coverage; doc drift cleanup
+- README/CHANGELOG — round 431 rollup (cm_init write side, P/B grammar reconciliation, low-delay P encoder)
+- low-delay P encoder — skip/inter/intra mode ladder, quarter-pel ME, GOP registry option
+- P/B transform-tree spec-reconciliation — cbf_all, skip elision, chroma-first cbfs, cbf_luma inference, B direct_mode_flag
+- sps_cm_init_flag entropy write side — the encoder's context-model rate win
+- 12-bit encode loop pin — the depth matrix closes
+- encoder deblock option — flag plumbing + decoder-mirrored §8.8.2 post-pass
+- encoder 10-/12-bit input + single-byte mutation gate over its own output
+- README/CHANGELOG — encoder bootstrap documented, validation posture stated
+- encoder determinism + QCIF rate/PSNR characterization pins
+- registered Encoder — dual-API make_encoder + whole-frame IDR access units
+- Baseline intra slice encoder — RD coding tree + 5-mode search, decoder-exact
+- encoder forward transform + quantizer — the §8.7 decode chain inverted
+- §7.3 header writers — SPS/PPS/IDR-slice-header duals + NAL wrap
+- encoder groundwork — RBSP BitWriter + CabacEncoder promoted out of cfg(test)
+- scrub a stale ALF module-doc claim — 23094-1 signals no per-CTU filter-set index
+- tile-axis corpus extension + single-byte mutation gate
+- DRA apply at every bit depth — the 8-bit-only gate is lifted
+- multi-tile decode through the registered decoder — single_tile gate lifted
+- §8.8.4.5/.6 per-CTB ALF input-sample derivation
+- §8.8.2.1/§8.8.3.1 tile-boundary deblocking exemption
+- §7.3.8.1/§9.3.1 multi-tile P/B pixel walker
+- §7.3.8.1/§9.3.1 multi-tile IDR pixel walker
+- §6.4.1/§6.4.3 tile bullet through every decode-time neighbour probe
+- mark internal plumbing #[doc(hidden)] — stable API is probe/EvcFileInfo/CODEC_ID_STR + register + decoder::make_decoder
+- scrub an ambiguous provenance phrase from a relocated comment
+- bound U binarization by Table 91 cMax — fixes large-TB coeff_zero_run/level rejection
+- README — round 408 state (TB-split tiling, eq. 51, HTDF wiring, errata #238)
+- errata #238(a) — TB-split tiling on the P/B intra-CU path
+- HTDF wired to pixels — \xc2\xa78.4.1 intra + \xc2\xa78.5 step-7 inter invocation points
+- TB-split at the 128-CTB spec geometry + per-TU cu_qp_delta chain fixtures
+- errata #238(a) — §7.3.8.4 transform-unit tiling on the inter path
+- errata #238(a) — §7.3.8.4 transform-unit tiling on the intra walkers
+- eq. 51 — MaxTbLog2SizeY is the constant 6 at every decoder entry point
+- errata #238(b)/(c) reconciliation — eq. 148 sign flag + eq. 74 startQp seed anchored
+- ATS coverage deepening — quad SBT + P/B intra ATS fixtures
+- errata #213(b) conformance guard — y-suffix sized by y_prefix
+- ATS to pixels on the P/B path — the last gated Main tool is lifted
+- ATS-intra to pixels on the IDR path (§7.3.8.5 + §8.7.4.2)
+- README — round 397 Main-profile toolset state (cm_init/DQUANT/EIPD/ADCC/ADDB)
+- ADDB — §8.8.3 advanced deblocking to pixels
+- ADCC — §7.3.8.8 residual_coding_adv() through both walkers
+- EIPD leaf wiring — §7.3.8.4 MPM/PIMS/rem group + §8.4.2/.3 derivation to pixels
+- §7.3.8.3/§7.3.8.5 DQUANT — cuQpDeltaCode marks, coded-latch gate, eq. 1042 QpY chain
+- sps_cm_init_flag P/B walker — initType-1 offsets through every inter read
+- §9.3.2.2/§9.3.4.2.1 sps_cm_init_flag context machinery on the pixel walkers
+- SUCO-on-quad, boundary-BTT and 10-bit NAL-stream fixtures
+- README + CHANGELOG — round 391 BTT/SUCO walk + 10-bit chain
+- SPS-driven end-to-end fixtures — Main-shaped BTT SPS + 10-bit SPS
+- 10-bit support through the whole reconstruction chain
+- §7.3.8.3 BTT+SUCO walk + §7.4.9.3 mode constraints on the P/B path
+- §7.3.8.3 BTT+SUCO CABAC coding-tree walk on the IDR pixel path
+- add CI / crates.io / docs.rs / MIT-license badges
+- B-slice bi-pred affine inheritance test + README/CHANGELOG for round 387
+- whole-picture P/B integration depth — affine CU chain + cross-picture DMVR→TMVP
+- §8.5.3.5/§8.5.3.2 per-CU CPMV store → inherited affine candidates
+- §8.5.1 DMVR invocation on qualifying bi-pred merge CUs
+- §8.5.5.2 DMVR bilinear interpolation + refs-level refinement driver
+- §8.5.4.3.2/.3.3 eqs. 923/924 + 932/933 subblock padding clamp
+- README — round 384 ADMVP-to-pixels integration state
+- §8.5.2.4 admvp=1 luma MVP derivation + merge_mode_flag inference fix
+- lift sps_admvp_flag from the decoder gates, thread InterToolGates
+- decode + reconstruct the §7.3.8.4 explicit-affine sub-tree
+- affine-merge CUs reconstruct through the §8.5.3 CPMV sub-block field
+- wire §8.5.2.3.3 collocated temporal merge (TMVP) into the admvp list
+- wire §8.5.2.3.9 POC-scaled MMVD into the admvp CU path
+- §8.5.2.3.9 full MMVD motion-vector derivation (eqs. 531-616)
+- CHANGELOG — §7.3.8.4 admvp coding_unit() integration round-381
+- B-slice bi-pred admvp coverage + README round-381 update
+- validate §8.5.2.3 admvp merge-list reconstruction from populated grid
+- wire §7.3.8.4 admvp non-skip merge-mode + explicit-AMVP into coding_unit()
+- wire §7.3.8.4 admvp cu_skip merge tree into coding_unit() decode
+- README + CHANGELOG — §7.3.8.4 Main-profile inter-CU syntax driver milestone
+- §7.3.8.4 cu_skip Main-profile merge driver + shared merge-branch reader
+- §7.3.8.4 Main-profile explicit-AMVP syntax driver (read_explicit_amvp)
+- §7.3.8.4 inter_pred_idc + bi_pred_idx explicit-AMVP syntax readers
+- §7.3.8.4 Main-profile inter-CU merge-branch syntax driver (inter_cu_syntax module)
+- §7.3.8.4 + §9.3.3 merge_idx syntax reader (amvr_syntax::read_merge_idx)
+- README — round 373 inter toolset rollup (affine corner resolution + per-cell TMVP POC + ATS-inter/MMVD/AMVR/DMVR)
+- §8.5.5 DMVR (decoder-side motion-vector refinement) search core (dmvr module)
+- §7.3.8.4 AMVR + inter-mode-gating CABAC syntax (amvr_syntax module)
+- §7.3.8.4 MMVD CABAC syntax reader (mmvd_syntax::read_mmvd_group)
+- §7.3.8.5 ATS-inter (sub-block transform) syntax + geometry (ats::read_ats_inter / AllowAtsInter / AtsInter)
+- §8.5.2.3.3 per-cell TMVP POC-distance wiring (tmvp::PocInputs / tmvp_merge_candidate_with_poc)
+- §8.5.3.4 affine corner CPMV resolution + corner-2/3 collocated-MV fallback (affine_cand::resolve_affine_corners)
+- §8.4.4 EIPD end-to-end picture-buffer reconstruct (picture::intra_reconstruct_cb_eipd)
+- §8.7.6 HTDF picture-buffer bridge (picture::apply_htdf_luma)
+- §8.7.6 Hadamard Transform Domain Filter (HTDF) post-reconstruction filter (htdf module)
+- §8.4.4.1 EIPD picture-buffer reference fetch (picture::fetch_eipd_refs)
+- §8.4.4.4 EIPD INTRA_HOR availLR-dependent right-column blend + §8.4.4.5 INTRA_VER
+- §8.4.4.1/.2 intra reference-sample construction + substitution (eipd_ref module)
+- README + CHANGELOG — §8.5.3.2/.4/.5/.6 affine candidate-list assembly landed
+- §8.5.3.2/.5 affine neighbour-position geometry helpers
+- §8.5.3.5/.3.1 affine AMVP CPMV-reconstruction bridge
+- §8.5.3.2/.4/.5/.6 affine merge + MVP candidate-list assembly (affine_cand module)
+- README + CHANGELOG — §8.5.3 affine derivation + §7.3.8.4 syntax milestone
+- §7.3.8.4 affine inter-syntax CABAC reads (affine_syntax module)
+- §8.5.3.3 inherited affine CPMV derivation from a neighbour block
+- §8.5.3.7-.10 affine subblock-MV geometric core (affine module)
+- README — document §8.5.2.3.3–.5 TMVP derivation + SideInfoGrid ColPic bridge
+- bridge SideInfoGrid ColPic motion field into TMVP derivation
+- §8.5.2.3.3–.5 temporal (collocated) merge candidate (TMVP) derivation
+- README — ATS-intra DST-VII/DCT-VIII now full {4,8,16,32} + apply_inverse bridge
+- bridge ATS-intra decode to inverse transform + end-to-end test
+- ATS-intra DST-VII/DCT-VIII 32×32 kernels — full {4,8,16,32} range
+- ATS-intra DST-VII/DCT-VIII 16×16 transform kernels
+- README — §8.5.2.3 ADMVP merge-mode derivation layer landed
+- §8.5.2.3.1 step-6 merge selection bridge (select_merge_candidate -> MergedMotion)
+- §8.5.2.3.6 HMVP merge-candidate derivation (HmvpCandList::hmvp_merge_candidates)
+- §8.5.2.3 ADMVP merge-mode candidate-list derivation (merge module)
+- README + CHANGELOG — EIPD CABAC syntax wiring + ATS-intra milestone
+- §7.3.8.5 ATS-intra syntax + Table 30 trType derivation + §8.7.4.3 DST-VII/DCT-VIII kernels
+- §8.4.2/.3 EIPD mode resolution — syntax→derivation→kernel composition
+- §7.3.8.4 EIPD intra-mode CABAC syntax reader (eipd_syntax) + §9.3.3.6 TB primitive
+- README + CHANGELOG — EIPD intra prediction + mode derivation milestone
+- §8.4.3 EIPD chroma intra-mode derivation (Table 16 + modeIdx skip)
+- §8.4.2 EIPD luma intra-mode derivation (candModeList/extCandModeList/remModeList)
+- §8.4.4.8/9/10 EIPD prediction-sample derivation (INTRA_BI/PLN/directional)
+- §8.9.8 tableNum==0 branch — promote round-284 pin to errata #81/#130 lock
+- §7.4.9.3 SUCO availability layer (SucoSizeLimits eqs. 68/69 + allow_split_unit_coding_order)
+- §7.3.8.3 split-unit recursion-geometry layer (split_unit_children + quad_split_children)
+- §7.3.8.3 CABAC-driven BTT split-syntax reader (decode_btt_split)
+- §8.9.4 spec-faithful chroma inverse-mapping apply (eqs. 1377-1382)
+- §7.4.8.3 BTT split-geometry layer (allowSplit* + SplitMode)
+- description reflects working Baseline pixel decoder
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - **§8.3 reference bookkeeping for `sps_rpl_flag == 0` (round 452).** The
