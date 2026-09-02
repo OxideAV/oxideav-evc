@@ -57,8 +57,10 @@ use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
+use crate::eipd_mode::{derive_chroma_mode, ModeSelector};
 use crate::intra::{predict, IntraMode, RefSamples};
-use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
+use crate::intra_enc::{self, IntraSel};
+use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile, YuvPicture};
 use crate::quant_enc::{forward_quantize, forward_transform_fractional, level_unit_sse_weights};
 use crate::rdoq::{rdoq_rle, RdoqInputs};
 use crate::slice_data::zigzag_scan;
@@ -78,14 +80,21 @@ const CTB_LOG2: u32 = 6;
 const MIN_CB_LOG2: u32 = 2;
 
 /// Per-picture encode statistics.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncStats {
     /// CTUs walked.
     pub ctus: u32,
     /// Leaf coding units (one SINGLE_TREE `coding_unit()` each).
     pub leaves: u32,
-    /// Leaves per chosen luma intra mode (Table 13 order DC/HOR/VER/UL/UR).
+    /// Leaves per chosen luma intra mode (Table 13 order DC/HOR/VER/UL/UR)
+    /// under `sps_eipd_flag == 0`.
     pub mode_histogram: [u32; 5],
+    /// Leaves per chosen `IntraPredModeY` (Table 15, 0..=32) under
+    /// `sps_eipd_flag == 1`.
+    pub eipd_mode_histogram: [u32; 33],
+    /// EIPD leaves whose `intra_chroma_pred_mode != 0` (a non-DM chroma
+    /// mode won the chroma RD).
+    pub eipd_chroma_non_dm: u32,
     /// Leaves whose `cbf_luma` was signalled 1.
     pub cbf_luma_set: u32,
     /// Chroma CBFs signalled 1 (cb + cr).
@@ -94,10 +103,25 @@ pub struct EncStats {
     pub split_flag_bins: u32,
 }
 
+impl Default for EncStats {
+    fn default() -> Self {
+        Self {
+            ctus: 0,
+            leaves: 0,
+            mode_histogram: [0; 5],
+            eipd_mode_histogram: [0; 33],
+            eipd_chroma_non_dm: 0,
+            cbf_luma_set: 0,
+            cbf_chroma_set: 0,
+            split_flag_bins: 0,
+        }
+    }
+}
+
 /// One decided leaf: everything the emit pass needs to reproduce the
 /// exact bin stream whose decode lands on the already-committed recon.
 struct LeafPlan {
-    mode_idx: usize,
+    intra: IntraSel,
     levels_y: Vec<i32>,
     cbf_y: bool,
     levels_cb: Vec<i32>,
@@ -123,6 +147,11 @@ struct EncCtx<'a> {
     /// The entropy shape the emit pass will run under — the decide
     /// pass costs every candidate against the same contexts.
     sel: CtxSel,
+    /// `sps_eipd_flag`: the 33-mode intra search + MPM syntax.
+    eipd: bool,
+    /// Decode-order side-info grid — the §8.4.2 neighbour modes the
+    /// EIPD lists derive from (and the §8.8.2 deblocking inputs).
+    side_info: SideInfoGrid,
 }
 
 /// [`encode_idr_slice_data_with`] with deblocking off — the historical
@@ -176,6 +205,21 @@ pub fn encode_idr_slice_data_opts(
     deblock: bool,
     cm_init: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_slice_data_full(src, slice_qp, deblock, cm_init, false)
+}
+
+/// [`encode_idr_slice_data_opts`] plus `sps_eipd_flag` (round 455):
+/// with `eipd` every leaf runs the 33-mode EIPD search
+/// ([`crate::intra_enc`]) and writes the §7.3.8.4 MPM / PIMS /
+/// rem-mode luma group plus `intra_chroma_pred_mode`; the caller must
+/// signal `sps_eipd_flag = 1` in the SPS.
+pub fn encode_idr_slice_data_full(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+    eipd: bool,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
             "evc encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
@@ -203,6 +247,8 @@ pub fn encode_idr_slice_data_opts(
         pic_w: src.width,
         pic_h: src.height,
         sel,
+        eipd,
+        side_info: SideInfoGrid::new(src.width, src.height),
     };
     let mut stats = EncStats::default();
     // The decide pass's rate model: the same context table the emit
@@ -243,9 +289,21 @@ pub fn encode_idr_slice_data_opts(
     if cm_init {
         enc.init_main_profile(InitType::I, slice_qp);
     }
+    // The emit-order grid: the §8.4.2 neighbour probes must see exactly
+    // the CUs the decoder has already reconstructed at that point.
+    let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
     for (x0, y0, node) in &roots {
         emit_split_unit(
-            &mut enc, &mut stats, &ctx, sel, *x0, *y0, CTB_LOG2, CTB_LOG2, node,
+            &mut enc,
+            &mut stats,
+            &ctx,
+            sel,
+            &mut emit_grid,
+            *x0,
+            *y0,
+            CTB_LOG2,
+            CTB_LOG2,
+            node,
         );
     }
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
@@ -298,7 +356,7 @@ fn stamp_decided(
                 cu_y0: y0 as u16,
                 cu_log2_w: log2_w as u8,
                 cu_log2_h: log2_h as u8,
-                intra_luma_mode: plan.mode_idx as u8,
+                intra_luma_mode: plan.intra.stamp_value(),
                 qp_y: slice_qp.clamp(0, 51) as u8,
                 ..Default::default()
             },
@@ -349,13 +407,16 @@ fn decide_split_unit(
     let (split_t, split_i) = ctx.sel.ctx(MainCtxTable::SplitCuFlag, 0);
     let before = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
     let model_before = model.clone();
+    let grid_before = ctx.side_info.clone();
     let leaf_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 0));
     let (leaf_plan, leaf_cost) = decide_leaf(ctx, model, stats, x0, y0, log2_w, log2_h)?;
     let leaf_cost = leaf_cost + ctx.lambda * leaf_flag_bits;
     let after_leaf = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
     let model_after_leaf = model.clone();
+    let grid_after_leaf = ctx.side_info.clone();
     restore_region(&mut ctx.recon, &before, x0, y0, log2_w, log2_h);
     *model = model_before;
+    ctx.side_info = grid_before;
 
     let split_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 1));
     let (children, split_cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
@@ -364,6 +425,7 @@ fn decide_split_unit(
     if leaf_cost <= split_cost {
         restore_region(&mut ctx.recon, &after_leaf, x0, y0, log2_w, log2_h);
         *model = model_after_leaf;
+        ctx.side_info = grid_after_leaf;
         Ok((Node::Leaf(leaf_plan), leaf_cost))
     } else {
         Ok((Node::Split(children), split_cost))
@@ -420,119 +482,278 @@ fn decide_leaf(
     let bd = ctx.bit_depth;
     let max_val = (1i32 << bd) - 1;
     let sel = ctx.sel;
-
-    // ---- luma: 5-mode search over the decoder's reference fetch ----
-    let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
     let src_y = gather_block(&ctx.src.y, ctx.src.y_stride(), x0, y0, w, h);
-    let mut best: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
-    let mut best_cost = f64::INFINITY;
     // §8.7.1: quantization runs at qP = Qp′ (eqs. 1050-1052) — the
     // luma bit-depth offset and the chroma ChromaQpTable mapping (the
     // encoder's SPS declares sps_iqt_flag = 0 and zero chroma offsets).
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
     let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
-    for (mode_idx, &mode) in MODES.iter().enumerate() {
-        let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
-        let (levels, cbf, res, dist) =
-            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
-        let bits = model.measure(|m| {
-            emit_intra_pred_mode(m, sel, mode_idx);
-            let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-            m.encode_decision(t, i, u8::from(cbf));
-            if cbf {
-                emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
-            }
-        });
-        let cost = dist + ctx.lambda * bits;
-        if cost < best_cost {
-            best_cost = cost;
-            best = Some((mode_idx, levels, cbf, res));
-        }
-    }
-    let (mode_idx, levels_y, cbf_y, res_y) = best.expect("5 candidates");
-    let cost_y = best_cost;
-    intra_reconstruct_cb_in_tile(
-        &mut ctx.recon,
-        x0,
-        y0,
-        log2_w,
-        log2_h,
-        MODES[mode_idx],
-        0,
-        &res_y,
-        None,
-    )?;
-
-    // ---- chroma: §8.4.3 DM — the never-present (`sps_eipd_flag == 0`)
-    // `intra_chroma_pred_mode` is inferred 0, so IntraPredModeC =
-    // IntraPredModeY (the mode just decided for this SINGLE_TREE CU);
-    // quantize each component's residual under that prediction ----
-    let mode_c = MODES[mode_idx];
+    let lambda_c = rd_lambda_at_qp_prime(qp_c);
     let wc = 1usize << (log2_w - 1);
     let hc = 1usize << (log2_h - 1);
-    let mut cost = cost_y;
-    let mut chroma = Vec::with_capacity(2);
-    for c_idx in 1..=2u32 {
-        let plane = if c_idx == 1 { &ctx.src.cb } else { &ctx.src.cr };
-        let refs_c = ctx.recon.fetch_intra_refs(x0 >> 1, y0 >> 1, wc, hc, c_idx);
-        let src_c = gather_block(plane, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
-        let table = if c_idx == 1 {
-            MainCtxTable::CbfCb
-        } else {
-            MainCtxTable::CbfCr
+    let src_cb = gather_block(&ctx.src.cb, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
+    let src_cr = gather_block(&ctx.src.cr, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
+
+    let (plan, cost) = if ctx.eipd {
+        // ---- EIPD luma: SAD-ranked candidates + MPMs through the RD ----
+        let lists = intra_enc::mode_lists(&ctx.side_info, ctx.pic_w, ctx.pic_h, x0, y0, log2_w);
+        let mode_bits = |model: &mut BitCostModel, selector: ModeSelector| -> f64 {
+            model.measure(|m| intra_enc::emit_luma_selector(m, sel, selector))
         };
-        let rdoq = RdoqInputs::new(model, rd_lambda_at_qp_prime(qp_c), sel, c_idx, table);
-        let (levels, cbf, res, dist) = quantize_block(
-            &refs_c,
-            mode_c,
-            &src_c,
-            wc,
-            hc,
-            qp_c,
-            bd,
-            max_val,
-            Some(&rdoq),
-        )?;
-        let bits = model.measure(|m| {
-            let (t, i) = sel.ctx(table, 0);
-            m.encode_decision(t, i, u8::from(cbf));
-            if cbf {
-                emit_residual_rle(m, sel, c_idx, &levels, log2_w - 1, log2_h - 1);
+        let cands = intra_enc::luma_candidates(
+            &ctx.recon,
+            &src_y,
+            x0,
+            y0,
+            log2_w,
+            log2_h,
+            &lists,
+            ctx.lambda,
+            |selector| mode_bits(model, selector),
+        );
+        let mut best: Option<(i32, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best_cost = f64::INFINITY;
+        for &mode in &cands {
+            let pred = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 0, mode);
+            let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
+            let (levels, cbf, res, dist) =
+                quantize_pred(&pred, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
+            let selector = intra_enc::selector_for(&lists, mode);
+            let bits = model.measure(|m| {
+                intra_enc::emit_luma_selector(m, sel, selector);
+                let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+                m.encode_decision(t, i, u8::from(cbf));
+                if cbf {
+                    emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+                }
+            });
+            let cost = dist + ctx.lambda * bits;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((mode, levels, cbf, res));
             }
-        });
-        cost += dist + ctx.lambda * bits;
+        }
+        let (mode_y, levels_y, cbf_y, res_y) = best.expect("at least one candidate");
+        intra_reconstruct_cb_eipd_in_tile(
+            &mut ctx.recon,
+            x0,
+            y0,
+            log2_w,
+            log2_h,
+            mode_y,
+            0,
+            false,
+            false,
+            &res_y,
+            None,
+        )?;
+        // ---- EIPD chroma: the five intra_chroma_pred_mode values ----
+        let mut best_c: Option<intra_enc::ChromaChoice> = None;
+        let mut best_c_cost = f64::INFINITY;
+        for raw in 0..=4i32 {
+            let mode_c = derive_chroma_mode(raw, mode_y);
+            let pred_cb = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 1, mode_c);
+            let pred_cr = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 2, mode_c);
+            let rdoq_cb = RdoqInputs::new(model, lambda_c, sel, 1, MainCtxTable::CbfCb);
+            let (lv_cb, cbf_cb, res_cb, d_cb) =
+                quantize_pred(&pred_cb, &src_cb, wc, hc, qp_c, bd, max_val, Some(&rdoq_cb))?;
+            let rdoq_cr = RdoqInputs::new(model, lambda_c, sel, 2, MainCtxTable::CbfCr);
+            let (lv_cr, cbf_cr, res_cr, d_cr) =
+                quantize_pred(&pred_cr, &src_cr, wc, hc, qp_c, bd, max_val, Some(&rdoq_cr))?;
+            let bits = model.measure(|m| {
+                intra_enc::emit_chroma_pred_mode(m, sel, raw);
+                let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+                m.encode_decision(t, i, u8::from(cbf_cb));
+                let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+                m.encode_decision(t, i, u8::from(cbf_cr));
+                if cbf_cb {
+                    emit_residual_rle(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
+                }
+                if cbf_cr {
+                    emit_residual_rle(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
+                }
+            });
+            let cost = d_cb + d_cr + ctx.lambda * bits;
+            if cost < best_c_cost {
+                best_c_cost = cost;
+                best_c = Some((raw, mode_c, lv_cb, cbf_cb, res_cb, lv_cr, cbf_cr, res_cr));
+            }
+        }
+        let (raw, mode_c, levels_cb, cbf_cb, res_cb, levels_cr, cbf_cr, res_cr) =
+            best_c.expect("five chroma candidates");
+        for (c_idx, res) in [(1u32, &res_cb), (2, &res_cr)] {
+            intra_reconstruct_cb_eipd_in_tile(
+                &mut ctx.recon,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                mode_c,
+                c_idx,
+                false,
+                false,
+                res,
+                None,
+            )?;
+        }
+        stats.eipd_mode_histogram[mode_y as usize] += 1;
+        stats.eipd_chroma_non_dm += u32::from(raw != 0);
+        (
+            LeafPlan {
+                intra: IntraSel::Eipd {
+                    mode_y,
+                    chroma_raw: raw,
+                },
+                levels_y,
+                cbf_y,
+                levels_cb,
+                cbf_cb,
+                levels_cr,
+                cbf_cr,
+            },
+            best_cost + best_c_cost,
+        )
+    } else {
+        // ---- Baseline luma: 5-mode search over the decoder's reference fetch ----
+        let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
+        let mut best: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best_cost = f64::INFINITY;
+        for (mode_idx, &mode) in MODES.iter().enumerate() {
+            let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
+            let (levels, cbf, res, dist) =
+                quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
+            let bits = model.measure(|m| {
+                emit_intra_pred_mode(m, sel, mode_idx);
+                let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+                m.encode_decision(t, i, u8::from(cbf));
+                if cbf {
+                    emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+                }
+            });
+            let cost = dist + ctx.lambda * bits;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((mode_idx, levels, cbf, res));
+            }
+        }
+        let (mode_idx, levels_y, cbf_y, res_y) = best.expect("5 candidates");
+        let cost_y = best_cost;
         intra_reconstruct_cb_in_tile(
             &mut ctx.recon,
             x0,
             y0,
             log2_w,
             log2_h,
-            mode_c,
-            c_idx,
-            &res,
+            MODES[mode_idx],
+            0,
+            &res_y,
             None,
         )?;
-        chroma.push((levels, cbf));
-    }
-    let (levels_cr, cbf_cr) = chroma.pop().expect("cr");
-    let (levels_cb, cbf_cb) = chroma.pop().expect("cb");
+
+        // ---- chroma: §8.4.3 DM — the never-present (`sps_eipd_flag == 0`)
+        // `intra_chroma_pred_mode` is inferred 0, so IntraPredModeC =
+        // IntraPredModeY (the mode just decided for this SINGLE_TREE CU);
+        // quantize each component's residual under that prediction ----
+        let mode_c = MODES[mode_idx];
+        let mut cost = cost_y;
+        let mut chroma = Vec::with_capacity(2);
+        for c_idx in 1..=2u32 {
+            let src_c = if c_idx == 1 { &src_cb } else { &src_cr };
+            let refs_c = ctx.recon.fetch_intra_refs(x0 >> 1, y0 >> 1, wc, hc, c_idx);
+            let table = if c_idx == 1 {
+                MainCtxTable::CbfCb
+            } else {
+                MainCtxTable::CbfCr
+            };
+            let rdoq = RdoqInputs::new(model, lambda_c, sel, c_idx, table);
+            let (levels, cbf, res, dist) = quantize_block(
+                &refs_c,
+                mode_c,
+                src_c,
+                wc,
+                hc,
+                qp_c,
+                bd,
+                max_val,
+                Some(&rdoq),
+            )?;
+            let bits = model.measure(|m| {
+                let (t, i) = sel.ctx(table, 0);
+                m.encode_decision(t, i, u8::from(cbf));
+                if cbf {
+                    emit_residual_rle(m, sel, c_idx, &levels, log2_w - 1, log2_h - 1);
+                }
+            });
+            cost += dist + ctx.lambda * bits;
+            intra_reconstruct_cb_in_tile(
+                &mut ctx.recon,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                mode_c,
+                c_idx,
+                &res,
+                None,
+            )?;
+            chroma.push((levels, cbf));
+        }
+        let (levels_cr, cbf_cr) = chroma.pop().expect("cr");
+        let (levels_cb, cbf_cb) = chroma.pop().expect("cb");
+        stats.mode_histogram[mode_idx] += 1;
+        (
+            LeafPlan {
+                intra: IntraSel::Baseline(mode_idx),
+                levels_y,
+                cbf_y,
+                levels_cb,
+                cbf_cb,
+                levels_cr,
+                cbf_cr,
+            },
+            cost,
+        )
+    };
 
     stats.leaves += 1;
-    stats.mode_histogram[mode_idx] += 1;
-    stats.cbf_luma_set += u32::from(cbf_y);
-    stats.cbf_chroma_set += u32::from(cbf_cb) + u32::from(cbf_cr);
+    stats.cbf_luma_set += u32::from(plan.cbf_y);
+    stats.cbf_chroma_set += u32::from(plan.cbf_cb) + u32::from(plan.cbf_cr);
 
-    let plan = LeafPlan {
-        mode_idx,
-        levels_y,
-        cbf_y,
-        levels_cb,
-        cbf_cb,
-        levels_cr,
-        cbf_cr,
-    };
-    // Advance the rate model over the decided leaf's exact bin string.
-    model.commit(|m| emit_leaf(m, sel, &plan, log2_w, log2_h));
+    // Advance the rate model over the decided leaf's exact bin string
+    // (the §8.4.2 probes read the L/A/R neighbours, which this CU's own
+    // stamp does not touch — so the pre-stamp grid is the emit grid),
+    // then stamp the CU for the CUs that follow.
+    model.commit(|m| {
+        emit_leaf(
+            m,
+            sel,
+            &plan,
+            &ctx.side_info,
+            ctx.pic_w,
+            ctx.pic_h,
+            x0,
+            y0,
+            log2_w,
+            log2_h,
+        )
+    });
+    ctx.side_info.stamp_block(
+        x0,
+        y0,
+        w as u32,
+        h as u32,
+        CuSideInfo {
+            pred_mode: CuPredMode::Intra,
+            cbf_luma: u8::from(plan.cbf_y),
+            cu_x0: x0 as u16,
+            cu_y0: y0 as u16,
+            cu_log2_w: log2_w as u8,
+            cu_log2_h: log2_h as u8,
+            intra_luma_mode: plan.intra.stamp_value(),
+            qp_y: ctx.qp.clamp(0, 51) as u8,
+            ..Default::default()
+        },
+    );
     Ok((plan, cost))
 }
 
@@ -562,9 +783,6 @@ pub(crate) fn quantize_residual(
     }
 }
 
-/// Predict + transform + quantize + reconstruct one candidate block
-/// through the decoder's pipeline; returns (levels, cbf, recon
-/// residual, SSE distortion).
 /// The RD Lagrange multiplier, calibrated to the §8.7 quantizer step
 /// this crate's decode chain actually realises: `λ = RD_LAMBDA_SCALE ·
 /// Δ²`, where `Δ` is the pixel-domain (orthonormal-basis) step of one
@@ -624,6 +842,24 @@ pub(crate) fn quantize_block(
     let n = w * h;
     let mut pred = vec![0i32; n];
     predict(mode, refs, w, h, bit_depth, &mut pred);
+    quantize_pred(&pred, src, w, h, qp, bit_depth, max_val, rdoq)
+}
+
+/// Transform + quantize + reconstruct the residual of `src` against an
+/// already-computed prediction `pred`; returns (levels, cbf, recon
+/// residual, SSE distortion) exactly like [`quantize_block`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_pred(
+    pred: &[i32],
+    src: &[i32],
+    w: usize,
+    h: usize,
+    qp: i32,
+    bit_depth: u32,
+    max_val: i32,
+    rdoq: Option<&RdoqInputs<'_>>,
+) -> Result<(Vec<i32>, bool, Vec<i32>, f64)> {
+    let n = w * h;
     let diff: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
     let (levels, cbf) = quantize_residual(&diff, w, h, qp, bit_depth, rdoq)?;
     let mut res = vec![0i32; n];
@@ -733,6 +969,7 @@ fn emit_split_unit<S: BinSink>(
     stats: &mut EncStats,
     ctx: &EncCtx<'_>,
     sel: CtxSel,
+    grid: &mut SideInfoGrid,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -752,7 +989,7 @@ fn emit_split_unit<S: BinSink>(
             }
             // (implicit split when !within: no bin, matching the decoder)
             for (cx, cy, clw, clh, child) in children {
-                emit_split_unit(enc, stats, ctx, sel, *cx, *cy, *clw, *clh, child);
+                emit_split_unit(enc, stats, ctx, sel, grid, *cx, *cy, *clw, *clh, child);
             }
         }
         Node::Leaf(plan) => {
@@ -760,7 +997,26 @@ fn emit_split_unit<S: BinSink>(
                 enc.encode_decision(split_t, split_i, 0);
                 stats.split_flag_bins += 1;
             }
-            emit_leaf(enc, sel, plan, log2_w, log2_h);
+            emit_leaf(
+                enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, x0, y0, log2_w, log2_h,
+            );
+            grid.stamp_block(
+                x0,
+                y0,
+                1u32 << log2_w,
+                1u32 << log2_h,
+                CuSideInfo {
+                    pred_mode: CuPredMode::Intra,
+                    cbf_luma: u8::from(plan.cbf_y),
+                    cu_x0: x0 as u16,
+                    cu_y0: y0 as u16,
+                    cu_log2_w: log2_w as u8,
+                    cu_log2_h: log2_h as u8,
+                    intra_luma_mode: plan.intra.stamp_value(),
+                    qp_y: ctx.qp.clamp(0, 51) as u8,
+                    ..Default::default()
+                },
+            );
         }
     }
 }
@@ -781,9 +1037,31 @@ pub(crate) fn emit_intra_pred_mode<S: BinSink>(enc: &mut S, sel: CtxSel, mode_id
     });
 }
 
-fn emit_leaf<S: BinSink>(enc: &mut S, sel: CtxSel, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
-    // One SINGLE_TREE coding_unit(): intra_pred_mode first.
-    emit_intra_pred_mode(enc, sel, plan.mode_idx);
+/// One SINGLE_TREE `coding_unit()`: the intra-mode syntax (Baseline
+/// `intra_pred_mode`, or the EIPD luma group + `intra_chroma_pred_mode`
+/// against the §8.4.2 lists derived from `grid` — the neighbours as the
+/// decoder holds them at this point), then the `transform_unit()`.
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf<S: BinSink>(
+    enc: &mut S,
+    sel: CtxSel,
+    plan: &LeafPlan,
+    grid: &SideInfoGrid,
+    pic_w: u32,
+    pic_h: u32,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+) {
+    match plan.intra {
+        IntraSel::Baseline(mode_idx) => emit_intra_pred_mode(enc, sel, mode_idx),
+        IntraSel::Eipd { mode_y, chroma_raw } => {
+            let lists = intra_enc::mode_lists(grid, pic_w, pic_h, x0, y0, log2_w);
+            intra_enc::emit_luma_selector(enc, sel, intra_enc::selector_for(&lists, mode_y));
+            intra_enc::emit_chroma_pred_mode(enc, sel, chroma_raw);
+        }
+    }
     // transform_unit(), SINGLE_TREE (§7.3.8.5): cbf_cb then cbf_cr
     // (Tables 76/77, ctxInc 0 — the line-3066 chroma-carrying-tree
     // gate), then cbf_luma (Table 75 — always present on a MODE_INTRA
@@ -1016,6 +1294,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 455 — **EIPD**: the 33-mode search + MPM / PIMS / rem-mode
+    /// syntax + `intra_chroma_pred_mode` round-trip recon-exactly through
+    /// the decoder's `sps_eipd_flag == 1` walker on both entropy shapes
+    /// across the size × QP matrix; the mode histogram reaches beyond
+    /// the five Baseline directions, non-DM chroma modes get picked, and
+    /// the EIPD stream never costs more than 5 % over the Baseline-mode
+    /// stream at the same QP while beating it at at least one QP.
+    #[test]
+    fn eipd_round_trip_recon_exact_and_pays_off() {
+        let mut wins = 0;
+        for &cm_init in &[false, true] {
+            for &(w, h) in &[(64u32, 64u32), (32, 32), (128, 96), (100, 60), (176, 144)] {
+                for &qp in &[4i32, 22, 37, 51] {
+                    let src = synth_picture(w, h, 0xC0FFEE ^ (w * 31 + h * 7 + qp as u32));
+                    let (payload, enc_recon, stats) =
+                        encode_idr_slice_data_full(&src, qp, false, cm_init, true).expect("encode");
+                    let mut walk = walk_inputs_cm(w, h, cm_init);
+                    walk.sps_eipd_flag = true;
+                    let (dec, dec_stats) =
+                        decode_baseline_idr_slice(&payload, walk, decode_inputs(qp))
+                            .unwrap_or_else(|e| {
+                                panic!("{w}x{h} qp{qp} cm{cm_init}: decode failed: {e}")
+                            });
+                    assert_eq!(dec.y, enc_recon.y, "{w}x{h} qp{qp} cm{cm_init}: luma recon");
+                    assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp} cm{cm_init}: cb recon");
+                    assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp} cm{cm_init}: cr recon");
+                    assert_eq!(dec_stats.ctus, stats.ctus);
+                    assert_eq!(
+                        stats.eipd_mode_histogram.iter().sum::<u32>(),
+                        stats.leaves,
+                        "every leaf is an EIPD leaf"
+                    );
+                    assert_eq!(stats.mode_histogram, [0; 5]);
+                    if (w, h) == (176, 144) {
+                        let directional: u32 = stats.eipd_mode_histogram[5..].iter().sum();
+                        assert!(
+                            directional > 0,
+                            "qp{qp} cm{cm_init}: {:?}",
+                            stats.eipd_mode_histogram
+                        );
+                        let (base, _, _) =
+                            encode_idr_slice_data_opts(&src, qp, false, cm_init).expect("encode");
+                        assert!(
+                            payload.len() * 100 <= base.len() * 105,
+                            "qp{qp} cm{cm_init}: eipd {} vs baseline {}",
+                            payload.len(),
+                            base.len()
+                        );
+                        wins += usize::from(payload.len() < base.len());
+                    }
+                }
+            }
+        }
+        assert!(
+            wins >= 4,
+            "EIPD must beat the Baseline modes on the busy frame: {wins}"
+        );
     }
 
     /// The `sps_cm_init_flag == 1` entropy shape must never lose to the

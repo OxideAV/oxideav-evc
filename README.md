@@ -566,107 +566,82 @@ bypass-formulation asks, and the in-repo #213 (c)
 `sps_cm_init_flag == 0` context-topology entry (corpus-adjudicable
 per its own text) — see the CHANGELOG round-441/444 entries.
 
-## Encoder (round 429 intra; round 431 low-delay P; round 452 B / multi-ref / rate control / cropping)
+## Encoder (round 429 intra; 431 low-delay P; 452 B / multi-ref / RC / cropping; 455 exact-bit RD, RDOQ, EIPD, two-pass)
 
 The crate registers an **encoder** alongside the decoder (dual API:
 `register(&mut codecs)` wires both factories; `encoder::make_encoder`
 stays directly callable). Scope: intra pictures plus **low-delay P or
 B GOPs** — every GOP opens with a self-contained `[SPS][PPS][IDR]` key
-access unit in the Annex B length-prefixed framing, and with
-`gop = N > 1` the following frames are single-NAL NonIDR P (or, with
-`b=1`, low-delay B) pictures in coding order (the decoder's
-`sps_pocs_flag == 0` POC + §8.3.2.2 list construction resolve the
-references). 4:2:0 input at 8 bits (`Yuv420P`), 10 bits
-(`Yuv420P10Le`) or 12 bits (`Yuv420P12Le`); any non-zero **even**
-geometry (the coded picture is the §7.4.3.1 multiple-of-8 round-up
-with edge-replicated padding, and the SPS conformance-cropping window
-restores the display size at the decoder's output; odd dimensions are
-unrepresentable in 4:2:0 crop units and refused). Options: `qp`
-0..=51 (default 30), `gop` (default 1 = all-intra), `b` (low-delay B
-non-key pictures, default off), `refs` 1..=5 (the SPS
-`max_num_tid0_ref_pics` reference depth, default 1), `bitrate` +
-`fps` (frame-level rate control, default off / 30), `deblock`
-(default off), `cm_init` (default **on**).
+access unit in the Annex B length-prefixed framing, the following
+frames single-NAL NonIDR P (or, with `b=1`, low-delay B) pictures in
+coding order. 4:2:0 input at 8 / 10 / 12 bits; any non-zero **even**
+geometry (multiple-of-8 round-up + §7.4.3.1 conformance-cropping
+window). Options: `qp` 0..=51 (default 30), `gop` (default 1 =
+all-intra), `b`, `refs` 1..=5, `eipd` (default **on**), `cm_init`
+(default **on**), `deblock`, `bitrate` + `fps` (one-pass rate control),
+`pass=1|2` + `stats=<path>` + `vbv` (two-pass rate control).
 
 Pipeline: §7.3 header **writers** that are field-for-field duals of
-the crate's parsers (`bitwriter` + `headers_enc`, parse-back pinned);
-the exact carry-propagation **CABAC encoder** driving the §7.3.8
-`slice_data()` bin stream under **both entropy shapes** (the
-`sps_cm_init_flag == 1` §9.3.2.2 context-model init at the slice QP,
-or the Baseline single-context collapse); a **forward transform +
-quantizer** (`quant_enc`) built by linear inversion of the §8.7
-decode chain; and true **RD decisions** running the decoder's own
-reconstruction pipeline under `SSE + λ·bits` (λ evaluated without
-transcendental calls, so the same source encodes to the same bytes on
-every platform — pinned by the MD5 stream fixtures in
-`tests/encoder_streams.rs`).
+the crate's parsers; the exact carry-propagation **CABAC encoder**
+under both entropy shapes; a forward transform + quantizer built by
+linear inversion of the §8.7 decode chain; and RD decisions running
+the decoder's own reconstruction pipeline. Round 455 rebuilt the RD
+core:
 
-The **P/B slice encoder** (`slice_enc_p`) decides a per-CU mode
-ladder: *skip* (`mvp_idx` off the §8.5.2.4 AMVP list at refIdx 0 —
-on B both lists' slots, eq. 988 bi-averaged), *direct* (B:
-`direct_mode_flag = 1`, the decoder's own §8.5.2.5 temporal
-derivation over the retained `RefPicList1[0]` motion field,
-bi-predicted per errata #313), *explicit inter* (`inter_pred_idc`
-electing PRED_L0 / PRED_L1 / PRED_BI; per used list the `ref_idx_lX`
-across every active reference — quarter-pel motion search per
-reference against the decoder's §8.5.4 kernels, the bi candidate
-pairing the best list-0 vector with a list-1 sub-pel re-fit on the
-averaged prediction — plus `mvp_idx` and the MVD pair, with the
-`cbf_all`-gated residual and the §7.4.9.5 `cbf_luma` inference
-honoured on the write side), and *intra* (the 5-mode search in the
-single-tree shape, chroma predicting with the luma mode). The decide
-pass commits reconstruction + both-list motion grid + HMVP in decode
-order so the emit pass reproduces the decoder's exact bins, including
-the §9.3.4.2.4 neighbour ctxIncs under `cm_init`. The registered
-encoder keeps a **mirror DPB** and runs the same `ref_lists`
-§8.3.1/§8.3.3.2/§8.3.2.2 derivations as the decoder, so every
-`ref_idx` addresses the picture the decoder resolves; each
-reconstruction's stamped motion field is retained as the §8.3.4
-collocated field the next B picture's direct mode reads. With
-`deblock` the §8.8.2 pass is pixel-effective on P/B pictures and the
-output remains byte-exact against the decoder's filtered picture.
+* **Exact entropy-coder bit costs** — the rate term is the
+  `−log2( valState / 512 )` cost of the exact bin string each candidate
+  would emit at the coder's current context state
+  (`bin_cost::BitCostModel`, a second `BinSink` behind the same syntax
+  writers), advanced with every decided bin in decode order.
+* **λ calibrated to the realised quantizer step** — this chain's
+  orthonormal-basis step is `Δ = levelScale[ Qp′ % 6 ] · 2^( Qp′ / 6 ) / 2^10`
+  (24 QP finer than the classic `2^(( QP − 4 ) / 6 )`); `λ = 0.09 · Δ²`
+  at `Qp′Y` (chroma trades at its own `Qp′C`). The classic
+  `0.57 · 2^(( qp − 12 ) / 3)` sat ~256× too high and drove every inter
+  picture into skip: **P/B −51 % BD-rate** at equal PSNR.
+* **RDOQ** (`rdoq`) — a linear-time trellis over the §7.3.8.7
+  run-length syntax (scan position × `Min( PrevLevel − 1, 5 )` bucket):
+  level decisions, last-position trimming and the `cbf = 0` zero-out
+  under `D + λ · R` with exact bin costs and per-position SSE weights.
+  Intra −3.2 %, P −7.5 %, B −6.7 % (Y BD-rate).
+* **EIPD intra** (`intra_enc`, `sps_eipd_flag = 1`) — the 33-mode
+  §8.4.4 search (SAD-ranked candidates + both MPMs through the full RD),
+  the §7.3.8.4 MPM / PIMS / rem-mode luma group and all five
+  `intra_chroma_pred_mode` values, on I slices and on the P/B intra
+  candidates. Intra −10.2 %, P −5.3 %, B −3.7 % (Y BD-rate).
+* **Two-pass rate control** (`rate_plan`) — pass 1 records `idr qp
+  bits` per frame; pass 2 plans one dithered sequence-wide base QP under
+  a leaky-bucket buffer and re-plans every frame with an
+  online-refined rate slope (`bits ∝ 2^( −s · Δqp )`, corpus prior
+  `s ≈ 0.07`). Measured on 24-frame GOP 1 / 8-P / 8-B / 24-P sequences
+  at ½× and 2× the pass-1 rate: **every run within ±0.25 %** of target
+  (one-pass: −0.8…+2.5 % at ½×, −12…−16 % at 2×), 0.4-0.8 dB above
+  one-pass at equal rate.
 
-**Rate control** (`bitrate` + `fps`): a per-class (IDR vs inter)
-complexity model `bits ≈ X · 2^(−qp/6)` fed back from the actual
-access-unit sizes, with a leaky bit reservoir and a ±6 per-class QP
-clamp. Measured on the in-tree 96×64 noisy moving scene (24 frames,
-`gop=8`, `refs=2`): target 300 kb/s → 299.4 kb/s at 39.8 dB luma;
-target 600 kb/s → 595.6 kb/s at 41.2 dB.
+The P/B slice encoder (`slice_enc_p`) decides a per-CU ladder — skip
+(both lists' AMVP slots on B), direct (B, §8.5.2.5, bi-predicted per
+errata #313), explicit inter (per-list `ref_idx` across every active
+reference, quarter-pel search, bi re-fit) and intra — committing
+reconstruction + motion grid + HMVP in decode order; the registered
+encoder keeps a mirror DPB driven by the shared `ref_lists`
+derivations. `examples/rd_curve.rs` is the rate/PSNR measurement tool
+over the synthetic corpus (176×144 / 96×64 / 64×48 moving scenes) the
+numbers above come from.
 
 **Validation posture (stated plainly):** no external EVC validator
-binary is staged under `docs/video/evc/`, so the encoder's gates are
-(a) re-parse-exactness through this crate's own §7.3 parsers and
-(b) **byte-exact encode→decode == encoder-reconstruction** through the
-crate's registered decoder, pinned across a size × QP matrix on both
-entropy shapes, whole P and B GOPs (entropy × deblock matrix,
-multi-reference lists, the cropped-geometry loop), determinism,
-MD5-pinned stream fixtures, multi-frame sessions and single-byte
-mutation gates over the IDR and P access units (every flip/invert
-decodes to a clean error or a frame, never a panic).
-Cross-implementation decode remains open until a validator lands in
-docs.
+binary is staged under `docs/video/evc/` and no EVC-capable `ffmpeg`
+decoder is installed, so the encoder's gates are (a)
+re-parse-exactness through this crate's own §7.3 parsers and (b)
+**byte-exact encode→decode == encoder-reconstruction** through the
+crate's registered decoder — pinned across the size × QP × entropy
+shape matrix (EIPD and Baseline modes), whole P and B GOPs, 10/12-bit,
+MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
+harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
+Cross-implementation decode remains open until a validator lands.
 
-Measured on the in-tree busy synthetic QCIF frame (176×144), intra
-(round-452 re-measure — unchanged from round 444):
-
-| QP | cm_init=0 bytes | cm_init=1 bytes | saving | luma PSNR |
-|----|----------------|----------------|--------|-----------|
-| 4  | 80 280 | 67 391 | 16.1 % | 92.2 dB |
-| 22 | 35 849 | 27 019 | 24.6 % | 80.7 dB |
-| 34 | 23 531 | 18 256 | 22.4 % | 52.2 dB |
-| 51 | 13 574 | 11 135 | 18.0 % | 37.8 dB |
-
-and on a moving-scene QCIF GOP at QP 30 (cm_init on): IDR 12 535
-bytes / 55.2 dB, then P frames of 69-875 bytes at 47.8-49.1 dB with
-93-99.5 % of leaves riding the skip ladder. Low-delay B on the same
-class of content sits within ±5 % of the P stream (it spends a
-`direct_mode_flag` per explicit CU and a second skip `mvp_idx`; the
-bi/direct wins pay for them on noisy content — measured at QP 12 on
-the 64×48 noisy scene: P 29 682 vs B 30 198 bytes).
-
-Encoder follow-ups: hierarchical (reordered) B sub-GOPs over the
-`log2_sub_gop_length > 0` POC shape, macroblock-level rate control,
-and a cross-implementation validator once one is staged in docs.
+Encoder follow-ups: BTT/TT splits and ATS (the decoder parses both),
+hierarchical B sub-GOPs, ADCC residual coding with its own RDOQ, ALF
+filter design, CU-level QP delta / adaptive quantization.
 
 ## Usage
 

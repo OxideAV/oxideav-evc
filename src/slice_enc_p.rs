@@ -63,20 +63,22 @@ use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
+use crate::eipd_mode::{derive_chroma_mode, ModeSelector};
 use crate::hmvp::{HmvpCandList, HmvpCandidate};
 use crate::inter::{
     average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
     MotionVector, RefPictureView,
 };
-use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
+use crate::intra_enc::{self, IntraSel};
+use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile, YuvPicture};
 use crate::rdoq::RdoqInputs;
 use crate::slice_data::{
     baseline_amvp_select_with_grid_and_hmvp, ctx_inc_neighbour_cells, derive_direct_mode_mvs,
     mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
 };
 use crate::slice_enc::{
-    emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, quantize_residual,
-    restore_region, save_region, MODES,
+    emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, quantize_pred,
+    quantize_residual, rd_lambda_at_qp_prime, restore_region, save_region, MODES,
 };
 
 /// Geometry constants of the encoder SPS (§7.4.3.1 `sps_btt_flag == 0`
@@ -151,6 +153,9 @@ pub struct InterEncInputs<'a> {
     pub slice_qp: i32,
     pub deblock: bool,
     pub cm_init: bool,
+    /// `sps_eipd_flag` — the intra candidates run the 33-mode EIPD
+    /// search and write the §7.3.8.4 EIPD syntax (round 455).
+    pub eipd: bool,
 }
 
 /// Output of [`encode_inter_slice_data`].
@@ -208,7 +213,7 @@ enum PLeaf {
         res: Residual,
     },
     Intra {
-        mode_idx: usize,
+        intra: IntraSel,
         res: Residual,
     },
 }
@@ -248,6 +253,8 @@ struct PCtx<'a> {
     walk: SliceWalkInputs,
     /// The entropy shape the emit pass runs under.
     sel: CtxSel,
+    /// `sps_eipd_flag`.
+    eipd: bool,
 }
 
 impl<'a> PCtx<'a> {
@@ -308,6 +315,7 @@ pub fn encode_p_slice_data(
             slice_qp,
             deblock,
             cm_init,
+            eipd: false,
         },
     )?;
     Ok((out.payload, out.recon, out.stats))
@@ -394,6 +402,7 @@ pub fn encode_inter_slice_data(
             ..Default::default()
         },
         sel: CtxSel::new(inputs.cm_init, InitType::Pb),
+        eipd: inputs.eipd,
     };
     let mut stats = PEncStats::default();
     // The decide pass's rate model — the emit pass's context table,
@@ -1390,109 +1399,224 @@ fn decide_leaf(
         cost: inter_cost,
     } = explicit;
 
-    // ---- intra (single tree, chroma follows the luma mode). The luma
-    // mode search costs each mode's own syntax (pred-mode bins, the
-    // U-coded `intra_pred_mode`, `cbf_luma`, the RLE string); chroma is
-    // added on the decided mode.
-    let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
-    let mut best_intra: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
-    let mut best_intra_luma_cost = f64::INFINITY;
+    // ---- intra: Baseline (5 modes, chroma DM) or EIPD (33-mode search
+    // + intra_chroma_pred_mode). Every candidate's rate is the exact
+    // cost of its head (cu_skip_flag, pred_mode_flag, the mode syntax),
+    // cbf and residual bins.
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
     let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
-    for (mode_idx, &mode) in MODES.iter().enumerate() {
-        let (levels, cbf, res, dist) = quantize_block(
-            &refs,
-            mode,
+    let lambda_c = rd_lambda_at_qp_prime(qp_c);
+    let (
+        intra_sel,
+        i_levels_y,
+        i_cbf_y,
+        i_res_y,
+        i_levels_cb,
+        i_cbf_cb,
+        i_res_cb,
+        i_levels_cr,
+        i_cbf_cr,
+        i_res_cr,
+        i_mode_c,
+        intra_cost,
+    ) = if ctx.eipd {
+        let lists = intra_enc::mode_lists(&ctx.side_info, ctx.pic_w, ctx.pic_h, x0, y0, log2_w);
+        let head_bits = |model: &mut BitCostModel, ctx: &PCtx<'_>, selector: ModeSelector| -> f64 {
+            model.measure(|m| {
+                let (t, i) = skip_flag_ctx(ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h);
+                m.encode_decision(t, i, 0);
+                let (t, i) = pred_mode_flag_ctx(ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h);
+                m.encode_decision(t, i, 1);
+                intra_enc::emit_luma_selector(m, sel, selector);
+            })
+        };
+        let cands = intra_enc::luma_candidates(
+            &ctx.recon,
             &src_y,
-            w,
-            h,
-            qp_y,
+            x0,
+            y0,
+            log2_w,
+            log2_h,
+            &lists,
+            ctx.lambda,
+            |selector| head_bits(model, ctx, selector),
+        );
+        let mut best: Option<(i32, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best_cost = f64::INFINITY;
+        for &mode in &cands {
+            let pred = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 0, mode);
+            let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
+            let (levels, cbf, res, dist) =
+                quantize_pred(&pred, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
+            let selector = intra_enc::selector_for(&lists, mode);
+            let bits = head_bits(model, ctx, selector)
+                + model.measure(|m| {
+                    let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+                    m.encode_decision(t, i, u8::from(cbf));
+                    if cbf {
+                        emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+                    }
+                });
+            let cost = dist + ctx.lambda * bits;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((mode, levels, cbf, res));
+            }
+        }
+        let (mode_y, levels_y, cbf_y, res_y) = best.expect("at least one candidate");
+        let mut best_c: Option<intra_enc::ChromaChoice> = None;
+        let mut best_c_cost = f64::INFINITY;
+        for raw in 0..=4i32 {
+            let mode_c = derive_chroma_mode(raw, mode_y);
+            let pred_cb = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 1, mode_c);
+            let pred_cr = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 2, mode_c);
+            let rdoq_cb = RdoqInputs::new(model, lambda_c, sel, 1, MainCtxTable::CbfCb);
+            let (lv_cb, cbf_cb, res_cb, d_cb) =
+                quantize_pred(&pred_cb, &src_cb, wc, hc, qp_c, bd, max_val, Some(&rdoq_cb))?;
+            let rdoq_cr = RdoqInputs::new(model, lambda_c, sel, 2, MainCtxTable::CbfCr);
+            let (lv_cr, cbf_cr, res_cr, d_cr) =
+                quantize_pred(&pred_cr, &src_cr, wc, hc, qp_c, bd, max_val, Some(&rdoq_cr))?;
+            let bits = model.measure(|m| {
+                intra_enc::emit_chroma_pred_mode(m, sel, raw);
+                let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+                m.encode_decision(t, i, u8::from(cbf_cb));
+                let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+                m.encode_decision(t, i, u8::from(cbf_cr));
+                if cbf_cb {
+                    emit_residual_rle(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
+                }
+                if cbf_cr {
+                    emit_residual_rle(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
+                }
+            });
+            let cost = d_cb + d_cr + ctx.lambda * bits;
+            if cost < best_c_cost {
+                best_c_cost = cost;
+                best_c = Some((raw, mode_c, lv_cb, cbf_cb, res_cb, lv_cr, cbf_cr, res_cr));
+            }
+        }
+        let (raw, mode_c, lv_cb, cbf_cb, res_cb, lv_cr, cbf_cr, res_cr) =
+            best_c.expect("five chroma candidates");
+        (
+            IntraSel::Eipd {
+                mode_y,
+                chroma_raw: raw,
+            },
+            levels_y,
+            cbf_y,
+            res_y,
+            lv_cb,
+            cbf_cb,
+            res_cb,
+            lv_cr,
+            cbf_cr,
+            res_cr,
+            mode_c,
+            best_cost + best_c_cost,
+        )
+    } else {
+        let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
+        let mut best_intra: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best_intra_luma_cost = f64::INFINITY;
+        for (mode_idx, &mode) in MODES.iter().enumerate() {
+            let (levels, cbf, res, dist) = quantize_block(
+                &refs,
+                mode,
+                &src_y,
+                w,
+                h,
+                qp_y,
+                bd,
+                max_val,
+                Some(&RdoqInputs::new(
+                    model,
+                    ctx.lambda,
+                    sel,
+                    0,
+                    MainCtxTable::CbfLuma,
+                )),
+            )?;
+            let intra = IntraSel::Baseline(mode_idx);
+            let bits = model.measure(|m| {
+                emit_intra_head(m, ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h, intra);
+                let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+                m.encode_decision(t, i, u8::from(cbf));
+                if cbf {
+                    emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+                }
+            });
+            let cost = dist + ctx.lambda * bits;
+            if cost < best_intra_luma_cost {
+                best_intra_luma_cost = cost;
+                best_intra = Some((mode_idx, levels, cbf, res));
+            }
+        }
+        let (i_mode, i_levels_y, i_cbf_y, i_res_y) = best_intra.expect("5 candidates");
+        // Chroma with the same mode (decoder: IntraPredModeC = IntraPredModeY).
+        let mode = MODES[i_mode];
+        let refs_cb = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 1);
+        let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) = quantize_block(
+            &refs_cb,
+            mode,
+            &src_cb,
+            wc,
+            hc,
+            qp_c,
             bd,
             max_val,
             Some(&RdoqInputs::new(
                 model,
-                ctx.lambda,
+                lambda_c,
                 sel,
-                0,
-                MainCtxTable::CbfLuma,
+                1,
+                MainCtxTable::CbfCb,
             )),
         )?;
-        let bits = model.measure(|m| {
-            emit_intra_head(
-                m,
-                ctx,
+        let refs_cr = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 2);
+        let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) = quantize_block(
+            &refs_cr,
+            mode,
+            &src_cr,
+            wc,
+            hc,
+            qp_c,
+            bd,
+            max_val,
+            Some(&RdoqInputs::new(
+                model,
+                lambda_c,
                 sel,
-                &ctx.side_info,
-                x0,
-                y0,
-                log2_w,
-                log2_h,
-                mode_idx,
-            );
-            let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-            m.encode_decision(t, i, u8::from(cbf));
-            if cbf {
-                emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+                2,
+                MainCtxTable::CbfCr,
+            )),
+        )?;
+        let chroma_bits = model.measure(|m| {
+            let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+            m.encode_decision(t, i, u8::from(i_cbf_cb));
+            let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+            m.encode_decision(t, i, u8::from(i_cbf_cr));
+            if i_cbf_cb {
+                emit_residual_rle(m, sel, 1, &i_levels_cb, log2_w - 1, log2_h - 1);
+            }
+            if i_cbf_cr {
+                emit_residual_rle(m, sel, 2, &i_levels_cr, log2_w - 1, log2_h - 1);
             }
         });
-        let cost = dist + ctx.lambda * bits;
-        if cost < best_intra_luma_cost {
-            best_intra_luma_cost = cost;
-            best_intra = Some((mode_idx, levels, cbf, res));
-        }
-    }
-    let (i_mode, i_levels_y, i_cbf_y, i_res_y) = best_intra.expect("5 candidates");
-    // Chroma with the same mode (decoder: IntraPredModeC = IntraPredModeY).
-    let mode = MODES[i_mode];
-    let refs_cb = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 1);
-    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) = quantize_block(
-        &refs_cb,
-        mode,
-        &src_cb,
-        wc,
-        hc,
-        qp_c,
-        bd,
-        max_val,
-        Some(&RdoqInputs::new(
-            model,
-            crate::slice_enc::rd_lambda_at_qp_prime(qp_c),
-            sel,
-            1,
-            MainCtxTable::CbfCb,
-        )),
-    )?;
-    let refs_cr = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 2);
-    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) = quantize_block(
-        &refs_cr,
-        mode,
-        &src_cr,
-        wc,
-        hc,
-        qp_c,
-        bd,
-        max_val,
-        Some(&RdoqInputs::new(
-            model,
-            crate::slice_enc::rd_lambda_at_qp_prime(qp_c),
-            sel,
-            2,
-            MainCtxTable::CbfCr,
-        )),
-    )?;
-    let chroma_bits = model.measure(|m| {
-        let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
-        m.encode_decision(t, i, u8::from(i_cbf_cb));
-        let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
-        m.encode_decision(t, i, u8::from(i_cbf_cr));
-        if i_cbf_cb {
-            emit_residual_rle(m, sel, 1, &i_levels_cb, log2_w - 1, log2_h - 1);
-        }
-        if i_cbf_cr {
-            emit_residual_rle(m, sel, 2, &i_levels_cr, log2_w - 1, log2_h - 1);
-        }
-    });
-    let intra_cost = best_intra_luma_cost + i_dist_cb + i_dist_cr + ctx.lambda * chroma_bits;
+        (
+            IntraSel::Baseline(i_mode),
+            i_levels_y,
+            i_cbf_y,
+            i_res_y,
+            i_levels_cb,
+            i_cbf_cb,
+            i_res_cb,
+            i_levels_cr,
+            i_cbf_cr,
+            i_res_cr,
+            i_mode as i32,
+            best_intra_luma_cost + i_dist_cb + i_dist_cr + ctx.lambda * chroma_bits,
+        )
+    };
 
     // ---- choose and commit (the statistics are tallied by the emit
     // pass over the *decided* tree — the decide pass trials leaves that
@@ -1567,8 +1691,8 @@ fn decide_leaf(
         }
         _ => {
             // Commit the intra reconstruction through the decoder's own
-            // kernels (luma then chroma, both with the luma mode), then
-            // stamp — the same aggregate the decoder records.
+            // kernels (luma then chroma), then stamp — the same
+            // aggregate the decoder records.
             ctx.side_info.stamp_block(
                 x0,
                 y0,
@@ -1581,27 +1705,53 @@ fn decide_leaf(
                     cu_y0: y0 as u16,
                     cu_log2_w: log2_w as u8,
                     cu_log2_h: log2_h as u8,
-                    intra_luma_mode: i_mode as u8,
+                    intra_luma_mode: intra_sel.stamp_value(),
                     qp_y: ctx.qp.clamp(0, 51) as u8,
                     ..Default::default()
                 },
             );
-            for (c_idx, res) in [(0u32, &i_res_y), (1, &i_res_cb), (2, &i_res_cr)] {
-                intra_reconstruct_cb_in_tile(
-                    &mut ctx.recon,
-                    x0,
-                    y0,
-                    log2_w,
-                    log2_h,
-                    mode,
-                    c_idx,
-                    res,
-                    None,
-                )?;
+            match intra_sel {
+                IntraSel::Baseline(idx) => {
+                    let mode = MODES[idx];
+                    for (c_idx, res) in [(0u32, &i_res_y), (1, &i_res_cb), (2, &i_res_cr)] {
+                        intra_reconstruct_cb_in_tile(
+                            &mut ctx.recon,
+                            x0,
+                            y0,
+                            log2_w,
+                            log2_h,
+                            mode,
+                            c_idx,
+                            res,
+                            None,
+                        )?;
+                    }
+                }
+                IntraSel::Eipd { mode_y, .. } => {
+                    for (c_idx, mode, res) in [
+                        (0u32, mode_y, &i_res_y),
+                        (1, i_mode_c, &i_res_cb),
+                        (2, i_mode_c, &i_res_cr),
+                    ] {
+                        intra_reconstruct_cb_eipd_in_tile(
+                            &mut ctx.recon,
+                            x0,
+                            y0,
+                            log2_w,
+                            log2_h,
+                            mode,
+                            c_idx,
+                            false,
+                            false,
+                            res,
+                            None,
+                        )?;
+                    }
+                }
             }
             (
                 PLeaf::Intra {
-                    mode_idx: i_mode,
+                    intra: intra_sel,
                     res: Residual {
                         levels_y: i_levels_y,
                         cbf_y: i_cbf_y,
@@ -1829,7 +1979,8 @@ fn emit_inter_residual<S: BinSink>(
 
 /// The `cu_skip_flag = 0`, `pred_mode_flag = 1` head of an intra CU
 /// on a P/B slice (both §9.3.4.2.4 neighbour-context flags) plus its
-/// `intra_pred_mode`.
+/// luma mode syntax: the Baseline `intra_pred_mode`, or the EIPD
+/// MPM / PIMS / rem-mode group against the §8.4.2 lists over `grid`.
 #[allow(clippy::too_many_arguments)]
 fn emit_intra_head<S: BinSink>(
     enc: &mut S,
@@ -1840,13 +1991,19 @@ fn emit_intra_head<S: BinSink>(
     y0: u32,
     log2_w: u32,
     log2_h: u32,
-    mode_idx: usize,
+    intra: IntraSel,
 ) {
     let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
     enc.encode_decision(t, i, 0); // cu_skip_flag = 0
     let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
     enc.encode_decision(t, i, 1); // pred_mode_flag = 1 (MODE_INTRA)
-    emit_intra_pred_mode(enc, sel, mode_idx);
+    match intra {
+        IntraSel::Baseline(mode_idx) => emit_intra_pred_mode(enc, sel, mode_idx),
+        IntraSel::Eipd { mode_y, .. } => {
+            let lists = intra_enc::mode_lists(grid, ctx.pic_w, ctx.pic_h, x0, y0, log2_w);
+            intra_enc::emit_luma_selector(enc, sel, intra_enc::selector_for(&lists, mode_y));
+        }
+    }
 }
 
 /// The complete `coding_unit()` bin string of one leaf, probing `grid`
@@ -1908,8 +2065,11 @@ fn emit_leaf_bins<S: BinSink>(
             }
             emit_inter_residual(enc, sel, res, log2_w, log2_h);
         }
-        PLeaf::Intra { mode_idx, res } => {
-            emit_intra_head(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, *mode_idx);
+        PLeaf::Intra { intra, res } => {
+            emit_intra_head(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, *intra);
+            if let IntraSel::Eipd { chroma_raw, .. } = intra {
+                intra_enc::emit_chroma_pred_mode(enc, sel, *chroma_raw);
+            }
             // Single-tree intra TU: cbf_cb, cbf_cr, then cbf_luma
             // (always present — MODE_INTRA), then luma/cb/cr residuals.
             let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
@@ -1996,7 +2156,7 @@ fn emit_leaf<S: BinSink>(
                 res.cbf_y,
             );
         }
-        PLeaf::Intra { mode_idx, res } => {
+        PLeaf::Intra { intra, res } => {
             stats.intra_cus += 1;
             grid.stamp_block(
                 x0,
@@ -2010,7 +2170,7 @@ fn emit_leaf<S: BinSink>(
                     cu_y0: y0 as u16,
                     cu_log2_w: log2_w as u8,
                     cu_log2_h: log2_h as u8,
-                    intra_luma_mode: *mode_idx as u8,
+                    intra_luma_mode: intra.stamp_value(),
                     qp_y: ctx.qp.clamp(0, 51) as u8,
                     ..Default::default()
                 },
@@ -2475,6 +2635,7 @@ mod tests {
                 slice_qp: 30,
                 deblock: false,
                 cm_init: true,
+                eipd: false,
             },
         );
         assert!(bad.is_err());
@@ -2490,6 +2651,7 @@ mod tests {
                 slice_qp: 30,
                 deblock: false,
                 cm_init: true,
+                eipd: false,
             },
         );
         assert!(bad_b.is_err());
@@ -2525,6 +2687,7 @@ mod tests {
                     slice_qp: qp,
                     deblock: false,
                     cm_init,
+                    eipd: false,
                 },
             )
             .unwrap();
@@ -2616,6 +2779,7 @@ mod tests {
                             slice_qp: qp,
                             deblock,
                             cm_init,
+                            eipd: false,
                         },
                     )
                     .unwrap();
@@ -2655,6 +2819,7 @@ mod tests {
                                 slice_qp: qp,
                                 deblock,
                                 cm_init,
+                                eipd: false,
                             },
                         )
                         .unwrap();
@@ -2730,6 +2895,7 @@ mod tests {
                 slice_qp: qp,
                 deblock: false,
                 cm_init: true,
+                eipd: false,
             },
         )
         .unwrap();
@@ -2758,6 +2924,7 @@ mod tests {
                 slice_qp: qp,
                 deblock: false,
                 cm_init: true,
+                eipd: false,
             },
         )
         .unwrap();
@@ -2819,6 +2986,7 @@ mod tests {
                     slice_qp: 33,
                     deblock: false,
                     cm_init: true,
+                    eipd: false,
                 },
             )
             .unwrap()

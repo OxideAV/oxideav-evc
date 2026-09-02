@@ -4,6 +4,29 @@
 
 ### Other
 
+- **Encoder: EIPD intra — 33 modes, MPM / PIMS / rem-mode syntax,
+  `intra_chroma_pred_mode` (round 455).** New `intra_enc` module: the
+  §8.4.2 lists are derived from the encoder's decode-order side-info grid
+  (the same L / A / R probes the decoder runs), every mode is ranked by
+  `SAD + √λ · bits( mode syntax )`, the best three plus both MPMs go
+  through the exact RD (RDOQ residual, true §8.4.4 reconstruction, exact
+  bins), and chroma tries all five `intra_chroma_pred_mode` values under
+  the §8.4.3 collision skip. Write-side duals of `eipd_syntax` (FL / TB
+  bypass, Table 93 chroma string) are pinned against the decoder's
+  readers on both entropy shapes; the SPS carries `sps_eipd_flag = 1`,
+  the conditional `sps_ibc_flag = 0` and the Table A.6 binIdx-8 toolset
+  bit (Main profile). Applied on I slices and on the intra candidates of
+  the P/B ladder (P/B init type); the emit pass replays an emit-order
+  grid so the MPM lists match the decoder's at every CU. Registry option
+  `eipd`, **default on** (`eipd=0 cm_init=0` keeps the pure
+  Baseline-profile stream, which one fixture still pins). Measured
+  against the previous commit at equal PSNR (QP 32-50, three
+  geometries): **intra −10.2 % Y / −11.8 % YUV, P −5.3 % / −6.4 %,
+  low-delay B −3.7 % / −4.8 %** BD-rate. Round-trip pins: the size × QP
+  × entropy-shape matrix through the decoder's `sps_eipd_flag == 1`
+  walker, P/B GOPs through the registry; the round-429/431/452 registry
+  pins compare against the Baseline-mode direct entry points with
+  `eipd=0`. Fixtures re-pinned.
 - **Fuzz harness (round 455).** New `fuzz/` (cargo-fuzz, own workspace)
   with two targets and the org-level nightly `Fuzz` workflow shim:
   `rdoq_trellis` drives the RDOQ trellis on fuzzed blocks (size 2..64 ×

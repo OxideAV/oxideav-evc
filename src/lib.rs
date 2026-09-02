@@ -140,6 +140,8 @@ pub mod inter_cu_syntax;
 #[doc(hidden)]
 pub mod intra;
 #[doc(hidden)]
+pub mod intra_enc;
+#[doc(hidden)]
 pub mod merge;
 #[doc(hidden)]
 pub mod mmvd;

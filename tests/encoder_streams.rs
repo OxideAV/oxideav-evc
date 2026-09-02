@@ -79,8 +79,8 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "3"), ("qp", "24")],
-        stream_md5: "79ec391406643e93cb4201fc239e2c5b",
-        output_md5: "9ffa4477ba727601f9dace68946bc350",
+        stream_md5: "1d54ac975ffdbc1b56f011ed10d3ae21",
+        output_md5: "b76bd9f97f8a4c8a41fdc52267a795d4",
     },
     Case {
         name: "b_low_delay",
@@ -88,10 +88,11 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "2"), ("b", "1"), ("qp", "24")],
-        stream_md5: "49275b6cf75149e6c36f1cd590fcb309",
-        output_md5: "55d667f2b4e459a7a8d8c0573547a20c",
+        stream_md5: "bfe564cd2859fc90b5cc7d4720227d80",
+        output_md5: "6dc26112bb680aa8026f3c46d7c1a03a",
     },
     Case {
+        // The one pure Baseline-profile stream (`cm_init=0 eipd=0`).
         name: "b_low_delay_baseline_deblock",
         w: 64,
         h: 48,
@@ -102,6 +103,7 @@ const CASES: &[Case] = &[
             ("b", "1"),
             ("qp", "30"),
             ("cm_init", "0"),
+            ("eipd", "0"),
             ("deblock", "1"),
         ],
         stream_md5: "cbc0d5eb74e0448960d83f7457f1cf78",

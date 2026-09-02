@@ -51,6 +51,12 @@ pub struct EncSequenceConfig {
     /// `picture_cropping_flag = 0` — the historical SPS byte for byte.
     pub crop_right: u32,
     pub crop_bottom: u32,
+    /// `sps_eipd_flag` (§7.4.3.1) — the 33-mode EIPD intra prediction
+    /// with the §8.4.2 MPM / PIMS / rem-mode luma syntax and the §8.4.3
+    /// `intra_chroma_pred_mode` (round 455). Main-profile only
+    /// (Table A.6 binIdx 8, `0x100`): setting it forces `profile_idc =
+    /// 1` even with `cm_init` off.
+    pub eipd: bool,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -100,10 +106,14 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         )));
     }
     let mut w = BitWriter::new();
+    let main = cfg.cm_init || cfg.eipd;
+    // Table A.6: binIdx 14 = sps_cm_init_flag (0x4000), binIdx 8 =
+    // sps_eipd_flag (0x100); Baseline (A.3.2) requires toolset_idc_h = 0.
+    let toolset_h = (if cfg.cm_init { 0x4000 } else { 0 }) | (if cfg.eipd { 0x100 } else { 0 });
     w.ue(0); // sps_seq_parameter_set_id
-    w.u(8, u32::from(cfg.cm_init)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
+    w.u(8, u32::from(main)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
-    w.u(32, if cfg.cm_init { 0x4000 } else { 0 }); // toolset_idc_h (Table A.6 binIdx 14)
+    w.u(32, toolset_h); // toolset_idc_h
     w.u(32, 0); // toolset_idc_l
     w.ue(1); // chroma_format_idc = 1 (4:2:0)
     w.ue(cfg.width); // pic_width_in_luma_samples
@@ -113,7 +123,10 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.u1(false); // sps_btt_flag → CtbLog2SizeY=6, MinCbLog2SizeY=2 defaults
     w.u1(false); // sps_suco_flag
     w.u1(false); // sps_admvp_flag
-    w.u1(false); // sps_eipd_flag
+    w.u1(cfg.eipd); // sps_eipd_flag
+    if cfg.eipd {
+        w.u1(false); // sps_ibc_flag (§7.3.2.1: present when sps_eipd_flag)
+    }
     w.u1(cfg.cm_init); // sps_cm_init_flag
     if cfg.cm_init {
         w.u1(false); // sps_adcc_flag (§7.3.2.1: present when cm_init)
@@ -287,6 +300,7 @@ mod tests {
             max_num_tid0_ref_pics: 1,
             crop_right: 0,
             crop_bottom: 0,
+            eipd: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -325,6 +339,37 @@ mod tests {
 
     /// 10-bit SPS parse-back: the bit-depth fields land where the
     /// encoder put them; out-of-range depths are refused.
+    /// Round 455: the EIPD SPS shape — Main profile with the Table A.6
+    /// binIdx-8 toolset bit, `sps_eipd_flag = 1`, the conditional
+    /// `sps_ibc_flag = 0`, parsed back by the crate's SPS reader.
+    #[test]
+    fn sps_parse_back_eipd() {
+        for &cm_init in &[false, true] {
+            let cfg = EncSequenceConfig {
+                width: 64,
+                height: 48,
+                level_idc: 30,
+                bit_depth: 8,
+                cm_init,
+                max_num_tid0_ref_pics: 1,
+                crop_right: 0,
+                crop_bottom: 0,
+                eipd: true,
+            };
+            let rbsp = write_sps_rbsp(&cfg).unwrap();
+            let sps = crate::sps::parse(&rbsp).unwrap();
+            assert_eq!(sps.profile_idc, 1, "EIPD is Main-profile only");
+            assert!(sps.sps_eipd_flag);
+            assert!(!sps.sps_ibc_flag);
+            assert_eq!(sps.sps_cm_init_flag, cm_init);
+            assert_eq!(
+                sps.toolset_idc_h,
+                0x100 | if cm_init { 0x4000 } else { 0 },
+                "Table A.6 bits"
+            );
+        }
+    }
+
     #[test]
     fn sps_parse_back_10bit() {
         let cfg = EncSequenceConfig {
@@ -336,6 +381,7 @@ mod tests {
             max_num_tid0_ref_pics: 1,
             crop_right: 0,
             crop_bottom: 0,
+            eipd: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -376,6 +422,7 @@ mod tests {
             max_num_tid0_ref_pics: 1,
             crop_right: 0,
             crop_bottom: 0,
+            eipd: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -439,6 +486,7 @@ mod tests {
             max_num_tid0_ref_pics: 1,
             crop_right: 0,
             crop_bottom: 0,
+            eipd: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(
