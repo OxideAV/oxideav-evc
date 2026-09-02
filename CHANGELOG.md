@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-evc/compare/v0.0.4...v0.0.5) - 2026-09-02
+
+### Other
+
+- EIPD intra — 33-mode search, MPM/PIMS/rem-mode + intra_chroma_pred_mode duals, default on
+- fuzz harness — RDOQ trellis + whole-encoder round trip; two trellis findings fixed
+- two-pass rate control — first-pass stats, slope-refined re-planning under a buffer model
+- RDOQ — rate-distortion optimised quantization over the §7.3.8.7 RLE syntax
+- RD λ calibrated to the realised §8.7 quantizer step
+- exact entropy-coder bit costs in the encoder's decide pass
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Other
 
 - **Encoder: EIPD intra — 33 modes, MPM / PIMS / rem-mode syntax,
