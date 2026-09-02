@@ -1,0 +1,34 @@
+[package]
+name = "oxideav-evc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-evc]
+path = ".."
+
+# The fuzz crate is its own workspace root (it is not a member of the
+# umbrella workspace and resolves its dependencies separately).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdoq_trellis"
+path = "fuzz_targets/rdoq_trellis.rs"
+test = false
+doc = false
+bench = false

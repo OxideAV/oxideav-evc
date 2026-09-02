@@ -816,7 +816,8 @@ fn emit_leaf<S: BinSink>(enc: &mut S, sel: CtxSel, plan: &LeafPlan, log2_w: u32,
 /// ctxInc driven by `cIdx`, the bin position and the §7.3.8.7
 /// `PrevLevel` chain (init 6, then the previous coefficient's absolute
 /// level), and `coeff_last_flag` the Table 95 `cIdx == 0 ? 0 : 1`.
-pub(crate) fn emit_residual_rle<S: BinSink>(
+#[doc(hidden)]
+pub fn emit_residual_rle<S: BinSink>(
     enc: &mut S,
     sel: CtxSel,
     c_idx: u32,

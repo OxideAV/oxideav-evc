@@ -204,12 +204,14 @@ pub fn rdoq_rle(
     // provisional). back[p][b] = (q, b_prev, abs_level); q = -1 = start.
     let mut best = vec![[INF; 6]; n];
     let mut back = vec![[(-1i32, 0u8, 0u32); 6]; n];
-    // Running minima for the r ≥ 1 transitions, per previous bucket;
-    // the start pseudo-state (q = −1, PrevLevel 6 ⇒ bucket 5).
+    // Running minima for the r ≥ 1 transitions, per previous bucket
+    // (a state q joins them only once p ≥ q + 2 — the fold below runs
+    // after each position — so the run-0 transition is never costed
+    // with the r ≥ 1 formula, whose `A` term is not the bin-0 `0`).
     let mut run_min = [INF; 6];
-    run_min[5] = lambda * bc[5].run_b; // 0 − z[0] − λ·B·(−1)
     let mut run_min_arg = [(-1i32, 0u8); 6];
-    // best[p − 1][·] with the start state at p = 0.
+    // best[p − 1][·]: the start pseudo-state (q = −1, PrevLevel 6 ⇒
+    // bucket 5) at p = 0.
     let mut prev = [INF; 6];
     prev[5] = 0.0;
     let mut prev_q = -1i32;
@@ -218,15 +220,18 @@ pub fn rdoq_rle(
         let c = frac[scan[p]];
         let w = weights[scan[p]];
         let mag = c.abs();
-        let lo = mag.floor() as u32;
-        let hi = lo + 1;
+        // §7.4.9.6: TransCoeffLevel ∈ [−32768, 32767] — the magnitude
+        // cap depends on the sign.
+        let cap = if c < 0.0 { 32768u32 } else { 32767 };
+        let lo = (mag.floor() as u32).min(cap);
+        let hi = (lo + 1).min(cap);
         let mut cands = [0u32; 2];
         let mut n_cand = 0;
         if lo >= 1 {
-            cands[n_cand] = lo.min(32767);
+            cands[n_cand] = lo;
             n_cand += 1;
         }
-        if mag >= 0.25 && hi <= 32767 && (n_cand == 0 || cands[0] != hi) {
+        if mag >= 0.25 && hi != lo {
             cands[n_cand] = hi;
             n_cand += 1;
         }
@@ -458,6 +463,49 @@ mod tests {
         assert_eq!(levels[w * h - 2], 0, "tail must be trimmed: {levels:?}");
         let (levels, _, _) = rdoq_rle(&frac, &weights, w, h, &inputs(&model, sel, 0.0));
         assert_eq!(levels[w * h - 2], 1, "λ = 0 keeps it");
+    }
+
+    /// The trellis's own cost accounting equals a re-measure of the
+    /// chosen levels on a block whose first coefficient is a large
+    /// level at run 0 under skewed `cm_init` contexts — the shape where
+    /// a run-0 transition costed with the `r ≥ 1` formula (the fuzz
+    /// finding of round 455) showed up as a 0.09-bit under-count.
+    #[test]
+    fn accounting_matches_measure_on_skewed_contexts() {
+        let (w, h) = (4usize, 16usize);
+        let n = w * h;
+        let residual: Vec<i32> = (0..n)
+            .map(|i| {
+                let b = [0xf7i32, 0xff][i % 2];
+                let sign = if (i / 2) % 2 == 0 { 1 } else { -1 };
+                (sign * b * 4).clamp(-1024, 1024)
+            })
+            .collect();
+        let frac = forward_transform_fractional(&residual, w, h, 63, 10).unwrap();
+        let weights = level_unit_sse_weights(w, h, 63, 10);
+        let sel = CtxSel::new(true, InitType::Pb);
+        let mut model = BitCostModel::new();
+        model.init_main_profile(InitType::Pb, 49);
+        model.commit(|m| {
+            for i in 0..0x31usize {
+                let (t, ci) = sel.ctx(MainCtxTable::CoeffLastFlag, i % 2);
+                m.encode_decision(t, ci, u8::from(i % 3 == 0));
+            }
+        });
+        let inp = RdoqInputs {
+            lambda: 221.0 * 221.0 / 16.0,
+            sel,
+            model: &model,
+            c_idx: 1,
+            cbf_ctx: sel.ctx(MainCtxTable::CbfCb, 0),
+        };
+        let (levels, cbf, cost) = rdoq_rle(&frac, &weights, w, h, &inp);
+        assert!(cbf);
+        let own = account(&levels, &frac, &weights, w, h, &inp);
+        assert!(
+            (own - cost).abs() < 1e-6 * cost,
+            "accounting {own} vs trellis {cost}"
+        );
     }
 
     /// A block of small coefficients zeroes out entirely at a high λ.

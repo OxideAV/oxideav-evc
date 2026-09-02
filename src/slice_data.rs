@@ -1385,7 +1385,8 @@ fn decode_residual_block(
 /// * `coeff_sign_flag`: bypass.
 /// * `coeff_last_flag` (only if `ScanPos < total - 1`): Table 86,
 ///   ctxInc `cIdx == 0 ? 0 : 1` (Table 95).
-pub(crate) fn decode_residual_coding_rle(
+#[doc(hidden)]
+pub fn decode_residual_coding_rle(
     eng: &mut CabacEngine,
     sel: crate::cabac_init::CtxSel,
     c_idx: u32,

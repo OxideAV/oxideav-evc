@@ -1,0 +1,17 @@
+name: Fuzz
+
+# Nightly libFuzzer run over the harnesses under `fuzz/fuzz_targets/`
+# through the OxideAV org-level reusable workflow (auto-discovers the
+# targets, splits the time budget, persists the corpus, fails on crash).
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

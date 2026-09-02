@@ -4,6 +4,26 @@
 
 ### Other
 
+- **Fuzz harness (round 455).** New `fuzz/` (cargo-fuzz, own workspace)
+  with two targets and the org-level nightly `Fuzz` workflow shim:
+  `rdoq_trellis` drives the RDOQ trellis on fuzzed blocks (size 2..64 ×
+  2..64, Qp′ 0..63, 8/10-bit, both entropy shapes, both init types,
+  fuzzed λ and context state) and checks the level invariants, that the
+  trellis never scores worse than rounding under its own objective, that
+  its accounting equals a re-measure of the chosen string, and that the
+  §7.3.8.7 RLE string it writes decodes back through
+  `decode_residual_coding_rle`; `encode_roundtrip` runs the registered
+  encoder (IDR + P/B GOP, 8..64 × 8..64, 8/10-bit, every tool flag) on
+  fuzzed pixels and asserts the registered decoder reproduces the
+  encoder's reconstruction sample for sample. Two findings, fixed in the
+  same commit: the trellis's start pseudo-state was reachable through the
+  `r ≥ 1` run formula at scan position 0 (a run-0 transition costed with
+  the wrong bin, a 0.09-bit under-count on skewed `cm_init` contexts —
+  regression-pinned), and the negative magnitude cap was 32767 where
+  §7.4.9.6 allows −32768. 7 minutes on `rdoq_trellis` (62 k runs) and 9
+  on `encode_roundtrip` (3.8 k runs) clean after the fixes; the stream
+  fixtures are unchanged. `emit_residual_rle` and
+  `decode_residual_coding_rle` are `#[doc(hidden)] pub` for the harness.
 - **Encoder: two-pass rate control (round 455).** `pass=1 stats=<path>`
   records every frame's `idr qp bits` (text, rewritten per frame and at
   `flush`); `pass=2 stats=<path> bitrate=… [fps=…] [vbv=…]` follows the
