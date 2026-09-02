@@ -4,6 +4,28 @@
 
 ### Other
 
+- **Encoder: RD λ calibrated to the realised §8.7 quantizer step (round
+  455).** `rd_lambda` was the classic `0.57 · 2^(( qp − 12 ) / 3)`, which
+  is right for a `2^(( QP − 4 ) / 6)` step; this crate's decode chain
+  (eq. 1059 `levelScale << ( qP / 6 ) >> bdShift` with eq. 1056's
+  `BitDepth + Log2( nTbS ) − 5`, the 64-scaled eq. 1062 kernels, and the
+  eq. 1053/1055 `( 20 − BitDepth ) + 7` renormalisation — no `m = 16`
+  flat-scaling term anywhere) realises an orthonormal-basis step of
+  `Δ = levelScale[ Qp′ % 6 ] · 2^( Qp′ / 6 ) / 2^10` for every TB shape
+  and bit depth — 24 QP finer, so the old λ sat ~256× above `0.09 · Δ²`
+  and every inter picture collapsed into the skip ladder (P/B pictures
+  at ~31 dB behind a 52 dB IDR at the same QP). λ is now
+  `RD_LAMBDA_SCALE · Δ²` at `Qp′Y` (eq. 1043, so 10-/12-bit sources scale
+  with their sample range), the scale tuned on the corpus (0.05 / 0.15 /
+  0.25 lose 0.8-6 % BD-rate to 0.09). Measured against the previous
+  commit at equal PSNR: **P −51.2 %, low-delay B −51.7 % BD-rate**
+  (luma, three geometries), intra −1.6 %. Test premises that encoded the
+  old behaviour are rewritten: a static P picture is skip-*carried*
+  (≥ 75 % of leaves) rather than skip-*only* (the RD now re-codes the
+  IDR's quantization error where that beats skip), the B tool-coverage
+  loop runs QP 14 and QP 51 (the noise is worth coding at QP 40), and
+  the low-delay B stream may beat P by more than 5 %. MD5 stream
+  fixtures re-pinned.
 - **Encoder: exact entropy-coder bit costs in the decide pass (round
   455).** The RD rate term was a per-element bin *count*; it is now the
   §9.3.4.3.2 cost of the exact bin string each candidate would emit —

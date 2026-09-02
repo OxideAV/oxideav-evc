@@ -197,7 +197,7 @@ pub fn encode_idr_slice_data_opts(
         src,
         recon,
         qp: slice_qp,
-        lambda: rd_lambda(slice_qp),
+        lambda: rd_lambda(slice_qp, src.bit_depth),
         bit_depth: src.bit_depth,
         pic_w: src.width,
         pic_h: src.height,
@@ -527,19 +527,42 @@ fn decide_leaf(
 /// Predict + transform + quantize + reconstruct one candidate block
 /// through the decoder's pipeline; returns (levels, cbf, recon
 /// residual, SSE distortion).
-/// The RD Lagrange multiplier `λ = 0.57 · 2^((qp − 12) / 3)`, evaluated
-/// without a transcendental call: `2^((qp − 12) / 3)` splits into an
-/// exact power of two times one of `{1, ∛2, ∛4}`, so every platform's
-/// encoder lands on bit-identical costs (the same source encodes to the
-/// same bytes on every CI host — the MD5-pinned stream fixtures rely
-/// on it).
-pub(crate) fn rd_lambda(qp: i32) -> f64 {
-    const CBRT: [f64; 3] = [1.0, 1.259_921_049_894_873_2, 1.587_401_051_968_199_4];
-    let e = qp - 12;
-    let q = e.div_euclid(3);
-    let r = e.rem_euclid(3) as usize;
-    0.57 * 2f64.powi(q) * CBRT[r]
+/// The RD Lagrange multiplier, calibrated to the §8.7 quantizer step
+/// this crate's decode chain actually realises: `λ = RD_LAMBDA_SCALE ·
+/// Δ²`, where `Δ` is the pixel-domain (orthonormal-basis) step of one
+/// `TransCoeffLevel` unit at `Qp′Y` (eq. 1043),
+///
+/// ```text
+/// Δ = levelScale[ Qp′ % 6 ] · 2^( Qp′ / 6 ) / 2^10
+/// ```
+///
+/// — eq. 1059's `levelScale << ( qP / 6 ) >> bdShift` (eq. 1056:
+/// `BitDepth + Log2( nTbS ) − 5`) carried through the eq. 1062 kernels
+/// (row norm² `nTbS · 64²`) and the eq. 1053/1055 `( 20 − BitDepth ) +
+/// 7` renormalisation: the bit-depth and size terms cancel, leaving the
+/// step above for every TB shape (rectangular shapes via `rectNorm`,
+/// eq. 1058, to within its 181/128 rounding). At 8 bits, Qp′ 32 gives
+/// Δ ≈ 1.6 and Qp′ 51 ≈ 14 — this chain's QP scale is 24 finer than
+/// the classic `2^(( QP − 4 ) / 6)` step, which is why the historical
+/// `0.57 · 2^(( qp − 12 ) / 3)` (right for that classic step) sat ~256×
+/// too high here and drove every inter picture into the skip ladder.
+/// `RD_LAMBDA_SCALE` is the classic constant re-expressed in Δ²
+/// (`0.57 · 2^(( QP − 12 ) / 3) / Δ_classic( QP )²`, QP-independent), then
+/// tuned on the crate's corpus (see the CHANGELOG round-455 entry).
+///
+/// Evaluated without transcendental calls (`2^( Qp′ / 6 )` is an exact
+/// power of two here since Δ² only needs `2^( 2 · ⌊Qp′ / 6⌋ )`), so
+/// every platform's encoder lands on bit-identical costs — the
+/// MD5-pinned stream fixtures rely on it.
+pub(crate) fn rd_lambda(qp: i32, bit_depth: u32) -> f64 {
+    let qp_prime = crate::dequant::qp_prime_y(qp, bit_depth);
+    let ls = f64::from(crate::dequant::LEVEL_SCALE_BASELINE[qp_prime.rem_euclid(6) as usize]);
+    let step = ls * 2f64.powi(qp_prime.div_euclid(6)) / 1024.0;
+    RD_LAMBDA_SCALE * step * step
 }
+
+/// `λ / Δ²` — see [`rd_lambda`].
+pub(crate) const RD_LAMBDA_SCALE: f64 = 0.09;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_block(

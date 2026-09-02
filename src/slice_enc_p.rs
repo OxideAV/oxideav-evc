@@ -382,7 +382,7 @@ pub fn encode_inter_slice_data(
         slice_is_b: inputs.slice_is_b,
         curr_poc: inputs.curr_poc,
         qp: slice_qp,
-        lambda: crate::slice_enc::rd_lambda(slice_qp),
+        lambda: crate::slice_enc::rd_lambda(slice_qp, src.bit_depth),
         bit_depth: src.bit_depth,
         pic_w: src.width,
         pic_h: src.height,
@@ -2152,8 +2152,13 @@ mod tests {
             p_payload.len(),
             idr_payload.len()
         );
-        // The recon of a skip-only frame IS the reference.
-        assert_eq!(recon.y, refr.y);
+        // Skip carries the frame; the few CUs the RD refines (the
+        // IDR's own quantization error re-coded where that beats the
+        // skip distortion at λ) stay a small minority.
+        assert!(
+            stats.skip_cus * 4 >= stats.leaves * 3,
+            "skip must carry a static P picture: {stats:?}"
+        );
         let (dec, _) = decode_p(&p_payload, &refr, w, h, qp, false, true);
         assert_eq!(dec.y, recon.y);
     }
@@ -2490,14 +2495,14 @@ mod tests {
     /// Round 452 — **low-delay B**: both lists resolve to the same
     /// descending past (§8.3.2.2 with nothing above the current POC),
     /// the collocated field is the previous P/B picture's grid. Every
-    /// B tool must appear and the loop stays recon-exact on both
-    /// entropy shapes and both deblock settings.
+    /// B tool must appear (over a low and a high QP — at QP 14 the
+    /// per-frame noise stays in the reconstructions and the bi/direct
+    /// averaging wins leaves; at QP 51 it quantizes away and the skip
+    /// ladder carries the picture) and the loop stays recon-exact on
+    /// both entropy shapes and both deblock settings.
     #[test]
     fn low_delay_b_round_trips_with_every_tool() {
         let (w, h) = (96u32, 64u32);
-        // A low QP keeps the per-frame noise in the reconstructions
-        // (it would quantize away at QP 30, leaving skip to win).
-        let qp = 14;
         // Independent per-frame noise on top of the moving scene: the
         // eq. 988 average of two past pictures halves the noise
         // variance, which is what makes explicit bi-prediction win
@@ -2514,100 +2519,103 @@ mod tests {
         };
         for &cm_init in &[false, true] {
             for &deblock in &[false, true] {
-                let f0 = synth_noisy(0);
-                let (_ip, r0, _s) =
-                    crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, deblock, cm_init)
-                        .unwrap();
-                let f1 = synth_noisy(1);
-                let (_pp, r1, _s) = encode_p_slice_data(&f1, &r0, qp, deblock, cm_init).unwrap();
-                // The P picture's motion field must come from the same
-                // encoder path — re-run through the general entry to
-                // capture the grid (identical payload).
-                let refs1 = [RefEntry { pic: &r0, poc: 0 }];
-                let p_out = encode_inter_slice_data(
-                    &f1,
-                    InterEncInputs {
-                        refs_l0: &refs1,
-                        refs_l1: &[],
-                        slice_is_b: false,
-                        curr_poc: 1,
-                        col: None,
-                        slice_qp: qp,
-                        deblock,
-                        cm_init,
-                    },
-                )
-                .unwrap();
-                assert_eq!(p_out.recon.y, r1.y);
                 let mut totals = PEncStats::default();
-                let mut dpb: Vec<(YuvPicture, SideInfoGrid, i32, Vec<i32>)> = vec![
-                    (r0.clone(), SideInfoGrid::new(w, h), 0, vec![]),
-                    (r1.clone(), p_out.side_info, 1, vec![0]),
-                ];
-                for t in 2..=4u32 {
-                    let src = synth_noisy(t);
-                    let curr_poc = t as i32;
-                    // §8.3.2.2 low-delay: L0 = L1 = descending POCs.
-                    let mut order: Vec<usize> = (0..dpb.len()).collect();
-                    order.sort_by_key(|&i| -dpb[i].2);
-                    let refs: Vec<RefEntry<'_>> = order
-                        .iter()
-                        .take(2)
-                        .map(|&i| RefEntry {
-                            pic: &dpb[i].0,
-                            poc: dpb[i].2,
-                        })
-                        .collect();
-                    let col_i = order[0];
-                    let col = ColMotion {
-                        grid: &dpb[col_i].1,
-                        poc: dpb[col_i].2,
-                        ref_pocs_l0: &dpb[col_i].3,
-                    };
-                    let out = encode_inter_slice_data(
-                        &src,
+                for &qp in &[14i32, 51] {
+                    let f0 = synth_noisy(0);
+                    let (_ip, r0, _s) =
+                        crate::slice_enc::encode_idr_slice_data_opts(&f0, qp, deblock, cm_init)
+                            .unwrap();
+                    let f1 = synth_noisy(1);
+                    let (_pp, r1, _s) =
+                        encode_p_slice_data(&f1, &r0, qp, deblock, cm_init).unwrap();
+                    // The P picture's motion field must come from the same
+                    // encoder path — re-run through the general entry to
+                    // capture the grid (identical payload).
+                    let refs1 = [RefEntry { pic: &r0, poc: 0 }];
+                    let p_out = encode_inter_slice_data(
+                        &f1,
                         InterEncInputs {
-                            refs_l0: &refs,
-                            refs_l1: &refs,
-                            slice_is_b: true,
-                            curr_poc,
-                            col: Some(col),
+                            refs_l0: &refs1,
+                            refs_l1: &[],
+                            slice_is_b: false,
+                            curr_poc: 1,
+                            col: None,
                             slice_qp: qp,
                             deblock,
                             cm_init,
                         },
                     )
                     .unwrap();
-                    let (dec, dec_stats) = decode_lists(
-                        &out.payload,
-                        &refs,
-                        &refs,
-                        true,
-                        curr_poc,
-                        Some(col),
-                        w,
-                        h,
-                        qp,
-                        deblock,
-                        cm_init,
-                    );
-                    assert_eq!(dec.y, out.recon.y, "t{t} cm{cm_init} db{deblock}: luma");
-                    assert_eq!(dec.cb, out.recon.cb, "t{t} cm{cm_init} db{deblock}: cb");
-                    assert_eq!(dec.cr, out.recon.cr, "t{t} cm{cm_init} db{deblock}: cr");
-                    assert_eq!(dec_stats.direct_cus, out.stats.direct_cus);
-                    assert_eq!(
-                        dec_stats.bi_pred_cus > 0,
-                        out.stats.bi_cus + out.stats.direct_cus + out.stats.skip_cus > 0
-                    );
-                    let s = out.stats;
-                    totals.skip_cus += s.skip_cus;
-                    totals.direct_cus += s.direct_cus;
-                    totals.bi_cus += s.bi_cus;
-                    totals.l1_only_cus += s.l1_only_cus;
-                    totals.multi_ref_cus += s.multi_ref_cus;
-                    totals.inter_cus += s.inter_cus;
-                    let ref_pocs: Vec<i32> = refs.iter().map(|r| r.poc).collect();
-                    dpb.push((out.recon, out.side_info, curr_poc, ref_pocs));
+                    assert_eq!(p_out.recon.y, r1.y);
+                    let mut dpb: Vec<(YuvPicture, SideInfoGrid, i32, Vec<i32>)> = vec![
+                        (r0.clone(), SideInfoGrid::new(w, h), 0, vec![]),
+                        (r1.clone(), p_out.side_info, 1, vec![0]),
+                    ];
+                    for t in 2..=4u32 {
+                        let src = synth_noisy(t);
+                        let curr_poc = t as i32;
+                        // §8.3.2.2 low-delay: L0 = L1 = descending POCs.
+                        let mut order: Vec<usize> = (0..dpb.len()).collect();
+                        order.sort_by_key(|&i| -dpb[i].2);
+                        let refs: Vec<RefEntry<'_>> = order
+                            .iter()
+                            .take(2)
+                            .map(|&i| RefEntry {
+                                pic: &dpb[i].0,
+                                poc: dpb[i].2,
+                            })
+                            .collect();
+                        let col_i = order[0];
+                        let col = ColMotion {
+                            grid: &dpb[col_i].1,
+                            poc: dpb[col_i].2,
+                            ref_pocs_l0: &dpb[col_i].3,
+                        };
+                        let out = encode_inter_slice_data(
+                            &src,
+                            InterEncInputs {
+                                refs_l0: &refs,
+                                refs_l1: &refs,
+                                slice_is_b: true,
+                                curr_poc,
+                                col: Some(col),
+                                slice_qp: qp,
+                                deblock,
+                                cm_init,
+                            },
+                        )
+                        .unwrap();
+                        let (dec, dec_stats) = decode_lists(
+                            &out.payload,
+                            &refs,
+                            &refs,
+                            true,
+                            curr_poc,
+                            Some(col),
+                            w,
+                            h,
+                            qp,
+                            deblock,
+                            cm_init,
+                        );
+                        assert_eq!(dec.y, out.recon.y, "t{t} cm{cm_init} db{deblock}: luma");
+                        assert_eq!(dec.cb, out.recon.cb, "t{t} cm{cm_init} db{deblock}: cb");
+                        assert_eq!(dec.cr, out.recon.cr, "t{t} cm{cm_init} db{deblock}: cr");
+                        assert_eq!(dec_stats.direct_cus, out.stats.direct_cus);
+                        assert_eq!(
+                            dec_stats.bi_pred_cus > 0,
+                            out.stats.bi_cus + out.stats.direct_cus + out.stats.skip_cus > 0
+                        );
+                        let s = out.stats;
+                        totals.skip_cus += s.skip_cus;
+                        totals.direct_cus += s.direct_cus;
+                        totals.bi_cus += s.bi_cus;
+                        totals.l1_only_cus += s.l1_only_cus;
+                        totals.multi_ref_cus += s.multi_ref_cus;
+                        totals.inter_cus += s.inter_cus;
+                        let ref_pocs: Vec<i32> = refs.iter().map(|r| r.poc).collect();
+                        dpb.push((out.recon, out.side_info, curr_poc, ref_pocs));
+                    }
                 }
                 assert!(
                     totals.skip_cus > 0,
