@@ -79,8 +79,8 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "3"), ("qp", "24")],
-        stream_md5: "2619bb15c55979d5e9dc9e58783749d6",
-        output_md5: "fdb45d7626392cc67d5fa2cd95168092",
+        stream_md5: "79ec391406643e93cb4201fc239e2c5b",
+        output_md5: "9ffa4477ba727601f9dace68946bc350",
     },
     Case {
         name: "b_low_delay",
@@ -88,8 +88,8 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "2"), ("b", "1"), ("qp", "24")],
-        stream_md5: "9ad5f174b228f03d1e584f4cc701d213",
-        output_md5: "c73ae3972ce4f01df20020de546d64ec",
+        stream_md5: "49275b6cf75149e6c36f1cd590fcb309",
+        output_md5: "55d667f2b4e459a7a8d8c0573547a20c",
     },
     Case {
         name: "b_low_delay_baseline_deblock",
@@ -104,8 +104,8 @@ const CASES: &[Case] = &[
             ("cm_init", "0"),
             ("deblock", "1"),
         ],
-        stream_md5: "e78b8594767e2cfd0af9fdfc1b61cf8b",
-        output_md5: "c21a94c732433d892916ffff79035413",
+        stream_md5: "cbc0d5eb74e0448960d83f7457f1cf78",
+        output_md5: "9585661b68e2fe365c8f39a6351ebeef",
     },
 ];
 

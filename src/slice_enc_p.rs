@@ -69,14 +69,14 @@ use crate::inter::{
     MotionVector, RefPictureView,
 };
 use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
-use crate::quant_enc::forward_quantize;
+use crate::rdoq::RdoqInputs;
 use crate::slice_data::{
     baseline_amvp_select_with_grid_and_hmvp, ctx_inc_neighbour_cells, derive_direct_mode_mvs,
     mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
 };
 use crate::slice_enc::{
-    emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, restore_region,
-    save_region, MODES,
+    emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, quantize_residual,
+    restore_region, save_region, MODES,
 };
 
 /// Geometry constants of the encoder SPS (§7.4.3.1 `sps_btt_flag == 0`
@@ -822,12 +822,12 @@ fn quantize_inter_plane(
     h: usize,
     qp: i32,
     bit_depth: u32,
+    rdoq: &RdoqInputs<'_>,
 ) -> Result<(Vec<i32>, bool, Vec<i32>, f64)> {
     let n = w * h;
     let max_val = (1i32 << bit_depth) - 1;
     let diff: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
-    let mut levels = vec![0i32; n];
-    let cbf = forward_quantize(&diff, &mut levels, w, h, qp, bit_depth)?;
+    let (levels, cbf) = quantize_residual(&diff, w, h, qp, bit_depth, Some(rdoq))?;
     let mut res = vec![0i32; n];
     if cbf {
         scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth, false)?;
@@ -875,11 +875,39 @@ fn quantize_inter_residual(
     // §8.7.1: quantize at qP = Qp′ (eqs. 1050-1052).
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
     let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
-    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(src.0, &pred.0, w, h, qp_y, bd)?;
-    let (levels_cb, cbf_cb, res_cb, dist_cb) =
-        quantize_inter_plane(src.1, &pred.1, wc, hc, qp_c, bd)?;
-    let (levels_cr, cbf_cr, res_cr, dist_cr) =
-        quantize_inter_plane(src.2, &pred.2, wc, hc, qp_c, bd)?;
+    let sel = ctx.sel;
+    let lambda_c = crate::slice_enc::rd_lambda_at_qp_prime(qp_c);
+    let rdoq = |c_idx: u32, table: MainCtxTable| {
+        let lambda = if c_idx == 0 { ctx.lambda } else { lambda_c };
+        RdoqInputs::new(&*model, lambda, sel, c_idx, table)
+    };
+    let (levels_y, cbf_y, res_y, dist_y) = quantize_inter_plane(
+        src.0,
+        &pred.0,
+        w,
+        h,
+        qp_y,
+        bd,
+        &rdoq(0, MainCtxTable::CbfLuma),
+    )?;
+    let (levels_cb, cbf_cb, res_cb, dist_cb) = quantize_inter_plane(
+        src.1,
+        &pred.1,
+        wc,
+        hc,
+        qp_c,
+        bd,
+        &rdoq(1, MainCtxTable::CbfCb),
+    )?;
+    let (levels_cr, cbf_cr, res_cr, dist_cr) = quantize_inter_plane(
+        src.2,
+        &pred.2,
+        wc,
+        hc,
+        qp_c,
+        bd,
+        &rdoq(2, MainCtxTable::CbfCr),
+    )?;
     let res = Residual {
         levels_y,
         cbf_y,
@@ -1372,8 +1400,23 @@ fn decide_leaf(
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
     let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
     for (mode_idx, &mode) in MODES.iter().enumerate() {
-        let (levels, cbf, res, dist) =
-            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val)?;
+        let (levels, cbf, res, dist) = quantize_block(
+            &refs,
+            mode,
+            &src_y,
+            w,
+            h,
+            qp_y,
+            bd,
+            max_val,
+            Some(&RdoqInputs::new(
+                model,
+                ctx.lambda,
+                sel,
+                0,
+                MainCtxTable::CbfLuma,
+            )),
+        )?;
         let bits = model.measure(|m| {
             emit_intra_head(
                 m,
@@ -1402,11 +1445,41 @@ fn decide_leaf(
     // Chroma with the same mode (decoder: IntraPredModeC = IntraPredModeY).
     let mode = MODES[i_mode];
     let refs_cb = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 1);
-    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) =
-        quantize_block(&refs_cb, mode, &src_cb, wc, hc, qp_c, bd, max_val)?;
+    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) = quantize_block(
+        &refs_cb,
+        mode,
+        &src_cb,
+        wc,
+        hc,
+        qp_c,
+        bd,
+        max_val,
+        Some(&RdoqInputs::new(
+            model,
+            crate::slice_enc::rd_lambda_at_qp_prime(qp_c),
+            sel,
+            1,
+            MainCtxTable::CbfCb,
+        )),
+    )?;
     let refs_cr = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 2);
-    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) =
-        quantize_block(&refs_cr, mode, &src_cr, wc, hc, qp_c, bd, max_val)?;
+    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) = quantize_block(
+        &refs_cr,
+        mode,
+        &src_cr,
+        wc,
+        hc,
+        qp_c,
+        bd,
+        max_val,
+        Some(&RdoqInputs::new(
+            model,
+            crate::slice_enc::rd_lambda_at_qp_prime(qp_c),
+            sel,
+            2,
+            MainCtxTable::CbfCr,
+        )),
+    )?;
     let chroma_bits = model.measure(|m| {
         let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
         m.encode_decision(t, i, u8::from(i_cbf_cb));

@@ -85,6 +85,86 @@ pub fn forward_quantize(
     Ok(levels.iter().any(|&v| v != 0))
 }
 
+/// The **fractional** level values of `residual` — what
+/// [`forward_quantize`] rounds — including its one refinement pass
+/// against the exact decode chain: the first-pass rounding's decoded
+/// error is re-inverted and folded back in as a fractional correction.
+/// The RDOQ trellis ([`crate::rdoq`]) chooses each level among the
+/// integers around these values.
+pub fn forward_transform_fractional(
+    residual: &[i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+) -> Result<Vec<f64>> {
+    let n = n_tb_w * n_tb_h;
+    if residual.len() != n {
+        return Err(Error::invalid(format!(
+            "evc forward_transform_fractional: length mismatch (res={}, expected {n})",
+            residual.len()
+        )));
+    }
+    let mut frac = vec![0f64; n];
+    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth)?;
+    let levels: Vec<i32> = frac
+        .iter()
+        .map(|v| v.round().clamp(-32768.0, 32767.0) as i32)
+        .collect();
+    let mut back = vec![0i32; n];
+    crate::dequant::scale_and_inverse_transform(
+        &levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth, false,
+    )?;
+    let err: Vec<i32> = residual
+        .iter()
+        .zip(back.iter())
+        .map(|(&want, &got)| want - got)
+        .collect();
+    if err.iter().any(|&e| e != 0) {
+        // The correction is for the error *after* rounding, so it
+        // refines the rounded levels — `round( levels + delta )` is
+        // exactly what `forward_quantize` produces.
+        let mut delta = vec![0f64; n];
+        forward_pass_fractional(&err, &mut delta, n_tb_w, n_tb_h, qp, bit_depth)?;
+        for ((f, d), l) in frac.iter_mut().zip(delta.iter()).zip(levels.iter()) {
+            *f = (f64::from(*l) + *d).clamp(-32768.0, 32767.0);
+        }
+    }
+    Ok(frac)
+}
+
+/// Pixel-domain SSE per **unit level error** at each coefficient
+/// position (row-major `n_tb_w × n_tb_h`): the square of eq. 1059's
+/// `levelScale << ( qP / 6 ) · rectNorm >> bdShift` scaling, carried
+/// through the eq. 1062 kernels (the product of the two basis-vector
+/// norms², exact for the orthogonal 2-/4-point kernels and within the
+/// ≲ 0.2 % row-orthogonality defect of the larger ones) and the
+/// eq. 1053/1055 `2^bdShift` renormalisation. The RDOQ distortion term
+/// is `( fractional − level )² · weight`, which this makes commensurate
+/// with the pixel-domain SSE of the mode decisions.
+pub fn level_unit_sse_weights(n_tb_w: usize, n_tb_h: usize, qp: i32, bit_depth: u32) -> Vec<f64> {
+    let a = trans_matrix(n_tb_h);
+    let b = trans_matrix(n_tb_w);
+    let d_a = row_norms(a, n_tb_h);
+    let d_b = row_norms(b, n_tb_w);
+    let bd_shift_post = (20 - bit_depth) + 7;
+    let bd_shift = scaling_bd_shift(n_tb_w, n_tb_h, bit_depth);
+    let rect = rect_norm(n_tb_w, n_tb_h) as f64;
+    let q_step =
+        (LEVEL_SCALE_BASELINE[(qp % 6) as usize] as f64) * f64::from(1u32 << (qp / 6) as u32);
+    // d per unit level (eq. 1059, pre-rounding), then the two shifts.
+    let d_unit = q_step * rect / f64::from(1u32 << bd_shift);
+    let gain = d_unit / f64::from(1u32 << bd_shift_post);
+    let g2 = gain * gain;
+    let mut out = vec![0f64; n_tb_w * n_tb_h];
+    for i in 0..n_tb_h {
+        for j in 0..n_tb_w {
+            out[i * n_tb_w + j] = g2 * d_a[i] * d_b[j];
+        }
+    }
+    out
+}
+
 /// One linear-inversion pass (no refinement) — see [`forward_quantize`].
 fn forward_quantize_pass(
     residual: &[i32],
@@ -94,6 +174,28 @@ fn forward_quantize_pass(
     qp: i32,
     bit_depth: u32,
 ) -> Result<bool> {
+    let n = n_tb_w * n_tb_h;
+    debug_assert_eq!(levels.len(), n);
+    let mut frac = vec![0f64; n];
+    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth)?;
+    let mut any = false;
+    for (lvl, f) in levels.iter_mut().zip(frac.iter()) {
+        *lvl = f.round().clamp(-32768.0, 32767.0) as i32;
+        any |= *lvl != 0;
+    }
+    Ok(any)
+}
+
+/// The linear inversion proper: `frac` receives the unrounded level
+/// values (`scaled* · gain`, see the module doc).
+fn forward_pass_fractional(
+    residual: &[i32],
+    frac: &mut [f64],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+) -> Result<()> {
     let n = n_tb_w * n_tb_h;
     if !matches!(n_tb_w, 2 | 4 | 8 | 16 | 32 | 64) || !matches!(n_tb_h, 2 | 4 | 8 | 16 | 32 | 64) {
         return Err(Error::unsupported(format!(
@@ -106,7 +208,7 @@ fn forward_quantize_pass(
         )));
     }
     debug_assert_eq!(residual.len(), n);
-    debug_assert_eq!(levels.len(), n);
+    debug_assert_eq!(frac.len(), n);
 
     let a = trans_matrix(n_tb_h); // vertical kernel (H×H)
     let b = trans_matrix(n_tb_w); // horizontal kernel (W×W)
@@ -136,20 +238,16 @@ fn forward_quantize_pass(
         (LEVEL_SCALE_BASELINE[(qp % 6) as usize] as f64) * f64::from(1u32 << (qp / 6) as u32);
     let gain = f64::from(1u32 << bd_shift_post) * f64::from(1u32 << bd_shift) / (q_step * rect);
 
-    let mut any = false;
     for i in 0..n_tb_h {
         for j in 0..n_tb_w {
             let mut acc = 0f64;
             for l in 0..n_tb_w {
                 acc += t[i * n_tb_w + l] * (b[l * n_tb_w + j] as f64) / d_b[l];
             }
-            let lvl = (acc * gain).round();
-            let lvl = lvl.clamp(-32768.0, 32767.0) as i32;
-            levels[i * n_tb_w + j] = lvl;
-            any |= lvl != 0;
+            frac[i * n_tb_w + j] = acc * gain;
         }
     }
-    Ok(any)
+    Ok(())
 }
 
 /// Per-row squared norms of a row-major `n × n` kernel — the diagonal of
@@ -253,6 +351,51 @@ mod tests {
         let res = vec![37i32; 16];
         let err = round_trip_max_err(&res, 4, 4, 22);
         assert!(err <= 4, "flat 4x4 qp22 err {err}");
+    }
+
+    /// `level_unit_sse_weights` predicts the pixel-domain SSE the decode
+    /// chain realises for a single unit level, per position, within the
+    /// kernels' row-orthogonality defect plus the eq. 1055 rounding.
+    #[test]
+    fn unit_level_weights_match_decode_chain() {
+        for (w, h) in [(4usize, 4usize), (8, 8), (16, 16), (8, 4), (4, 8), (32, 32)] {
+            let weights = level_unit_sse_weights(w, h, 45, 8);
+            for pos in [0usize, 1, w, w * h / 2 + 1, w * h - 1] {
+                // A large level keeps the eq. 1055 rounding negligible.
+                let lvl = 64i32;
+                let mut levels = vec![0i32; w * h];
+                levels[pos] = lvl;
+                let mut back = vec![0i32; w * h];
+                scale_and_inverse_transform(&levels, &mut back, w, h, 45, 8, false).unwrap();
+                let sse: f64 = back.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                let want = weights[pos] * (lvl as f64) * (lvl as f64);
+                let rel = (sse - want).abs() / want;
+                assert!(
+                    rel < 0.02,
+                    "{w}x{h} pos {pos}: sse {sse} vs weight {want} ({rel})"
+                );
+            }
+        }
+    }
+
+    /// The fractional values round to exactly the levels the integer
+    /// quantizer produces (the decode-chain correction refines the
+    /// rounded first pass in both).
+    #[test]
+    fn fractional_rounds_to_forward_quantize() {
+        let mut seed = 0x0bad_f00du32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) as i32 % 301) - 150
+        };
+        for (w, h, qp) in [(4usize, 4usize, 20), (8, 8, 33), (16, 8, 40), (32, 32, 12)] {
+            let res: Vec<i32> = (0..w * h).map(|_| next()).collect();
+            let mut levels = vec![0i32; w * h];
+            forward_quantize(&res, &mut levels, w, h, qp, 8).unwrap();
+            let frac = forward_transform_fractional(&res, w, h, qp, 8).unwrap();
+            let rounded: Vec<i32> = frac.iter().map(|v| v.round() as i32).collect();
+            assert_eq!(levels, rounded, "{w}x{h} qp{qp}");
+        }
     }
 
     /// Bad inputs are refused.

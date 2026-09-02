@@ -4,6 +4,33 @@
 
 ### Other
 
+- **Encoder: RDOQ — rate-distortion optimised quantization over the
+  §7.3.8.7 run-length syntax (round 455).** New `rdoq` module: per
+  transform block a dynamic programme over (scan position, `Min(
+  PrevLevel − 1, 5 )` bucket) chooses every level among `⌊|c|⌋ / ⌈|c|⌉ /
+  0` of the fractional level `c` under `D + λ · R`, where `R` is the
+  exact `coeff_zero_run` / `coeff_abs_level_minus1` / `coeff_sign_flag` /
+  `coeff_last_flag` bin cost at the coder's current context state
+  (§9.3.4.2.2 eq. 1434/1435 buckets under `cm_init`, the Table-95
+  shared-table pair under the Baseline collapse — the run string's cost is
+  linear in the run, which keeps the trellis linear in the block) and `D`
+  the transform-domain error weighted into pixel SSE per position
+  (eq. 1059 scaling × the eq. 1062 basis norms ÷ the eq. 1053/1055
+  renormalisation — `quant_enc::level_unit_sse_weights`, pinned against
+  the decode chain within 2 %). Level decisions, last-position trimming
+  and the whole-block zero-out (`cbf = 0`, against the `cbf` bin's own
+  cost) fall out of the same trellis; a `λ = 0` trellis is the nearest
+  quantizer and it never scores worse than rounding under its objective
+  (pinned). `quant_enc::forward_transform_fractional` exposes the
+  quantizer's pre-rounding values with its decode-chain correction anchored
+  on the rounded first pass (so `round( fractional ) == forward_quantize`).
+  Chroma blocks trade at the λ of their own `Qp′Cb` / `Qp′Cr` step
+  (eqs. 1048/1049), which is what keeps the chroma planes from being
+  zeroed at the luma λ. Applied on every path (intra luma/chroma in I and
+  P/B slices, inter residual planes). Measured against the previous
+  commit at equal PSNR (QP 32-50, three geometries): **intra −3.2 % Y /
+  −2.3 % YUV, P −7.5 % / −7.3 %, low-delay B −6.7 % / −7.3 %** BD-rate.
+  Fixtures re-pinned.
 - **Encoder: RD λ calibrated to the realised §8.7 quantizer step (round
   455).** `rd_lambda` was the classic `0.57 · 2^(( qp − 12 ) / 3)`, which
   is right for a `2^(( QP − 4 ) / 6)` step; this crate's decode chain

@@ -59,7 +59,8 @@ use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
 use crate::intra::{predict, IntraMode, RefSamples};
 use crate::picture::{intra_reconstruct_cb_in_tile, YuvPicture};
-use crate::quant_enc::forward_quantize;
+use crate::quant_enc::{forward_quantize, forward_transform_fractional, level_unit_sse_weights};
+use crate::rdoq::{rdoq_rle, RdoqInputs};
 use crate::slice_data::zigzag_scan;
 
 /// The five Table-13 Baseline intra modes in syntax-index order.
@@ -431,8 +432,9 @@ fn decide_leaf(
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
     let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
     for (mode_idx, &mode) in MODES.iter().enumerate() {
+        let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
         let (levels, cbf, res, dist) =
-            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val)?;
+            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
         let bits = model.measure(|m| {
             emit_intra_pred_mode(m, sel, mode_idx);
             let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
@@ -474,14 +476,24 @@ fn decide_leaf(
         let plane = if c_idx == 1 { &ctx.src.cb } else { &ctx.src.cr };
         let refs_c = ctx.recon.fetch_intra_refs(x0 >> 1, y0 >> 1, wc, hc, c_idx);
         let src_c = gather_block(plane, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
-        let (levels, cbf, res, dist) =
-            quantize_block(&refs_c, mode_c, &src_c, wc, hc, qp_c, bd, max_val)?;
+        let table = if c_idx == 1 {
+            MainCtxTable::CbfCb
+        } else {
+            MainCtxTable::CbfCr
+        };
+        let rdoq = RdoqInputs::new(model, rd_lambda_at_qp_prime(qp_c), sel, c_idx, table);
+        let (levels, cbf, res, dist) = quantize_block(
+            &refs_c,
+            mode_c,
+            &src_c,
+            wc,
+            hc,
+            qp_c,
+            bd,
+            max_val,
+            Some(&rdoq),
+        )?;
         let bits = model.measure(|m| {
-            let table = if c_idx == 1 {
-                MainCtxTable::CbfCb
-            } else {
-                MainCtxTable::CbfCr
-            };
             let (t, i) = sel.ctx(table, 0);
             m.encode_decision(t, i, u8::from(cbf));
             if cbf {
@@ -524,6 +536,32 @@ fn decide_leaf(
     Ok((plan, cost))
 }
 
+/// Quantize one residual block: the RDOQ trellis when `rdoq` is given
+/// (levels chosen under `D + λ · R` at the model's context state), else
+/// nearest-level rounding. Returns `(levels, cbf)`.
+pub(crate) fn quantize_residual(
+    diff: &[i32],
+    w: usize,
+    h: usize,
+    qp: i32,
+    bit_depth: u32,
+    rdoq: Option<&RdoqInputs<'_>>,
+) -> Result<(Vec<i32>, bool)> {
+    match rdoq {
+        Some(inp) => {
+            let frac = forward_transform_fractional(diff, w, h, qp, bit_depth)?;
+            let weights = level_unit_sse_weights(w, h, qp, bit_depth);
+            let (levels, cbf, _cost) = rdoq_rle(&frac, &weights, w, h, inp);
+            Ok((levels, cbf))
+        }
+        None => {
+            let mut levels = vec![0i32; w * h];
+            let cbf = forward_quantize(diff, &mut levels, w, h, qp, bit_depth)?;
+            Ok((levels, cbf))
+        }
+    }
+}
+
 /// Predict + transform + quantize + reconstruct one candidate block
 /// through the decoder's pipeline; returns (levels, cbf, recon
 /// residual, SSE distortion).
@@ -555,7 +593,14 @@ fn decide_leaf(
 /// every platform's encoder lands on bit-identical costs — the
 /// MD5-pinned stream fixtures rely on it.
 pub(crate) fn rd_lambda(qp: i32, bit_depth: u32) -> f64 {
-    let qp_prime = crate::dequant::qp_prime_y(qp, bit_depth);
+    rd_lambda_at_qp_prime(crate::dequant::qp_prime_y(qp, bit_depth))
+}
+
+/// [`rd_lambda`] at an explicit `Qp′` — the chroma planes quantize at
+/// `Qp′Cb` / `Qp′Cr` (eqs. 1048/1049, through the ChromaQpTable), so
+/// their level decisions trade distortion against bits at the λ of
+/// *their* step.
+pub(crate) fn rd_lambda_at_qp_prime(qp_prime: i32) -> f64 {
     let ls = f64::from(crate::dequant::LEVEL_SCALE_BASELINE[qp_prime.rem_euclid(6) as usize]);
     let step = ls * 2f64.powi(qp_prime.div_euclid(6)) / 1024.0;
     RD_LAMBDA_SCALE * step * step
@@ -574,13 +619,13 @@ pub(crate) fn quantize_block(
     qp: i32,
     bit_depth: u32,
     max_val: i32,
+    rdoq: Option<&RdoqInputs<'_>>,
 ) -> Result<(Vec<i32>, bool, Vec<i32>, f64)> {
     let n = w * h;
     let mut pred = vec![0i32; n];
     predict(mode, refs, w, h, bit_depth, &mut pred);
     let diff: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
-    let mut levels = vec![0i32; n];
-    let cbf = forward_quantize(&diff, &mut levels, w, h, qp, bit_depth)?;
+    let (levels, cbf) = quantize_residual(&diff, w, h, qp, bit_depth, rdoq)?;
     let mut res = vec![0i32; n];
     if cbf {
         scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth, false)?;
