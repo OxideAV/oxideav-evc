@@ -156,6 +156,8 @@ pub mod pps;
 #[doc(hidden)]
 pub mod quant_enc;
 #[doc(hidden)]
+pub mod rate_plan;
+#[doc(hidden)]
 pub mod rdoq;
 #[doc(hidden)]
 pub mod ref_lists;

@@ -4,6 +4,26 @@
 
 ### Other
 
+- **Encoder: two-pass rate control (round 455).** `pass=1 stats=<path>`
+  records every frame's `idr qp bits` (text, rewritten per frame and at
+  `flush`); `pass=2 stats=<path> bitrate=… [fps=…] [vbv=…]` follows the
+  new `rate_plan` module: one sequence-wide fractional base QP found by
+  bisection so the modelled total meets `bitrate · frames / fps`,
+  dithered per frame to track the fractional target, under a leaky-bucket
+  buffer (`vbv` bits, default one second) that raises a frame's QP only
+  where it would underflow. The rate model `bits ∝ 2^( −s · Δqp )` carries
+  an explicit **slope** — the classic `1/6` is 24 QP too steep for this
+  crate's quantizer scale; the corpus prior is `s ≈ 0.07` and pass 2
+  refines it online from every frame it codes at a different QP than
+  pass 1 (`log2( bits_1 / bits_2 ) / Δqp`, logarithm by bisection on the
+  `2^( x / 6 )` ladder — deterministic), re-planning the frames still to
+  come from the buffer as it actually stands. Measured (24 frames,
+  176×144 and 96×64, targets at ½× and 2× the pass-1 rate, GOP 1 / 8-P /
+  8-B / 24-P): **every run within ±0.25 %** of target (one-pass at the
+  same targets: −0.8…+2.5 % at ½×, −12…−16 % at 2× — its ±6 QP clamp
+  cannot reach the rate in 24 frames), 0.4-0.8 dB above one-pass at
+  equal rate. The one-pass path is unchanged (`pow2_qp_over6` moved to
+  `rate_plan`).
 - **Encoder: RDOQ — rate-distortion optimised quantization over the
   §7.3.8.7 run-length syntax (round 455).** New `rdoq` module: per
   transform block a dynamic programme over (scan position, `Min(

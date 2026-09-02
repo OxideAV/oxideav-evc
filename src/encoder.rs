@@ -53,6 +53,17 @@
 //!   becomes the starting point.
 //! * `fps` — frames per second for the rate-control budget (default
 //!   30; only meaningful with `bitrate`).
+//! * `pass` + `stats` — **two-pass** rate control (round 455).
+//!   `pass=1 stats=<path>` runs the one-pass shape (constant `qp`, or
+//!   the one-pass controller with `bitrate`) and writes every frame's
+//!   `idr qp bits` record to `<path>` (rewritten after each frame and
+//!   at `flush`). `pass=2 stats=<path> bitrate=…` reads them back and
+//!   follows the [`crate::rate_plan`] plan: one sequence-wide base QP
+//!   (dithered per frame) that meets `bitrate · frames / fps` under a
+//!   leaky-bucket buffer of `vbv` bits (default one second, i.e.
+//!   `bitrate`), corrected frame by frame so first-pass model errors are
+//!   paid off over the remaining frames. Frames beyond the first pass's
+//!   count continue at the last planned QP.
 //!
 //! The encoder keeps a mirror DPB and runs the very same
 //! [`crate::ref_lists`] POC / marking / list-construction functions the
@@ -71,6 +82,10 @@ use crate::headers_enc::{
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
+use crate::rate_plan::{
+    format_stats, log2_ratio, parse_stats, plan_two_pass, pow2_qp_over6, BufferModel, FrameStat,
+    DEFAULT_SLOPE, SLOPE_RANGE,
+};
 use crate::ref_lists::{
     construct_ref_pic_lists_rpl_flag0, derive_poc_pocs_flag0, mark_references_rpl_flag0, RefPicInfo,
 };
@@ -385,6 +400,75 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
                 Error::invalid(format!("evc encoder: refs option {s:?} not in 1..=5"))
             })?,
     };
+    // Round 455: two-pass rate control.
+    let pass = match params.options.get("pass") {
+        None => 0u32,
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|p| (1..=2).contains(p))
+            .ok_or_else(|| Error::invalid(format!("evc encoder: pass option {s:?} not 1 or 2")))?,
+    };
+    let stats_path = params.options.get("stats").map(|s| s.to_string());
+    let vbv = match params.options.get("vbv") {
+        None => None,
+        Some(s) => Some(s.parse::<u64>().ok().filter(|&b| b > 0).ok_or_else(|| {
+            Error::invalid(format!(
+                "evc encoder: vbv option {s:?} not a positive bit count"
+            ))
+        })?),
+    };
+    let (first_pass, two_pass) = match pass {
+        0 => (None, None),
+        1 => {
+            let path = stats_path.ok_or_else(|| {
+                Error::invalid("evc encoder: pass=1 needs the stats=<path> option")
+            })?;
+            (
+                Some(FirstPass {
+                    path,
+                    stats: Vec::new(),
+                }),
+                None,
+            )
+        }
+        _ => {
+            let path = stats_path.ok_or_else(|| {
+                Error::invalid("evc encoder: pass=2 needs the stats=<path> option")
+            })?;
+            let bitrate = rc
+                .as_ref()
+                .map(|r| r.base * f64::from(fps))
+                .ok_or_else(|| Error::invalid("evc encoder: pass=2 needs the bitrate option"))?;
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                Error::invalid(format!("evc encoder: cannot read stats {path:?}: {e}"))
+            })?;
+            let stats = parse_stats(&text)?;
+            let inflow = bitrate / f64::from(fps);
+            let target_total = inflow * stats.len() as f64;
+            let buf = BufferModel {
+                inflow,
+                vbv: vbv.map_or(bitrate, |v| v as f64),
+            };
+            // Validate the plan once up front (empty stats etc.).
+            plan_two_pass(&stats, target_total, buf, buf.vbv, DEFAULT_SLOPE)?;
+            (
+                None,
+                Some(TwoPass {
+                    stats,
+                    buf,
+                    target_total,
+                    actual_so_far: 0.0,
+                    fullness: buf.vbv,
+                    slope: DEFAULT_SLOPE,
+                    slope_obs: 0,
+                    last_qp: qp,
+                }),
+            )
+        }
+    };
+    // Pass 2 replaces the one-pass controller.
+    let rc = if two_pass.is_some() { None } else { rc };
     let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     out_params.width = Some(width);
     out_params.height = Some(height);
@@ -404,27 +488,14 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         refs,
         b_pictures,
         rc,
+        first_pass,
+        two_pass,
         frame_idx: 0,
         dpb: Vec::new(),
         prev_tid0_poc: 0,
         prev_doc_offset: -1,
         queue: VecDeque::new(),
     })
-}
-
-/// `2^(qp / 6)` evaluated deterministically (an exact power of two
-/// times a sixth-root-of-two constant — no transcendental call, so the
-/// rate-controlled encode is byte-identical on every platform).
-fn pow2_qp_over6(qp: i32) -> f64 {
-    const SIXTH: [f64; 6] = [
-        1.0,
-        1.122_462_048_309_373,
-        1.259_921_049_894_873_2,
-        std::f64::consts::SQRT_2,
-        1.587_401_051_968_199_4,
-        1.781_797_436_280_678_6,
-    ];
-    2f64.powi(qp.div_euclid(6)) * SIXTH[qp.rem_euclid(6) as usize]
 }
 
 /// Frame-level rate control (round 452): a per-class complexity model
@@ -491,6 +562,83 @@ impl RateControl {
     }
 }
 
+/// Pass-1 state: the per-frame records and where they go.
+struct FirstPass {
+    path: String,
+    stats: Vec<FrameStat>,
+}
+
+impl FirstPass {
+    fn write(&self) -> Result<()> {
+        std::fs::write(&self.path, format_stats(&self.stats)).map_err(|e| {
+            Error::invalid(format!(
+                "evc encoder: cannot write stats {:?}: {e}",
+                self.path
+            ))
+        })
+    }
+}
+
+/// Pass-2 state: the first pass's records, the buffer as it actually
+/// stands, and the online-refined rate slope.
+struct TwoPass {
+    stats: Vec<FrameStat>,
+    buf: BufferModel,
+    target_total: f64,
+    actual_so_far: f64,
+    fullness: f64,
+    slope: f64,
+    slope_obs: u32,
+    last_qp: i32,
+}
+
+impl TwoPass {
+    /// The QP for frame `i`: re-plan the frames still to come for the
+    /// bits still allowed, from the buffer as it stands, at the current
+    /// slope estimate, and take the first frame's QP. Beyond the first
+    /// pass's frame count the last QP continues.
+    fn pick_qp(&mut self, i: usize) -> i32 {
+        let n = self.stats.len();
+        if i >= n {
+            return self.last_qp;
+        }
+        let remaining = self.target_total - self.actual_so_far;
+        let floor = self.buf.inflow * (n - i) as f64 / 64.0; // never plan on nothing
+        let remaining = remaining.max(floor);
+        let qp = match plan_two_pass(
+            &self.stats[i..],
+            remaining,
+            self.buf,
+            self.fullness,
+            self.slope,
+        ) {
+            Ok(plan) => plan.qps[0],
+            Err(_) => self.last_qp,
+        };
+        self.last_qp = qp;
+        qp
+    }
+
+    /// Feed back frame `i`'s actual size: buffer, budget, and — when
+    /// the frame ran at a different QP than in the first pass — one
+    /// slope observation `log2( bits_1 / bits_2 ) / ( qp_2 − qp_1 )`,
+    /// averaged into the estimate.
+    fn update(&mut self, i: usize, qp: i32, bits: f64) {
+        self.actual_so_far += bits;
+        self.fullness = (self.fullness - bits + self.buf.inflow).min(self.buf.vbv);
+        if let Some(st) = self.stats.get(i) {
+            let dq = qp - st.qp;
+            if dq != 0 && bits > 0.0 && st.bits > 0.0 {
+                let obs = (log2_ratio(st.bits / bits) / f64::from(dq))
+                    .clamp(SLOPE_RANGE.0, SLOPE_RANGE.1);
+                self.slope_obs += 1;
+                let k = f64::from(self.slope_obs.min(8));
+                self.slope = ((k - 1.0) * self.slope + obs) / k;
+            }
+        }
+    }
+}
+
 /// A picture in the encoder's mirror DPB — what the decoder holds for
 /// the same POC: the reconstruction (post-§8.8.2 when deblocking is
 /// on), the stamped motion field (`None` for an IDR: all-intra, no
@@ -535,6 +683,10 @@ pub struct EvcEncoder {
     /// Frame-level rate control (the `bitrate` option); `None` = the
     /// historical constant-QP shape.
     rc: Option<RateControl>,
+    /// `pass=1`: record every frame for a second pass.
+    first_pass: Option<FirstPass>,
+    /// `pass=2`: follow the first pass's plan.
+    two_pass: Option<TwoPass>,
     frame_idx: u64,
     /// The mirror DPB: every reconstruction still marked "used for
     /// reference" by the §8.3.3.2 walk, exactly as the decoder's.
@@ -674,9 +826,10 @@ impl Encoder for EvcEncoder {
         )?;
         let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
         let class = usize::from(!is_idr);
-        let frame_qp = match &self.rc {
-            Some(rc) => rc.pick_qp(class),
-            None => self.qp,
+        let frame_qp = match (&mut self.two_pass, &self.rc) {
+            (Some(tp), _) => tp.pick_qp(self.frame_idx as usize),
+            (None, Some(rc)) => rc.pick_qp(class),
+            (None, None) => self.qp,
         };
         let data = if is_idr {
             let (data, recon, _stats) = encode_idr_au_coded(
@@ -701,8 +854,20 @@ impl Encoder for EvcEncoder {
         } else {
             self.encode_inter_picture(&src, frame_qp)?
         };
+        let bits = data.len() as f64 * 8.0;
         if let Some(rc) = &mut self.rc {
-            rc.update(class, frame_qp, data.len() as f64 * 8.0);
+            rc.update(class, frame_qp, bits);
+        }
+        if let Some(tp) = &mut self.two_pass {
+            tp.update(self.frame_idx as usize, frame_qp, bits);
+        }
+        if let Some(fp) = &mut self.first_pass {
+            fp.stats.push(FrameStat {
+                idr: is_idr,
+                qp: frame_qp,
+                bits,
+            });
+            fp.write()?;
         }
         self.frame_idx += 1;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
@@ -718,7 +883,11 @@ impl Encoder for EvcEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // No lookahead: every frame was emitted eagerly.
+        // No lookahead: every frame was emitted eagerly. A first pass
+        // re-writes its complete record.
+        if let Some(fp) = &self.first_pass {
+            fp.write()?;
+        }
         Ok(())
     }
 }
@@ -1454,6 +1623,118 @@ mod tests {
         let mut bad_b = params(w, h);
         bad_b.options.insert("b", "later");
         assert!(make_encoder(&bad_b).is_err());
+    }
+
+    /// The noisy moving scene the rate-control pins run on.
+    fn rc_scene(w: u32, h: u32, t: usize) -> VideoFrame {
+        let mut f = synth_frame(w as usize, h as usize);
+        let mut s = 0x1357_9BDFu32 ^ (t as u32).wrapping_mul(0x9E37_79B9);
+        for (i, v) in f.planes[0].data.iter_mut().enumerate() {
+            let bx = 6 + 2 * (t % 8);
+            if (i % w as usize) >= bx && (i % w as usize) < bx + 12 {
+                *v = v.wrapping_add(60);
+            }
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (*v as i32 + ((s >> 24) % 7) as i32 - 3).clamp(0, 255) as u8;
+        }
+        f.pts = Some(t as i64);
+        f
+    }
+
+    /// Two-pass rate control (round 455): pass 1 records every frame,
+    /// pass 2 lands within ±1 % of the target at half and at double the
+    /// first pass's rate on a 24-frame GOP-8 P sequence (the
+    /// online-refined slope closes the model error the one-pass
+    /// controller cannot), stays recon-exact through the registered
+    /// decoder, and the option surface refuses inconsistent requests.
+    #[test]
+    fn two_pass_hits_target_and_round_trips() {
+        let (w, h) = (96u32, 64u32);
+        let frames = 24usize;
+        let stats =
+            std::env::temp_dir().join(format!("oxideav-evc-twopass-{}.txt", std::process::id()));
+        let stats_str: &'static str =
+            Box::leak(stats.to_string_lossy().into_owned().into_boxed_str());
+        let run = |extra: &[(&'static str, &'static str)]| -> usize {
+            let mut p = params(w, h);
+            p.options.insert("gop", "8");
+            p.options.insert("refs", "2");
+            p.options.insert("qp", "34");
+            for (k, v) in extra {
+                p.options.insert(*k, *v);
+            }
+            let mut enc = make_evc_encoder(&p).unwrap();
+            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+            let mut total = 0usize;
+            for t in 0..frames {
+                enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                let pkt = enc.receive_packet().unwrap();
+                total += pkt.data.len();
+                dec.send_packet(&pkt).unwrap();
+                let vf = match dec.receive_frame().unwrap() {
+                    Frame::Video(vf) => vf,
+                    other => panic!("expected video frame, got {other:?}"),
+                };
+                let y8: Vec<u8> = enc
+                    .last_recon()
+                    .unwrap()
+                    .y
+                    .iter()
+                    .map(|&v| v as u8)
+                    .collect();
+                assert_eq!(vf.planes[0].data, y8, "frame {t}: decode != recon");
+            }
+            enc.flush().unwrap();
+            total
+        };
+        let first = run(&[("pass", "1"), ("stats", stats_str)]);
+        let recorded =
+            crate::rate_plan::parse_stats(&std::fs::read_to_string(&stats).unwrap()).unwrap();
+        assert_eq!(recorded.len(), frames);
+        assert!(recorded[0].idr && !recorded[1].idr && recorded[8].idr);
+        assert!(recorded.iter().all(|s| s.qp == 34));
+        assert_eq!(
+            recorded.iter().map(|s| s.bits as usize).sum::<usize>(),
+            first * 8
+        );
+        for &mult in &[0.5f64, 2.0] {
+            let target = (first as f64 * 8.0 * 30.0 / frames as f64 * mult) as u64;
+            let ts: &'static str = Box::leak(target.to_string().into_boxed_str());
+            let total = run(&[
+                ("pass", "2"),
+                ("stats", stats_str),
+                ("bitrate", ts),
+                ("fps", "30"),
+            ]);
+            let achieved = total as f64 * 8.0 * 30.0 / frames as f64;
+            let err = achieved / target as f64 - 1.0;
+            eprintln!(
+                "two-pass ×{mult}: target {target} b/s → {achieved:.0} b/s ({:+.2} %)",
+                err * 100.0
+            );
+            assert!(err.abs() <= 0.01, "×{mult}: {achieved} vs {target}");
+        }
+        // Option surface.
+        let bad = |extra: &[(&'static str, &'static str)]| {
+            let mut p = params(w, h);
+            for (k, v) in extra {
+                p.options.insert(*k, *v);
+            }
+            assert!(make_evc_encoder(&p).is_err(), "{extra:?} must be refused");
+        };
+        bad(&[("pass", "1")]);
+        bad(&[("pass", "2"), ("stats", stats_str)]);
+        bad(&[("pass", "2"), ("bitrate", "100000")]);
+        bad(&[("pass", "3"), ("stats", stats_str)]);
+        bad(&[
+            ("pass", "2"),
+            ("stats", "/nonexistent/evc-stats"),
+            ("bitrate", "100000"),
+        ]);
+        std::fs::write(&stats, "garbage\n").unwrap();
+        bad(&[("pass", "2"), ("stats", stats_str), ("bitrate", "100000")]);
+        let _ = std::fs::remove_file(&stats);
     }
 
     /// Round 452 — **frame-level rate control**: with `bitrate` the
