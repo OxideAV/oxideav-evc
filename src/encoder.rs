@@ -1434,15 +1434,17 @@ mod tests {
         }
         // Low-delay B spends a `direct_mode_flag` per explicit CU and a
         // second `mvp_idx` per skip CU; on this small noisy scene the
-        // bi/direct wins roughly pay for them (measured: within ±5 %
-        // of the P stream — the tools are exercised, not a rate claim).
+        // bi/direct wins must at least pay for them (round 452
+        // measured B within ±5 % of P; the round-455 exact rate model
+        // lets B win by ~8 % — the tools are exercised, not a rate
+        // claim, so only "B must not lose by more than 5 %" is pinned).
         eprintln!(
             "gop6 refs3 qp12 cm_init: P {} bytes, low-delay B {} bytes",
             sizes[0], sizes[1]
         );
         assert!(
-            sizes[1] * 100 <= sizes[0] * 105 && sizes[0] * 100 <= sizes[1] * 105,
-            "low-delay B ({}) and P ({}) sizes must sit within 5 % of each other",
+            sizes[1] * 100 <= sizes[0] * 105,
+            "low-delay B ({}) must not lose to P ({}) by more than 5 %",
             sizes[1],
             sizes[0]
         );
@@ -1732,10 +1734,11 @@ mod tests {
                     vf.planes[0].data, y8,
                     "qp {qp} cm{cm_init}: decode != recon"
                 );
-                // The entropy layer must not touch the reconstruction.
-                let (other_stream, other_recon, _) =
+                // The other entropy shape (its RD decisions are costed
+                // against its own contexts, so the reconstructions may
+                // differ — the rate ordering is what is pinned).
+                let (other_stream, _other_recon, _) =
                     encode_idr_access_unit_opts(&src, qp, false, !cm_init).unwrap();
-                assert_eq!(recon.y, other_recon.y, "qp {qp}: recon differs by shape");
                 if cm_init {
                     let saved = 100.0 * (1.0 - stream.len() as f64 / other_stream.len() as f64);
                     assert!(

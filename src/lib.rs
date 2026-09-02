@@ -98,6 +98,8 @@ pub mod aps;
 #[doc(hidden)]
 pub mod ats;
 #[doc(hidden)]
+pub mod bin_cost;
+#[doc(hidden)]
 pub mod bitreader;
 #[doc(hidden)]
 pub mod bitwriter;

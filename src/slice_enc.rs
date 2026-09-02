@@ -52,7 +52,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::cabac::{CabacEncoder, InitType};
+use crate::bin_cost::BitCostModel;
+use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
@@ -118,6 +119,9 @@ struct EncCtx<'a> {
     bit_depth: u32,
     pic_w: u32,
     pic_h: u32,
+    /// The entropy shape the emit pass will run under — the decide
+    /// pass costs every candidate against the same contexts.
+    sel: CtxSel,
 }
 
 /// [`encode_idr_slice_data_with`] with deblocking off — the historical
@@ -188,6 +192,7 @@ pub fn encode_idr_slice_data_opts(
         )));
     }
     let recon = YuvPicture::new(src.width, src.height, 1, src.bit_depth)?;
+    let sel = CtxSel::new(cm_init, InitType::I);
     let mut ctx = EncCtx {
         src,
         recon,
@@ -196,8 +201,16 @@ pub fn encode_idr_slice_data_opts(
         bit_depth: src.bit_depth,
         pic_w: src.width,
         pic_h: src.height,
+        sel,
     };
     let mut stats = EncStats::default();
+    // The decide pass's rate model: the same context table the emit
+    // pass starts from, advanced by every decided bin in decode order,
+    // so each candidate is costed at the state it would be coded in.
+    let mut model = BitCostModel::new();
+    if cm_init {
+        model.init_main_profile(InitType::I, slice_qp);
+    }
 
     // Decide pass: raster CTU order, committing the chosen recon as we
     // go (later CUs predict from it exactly like the decoder).
@@ -208,6 +221,7 @@ pub fn encode_idr_slice_data_opts(
         for cx in 0..ctus_x {
             let (node, _cost) = decide_split_unit(
                 &mut ctx,
+                &mut model,
                 &mut stats,
                 cx << CTB_LOG2,
                 cy << CTB_LOG2,
@@ -224,7 +238,6 @@ pub fn encode_idr_slice_data_opts(
     // context table starts from the identical §9.3.2.2 init the decoder
     // runs (initType 0 — I slice — at the slice QP), so both context
     // states evolve in lockstep bin for bin.
-    let sel = CtxSel::new(cm_init, InitType::I);
     let mut enc = CabacEncoder::new();
     if cm_init {
         enc.init_main_profile(InitType::I, slice_qp);
@@ -302,10 +315,12 @@ fn split_geometry(ctx: &EncCtx<'_>, x0: u32, y0: u32, log2_w: u32, log2_h: u32) 
 }
 
 /// Decide one `split_unit()`: leaf vs quad split under RD cost,
-/// committing the winning reconstruction into `ctx.recon`. Returns the
-/// decided subtree and its cost (distortion + λ·bits).
+/// committing the winning reconstruction into `ctx.recon` and the
+/// winning bins into `model`. Returns the decided subtree and its cost
+/// (distortion + λ·bits).
 fn decide_split_unit(
     ctx: &mut EncCtx<'_>,
+    model: &mut BitCostModel,
     stats: &mut EncStats,
     x0: u32,
     y0: u32,
@@ -317,28 +332,37 @@ fn decide_split_unit(
 
     if can_recurse && !within {
         // Implicit split at the picture edge — no flag, no leaf option.
-        let (children, cost) = decide_children(ctx, stats, x0, y0, log2_w, log2_h)?;
+        let (children, cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
         return Ok((Node::Split(children), cost));
     }
     if !flag_present {
         // 4×4 in-picture leaf: nothing signalled, one coding_unit().
-        let (plan, cost) = decide_leaf(ctx, stats, x0, y0, log2_w, log2_h)?;
-        return Ok((Node::Leaf(plan), cost + ctx.lambda));
+        return decide_leaf(ctx, model, stats, x0, y0, log2_w, log2_h)
+            .map(|(plan, cost)| (Node::Leaf(plan), cost));
     }
 
-    // Both options are open. Trial the leaf first, snapshot its recon,
-    // rewind, trial the split, then keep the cheaper reconstruction.
+    // Both options are open. Trial the leaf first (its split_cu_flag =
+    // 0 bin committed ahead of it, exactly as the emit pass orders the
+    // bins), snapshot its recon + context state, rewind, trial the
+    // split, then keep the cheaper reconstruction.
+    let (split_t, split_i) = ctx.sel.ctx(MainCtxTable::SplitCuFlag, 0);
     let before = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
-    let (leaf_plan, leaf_cost) = decide_leaf(ctx, stats, x0, y0, log2_w, log2_h)?;
-    let leaf_cost = leaf_cost + ctx.lambda; // split_cu_flag = 0 bin
+    let model_before = model.clone();
+    let leaf_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 0));
+    let (leaf_plan, leaf_cost) = decide_leaf(ctx, model, stats, x0, y0, log2_w, log2_h)?;
+    let leaf_cost = leaf_cost + ctx.lambda * leaf_flag_bits;
     let after_leaf = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
+    let model_after_leaf = model.clone();
     restore_region(&mut ctx.recon, &before, x0, y0, log2_w, log2_h);
+    *model = model_before;
 
-    let (children, split_cost) = decide_children(ctx, stats, x0, y0, log2_w, log2_h)?;
-    let split_cost = split_cost + ctx.lambda; // split_cu_flag = 1 bin
+    let split_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 1));
+    let (children, split_cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
+    let split_cost = split_cost + ctx.lambda * split_flag_bits;
 
     if leaf_cost <= split_cost {
         restore_region(&mut ctx.recon, &after_leaf, x0, y0, log2_w, log2_h);
+        *model = model_after_leaf;
         Ok((Node::Leaf(leaf_plan), leaf_cost))
     } else {
         Ok((Node::Split(children), split_cost))
@@ -350,6 +374,7 @@ fn decide_split_unit(
 #[allow(clippy::type_complexity)]
 fn decide_children(
     ctx: &mut EncCtx<'_>,
+    model: &mut BitCostModel,
     stats: &mut EncStats,
     x0: u32,
     y0: u32,
@@ -362,6 +387,7 @@ fn decide_children(
     {
         let (node, c) = decide_split_unit(
             ctx,
+            model,
             stats,
             ch.x0,
             ch.y0,
@@ -376,9 +402,12 @@ fn decide_children(
 
 /// Decide one leaf: 5-mode luma search + §8.4.3 DM chroma, committing the
 /// winning reconstruction (via the decoder's own
-/// `intra_reconstruct_cb_in_tile`) and returning the plan + RD cost.
+/// `intra_reconstruct_cb_in_tile`) and the winning bins (into `model`),
+/// returning the plan + RD cost. Every candidate's rate is the exact
+/// cost of its bin string at the current context state.
 fn decide_leaf(
     ctx: &mut EncCtx<'_>,
+    model: &mut BitCostModel,
     stats: &mut EncStats,
     x0: u32,
     y0: u32,
@@ -389,6 +418,7 @@ fn decide_leaf(
     let h = 1usize << log2_h;
     let bd = ctx.bit_depth;
     let max_val = (1i32 << bd) - 1;
+    let sel = ctx.sel;
 
     // ---- luma: 5-mode search over the decoder's reference fetch ----
     let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
@@ -403,7 +433,14 @@ fn decide_leaf(
     for (mode_idx, &mode) in MODES.iter().enumerate() {
         let (levels, cbf, res, dist) =
             quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val)?;
-        let bits = (mode_idx + 1) as f64 + 1.0 + rle_bits_estimate(&levels, cbf);
+        let bits = model.measure(|m| {
+            emit_intra_pred_mode(m, sel, mode_idx);
+            let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+            m.encode_decision(t, i, u8::from(cbf));
+            if cbf {
+                emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+            }
+        });
         let cost = dist + ctx.lambda * bits;
         if cost < best_cost {
             best_cost = cost;
@@ -439,7 +476,18 @@ fn decide_leaf(
         let src_c = gather_block(plane, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
         let (levels, cbf, res, dist) =
             quantize_block(&refs_c, mode_c, &src_c, wc, hc, qp_c, bd, max_val)?;
-        let bits = 1.0 + rle_bits_estimate(&levels, cbf);
+        let bits = model.measure(|m| {
+            let table = if c_idx == 1 {
+                MainCtxTable::CbfCb
+            } else {
+                MainCtxTable::CbfCr
+            };
+            let (t, i) = sel.ctx(table, 0);
+            m.encode_decision(t, i, u8::from(cbf));
+            if cbf {
+                emit_residual_rle(m, sel, c_idx, &levels, log2_w - 1, log2_h - 1);
+            }
+        });
         cost += dist + ctx.lambda * bits;
         intra_reconstruct_cb_in_tile(
             &mut ctx.recon,
@@ -462,18 +510,18 @@ fn decide_leaf(
     stats.cbf_luma_set += u32::from(cbf_y);
     stats.cbf_chroma_set += u32::from(cbf_cb) + u32::from(cbf_cr);
 
-    Ok((
-        LeafPlan {
-            mode_idx,
-            levels_y,
-            cbf_y,
-            levels_cb,
-            cbf_cb,
-            levels_cr,
-            cbf_cr,
-        },
-        cost,
-    ))
+    let plan = LeafPlan {
+        mode_idx,
+        levels_y,
+        cbf_y,
+        levels_cb,
+        cbf_cb,
+        levels_cr,
+        cbf_cr,
+    };
+    // Advance the rate model over the decided leaf's exact bin string.
+    model.commit(|m| emit_leaf(m, sel, &plan, log2_w, log2_h));
+    Ok((plan, cost))
 }
 
 /// Predict + transform + quantize + reconstruct one candidate block
@@ -521,25 +569,6 @@ pub(crate) fn quantize_block(
         dist += d * d;
     }
     Ok((levels, cbf, res, dist))
-}
-
-/// Crude §7.3.8.7 rate estimate in bins: per non-zero coefficient the
-/// zero-run unary, the level unary, the sign and the last flag.
-pub(crate) fn rle_bits_estimate(levels: &[i32], cbf: bool) -> f64 {
-    if !cbf {
-        return 0.0;
-    }
-    let mut bits = 0f64;
-    let mut run = 0f64;
-    for &l in levels {
-        if l == 0 {
-            run += 1.0;
-        } else {
-            bits += run + 1.0 + (l.unsigned_abs() as f64) + 2.0;
-            run = 0.0;
-        }
-    }
-    bits
 }
 
 pub(crate) fn gather_block(
@@ -631,8 +660,8 @@ pub(crate) fn restore_region(
 // ---------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn emit_split_unit(
-    enc: &mut CabacEncoder,
+fn emit_split_unit<S: BinSink>(
+    enc: &mut S,
     stats: &mut EncStats,
     ctx: &EncCtx<'_>,
     sel: CtxSel,
@@ -668,22 +697,25 @@ fn emit_split_unit(
     }
 }
 
-fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
-    // One SINGLE_TREE coding_unit(): intra_pred_mode — U over Table 62
-    // with the Table 95 ctxInc (bin0 → 0, later bins → 1) under
-    // `cm_init`; all bins on (0, 0) under the Baseline collapse. The
-    // decoder reads it via `decode_u_regular` (63-bin compat cap).
-    {
-        let table = MainCtxTable::IntraPredMode;
-        let (t, off) = if sel.cm_init {
-            (table.as_usize(), table.ctx_idx_offset(sel.init_type))
-        } else {
-            (0, table.cm0_ctx_idx_offset(sel.init_type))
-        };
-        enc.encode_u_regular_capped(plan.mode_idx as u32, 63, t, |bin_idx| {
-            off + (bin_idx as usize).min(1)
-        });
-    }
+/// `intra_pred_mode` — U over Table 62 with the Table 95 ctxInc (bin0
+/// → 0, later bins → 1) under `cm_init`; all bins on (0, 0) under the
+/// Baseline collapse. The decoder reads it via `decode_u_regular`
+/// (63-bin compat cap).
+pub(crate) fn emit_intra_pred_mode<S: BinSink>(enc: &mut S, sel: CtxSel, mode_idx: usize) {
+    let table = MainCtxTable::IntraPredMode;
+    let (t, off) = if sel.cm_init {
+        (table.as_usize(), table.ctx_idx_offset(sel.init_type))
+    } else {
+        (0, table.cm0_ctx_idx_offset(sel.init_type))
+    };
+    enc.encode_u_regular_capped(mode_idx as u32, 63, t, |bin_idx| {
+        off + (bin_idx as usize).min(1)
+    });
+}
+
+fn emit_leaf<S: BinSink>(enc: &mut S, sel: CtxSel, plan: &LeafPlan, log2_w: u32, log2_h: u32) {
+    // One SINGLE_TREE coding_unit(): intra_pred_mode first.
+    emit_intra_pred_mode(enc, sel, plan.mode_idx);
     // transform_unit(), SINGLE_TREE (§7.3.8.5): cbf_cb then cbf_cr
     // (Tables 76/77, ctxInc 0 — the line-3066 chroma-carrying-tree
     // gate), then cbf_luma (Table 75 — always present on a MODE_INTRA
@@ -716,8 +748,8 @@ fn emit_leaf(enc: &mut CabacEncoder, sel: CtxSel, plan: &LeafPlan, log2_w: u32, 
 /// ctxInc driven by `cIdx`, the bin position and the §7.3.8.7
 /// `PrevLevel` chain (init 6, then the previous coefficient's absolute
 /// level), and `coeff_last_flag` the Table 95 `cIdx == 0 ? 0 : 1`.
-pub(crate) fn emit_residual_rle(
-    enc: &mut CabacEncoder,
+pub(crate) fn emit_residual_rle<S: BinSink>(
+    enc: &mut S,
     sel: CtxSel,
     c_idx: u32,
     levels: &[i32],
@@ -919,20 +951,18 @@ mod tests {
 
     /// The `sps_cm_init_flag == 1` entropy shape must never lose to the
     /// Baseline single-context collapse on the busy synthetic frame:
-    /// same decisions, same recon, strictly fewer payload bytes at
-    /// every QP (the per-element context modelling is precisely the
-    /// rate win the r429 README promised).
+    /// strictly fewer payload bytes at every QP (the per-element
+    /// context modelling is precisely the rate win the r429 README
+    /// promised). Since round 455 the RD decisions are costed against
+    /// each shape's own contexts, so the two reconstructions may
+    /// legitimately differ — only the rate ordering is pinned.
     #[test]
     fn cm_init_shrinks_payload_at_every_qp() {
         let (w, h) = (128u32, 96u32);
         let src = synth_picture(w, h, 0xFEED_BEEF);
         for &qp in &[4i32, 16, 28, 40, 51] {
-            let (p0, r0, _) = encode_idr_slice_data_opts(&src, qp, false, false).unwrap();
-            let (p1, r1, _) = encode_idr_slice_data_opts(&src, qp, false, true).unwrap();
-            assert_eq!(
-                r0.y, r1.y,
-                "qp {qp}: entropy layer must not change the reconstruction"
-            );
+            let (p0, _, _) = encode_idr_slice_data_opts(&src, qp, false, false).unwrap();
+            let (p1, _, _) = encode_idr_slice_data_opts(&src, qp, false, true).unwrap();
             assert!(
                 p1.len() < p0.len(),
                 "qp {qp}: cm_init payload {} must beat baseline {}",

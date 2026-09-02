@@ -490,10 +490,10 @@ impl<'a> CabacEngine<'a> {
 
 /// State-transition rule (§9.3.4.3.2.2, eq. 1476). The bracketing in the
 /// published spec is `valState - (valState + 16) >> 5` which under C
-/// precedence parses as `valState - ((valState + 16) >> 5)`; that matches
-/// every reference encoder we cross-checked numerically (range
-/// `[256→248, 256→263→249]`).
-fn next_state(var: ContextVar, bin_val: u8) -> ContextVar {
+/// precedence parses as `valState - ((valState + 16) >> 5)`; the crate's
+/// own round-trip fixtures pin that reading (range `[256→248,
+/// 256→263→249]`).
+pub(crate) fn next_state(var: ContextVar, bin_val: u8) -> ContextVar {
     let val_state = var.val_state as i32;
     let mut new_state: i32;
     let mut new_mps = var.val_mps;
@@ -645,73 +645,28 @@ impl CabacEncoder {
         self.low &= Self::WINDOW_MASK;
     }
 
-    /// Encode a U-binarised value (§9.3.3.2) the way
-    /// [`CabacEngine::decode_u_regular_capped`] reads it back: `value`
-    /// 1-bins followed by one terminating 0-bin (the decoder's capped
-    /// loop always consumes the terminator, including at `value ==
-    /// c_max`). `ctx_idx_for(binIdx)` mirrors the decode-side context
-    /// switch; under `sps_cm_init_flag == 0` callers pass `|_| 0`.
+    /// [`BinSink::encode_u_regular_capped`] — kept as an inherent
+    /// method so the decoder-side tests keep their call shape.
     pub fn encode_u_regular_capped<F>(
         &mut self,
         value: u32,
         c_max: u32,
         ctx_table: usize,
-        mut ctx_idx_for: F,
+        ctx_idx_for: F,
     ) where
         F: FnMut(u32) -> usize,
     {
-        debug_assert!(value <= c_max, "U value {value} exceeds cMax {c_max}");
-        for bin_idx in 0..value {
-            self.encode_decision(ctx_table, ctx_idx_for(bin_idx), 1);
-        }
-        self.encode_decision(ctx_table, ctx_idx_for(value), 0);
+        <Self as BinSink>::encode_u_regular_capped(self, value, c_max, ctx_table, ctx_idx_for)
     }
 
-    /// Encode an EG0 value (§9.3.3.4, k = 0) with every bin bypass —
-    /// the write dual of [`CabacEngine::decode_egk_bypass`] with
-    /// `k_in = 0` (the `sps_cm_init_flag == 0` `abs_mvd` shape). The
-    /// prefix is `p` 1-bins (where `2^p − 1 <= value`), a 0-bin, then
-    /// `p` suffix bits of `value − (2^p − 1)`, MSB first.
+    /// [`BinSink::encode_eg0_bypass`] (inherent alias).
     pub fn encode_eg0_bypass(&mut self, value: u32) {
-        let mut p = 0u32;
-        while (1u64 << (p + 1)) - 1 <= value as u64 {
-            p += 1;
-        }
-        for _ in 0..p {
-            self.encode_bypass(1);
-        }
-        self.encode_bypass(0);
-        let suffix = value - ((1u32 << p) - 1);
-        for i in (0..p).rev() {
-            self.encode_bypass(((suffix >> i) & 1) as u8);
-        }
+        <Self as BinSink>::encode_eg0_bypass(self, value)
     }
 
-    /// Encode an EG0 value whose **first bin is regular-coded** — the
-    /// write dual of [`CabacEngine::decode_eg0_first_regular`] (the
-    /// Table 95 `abs_mvd` shape under `sps_cm_init_flag == 1`: bin0 on
-    /// Table 73, the rest of the prefix and every suffix bit bypass).
+    /// [`BinSink::encode_eg0_first_regular`] (inherent alias).
     pub fn encode_eg0_first_regular(&mut self, ctx_table: usize, ctx_idx: usize, value: u32) {
-        let mut p = 0u32;
-        while (1u64 << (p + 1)) - 1 <= value as u64 {
-            p += 1;
-        }
-        for i in 0..p {
-            if i == 0 {
-                self.encode_decision(ctx_table, ctx_idx, 1);
-            } else {
-                self.encode_bypass(1);
-            }
-        }
-        if p == 0 {
-            self.encode_decision(ctx_table, ctx_idx, 0);
-        } else {
-            self.encode_bypass(0);
-        }
-        let suffix = value - ((1u32 << p) - 1);
-        for i in (0..p).rev() {
-            self.encode_bypass(((suffix >> i) & 1) as u8);
-        }
+        <Self as BinSink>::encode_eg0_first_regular(self, ctx_table, ctx_idx, value)
     }
 
     pub fn encode_terminate(&mut self, terminate: bool) {
@@ -768,6 +723,107 @@ impl CabacEncoder {
             out.push(byte);
         }
         out
+    }
+}
+
+/// A sink for CABAC bins — the write-side dual of the §9.3.4.3
+/// decoding primitives. Implemented by the real [`CabacEncoder`] (which
+/// emits the codeword) and by the encoder's decide-pass
+/// [`crate::bin_cost::BitCostModel`] (which only accumulates the exact
+/// −log2 cost of every bin against the same context state), so one
+/// syntax writer serves both the rate estimate and the emission.
+///
+/// The binarisation helpers (`U`, `EG0`) are provided methods built on
+/// the three primitives, mirroring the decoder's `decode_*` shapes.
+pub trait BinSink {
+    /// One context-coded regular bin (§9.3.4.3.2 dual).
+    fn encode_decision(&mut self, ctx_table: usize, ctx_idx: usize, bin: u8);
+    /// One equiprobable bin (§9.3.4.3.4 dual).
+    fn encode_bypass(&mut self, bin: u8);
+    /// The §9.3.4.3.5 terminate bin.
+    fn encode_terminate(&mut self, terminate: bool);
+
+    /// Encode a U-binarised value (§9.3.3.2) the way
+    /// [`CabacEngine::decode_u_regular_capped`] reads it back: `value`
+    /// 1-bins followed by one terminating 0-bin (the decoder's capped
+    /// loop always consumes the terminator, including at `value ==
+    /// c_max`). `ctx_idx_for(binIdx)` mirrors the decode-side context
+    /// switch; under `sps_cm_init_flag == 0` callers pass `|_| 0`.
+    fn encode_u_regular_capped<F>(
+        &mut self,
+        value: u32,
+        c_max: u32,
+        ctx_table: usize,
+        mut ctx_idx_for: F,
+    ) where
+        F: FnMut(u32) -> usize,
+    {
+        debug_assert!(value <= c_max, "U value {value} exceeds cMax {c_max}");
+        for bin_idx in 0..value {
+            self.encode_decision(ctx_table, ctx_idx_for(bin_idx), 1);
+        }
+        self.encode_decision(ctx_table, ctx_idx_for(value), 0);
+    }
+
+    /// Encode an EG0 value (§9.3.3.4, k = 0) with every bin bypass —
+    /// the write dual of [`CabacEngine::decode_egk_bypass`] with
+    /// `k_in = 0` (the `sps_cm_init_flag == 0` `abs_mvd` shape). The
+    /// prefix is `p` 1-bins (where `2^p − 1 <= value`), a 0-bin, then
+    /// `p` suffix bits of `value − (2^p − 1)`, MSB first.
+    fn encode_eg0_bypass(&mut self, value: u32) {
+        let mut p = 0u32;
+        while (1u64 << (p + 1)) - 1 <= value as u64 {
+            p += 1;
+        }
+        for _ in 0..p {
+            self.encode_bypass(1);
+        }
+        self.encode_bypass(0);
+        let suffix = value - ((1u32 << p) - 1);
+        for i in (0..p).rev() {
+            self.encode_bypass(((suffix >> i) & 1) as u8);
+        }
+    }
+
+    /// Encode an EG0 value whose **first bin is regular-coded** — the
+    /// write dual of [`CabacEngine::decode_eg0_first_regular`] (the
+    /// Table 95 `abs_mvd` shape under `sps_cm_init_flag == 1`: bin0 on
+    /// Table 73, the rest of the prefix and every suffix bit bypass).
+    fn encode_eg0_first_regular(&mut self, ctx_table: usize, ctx_idx: usize, value: u32) {
+        let mut p = 0u32;
+        while (1u64 << (p + 1)) - 1 <= value as u64 {
+            p += 1;
+        }
+        for i in 0..p {
+            if i == 0 {
+                self.encode_decision(ctx_table, ctx_idx, 1);
+            } else {
+                self.encode_bypass(1);
+            }
+        }
+        if p == 0 {
+            self.encode_decision(ctx_table, ctx_idx, 0);
+        } else {
+            self.encode_bypass(0);
+        }
+        let suffix = value - ((1u32 << p) - 1);
+        for i in (0..p).rev() {
+            self.encode_bypass(((suffix >> i) & 1) as u8);
+        }
+    }
+}
+
+impl BinSink for CabacEncoder {
+    fn encode_decision(&mut self, ctx_table: usize, ctx_idx: usize, bin: u8) {
+        CabacEncoder::encode_decision(self, ctx_table, ctx_idx, bin)
+    }
+
+    fn encode_bypass(&mut self, bin: u8) {
+        CabacEncoder::encode_bypass(self, bin)
+    }
+
+    fn encode_terminate(&mut self, terminate: bool) {
+        CabacEncoder::encode_terminate(self, terminate)
     }
 }
 

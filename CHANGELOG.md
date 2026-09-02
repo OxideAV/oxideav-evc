@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Other
+
+- **Encoder: exact entropy-coder bit costs in the decide pass (round
+  455).** The RD rate term was a per-element bin *count*; it is now the
+  §9.3.4.3.2 cost of the exact bin string each candidate would emit —
+  `−log2( valState / 512 )` per regular bin at the current context state,
+  one bit per bypass bin — accumulated by the new `bin_cost::BitCostModel`,
+  a second `cabac::BinSink` implementation that the syntax writers of
+  `slice_enc` / `slice_enc_p` are now generic over (the same
+  `emit_leaf_bins` / `emit_residual_rle` code produces the estimate and
+  the stream). The model's context table starts from the emit pass's
+  §9.3.2.2 init and is advanced by every decided bin in decode order
+  (snapshot/rewound with the leaf-vs-split trials), so `cm_init` and
+  Baseline streams are each decided against their own contexts — the two
+  entropy shapes may now reconstruct differently, and the round-429
+  "same recon, fewer bytes" pins become "fewer bytes". The `−log2` table
+  is built by an integer binary logarithm in a `const fn`, keeping the
+  encode byte-identical across platforms (MD5 stream fixtures re-pinned
+  for this change). New `examples/rd_curve.rs` is the crate's rate/PSNR
+  measurement tool over its synthetic corpus (176×144 / 96×64 / 64×48,
+  8-frame moving scene). Measured intra BD-rate (QP 32-50 ladder,
+  luma): −1.9 % mean over the three geometries.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-evc/compare/v0.0.3...v0.0.4) - 2026-08-30
 
 ### Other

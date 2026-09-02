@@ -58,7 +58,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::cabac::{CabacEncoder, InitType};
+use crate::bin_cost::BitCostModel;
+use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform;
@@ -74,7 +75,7 @@ use crate::slice_data::{
     mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
 };
 use crate::slice_enc::{
-    emit_residual_rle, gather_block, quantize_block, restore_region, rle_bits_estimate,
+    emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, restore_region,
     save_region, MODES,
 };
 
@@ -214,10 +215,8 @@ enum PLeaf {
 
 /// The best explicit-inter candidate of a leaf under evaluation.
 struct Explicit {
-    l0: Option<ListPred>,
-    l1: Option<ListPred>,
+    leaf: PLeaf,
     pred: Pred,
-    res: Residual,
     planes: Pred,
     cost: f64,
 }
@@ -247,6 +246,8 @@ struct PCtx<'a> {
     hmvp: HmvpCandList,
     /// Minimal walk inputs for the shared §9.3.4.2.4 probe helper.
     walk: SliceWalkInputs,
+    /// The entropy shape the emit pass runs under.
+    sel: CtxSel,
 }
 
 impl<'a> PCtx<'a> {
@@ -392,8 +393,15 @@ pub fn encode_inter_slice_data(
             pic_height: src.height,
             ..Default::default()
         },
+        sel: CtxSel::new(inputs.cm_init, InitType::Pb),
     };
     let mut stats = PEncStats::default();
+    // The decide pass's rate model — the emit pass's context table,
+    // advanced by every decided bin in decode order.
+    let mut model = BitCostModel::new();
+    if inputs.cm_init {
+        model.init_main_profile(InitType::Pb, slice_qp);
+    }
 
     // Decide pass — decode order, committing recon + grid + HMVP.
     let ctus_x = src.width.div_ceil(1 << CTB_LOG2);
@@ -408,6 +416,7 @@ pub fn encode_inter_slice_data(
             }
             let (node, _cost) = decide_split_unit(
                 &mut ctx,
+                &mut model,
                 &mut stats,
                 cx << CTB_LOG2,
                 cy << CTB_LOG2,
@@ -422,7 +431,7 @@ pub fn encode_inter_slice_data(
     // Emit pass — decoder-exact bin order over a replayed grid (the
     // §9.3.4.2.4 neighbour ctxIncs probe decode-time state).
     let cm_init = inputs.cm_init;
-    let sel = CtxSel::new(cm_init, InitType::Pb);
+    let sel = ctx.sel;
     let mut enc = CabacEncoder::new();
     if cm_init {
         enc.init_main_profile(InitType::Pb, slice_qp);
@@ -473,6 +482,7 @@ fn split_geometry(ctx: &PCtx<'_>, x0: u32, y0: u32, log2_w: u32, log2_h: u32) ->
 
 fn decide_split_unit(
     ctx: &mut PCtx<'_>,
+    model: &mut BitCostModel,
     stats: &mut PEncStats,
     x0: u32,
     y0: u32,
@@ -483,37 +493,45 @@ fn decide_split_unit(
     let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
 
     if can_recurse && !within {
-        let (children, cost) = decide_children(ctx, stats, x0, y0, log2_w, log2_h)?;
+        let (children, cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
         return Ok((Node::Split(children), cost));
     }
     if !flag_present {
-        let (plan, cost) = decide_leaf(ctx, x0, y0, log2_w, log2_h)?;
-        return Ok((Node::Leaf(plan), cost + ctx.lambda));
+        let (plan, cost) = decide_leaf(ctx, model, x0, y0, log2_w, log2_h)?;
+        return Ok((Node::Leaf(plan), cost));
     }
 
-    // Trial the leaf, snapshot, rewind, trial the split, keep the
-    // cheaper state (recon + grid + HMVP all roll back together).
+    // Trial the leaf (its split_cu_flag = 0 bin committed first, in
+    // emit order), snapshot, rewind, trial the split, keep the cheaper
+    // state (recon + grid + HMVP + rate model all roll back together).
+    let (split_t, split_i) = ctx.sel.ctx(MainCtxTable::SplitCuFlag, 0);
     let before_pix = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
     let before_grid = ctx.side_info.clone();
     let before_hmvp = ctx.hmvp.clone();
+    let before_model = model.clone();
 
-    let (leaf_plan, leaf_cost) = decide_leaf(ctx, x0, y0, log2_w, log2_h)?;
-    let leaf_cost = leaf_cost + ctx.lambda; // split_cu_flag = 0 bin
+    let leaf_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 0));
+    let (leaf_plan, leaf_cost) = decide_leaf(ctx, model, x0, y0, log2_w, log2_h)?;
+    let leaf_cost = leaf_cost + ctx.lambda * leaf_flag_bits;
     let after_leaf_pix = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
     let after_leaf_grid = ctx.side_info.clone();
     let after_leaf_hmvp = ctx.hmvp.clone();
+    let after_leaf_model = model.clone();
 
     restore_region(&mut ctx.recon, &before_pix, x0, y0, log2_w, log2_h);
     ctx.side_info = before_grid;
     ctx.hmvp = before_hmvp;
+    *model = before_model;
 
-    let (children, split_cost) = decide_children(ctx, stats, x0, y0, log2_w, log2_h)?;
-    let split_cost = split_cost + ctx.lambda; // split_cu_flag = 1 bin
+    let split_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 1));
+    let (children, split_cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
+    let split_cost = split_cost + ctx.lambda * split_flag_bits;
 
     if leaf_cost <= split_cost {
         restore_region(&mut ctx.recon, &after_leaf_pix, x0, y0, log2_w, log2_h);
         ctx.side_info = after_leaf_grid;
         ctx.hmvp = after_leaf_hmvp;
+        *model = after_leaf_model;
         Ok((Node::Leaf(leaf_plan), leaf_cost))
     } else {
         Ok((Node::Split(children), split_cost))
@@ -523,6 +541,7 @@ fn decide_split_unit(
 #[allow(clippy::type_complexity)]
 fn decide_children(
     ctx: &mut PCtx<'_>,
+    model: &mut BitCostModel,
     stats: &mut PEncStats,
     x0: u32,
     y0: u32,
@@ -535,6 +554,7 @@ fn decide_children(
     {
         let (node, c) = decide_split_unit(
             ctx,
+            model,
             stats,
             ch.x0,
             ch.y0,
@@ -793,16 +813,6 @@ fn ref_idx_bits(v: u32, n_refs: u32) -> f64 {
     (v + u32::from(v < c_max)) as f64
 }
 
-/// `inter_pred_idc` TR (cMax 2) bin count: PRED_L0 → `0`, PRED_L1 →
-/// `10`, PRED_BI → `11`.
-fn inter_pred_idc_bits(idc: u32) -> f64 {
-    if idc == 0 {
-        1.0
-    } else {
-        2.0
-    }
-}
-
 /// Quantize one inter residual plane through the decoder's §8.7 chain;
 /// returns (levels, cbf, reconstructed residual, SSE vs source).
 fn quantize_inter_plane(
@@ -843,14 +853,17 @@ fn sse_pred(src: &[i32], pred: &[i32], max_val: i32) -> f64 {
 }
 
 /// Quantized residual of an inter prediction against the source, with
-/// the §7.4.9.5-aware distortion + bit estimate: the `cbf_all` bin
-/// (1), then with any content `cbf_cb` + `cbf_cr`, the `cbf_luma` bin
-/// only when chroma carries something (quiet chroma infers it 1 — the
-/// all-quiet shape is exactly `cbf_all = 0`), and the RLE estimates.
+/// the distortion and the exact rate of the §7.3.8.5 residual syntax
+/// it would emit (`cbf_all`, then with any content `cbf_cb` +
+/// `cbf_cr`, the `cbf_luma` bin only when chroma carries something —
+/// quiet chroma infers it 1, the all-quiet shape is exactly
+/// `cbf_all = 0` — and the RLE strings), costed at the current
+/// context state of `model`.
 /// Returns `(residual, reconstructed residual planes, distortion, bits)`.
 #[allow(clippy::type_complexity)]
 fn quantize_inter_residual(
     ctx: &PCtx<'_>,
+    model: &mut BitCostModel,
     src: (&[i32], &[i32], &[i32]),
     pred: &Pred,
     w: usize,
@@ -875,15 +888,9 @@ fn quantize_inter_residual(
         levels_cr,
         cbf_cr,
     };
-    let mut bits = 1.0; // cbf_all
+    let (log2_w, log2_h) = ((w as u32).trailing_zeros(), (h as u32).trailing_zeros());
+    let bits = model.measure(|m| emit_inter_residual(m, ctx.sel, &res, log2_w, log2_h));
     let dist = if res.any() {
-        bits += 2.0; // cbf_cb + cbf_cr
-        if cbf_cb || cbf_cr {
-            bits += 1.0; // cbf_luma present
-        }
-        bits += rle_bits_estimate(&res.levels_y, cbf_y)
-            + rle_bits_estimate(&res.levels_cb, cbf_cb)
-            + rle_bits_estimate(&res.levels_cr, cbf_cr);
         dist_y + dist_cb + dist_cr
     } else {
         sse_pred(src.0, &pred.0, max_val)
@@ -1043,6 +1050,7 @@ fn commit_inter(
 #[allow(clippy::too_many_arguments)]
 fn uni_per_ref(
     ctx: &PCtx<'_>,
+    model: &mut BitCostModel,
     list: usize,
     x0: u32,
     y0: u32,
@@ -1058,7 +1066,8 @@ fn uni_per_ref(
         let mv = motion_search(rv, ctx.bit_depth, x0, y0, w, h, src.0, &cands)?;
         let lp = fit_mvp(&cands, r, mv);
         let pred = mc_pred(ctx, list, r, x0, y0, w, h, mv)?;
-        let (_res, _planes, dist, res_bits) = quantize_inter_residual(ctx, src, &pred, w, h)?;
+        let (_res, _planes, dist, res_bits) =
+            quantize_inter_residual(ctx, model, src, &pred, w, h)?;
         let bits = ref_idx_bits(r, n_refs) + list_pred_bits(&lp) + res_bits;
         out.push((lp, dist + ctx.lambda * bits));
     }
@@ -1163,6 +1172,7 @@ fn refine_bi_l1(
 
 fn decide_leaf(
     ctx: &mut PCtx<'_>,
+    model: &mut BitCostModel,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -1174,6 +1184,7 @@ fn decide_leaf(
     let bd = ctx.bit_depth;
     let max_val = (1i32 << bd) - 1;
     let is_b = ctx.slice_is_b;
+    let sel = ctx.sel;
     let src_y = gather_block(&ctx.src.y, ctx.src.y_stride(), x0, y0, w, h);
     let src_cb = gather_block(&ctx.src.cb, ctx.src.c_stride(), x0 / 2, y0 / 2, wc, hc);
     let src_cr = gather_block(&ctx.src.cr, ctx.src.c_stride(), x0 / 2, y0 / 2, wc, hc);
@@ -1182,6 +1193,14 @@ fn decide_leaf(
         sse_pred(&src_y, &p.0, max_val)
             + sse_pred(&src_cb, &p.1, max_val)
             + sse_pred(&src_cr, &p.2, max_val)
+    };
+    // Exact rate of a candidate leaf's whole bin string at the current
+    // context state (the neighbour-derived ctxIncs probe the committed
+    // decode-order grid, exactly as the emit pass will).
+    let leaf_bits = |model: &mut BitCostModel, ctx: &PCtx<'_>, leaf: &PLeaf| -> f64 {
+        model.measure(|m| {
+            emit_leaf_bins(m, ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h, leaf);
+        })
     };
 
     // ---- skip ladder: mvp slots at refIdx 0 (eqs. 445/448), whole-CU
@@ -1193,7 +1212,7 @@ fn decide_leaf(
     } else {
         [MotionVector::default(); 4]
     };
-    let mut best_skip: Option<([u32; 2], [MotionVector; 2], Pred)> = None;
+    let mut best_skip: Option<(PLeaf, Pred)> = None;
     let mut best_skip_cost = f64::INFINITY;
     let preds0: Vec<Pred> = cands0
         .iter()
@@ -1207,160 +1226,172 @@ fn decide_leaf(
         for (k0, p0) in preds0.iter().enumerate() {
             for (k1, p1) in preds1.iter().enumerate() {
                 let avg = bi_average(p0, p1);
-                let bits = 1.0 + tr3_bits(k0 as u32) + tr3_bits(k1 as u32);
-                let cost = sse_all(&avg) + ctx.lambda * bits;
+                let leaf = PLeaf::Skip {
+                    mvp_idx: [k0 as u32, k1 as u32],
+                    mv: [cands0[k0], cands1[k1]],
+                };
+                let cost = sse_all(&avg) + ctx.lambda * leaf_bits(model, ctx, &leaf);
                 if cost < best_skip_cost {
                     best_skip_cost = cost;
-                    best_skip = Some(([k0 as u32, k1 as u32], [cands0[k0], cands1[k1]], avg));
+                    best_skip = Some((leaf, avg));
                 }
             }
         }
     } else {
         for (k0, p0) in preds0.into_iter().enumerate() {
-            let bits = 1.0 + tr3_bits(k0 as u32); // cu_skip + mvp_idx
-            let cost = sse_all(&p0) + ctx.lambda * bits;
+            let leaf = PLeaf::Skip {
+                mvp_idx: [k0 as u32, 0],
+                mv: [cands0[k0], MotionVector::default()],
+            };
+            let cost = sse_all(&p0) + ctx.lambda * leaf_bits(model, ctx, &leaf);
             if cost < best_skip_cost {
                 best_skip_cost = cost;
-                best_skip = Some(([k0 as u32, 0], [cands0[k0], MotionVector::default()], p0));
+                best_skip = Some((leaf, p0));
             }
         }
     }
 
     // ---- direct (B): the §8.5.2.5 pair, bi-predicted, cbf_all-gated
-    // residual. Bits: cu_skip 0, pred_mode 0, direct 1, + residual.
-    let mut direct: Option<([MotionVector; 2], Pred, Residual, Pred, f64)> = None;
+    // residual.
+    let mut direct: Option<(PLeaf, Pred, Pred, f64)> = None;
     if is_b {
         let (mv0, mv1) =
             derive_direct_mode_mvs(&ctx.pocs(), ctx.col.as_ref(), x0, y0, w as u32, h as u32);
         let pred = mc_pred_pair(ctx, x0, y0, w, h, Some((0, mv0)), Some((0, mv1)))?;
-        let (res, planes, dist, res_bits) = quantize_inter_residual(ctx, src, &pred, w, h)?;
-        let cost = dist + ctx.lambda * (3.0 + res_bits);
-        direct = Some(([mv0, mv1], pred, res, planes, cost));
+        let (res, planes, dist, _) = quantize_inter_residual(ctx, model, src, &pred, w, h)?;
+        let leaf = PLeaf::Direct {
+            mv: [mv0, mv1],
+            res,
+        };
+        let cost = dist + ctx.lambda * leaf_bits(model, ctx, &leaf);
+        direct = Some((leaf, pred, planes, cost));
     }
 
     // ---- explicit inter: per-list ME (every reference) + residual;
     // on B also the bi-prediction pairing.
-    let head_bits = 2.0 + if is_b { 1.0 } else { 0.0 }; // cu_skip, pred_mode, [direct = 0]
     let mut explicit = {
-        let lp0 = best_of(&uni_per_ref(ctx, 0, x0, y0, w, h, src)?);
+        let lp0 = best_of(&uni_per_ref(ctx, model, 0, x0, y0, w, h, src)?);
         let pred0 = mc_pred(ctx, 0, lp0.ref_idx, x0, y0, w, h, lp0.mv)?;
-        let (res0, planes0, dist0, rbits0) = quantize_inter_residual(ctx, src, &pred0, w, h)?;
-        let bits0 = head_bits
-            + if is_b { inter_pred_idc_bits(0) } else { 0.0 }
-            + ref_idx_bits(lp0.ref_idx, ctx.n_refs(0))
-            + list_pred_bits(&lp0)
-            + rbits0;
-        Explicit {
+        let (res0, planes0, dist0, _) = quantize_inter_residual(ctx, model, src, &pred0, w, h)?;
+        let leaf = PLeaf::Inter {
             l0: Some(lp0),
             l1: None,
-            pred: pred0,
             res: res0,
+        };
+        let cost = dist0 + ctx.lambda * leaf_bits(model, ctx, &leaf);
+        Explicit {
+            leaf,
+            pred: pred0,
             planes: planes0,
-            cost: dist0 + ctx.lambda * bits0,
+            cost,
         }
     };
-    {
-        let lp0 = explicit.l0.expect("list-0 candidate");
-        if is_b {
-            let per_ref1 = uni_per_ref(ctx, 1, x0, y0, w, h, src)?;
-            let lp1 = best_of(&per_ref1);
-            let pred1 = mc_pred(ctx, 1, lp1.ref_idx, x0, y0, w, h, lp1.mv)?;
-            let (res1, planes1, dist1, rbits1) = quantize_inter_residual(ctx, src, &pred1, w, h)?;
-            let bits1 = head_bits
-                + inter_pred_idc_bits(1)
-                + ref_idx_bits(lp1.ref_idx, ctx.n_refs(1))
-                + list_pred_bits(&lp1)
-                + rbits1;
-            let cost1 = dist1 + ctx.lambda * bits1;
-            if cost1 < explicit.cost {
+    if is_b {
+        let PLeaf::Inter { l0: Some(lp0), .. } = explicit.leaf else {
+            unreachable!("list-0 candidate")
+        };
+        let per_ref1 = uni_per_ref(ctx, model, 1, x0, y0, w, h, src)?;
+        let lp1 = best_of(&per_ref1);
+        let pred1 = mc_pred(ctx, 1, lp1.ref_idx, x0, y0, w, h, lp1.mv)?;
+        let (res1, planes1, dist1, _) = quantize_inter_residual(ctx, model, src, &pred1, w, h)?;
+        let leaf1 = PLeaf::Inter {
+            l0: None,
+            l1: Some(lp1),
+            res: res1,
+        };
+        let cost1 = dist1 + ctx.lambda * leaf_bits(model, ctx, &leaf1);
+        if cost1 < explicit.cost {
+            explicit = Explicit {
+                leaf: leaf1,
+                pred: pred1,
+                planes: planes1,
+                cost: cost1,
+            };
+        }
+        // Bi: list-0 half fixed, list-1 vector re-fit on the average.
+        // Two pairings: the best list-1 reference, and — when that
+        // is the very picture list 0 already predicts from — the
+        // best list-1 reference that is a *different* picture (the
+        // averaging gain comes from independent reconstructions).
+        let pred_l0 = mc_pred(ctx, 0, lp0.ref_idx, x0, y0, w, h, lp0.mv)?;
+        let poc0 = ctx.ref_pocs[0][lp0.ref_idx as usize];
+        let mut pairings = vec![lp1];
+        if ctx.ref_pocs[1][lp1.ref_idx as usize] == poc0 {
+            let other = per_ref1
+                .iter()
+                .filter(|(p, _)| ctx.ref_pocs[1][p.ref_idx as usize] != poc0)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            if let Some((p, _)) = other {
+                pairings.push(*p);
+            }
+        }
+        for lp1 in pairings {
+            let mv1b = refine_bi_l1(ctx, x0, y0, w, h, &src_y, &pred_l0.0, lp1.ref_idx, lp1.mv)?;
+            let cands1b = amvp_candidates(ctx, 1, lp1.ref_idx, x0, y0, w, h);
+            let lp1b = fit_mvp(&cands1b, lp1.ref_idx, mv1b);
+            let predb = mc_pred_pair(
+                ctx,
+                x0,
+                y0,
+                w,
+                h,
+                Some((lp0.ref_idx, lp0.mv)),
+                Some((lp1b.ref_idx, lp1b.mv)),
+            )?;
+            let (resb, planesb, distb, _) = quantize_inter_residual(ctx, model, src, &predb, w, h)?;
+            let leafb = PLeaf::Inter {
+                l0: Some(lp0),
+                l1: Some(lp1b),
+                res: resb,
+            };
+            let costb = distb + ctx.lambda * leaf_bits(model, ctx, &leafb);
+            if costb < explicit.cost {
                 explicit = Explicit {
-                    l0: None,
-                    l1: Some(lp1),
-                    pred: pred1,
-                    res: res1,
-                    planes: planes1,
-                    cost: cost1,
+                    leaf: leafb,
+                    pred: predb,
+                    planes: planesb,
+                    cost: costb,
                 };
-            }
-            // Bi: list-0 half fixed, list-1 vector re-fit on the average.
-            // Two pairings: the best list-1 reference, and — when that
-            // is the very picture list 0 already predicts from — the
-            // best list-1 reference that is a *different* picture (the
-            // averaging gain comes from independent reconstructions).
-            let pred_l0 = mc_pred(ctx, 0, lp0.ref_idx, x0, y0, w, h, lp0.mv)?;
-            let poc0 = ctx.ref_pocs[0][lp0.ref_idx as usize];
-            let mut pairings = vec![lp1];
-            if ctx.ref_pocs[1][lp1.ref_idx as usize] == poc0 {
-                let other = per_ref1
-                    .iter()
-                    .filter(|(p, _)| ctx.ref_pocs[1][p.ref_idx as usize] != poc0)
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                if let Some((p, _)) = other {
-                    pairings.push(*p);
-                }
-            }
-            for lp1 in pairings {
-                let mv1b =
-                    refine_bi_l1(ctx, x0, y0, w, h, &src_y, &pred_l0.0, lp1.ref_idx, lp1.mv)?;
-                let cands1b = amvp_candidates(ctx, 1, lp1.ref_idx, x0, y0, w, h);
-                let lp1b = fit_mvp(&cands1b, lp1.ref_idx, mv1b);
-                let predb = mc_pred_pair(
-                    ctx,
-                    x0,
-                    y0,
-                    w,
-                    h,
-                    Some((lp0.ref_idx, lp0.mv)),
-                    Some((lp1b.ref_idx, lp1b.mv)),
-                )?;
-                let (resb, planesb, distb, rbitsb) =
-                    quantize_inter_residual(ctx, src, &predb, w, h)?;
-                let bitsb = head_bits
-                    + inter_pred_idc_bits(2)
-                    + ref_idx_bits(lp0.ref_idx, ctx.n_refs(0))
-                    + list_pred_bits(&lp0)
-                    + ref_idx_bits(lp1b.ref_idx, ctx.n_refs(1))
-                    + list_pred_bits(&lp1b)
-                    + rbitsb;
-                let costb = distb + ctx.lambda * bitsb;
-                if costb < explicit.cost {
-                    explicit = Explicit {
-                        l0: Some(lp0),
-                        l1: Some(lp1b),
-                        pred: predb,
-                        res: resb,
-                        planes: planesb,
-                        cost: costb,
-                    };
-                }
             }
         }
     }
     let Explicit {
-        l0: ex_l0,
-        l1: ex_l1,
+        leaf: ex_leaf,
         pred: ex_pred,
-        res: ex_res,
         planes: ex_planes,
         cost: inter_cost,
     } = explicit;
 
-    // ---- intra (single tree, chroma follows the luma mode).
+    // ---- intra (single tree, chroma follows the luma mode). The luma
+    // mode search costs each mode's own syntax (pred-mode bins, the
+    // U-coded `intra_pred_mode`, `cbf_luma`, the RLE string); chroma is
+    // added on the decided mode.
     let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
     let mut best_intra: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
     let mut best_intra_luma_cost = f64::INFINITY;
+    let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
+    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
     for (mode_idx, &mode) in MODES.iter().enumerate() {
-        let (levels, cbf, res, dist) = quantize_block(
-            &refs,
-            mode,
-            &src_y,
-            w,
-            h,
-            crate::dequant::qp_prime_y(ctx.qp, bd),
-            bd,
-            max_val,
-        )?;
-        let bits = 2.0 + (mode_idx + 1) as f64 + 1.0 + rle_bits_estimate(&levels, cbf);
+        let (levels, cbf, res, dist) =
+            quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val)?;
+        let bits = model.measure(|m| {
+            emit_intra_head(
+                m,
+                ctx,
+                sel,
+                &ctx.side_info,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                mode_idx,
+            );
+            let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+            m.encode_decision(t, i, u8::from(cbf));
+            if cbf {
+                emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
+            }
+        });
         let cost = dist + ctx.lambda * bits;
         if cost < best_intra_luma_cost {
             best_intra_luma_cost = cost;
@@ -1371,48 +1402,41 @@ fn decide_leaf(
     // Chroma with the same mode (decoder: IntraPredModeC = IntraPredModeY).
     let mode = MODES[i_mode];
     let refs_cb = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 1);
-    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) = quantize_block(
-        &refs_cb,
-        mode,
-        &src_cb,
-        wc,
-        hc,
-        crate::dequant::qp_prime_c(ctx.qp, 0, bd, false),
-        bd,
-        max_val,
-    )?;
+    let (i_levels_cb, i_cbf_cb, i_res_cb, i_dist_cb) =
+        quantize_block(&refs_cb, mode, &src_cb, wc, hc, qp_c, bd, max_val)?;
     let refs_cr = ctx.recon.fetch_intra_refs(x0 / 2, y0 / 2, wc, hc, 2);
-    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) = quantize_block(
-        &refs_cr,
-        mode,
-        &src_cr,
-        wc,
-        hc,
-        crate::dequant::qp_prime_c(ctx.qp, 0, bd, false),
-        bd,
-        max_val,
-    )?;
-    let intra_cost = best_intra_luma_cost
-        + i_dist_cb
-        + i_dist_cr
-        + ctx.lambda
-            * (2.0
-                + rle_bits_estimate(&i_levels_cb, i_cbf_cb)
-                + rle_bits_estimate(&i_levels_cr, i_cbf_cr));
+    let (i_levels_cr, i_cbf_cr, i_res_cr, i_dist_cr) =
+        quantize_block(&refs_cr, mode, &src_cr, wc, hc, qp_c, bd, max_val)?;
+    let chroma_bits = model.measure(|m| {
+        let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
+        m.encode_decision(t, i, u8::from(i_cbf_cb));
+        let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
+        m.encode_decision(t, i, u8::from(i_cbf_cr));
+        if i_cbf_cb {
+            emit_residual_rle(m, sel, 1, &i_levels_cb, log2_w - 1, log2_h - 1);
+        }
+        if i_cbf_cr {
+            emit_residual_rle(m, sel, 2, &i_levels_cr, log2_w - 1, log2_h - 1);
+        }
+    });
+    let intra_cost = best_intra_luma_cost + i_dist_cb + i_dist_cr + ctx.lambda * chroma_bits;
 
     // ---- choose and commit (the statistics are tallied by the emit
     // pass over the *decided* tree — the decide pass trials leaves that
     // a split later discards).
-    let direct_cost = direct.as_ref().map_or(f64::INFINITY, |d| d.4);
+    let direct_cost = direct.as_ref().map_or(f64::INFINITY, |d| d.3);
     let best = [best_skip_cost, direct_cost, inter_cost, intra_cost]
         .iter()
         .enumerate()
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i)
         .expect("4 costs");
-    match best {
+    let (leaf, cost) = match best {
         0 => {
-            let (k, mv, pred) = best_skip.expect("skip ladder evaluated");
+            let (leaf, pred) = best_skip.expect("skip ladder evaluated");
+            let PLeaf::Skip { mv, .. } = &leaf else {
+                unreachable!()
+            };
             let l1 = if is_b { Some((0, mv[1])) } else { None };
             commit_inter(
                 ctx,
@@ -1427,11 +1451,13 @@ fn decide_leaf(
                 &pred,
                 &(Vec::new(), Vec::new(), Vec::new()),
             );
-            Ok((PLeaf::Skip { mvp_idx: k, mv }, best_skip_cost))
+            (leaf, best_skip_cost)
         }
         1 => {
-            let (mv, pred, res, planes, cost) = direct.expect("direct evaluated");
-            let cbf_y = res.cbf_y;
+            let (leaf, pred, planes, cost) = direct.expect("direct evaluated");
+            let PLeaf::Direct { mv, res } = &leaf else {
+                unreachable!()
+            };
             commit_inter(
                 ctx,
                 x0,
@@ -1440,37 +1466,31 @@ fn decide_leaf(
                 log2_h,
                 Some((0, mv[0])),
                 Some((0, mv[1])),
-                cbf_y,
+                res.cbf_y,
                 false,
                 &pred,
                 &planes,
             );
-            Ok((PLeaf::Direct { mv, res }, cost))
+            (leaf, cost)
         }
         2 => {
-            let l0 = ex_l0.map(|p| (p.ref_idx, p.mv));
-            let l1 = ex_l1.map(|p| (p.ref_idx, p.mv));
+            let PLeaf::Inter { l0, l1, res } = &ex_leaf else {
+                unreachable!()
+            };
             commit_inter(
                 ctx,
                 x0,
                 y0,
                 log2_w,
                 log2_h,
-                l0,
-                l1,
-                ex_res.cbf_y,
+                l0.map(|p| (p.ref_idx, p.mv)),
+                l1.map(|p| (p.ref_idx, p.mv)),
+                res.cbf_y,
                 false,
                 &ex_pred,
                 &ex_planes,
             );
-            Ok((
-                PLeaf::Inter {
-                    l0: ex_l0,
-                    l1: ex_l1,
-                    res: ex_res,
-                },
-                inter_cost,
-            ))
+            (ex_leaf, inter_cost)
         }
         _ => {
             // Commit the intra reconstruction through the decoder's own
@@ -1506,7 +1526,7 @@ fn decide_leaf(
                     None,
                 )?;
             }
-            Ok((
+            (
                 PLeaf::Intra {
                     mode_idx: i_mode,
                     res: Residual {
@@ -1519,9 +1539,14 @@ fn decide_leaf(
                     },
                 },
                 intra_cost,
-            ))
+            )
         }
-    }
+    };
+    // Advance the rate model over the decided leaf's exact bin string
+    // (the §9.3.4.2.4 probes read the L/A/R neighbours, which this
+    // CU's own stamp does not touch — the emit pass sees the same).
+    model.commit(|m| emit_leaf_bins(m, ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h, &leaf));
+    Ok((leaf, cost))
 }
 
 // ---------------------------------------------------------------------
@@ -1529,8 +1554,8 @@ fn decide_leaf(
 // ---------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn emit_split_unit(
-    enc: &mut CabacEncoder,
+fn emit_split_unit<S: BinSink>(
+    enc: &mut S,
     stats: &mut PEncStats,
     ctx: &PCtx<'_>,
     sel: CtxSel,
@@ -1609,7 +1634,7 @@ fn pred_mode_flag_ctx(
 
 /// TR cMax 3 write for `mvp_idx_lX` — the dual of the decoder's
 /// `decode_tr_regular(3, 0, …)` with the Table 48 per-bin ctxInc.
-fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
+fn emit_mvp_idx<S: BinSink>(enc: &mut S, sel: CtxSel, v: u32) {
     // Table 95: per-bin ctxInc 0,1,2 under both entropy shapes.
     let table = MainCtxTable::MvpIdx;
     let (t, off) = if sel.cm_init {
@@ -1628,7 +1653,7 @@ fn emit_mvp_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
 
 /// TR cMax 2 write for `inter_pred_idc` — the dual of the decoder's
 /// `decode_tr_regular(2, 0, …)` over Table 69 (per-bin ctxInc 0, 1).
-fn emit_inter_pred_idc(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
+fn emit_inter_pred_idc<S: BinSink>(enc: &mut S, sel: CtxSel, v: u32) {
     let table = MainCtxTable::InterPredIdc;
     let (t, off) = if sel.cm_init {
         (table.as_usize(), table.ctx_idx_offset(sel.init_type))
@@ -1650,7 +1675,7 @@ fn emit_inter_pred_idc(enc: &mut CabacEncoder, sel: CtxSel, v: u32) {
 /// later bins bypass; under the Baseline collapse every bin is the
 /// `(0, 0)` regular context. Writes nothing when the list holds one
 /// picture (the element is absent).
-fn emit_ref_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32, n_refs: u32) {
+fn emit_ref_idx<S: BinSink>(enc: &mut S, sel: CtxSel, v: u32, n_refs: u32) {
     if n_refs <= 1 {
         return;
     }
@@ -1673,7 +1698,7 @@ fn emit_ref_idx(enc: &mut CabacEncoder, sel: CtxSel, v: u32, n_refs: u32) {
 /// Signed `abs_mvd` + `mvd_sign_flag` write — the dual of the decoder's
 /// `decode_signed_mvd` (EG0 bin0 regular on Table 73 under cm_init,
 /// all-bypass otherwise; sign bypass when non-zero).
-fn emit_signed_mvd(enc: &mut CabacEncoder, sel: CtxSel, v: i32) {
+fn emit_signed_mvd<S: BinSink>(enc: &mut S, sel: CtxSel, v: i32) {
     let abs = v.unsigned_abs();
     // Table 95: bin0 regular under both entropy shapes, rest bypass.
     {
@@ -1687,7 +1712,7 @@ fn emit_signed_mvd(enc: &mut CabacEncoder, sel: CtxSel, v: i32) {
 
 /// One list's explicit motion syntax: `ref_idx_lX` (when present),
 /// `mvp_idx_lX`, `abs_mvd_lX` + signs.
-fn emit_list_pred(enc: &mut CabacEncoder, sel: CtxSel, lp: &ListPred, n_refs: u32) {
+fn emit_list_pred<S: BinSink>(enc: &mut S, sel: CtxSel, lp: &ListPred, n_refs: u32) {
     emit_ref_idx(enc, sel, lp.ref_idx, n_refs);
     emit_mvp_idx(enc, sel, lp.mvp_idx);
     emit_signed_mvd(enc, sel, lp.mvd.x);
@@ -1696,8 +1721,8 @@ fn emit_list_pred(enc: &mut CabacEncoder, sel: CtxSel, lp: &ListPred, n_refs: u3
 
 /// The inter `transform_unit()` presence + body: `cbf_all`, then
 /// `cbf_cb` / `cbf_cr` / (presence-gated) `cbf_luma` and the residuals.
-fn emit_inter_residual(
-    enc: &mut CabacEncoder,
+fn emit_inter_residual<S: BinSink>(
+    enc: &mut S,
     sel: CtxSel,
     res: &Residual,
     log2_w: u32,
@@ -1729,34 +1754,47 @@ fn emit_inter_residual(
     }
 }
 
+/// The `cu_skip_flag = 0`, `pred_mode_flag = 1` head of an intra CU
+/// on a P/B slice (both §9.3.4.2.4 neighbour-context flags) plus its
+/// `intra_pred_mode`.
 #[allow(clippy::too_many_arguments)]
-fn emit_leaf(
-    enc: &mut CabacEncoder,
-    stats: &mut PEncStats,
+fn emit_intra_head<S: BinSink>(
+    enc: &mut S,
     ctx: &PCtx<'_>,
     sel: CtxSel,
-    grid: &mut SideInfoGrid,
+    grid: &SideInfoGrid,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+    mode_idx: usize,
+) {
+    let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
+    enc.encode_decision(t, i, 0); // cu_skip_flag = 0
+    let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
+    enc.encode_decision(t, i, 1); // pred_mode_flag = 1 (MODE_INTRA)
+    emit_intra_pred_mode(enc, sel, mode_idx);
+}
+
+/// The complete `coding_unit()` bin string of one leaf, probing `grid`
+/// for the neighbour-derived contexts — no side effects beyond the
+/// sink. Shared by the emit pass (real coder + stamp) and the decide
+/// pass (rate model).
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf_bins<S: BinSink>(
+    enc: &mut S,
+    ctx: &PCtx<'_>,
+    sel: CtxSel,
+    grid: &SideInfoGrid,
     x0: u32,
     y0: u32,
     log2_w: u32,
     log2_h: u32,
     plan: &PLeaf,
 ) {
-    let (w, h) = (1u32 << log2_w, 1u32 << log2_h);
     let is_b = ctx.slice_is_b;
-    let stamp_inter = |grid: &mut SideInfoGrid, l0: ListMotion, l1: ListMotion, cbf_y: bool| {
-        grid.stamp_block(
-            x0,
-            y0,
-            w,
-            h,
-            inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, ctx.qp),
-        );
-    };
-    stats.leaves += 1;
     match plan {
-        PLeaf::Skip { mvp_idx, mv } => {
-            stats.skip_cus += 1;
+        PLeaf::Skip { mvp_idx, .. } => {
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 1); // cu_skip_flag = 1
             emit_mvp_idx(enc, sel, mvp_idx[0]);
@@ -1764,16 +1802,8 @@ fn emit_leaf(
                 emit_mvp_idx(enc, sel, mvp_idx[1]);
             }
             // No residual syntax (§7.3.8.4).
-            let l1 = if is_b { Some((0, mv[1])) } else { None };
-            stamp_inter(grid, Some((0, mv[0])), l1, false);
-            mark_cu_skip_cells(grid, x0, y0, w, h);
         }
-        PLeaf::Direct { mv, res } => {
-            stats.inter_cus += 1;
-            stats.direct_cus += 1;
-            if !res.any() {
-                stats.cbf_all_zero_cus += 1;
-            }
+        PLeaf::Direct { res, .. } => {
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 0); // cu_skip_flag = 0
             let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
@@ -1781,21 +1811,8 @@ fn emit_leaf(
             let (t, i) = sel.ctx(MainCtxTable::DirectModeFlag, 0);
             enc.encode_decision(t, i, 1); // direct_mode_flag = 1
             emit_inter_residual(enc, sel, res, log2_w, log2_h);
-            stamp_inter(grid, Some((0, mv[0])), Some((0, mv[1])), res.cbf_y);
         }
         PLeaf::Inter { l0, l1, res } => {
-            stats.inter_cus += 1;
-            if !res.any() {
-                stats.cbf_all_zero_cus += 1;
-            }
-            match (l0, l1) {
-                (Some(_), Some(_)) => stats.bi_cus += 1,
-                (None, Some(_)) => stats.l1_only_cus += 1,
-                _ => {}
-            }
-            if l0.is_some_and(|p| p.ref_idx > 0) || l1.is_some_and(|p| p.ref_idx > 0) {
-                stats.multi_ref_cus += 1;
-            }
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
             enc.encode_decision(t, i, 0); // cu_skip_flag = 0
             let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
@@ -1817,29 +1834,9 @@ fn emit_leaf(
                 emit_list_pred(enc, sel, lp, ctx.n_refs(1));
             }
             emit_inter_residual(enc, sel, res, log2_w, log2_h);
-            stamp_inter(
-                grid,
-                l0.map(|p| (p.ref_idx, p.mv)),
-                l1.map(|p| (p.ref_idx, p.mv)),
-                res.cbf_y,
-            );
         }
         PLeaf::Intra { mode_idx, res } => {
-            stats.intra_cus += 1;
-            let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
-            enc.encode_decision(t, i, 0); // cu_skip_flag = 0
-            let (t, i) = pred_mode_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
-            enc.encode_decision(t, i, 1); // pred_mode_flag = 1 (MODE_INTRA)
-                                          // intra_pred_mode — U over Table 62 (bin0 → 0, later → 1).
-            {
-                let table = MainCtxTable::IntraPredMode;
-                let (t, off) = if sel.cm_init {
-                    (table.as_usize(), table.ctx_idx_offset(sel.init_type))
-                } else {
-                    (0, table.cm0_ctx_idx_offset(sel.init_type))
-                };
-                enc.encode_u_regular_capped(*mode_idx as u32, 63, t, |b| off + (b as usize).min(1));
-            }
+            emit_intra_head(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, *mode_idx);
             // Single-tree intra TU: cbf_cb, cbf_cr, then cbf_luma
             // (always present — MODE_INTRA), then luma/cb/cr residuals.
             let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
@@ -1857,6 +1854,77 @@ fn emit_leaf(
             if res.cbf_cr {
                 emit_residual_rle(enc, sel, 2, &res.levels_cr, log2_w - 1, log2_h - 1);
             }
+        }
+    }
+}
+
+/// Emit one decided leaf: its bins into the real coder, its statistics,
+/// and its side-info stamp into the emit-order grid (after the bins —
+/// the §9.3.4.2.4 probes read the neighbours, which the stamp does not
+/// touch, but the skip-cell marks must land before the next CU).
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf<S: BinSink>(
+    enc: &mut S,
+    stats: &mut PEncStats,
+    ctx: &PCtx<'_>,
+    sel: CtxSel,
+    grid: &mut SideInfoGrid,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+    plan: &PLeaf,
+) {
+    let (w, h) = (1u32 << log2_w, 1u32 << log2_h);
+    let is_b = ctx.slice_is_b;
+    emit_leaf_bins(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, plan);
+    let stamp_inter = |grid: &mut SideInfoGrid, l0: ListMotion, l1: ListMotion, cbf_y: bool| {
+        grid.stamp_block(
+            x0,
+            y0,
+            w,
+            h,
+            inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, ctx.qp),
+        );
+    };
+    stats.leaves += 1;
+    match plan {
+        PLeaf::Skip { mv, .. } => {
+            stats.skip_cus += 1;
+            let l1 = if is_b { Some((0, mv[1])) } else { None };
+            stamp_inter(grid, Some((0, mv[0])), l1, false);
+            mark_cu_skip_cells(grid, x0, y0, w, h);
+        }
+        PLeaf::Direct { mv, res } => {
+            stats.inter_cus += 1;
+            stats.direct_cus += 1;
+            if !res.any() {
+                stats.cbf_all_zero_cus += 1;
+            }
+            stamp_inter(grid, Some((0, mv[0])), Some((0, mv[1])), res.cbf_y);
+        }
+        PLeaf::Inter { l0, l1, res } => {
+            stats.inter_cus += 1;
+            if !res.any() {
+                stats.cbf_all_zero_cus += 1;
+            }
+            match (l0, l1) {
+                (Some(_), Some(_)) => stats.bi_cus += 1,
+                (None, Some(_)) => stats.l1_only_cus += 1,
+                _ => {}
+            }
+            if l0.is_some_and(|p| p.ref_idx > 0) || l1.is_some_and(|p| p.ref_idx > 0) {
+                stats.multi_ref_cus += 1;
+            }
+            stamp_inter(
+                grid,
+                l0.map(|p| (p.ref_idx, p.mv)),
+                l1.map(|p| (p.ref_idx, p.mv)),
+                res.cbf_y,
+            );
+        }
+        PLeaf::Intra { mode_idx, res } => {
+            stats.intra_cus += 1;
             grid.stamp_block(
                 x0,
                 y0,
