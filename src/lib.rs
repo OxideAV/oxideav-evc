@@ -90,6 +90,8 @@ pub mod affine_syntax;
 #[doc(hidden)]
 pub mod alf;
 #[doc(hidden)]
+pub mod alf_enc;
+#[doc(hidden)]
 pub mod alf_tables;
 #[doc(hidden)]
 pub mod amvr_syntax;
@@ -578,6 +580,10 @@ pub fn resolve_slice_tiles(
 pub struct IdrDecodeResult {
     pub pic: picture::YuvPicture,
     pub stats: slice_data::SliceDecodeStats,
+    /// `slice_alf_enabled_flag` — the §8.8.4 luma filter is invoked at
+    /// all (round 458: with it 0 and `slice_alf_chroma_idc == 0` the
+    /// picture is left untouched, spec line 16424).
+    pub luma_alf_enabled: bool,
     pub chroma_cb_enabled: bool,
     pub chroma_cr_enabled: bool,
     pub alf_luma_aps_id: Option<u8>,
@@ -692,6 +698,7 @@ pub fn decode_idr_slice_full(
     Ok(IdrDecodeResult {
         pic,
         stats,
+        luma_alf_enabled: header.slice_alf_enabled_flag,
         chroma_cb_enabled: header.slice_chroma_alf_enabled_flag,
         chroma_cr_enabled: header.slice_chroma2_alf_enabled_flag,
         alf_luma_aps_id: header.slice_alf_luma_aps_id,

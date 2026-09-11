@@ -58,6 +58,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::alf_enc::AlfSliceParams;
 use crate::ats::{self, AllowAtsInter, AtsInter, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
@@ -174,6 +175,9 @@ pub struct InterEncInputs<'a> {
     /// `sps_adcc_flag` (requires `cm_init`) — the §7.3.8.8 advanced
     /// residual coding (round 458).
     pub adcc: bool,
+    /// `sps_alf_flag` — design and apply the adaptive loop filter on
+    /// this picture (round 458); see [`InterEncOutput::alf`].
+    pub alf: bool,
 }
 
 /// Output of [`encode_inter_slice_data`].
@@ -187,6 +191,9 @@ pub struct InterEncOutput {
     /// collocated field for later slices).
     pub side_info: SideInfoGrid,
     pub stats: PEncStats,
+    /// The ALF design of this picture (`None`: off, or nothing paid
+    /// for itself).
+    pub alf: Option<AlfSliceParams>,
 }
 
 /// Per-list explicit prediction of a decided leaf.
@@ -406,6 +413,7 @@ pub fn encode_p_slice_data(
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         },
     )?;
     Ok((out.payload, out.recon, out.stats))
@@ -540,6 +548,47 @@ pub fn encode_inter_slice_data(
         }
     }
 
+    if inputs.deblock {
+        // The decoder's own §8.8.2 post-pass over the stamped grid —
+        // inter/cbf edges are live on a P/B picture.
+        let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
+        ctx.side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
+        crate::deblock::deblock_luma(&mut ctx.recon, &ctx.side_info, slice_qp)?;
+        crate::deblock::deblock_chroma(
+            &mut ctx.recon,
+            &ctx.side_info,
+            slice_qp,
+            ctx.chroma_qp_offset,
+            1,
+        )?;
+        crate::deblock::deblock_chroma(
+            &mut ctx.recon,
+            &ctx.side_info,
+            slice_qp,
+            ctx.chroma_qp_offset,
+            2,
+        )?;
+    }
+    // §8.8.4 ALF (round 458) on the deblocked reconstruction under the
+    // decoder's P/B edge availability (§6.4.4 over the motion grid: an
+    // inter neighbour keeps a CTB edge, intra mirrors).
+    let alf_params = if inputs.alf {
+        let avail = crate::alf::AlfInputAvailability {
+            pic_width: ctx.pic_w,
+            pic_height: ctx.pic_h,
+            loop_filter_across_tiles_enabled: true,
+            layout: None,
+            grid: Some(&ctx.side_info),
+        };
+        crate::alf_enc::design_and_apply(src, &mut ctx.recon, &avail, ctx.lambda, CTB_LOG2)?
+    } else {
+        None
+    };
+    let ctb_flags: Option<Vec<bool>> = alf_params
+        .as_ref()
+        .filter(|p| p.luma_enabled && p.map_flag)
+        .map(|p| p.ctb_luma.clone());
+
     // Emit pass — decoder-exact bin order over a replayed grid (the
     // §9.3.4.2.4 neighbour ctxIncs probe decode-time state).
     let cm_init = inputs.cm_init;
@@ -549,7 +598,11 @@ pub fn encode_inter_slice_data(
         enc.init_main_profile(InitType::Pb, slice_qp);
     }
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
-    for (x0, y0, node) in &roots {
+    for (ctu_idx, (x0, y0, node)) in roots.iter().enumerate() {
+        if let Some(flags) = &ctb_flags {
+            let (t, i) = sel.ctx(MainCtxTable::AlfCtbFlag, 0);
+            enc.encode_decision(t, i, u8::from(flags[ctu_idx]));
+        }
         let mut tree_stats = stats.tree;
         let mut leaf_fn = |enc: &mut CabacEncoder,
                            grid: &mut SideInfoGrid,
@@ -577,33 +630,12 @@ pub fn encode_inter_slice_data(
     }
     stats.split_flag_bins = stats.tree.split_cu_flag_bins;
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
-
-    if inputs.deblock {
-        // The decoder's own §8.8.2 post-pass over the stamped grid —
-        // inter/cbf edges are live on a P/B picture.
-        let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
-        ctx.side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
-        crate::deblock::deblock_luma(&mut ctx.recon, &ctx.side_info, slice_qp)?;
-        crate::deblock::deblock_chroma(
-            &mut ctx.recon,
-            &ctx.side_info,
-            slice_qp,
-            ctx.chroma_qp_offset,
-            1,
-        )?;
-        crate::deblock::deblock_chroma(
-            &mut ctx.recon,
-            &ctx.side_info,
-            slice_qp,
-            ctx.chroma_qp_offset,
-            2,
-        )?;
-    }
     Ok(InterEncOutput {
         payload: enc.finish(),
         recon: ctx.recon,
         side_info: ctx.side_info,
         stats,
+        alf: alf_params,
     })
 }
 
@@ -2981,6 +3013,7 @@ mod tests {
                 iqt: false,
                 ats: false,
                 adcc: false,
+                alf: false,
             },
         );
         assert!(bad.is_err());
@@ -3001,6 +3034,7 @@ mod tests {
                 iqt: false,
                 ats: false,
                 adcc: false,
+                alf: false,
             },
         );
         assert!(bad_b.is_err());
@@ -3041,6 +3075,7 @@ mod tests {
                     iqt: false,
                     ats: false,
                     adcc: false,
+                    alf: false,
                 },
             )
             .unwrap();
@@ -3137,6 +3172,7 @@ mod tests {
                             iqt: false,
                             ats: false,
                             adcc: false,
+                            alf: false,
                         },
                     )
                     .unwrap();
@@ -3181,6 +3217,7 @@ mod tests {
                                 iqt: false,
                                 ats: false,
                                 adcc: false,
+                                alf: false,
                             },
                         )
                         .unwrap();
@@ -3261,6 +3298,7 @@ mod tests {
                 iqt: false,
                 ats: false,
                 adcc: false,
+                alf: false,
             },
         )
         .unwrap();
@@ -3294,6 +3332,7 @@ mod tests {
                 iqt: false,
                 ats: false,
                 adcc: false,
+                alf: false,
             },
         )
         .unwrap();
@@ -3360,6 +3399,7 @@ mod tests {
                     iqt: false,
                     ats: false,
                     adcc: false,
+                    alf: false,
                 },
             )
             .unwrap()

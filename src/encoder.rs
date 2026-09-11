@@ -50,6 +50,11 @@
 //!   (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64) and the
 //!   lookahead RD search over rectangular leaves. `btt=0` restores the
 //!   quad tree.
+//! * `alf` — the **adaptive loop filter** (round 458), default **on**:
+//!   `sps_alf_flag = 1`; every picture designs its §8.8.4 luma
+//!   (per-class Wiener, merged) and chroma filters on the deblocked
+//!   reconstruction, elects CTBs, and ships them in an ALF APS ahead of
+//!   the slice when they pay for themselves.
 //! * `adcc` — **advanced residual coding** (round 458), default
 //!   **off**: `sps_adcc_flag = 1`, the §7.3.8.8 last-position /
 //!   significance / greater-flag / escape syntax with its candidate-set
@@ -102,9 +107,9 @@ use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Resu
 
 use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
-    append_length_prefixed_nal, iqt_chroma_qp_offset, write_idr_slice_header_with,
-    write_inter_slice_header_with, write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
-    EncSequenceConfig,
+    append_length_prefixed_nal, iqt_chroma_qp_offset, write_idr_slice_header_alf,
+    write_inter_slice_header_alf, write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
+    EncSequenceConfig, SliceAlfFields,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
@@ -219,11 +224,14 @@ fn encode_idr_au_coded(
         iqt,
         ats,
         adcc,
+        alf,
     } = tools;
-    let (payload, recon, stats) =
-        crate::slice_enc::encode_idr_slice_data_cfg(src, slice_qp, tools)?;
+    let out = crate::slice_enc::encode_idr_slice_data_out(src, slice_qp, tools)?;
+    let (payload, recon, stats) = (out.payload, out.recon, out.stats);
     let off = iqt_chroma_qp_offset(slice_qp, iqt);
-    let mut slice_rbsp = write_idr_slice_header_with(slice_qp as u32, deblock, off, off)?;
+    let alf_fields = out.alf.as_ref().and_then(SliceAlfFields::of);
+    let mut slice_rbsp =
+        write_idr_slice_header_alf(slice_qp as u32, deblock, off, off, alf, alf_fields)?;
     slice_rbsp.extend_from_slice(&payload);
 
     let cfg = EncSequenceConfig {
@@ -240,12 +248,17 @@ fn encode_idr_au_coded(
         iqt,
         ats,
         adcc,
+        alf,
     };
-    let mut out = Vec::new();
-    append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
-    append_length_prefixed_nal(&mut out, NalUnitType::Pps, &write_pps_rbsp()?);
-    append_length_prefixed_nal(&mut out, NalUnitType::Idr, &slice_rbsp);
-    Ok((out, recon, stats))
+    let mut bytes = Vec::new();
+    append_length_prefixed_nal(&mut bytes, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
+    append_length_prefixed_nal(&mut bytes, NalUnitType::Pps, &write_pps_rbsp()?);
+    if let Some(p) = &out.alf {
+        // The ALF APS (§7.3.2.3) precedes the slice that references it.
+        append_length_prefixed_nal(&mut bytes, NalUnitType::Aps, &p.aps_rbsp);
+    }
+    append_length_prefixed_nal(&mut bytes, NalUnitType::Idr, &slice_rbsp);
+    Ok((bytes, recon, stats))
 }
 
 /// The coded geometry for a source picture: each dimension rounded up
@@ -409,6 +422,8 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     // Round 458: advanced residual coding — default OFF (a measured
     // loss on the corpus; see the module doc).
     let adcc = parse_bool("adcc", false)?;
+    // Round 458: the adaptive loop filter — default ON.
+    let alf = parse_bool("alf", true)?;
     if adcc && !cm_init {
         return Err(Error::invalid(
             "evc encoder: adcc=1 requires cm_init=1 (§7.3.2.1 codes sps_adcc_flag under sps_cm_init_flag)",
@@ -555,6 +570,7 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         iqt,
         ats,
         adcc,
+        alf,
         gop,
         refs,
         b_pictures,
@@ -754,6 +770,8 @@ pub struct EvcEncoder {
     ats: bool,
     /// `sps_adcc_flag`.
     adcc: bool,
+    /// `sps_alf_flag`.
+    alf: bool,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
     /// units, the rest low-delay P/B pictures.
     gop: u32,
@@ -865,19 +883,26 @@ impl EvcEncoder {
                 iqt: self.iqt,
                 ats: self.ats,
                 adcc: self.adcc,
+                alf: self.alf,
             },
         )?;
         let off = iqt_chroma_qp_offset(frame_qp, self.iqt);
-        let mut slice_rbsp = write_inter_slice_header_with(
+        let alf_fields = out.alf.as_ref().and_then(SliceAlfFields::of);
+        let mut slice_rbsp = write_inter_slice_header_alf(
             is_b,
             [refs_l0.len() as u32, refs_l1.len() as u32],
             frame_qp as u32,
             self.deblock,
             off,
             off,
+            self.alf,
+            alf_fields,
         )?;
         slice_rbsp.extend_from_slice(&out.payload);
         let mut data = Vec::new();
+        if let Some(p) = &out.alf {
+            append_length_prefixed_nal(&mut data, NalUnitType::Aps, &p.aps_rbsp);
+        }
         append_length_prefixed_nal(&mut data, NalUnitType::NonIdr, &slice_rbsp);
         self.dpb.push(EncDpbPic {
             recon: out.recon,
@@ -932,6 +957,7 @@ impl Encoder for EvcEncoder {
                     iqt: self.iqt,
                     ats: self.ats,
                     adcc: self.adcc,
+                    alf: self.alf,
                 },
                 self.refs,
                 (self.coded_w - self.width, self.coded_h - self.height),
@@ -1106,6 +1132,7 @@ mod tests {
         p.options.insert("btt", "0");
         p.options.insert("ats", "0");
         p.options.insert("adcc", "0");
+        p.options.insert("alf", "0");
         p
     }
 
@@ -1845,6 +1872,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 458 — **ALF** through the registry: I, P and B pictures
+    /// (deblocking on and off, both entropy shapes) ship their designed
+    /// filters in an APS ahead of the slice and decode sample-exactly
+    /// to the encoder's post-ALF reconstruction; at least one picture
+    /// of the noisy scene elects a filter.
+    #[test]
+    fn alf_gop_round_trips_through_the_registry() {
+        let (w, h) = (96u32, 64u32);
+        let mut any_aps = false;
+        for &cm in &[false, true] {
+            for &(b, deblock) in &[(false, false), (true, true)] {
+                let mut p = params(w, h);
+                p.options.insert("gop", "4");
+                p.options.insert("refs", "2");
+                p.options.insert("qp", "38");
+                p.options.insert("btt", "1");
+                p.options.insert("eipd", "1");
+                p.options.insert("alf", "1");
+                p.options.insert("cm_init", if cm { "1" } else { "0" });
+                p.options.insert("b", if b { "1" } else { "0" });
+                p.options.insert("deblock", if deblock { "1" } else { "0" });
+                let mut enc = make_evc_encoder(&p).unwrap();
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                for t in 0..5usize {
+                    enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                    let pkt = enc.receive_packet().unwrap();
+                    let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                    if t == 0 {
+                        let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                        assert!(sps.sps_alf_flag);
+                    }
+                    any_aps |= nals
+                        .iter()
+                        .any(|n| n.header.nal_unit_type == NalUnitType::Aps);
+                    dec.send_packet(&pkt).unwrap();
+                    let vf = match dec.receive_frame().unwrap() {
+                        Frame::Video(vf) => vf,
+                        other => panic!("expected video frame, got {other:?}"),
+                    };
+                    let recon = enc.last_recon().unwrap();
+                    for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                        let got: Vec<u16> =
+                            vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                        let stride = if c == 0 {
+                            recon.y_stride()
+                        } else {
+                            recon.c_stride()
+                        };
+                        let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                        let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                        for yy in 0..rows {
+                            assert_eq!(
+                                &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                                &plane[yy * stride..yy * stride + cols],
+                                "cm{cm} b{b} deblock{deblock} frame {t} plane {c} row {yy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(any_aps, "the noisy scene elects an ALF somewhere");
     }
 
     /// Round 458 — **ADCC** through the registry: P and B GOPs with the

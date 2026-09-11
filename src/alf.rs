@@ -224,13 +224,13 @@ const COEF_POS_MAP_13: [usize; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
 /// §7.3.5 `golombOrderIdxY[ ]` (eq. 94) — selects which `expGoOrderY[ ]`
 /// entry parses each of the 12 luma coefficient deltas.
-const GOLOMB_ORDER_IDX_Y: [usize; 12] = [0, 0, 1, 0, 0, 1, 2, 1, 0, 0, 1, 2];
+pub(crate) const GOLOMB_ORDER_IDX_Y: [usize; 12] = [0, 0, 1, 0, 0, 1, 2, 1, 0, 0, 1, 2];
 
 /// §7.3.5 (chroma) `golombOrderIdxC[ ]` — only 6 entries because chroma
 /// signals 6 abs deltas (the 7th is derived). The spec text just below the
 /// chroma table mirrors the luma `golombOrderIdxY` shape; for 5×5 chroma
 /// the index pattern is `[0, 0, 1, 0, 0, 1]` (same prefix as luma).
-const GOLOMB_ORDER_IDX_C: [usize; 6] = [0, 0, 1, 0, 0, 1];
+pub(crate) const GOLOMB_ORDER_IDX_C: [usize; 6] = [0, 0, 1, 0, 0, 1];
 
 /// `LumaMaxGolombIdx` per §7.3.5 — `alf_luma_type_flag == 0` → 2, else 3.
 #[inline]
@@ -243,7 +243,7 @@ fn luma_max_golomb_idx(type_flag: bool) -> usize {
 }
 
 /// `ChromaMaxGolombIdx` per §7.3.5 — fixed at 2.
-const CHROMA_MAX_GOLOMB_IDX: usize = 2;
+pub(crate) const CHROMA_MAX_GOLOMB_IDX: usize = 2;
 
 /// Parse an `alf_data()` payload from the given byte slice.
 ///
@@ -585,7 +585,7 @@ fn derive_alf_coeff_l(
 ///
 /// In the spec's symmetric filter notation each c[k] (k < 12) appears twice
 /// (for both the north and south diamond arm). `c[12]` is added once.
-static LUMA_TAPS: [(i32, i32); 12] = [
+pub(crate) static LUMA_TAPS: [(i32, i32); 12] = [
     (-3, 0),
     (-2, -1),
     (-2, 0),
@@ -603,7 +603,7 @@ static LUMA_TAPS: [(i32, i32); 12] = [
 /// Symmetric counterpart of each tap: the position mirrored through the
 /// centre sample. Follows from the diamond-symmetry property of the filter
 /// (§8.9.4.1 eq. 1263): sample at `−(dy, dx)` is also weighted by c[k].
-static LUMA_TAPS_SYM: [(i32, i32); 12] = [
+pub(crate) static LUMA_TAPS_SYM: [(i32, i32); 12] = [
     (3, 0),
     (2, 1),
     (2, 0),
@@ -637,8 +637,10 @@ static LUMA_TAPS_SYM: [(i32, i32); 12] = [
 ///
 /// `CHROMA_TAPS[k]` is the `(dy, dx)` of the first read; `CHROMA_TAPS_SYM[k]`
 /// is its eq. 1321 symmetric partner.
-static CHROMA_TAPS: [(i32, i32); 6] = [(-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1)];
-static CHROMA_TAPS_SYM: [(i32, i32); 6] = [(2, 0), (1, 1), (1, 0), (1, -1), (0, 2), (0, 1)];
+pub(crate) static CHROMA_TAPS: [(i32, i32); 6] =
+    [(-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1)];
+pub(crate) static CHROMA_TAPS_SYM: [(i32, i32); 6] =
+    [(2, 0), (1, 1), (1, 0), (1, -1), (0, 2), (0, 1)];
 
 /// Apply the ALF luma filter to the entire Y plane per §8.8.4.2 eq.
 /// 1286-1288 (whole-plane, no per-sample classification). Writes results

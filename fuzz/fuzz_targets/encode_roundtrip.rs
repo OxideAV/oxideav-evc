@@ -42,6 +42,7 @@ fuzz_target!(|data: &[u8]| {
     let btt = flags & 0x40 != 0;
     let ats = flags & 0x80 != 0;
     let adcc = cm_init && data[4] & 1 != 0;
+    let alf = data[4] & 2 != 0;
     let (pf, bytes_per, max_val) = if ten_bit {
         (PixelFormat::Yuv420P10Le, 2usize, 1023u16)
     } else {
@@ -61,6 +62,7 @@ fuzz_target!(|data: &[u8]| {
     p.options.insert("btt", if btt { "1" } else { "0" });
     p.options.insert("ats", if ats { "1" } else { "0" });
     p.options.insert("adcc", if adcc { "1" } else { "0" });
+    p.options.insert("alf", if alf { "1" } else { "0" });
     let mut enc = oxideav_evc::encoder::make_evc_encoder(&p).expect("encoder");
     let mut dec = oxideav_evc::decoder::make_decoder(&CodecParameters::video(CodecId::new("evc")))
         .expect("decoder");

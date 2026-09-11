@@ -76,6 +76,55 @@ pub struct EncSequenceConfig {
     /// 458; Table A.6 binIdx 9, `0x200`). §7.3.2.1 reads it only under
     /// `sps_cm_init_flag == 1`, so `adcc` requires `cm_init`.
     pub adcc: bool,
+    /// `sps_alf_flag` (§7.4.3.1) — the adaptive loop filter (round
+    /// 458; Table A.6 binIdx 6, `0x40`). The slice headers then carry
+    /// the §7.3.4 ALF block and access units may carry ALF APS NALs.
+    pub alf: bool,
+}
+
+/// The §7.3.4 slice-header ALF block (present when `sps_alf_flag`).
+/// `None` codes `slice_alf_enabled_flag = 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SliceAlfFields {
+    /// `slice_alf_map_flag`.
+    pub map_flag: bool,
+    /// `slice_alf_chroma_idc` (0..=3).
+    pub chroma_idc: u32,
+}
+
+impl SliceAlfFields {
+    /// The fields of a designed slice ([`crate::alf_enc::AlfSliceParams`]).
+    pub fn of(p: &crate::alf_enc::AlfSliceParams) -> Option<Self> {
+        p.luma_enabled.then_some(Self {
+            map_flag: p.map_flag,
+            chroma_idc: p.chroma_idc,
+        })
+    }
+}
+
+/// Write the §7.3.4 ALF block: `slice_alf_enabled_flag`, then under it
+/// `slice_alf_luma_aps_id = 0`, `slice_alf_map_flag`,
+/// `slice_alf_chroma_idc` and — for 4:2:0 with chroma on —
+/// `slice_alf_chroma_aps_id = 0`.
+fn write_slice_alf_block(w: &mut BitWriter, fields: Option<SliceAlfFields>) -> Result<()> {
+    match fields {
+        None => w.u1(false),
+        Some(f) => {
+            if f.chroma_idc > 3 {
+                return Err(Error::invalid(
+                    "evc enc slice header: slice_alf_chroma_idc > 3",
+                ));
+            }
+            w.u1(true); // slice_alf_enabled_flag
+            w.u(5, 0); // slice_alf_luma_aps_id
+            w.u1(f.map_flag); // slice_alf_map_flag
+            w.u(2, f.chroma_idc); // slice_alf_chroma_idc
+            if f.chroma_idc > 0 {
+                w.u(5, 0); // slice_alf_chroma_aps_id (ChromaArrayType 1)
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -135,7 +184,7 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
             "evc enc sps: sps_adcc_flag is only coded under sps_cm_init_flag == 1 (§7.3.2.1)",
         ));
     }
-    let main = cfg.cm_init || cfg.eipd || cfg.btt || cfg.iqt || cfg.ats;
+    let main = cfg.cm_init || cfg.eipd || cfg.btt || cfg.iqt || cfg.ats || cfg.alf;
     // Table A.6: binIdx 14 = sps_cm_init_flag (0x4000), binIdx 8 =
     // sps_eipd_flag (0x100), binIdx 0 = sps_btt_flag (0x1), binIdx 11 =
     // sps_iqt_flag (0x800), binIdx 15 = sps_ats_flag (0x8000); Baseline
@@ -145,7 +194,8 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         | (if cfg.btt { 0x1 } else { 0 })
         | (if cfg.iqt { 0x800 } else { 0 })
         | (if cfg.ats { 0x8000 } else { 0 })
-        | (if cfg.adcc { 0x200 } else { 0 });
+        | (if cfg.adcc { 0x200 } else { 0 })
+        | (if cfg.alf { 0x40 } else { 0 });
     w.ue(0); // sps_seq_parameter_set_id
     w.u(8, u32::from(main)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
@@ -180,7 +230,7 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         w.u1(cfg.ats); // sps_ats_flag (§7.3.2.1: present when sps_iqt_flag)
     }
     w.u1(false); // sps_addb_flag
-    w.u1(false); // sps_alf_flag
+    w.u1(cfg.alf); // sps_alf_flag
     w.u1(false); // sps_htdf_flag
     w.u1(false); // sps_rpl_flag
     w.u1(false); // sps_pocs_flag
@@ -268,6 +318,19 @@ pub fn write_idr_slice_header_with(
     cb_qp_offset: i32,
     cr_qp_offset: i32,
 ) -> Result<Vec<u8>> {
+    write_idr_slice_header_alf(slice_qp, deblock, cb_qp_offset, cr_qp_offset, false, None)
+}
+
+/// [`write_idr_slice_header_with`] under an `sps_alf_flag` SPS: with
+/// `sps_alf` the §7.3.4 ALF block is written from `alf` (round 458).
+pub fn write_idr_slice_header_alf(
+    slice_qp: u32,
+    deblock: bool,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+    sps_alf: bool,
+    alf: Option<SliceAlfFields>,
+) -> Result<Vec<u8>> {
     if !(-12..=12).contains(&cb_qp_offset) || !(-12..=12).contains(&cr_qp_offset) {
         return Err(Error::invalid(
             "evc enc slice header: chroma QP offsets outside −12..=12 (§7.4.5)",
@@ -282,6 +345,9 @@ pub fn write_idr_slice_header_with(
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(2); // slice_type = I (§7.4.5: IDR must be 2)
     w.u1(false); // no_output_of_prior_pics_flag
+    if sps_alf {
+        write_slice_alf_block(&mut w, alf)?;
+    }
     w.u1(deblock); // slice_deblocking_filter_flag
     w.u(6, slice_qp); // slice_qp
     w.se(cb_qp_offset); // slice_cb_qp_offset
@@ -333,6 +399,32 @@ pub fn write_inter_slice_header_with(
     cb_qp_offset: i32,
     cr_qp_offset: i32,
 ) -> Result<Vec<u8>> {
+    write_inter_slice_header_alf(
+        slice_is_b,
+        num_active,
+        slice_qp,
+        deblock,
+        cb_qp_offset,
+        cr_qp_offset,
+        false,
+        None,
+    )
+}
+
+/// [`write_inter_slice_header_with`] under an `sps_alf_flag` SPS (round
+/// 458): the §7.3.4 ALF block follows `slice_type`, before the
+/// reference-list override.
+#[allow(clippy::too_many_arguments)]
+pub fn write_inter_slice_header_alf(
+    slice_is_b: bool,
+    num_active: [u32; 2],
+    slice_qp: u32,
+    deblock: bool,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+    sps_alf: bool,
+    alf: Option<SliceAlfFields>,
+) -> Result<Vec<u8>> {
     if !(-12..=12).contains(&cb_qp_offset) || !(-12..=12).contains(&cr_qp_offset) {
         return Err(Error::invalid(
             "evc enc slice header: chroma QP offsets outside −12..=12 (§7.4.5)",
@@ -354,6 +446,9 @@ pub fn write_inter_slice_header_with(
     let mut w = BitWriter::new();
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(if slice_is_b { 0 } else { 1 }); // slice_type: B = 0, P = 1 (Table 8)
+    if sps_alf {
+        write_slice_alf_block(&mut w, alf)?;
+    }
     let override_flag = num_active.iter().take(lists).any(|&n| n > 1);
     w.u1(override_flag); // num_ref_idx_active_override_flag
     if override_flag {
@@ -407,6 +502,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -465,6 +561,7 @@ mod tests {
                 iqt: false,
                 ats: false,
                 adcc: false,
+                alf: false,
             };
             let rbsp = write_sps_rbsp(&cfg).unwrap();
             let sps = crate::sps::parse(&rbsp).unwrap();
@@ -500,6 +597,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.profile_idc, 1);
@@ -564,6 +662,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -609,6 +708,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -689,6 +789,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -749,6 +850,7 @@ mod tests {
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

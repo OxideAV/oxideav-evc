@@ -129,6 +129,7 @@ struct NonIdrDecodeResult {
     pic: YuvPicture,
     poc: i32,
     alf_ctb_map: alf::AlfCtbMap,
+    luma_alf_enabled: bool,
     chroma_cb_enabled: bool,
     chroma_cr_enabled: bool,
     /// Round 126: the `slice_alf_luma_aps_id` / `slice_alf_chroma_aps_id`
@@ -230,6 +231,7 @@ const ALF_APS_SLOTS: usize = 32;
 /// describe.
 struct PostFilterInputs<'a> {
     alf_ctb_map: &'a alf::AlfCtbMap,
+    luma_alf_enabled: bool,
     chroma_cb_enabled: bool,
     chroma_cr_enabled: bool,
     /// Slice-referenced ALF APS ids (round 126). `None` falls back to
@@ -447,6 +449,7 @@ impl Decoder for EvcDecoder {
                     let crate::IdrDecodeResult {
                         mut pic,
                         stats,
+                        luma_alf_enabled,
                         chroma_cb_enabled,
                         chroma_cr_enabled,
                         alf_luma_aps_id,
@@ -466,6 +469,7 @@ impl Decoder for EvcDecoder {
                         &sps,
                         PostFilterInputs {
                             alf_ctb_map: &stats.alf_ctb_map,
+                            luma_alf_enabled,
                             chroma_cb_enabled,
                             chroma_cr_enabled,
                             alf_luma_aps_id,
@@ -520,6 +524,7 @@ impl Decoder for EvcDecoder {
                         mut pic,
                         poc,
                         alf_ctb_map,
+                        luma_alf_enabled,
                         chroma_cb_enabled,
                         chroma_cr_enabled,
                         alf_luma_aps_id,
@@ -545,6 +550,7 @@ impl Decoder for EvcDecoder {
                         &sps,
                         PostFilterInputs {
                             alf_ctb_map: &alf_ctb_map,
+                            luma_alf_enabled,
                             chroma_cb_enabled,
                             chroma_cr_enabled,
                             alf_luma_aps_id,
@@ -1038,6 +1044,7 @@ impl EvcDecoder {
             // §8.9 chroma path (ChromaArrayType 1..2): the plane is filtered
             // when the slice-level chroma ALF enable is set (the per-CTB
             // chroma map flags are inferred 0 in the Baseline 4:2:0 case).
+            luma_alf_enabled: header.slice_alf_enabled_flag,
             chroma_cb_enabled: header.slice_chroma_alf_enabled_flag,
             chroma_cr_enabled: header.slice_chroma2_alf_enabled_flag,
             // Round 126: surface the slice-referenced APS ids so
@@ -1166,7 +1173,11 @@ impl EvcDecoder {
         let alf_map = in_.alf_ctb_map;
         let chroma_cb_enabled = in_.chroma_cb_enabled;
         let chroma_cr_enabled = in_.chroma_cr_enabled;
-        if sps.sps_alf_flag {
+        // Spec line 16424: the ALF process runs only when
+        // `slice_alf_enabled_flag == 1` or `slice_alf_chroma_idc > 0`
+        // (round 458: a slice that codes ALF off keeps its picture).
+        let alf_invoked = in_.luma_alf_enabled || chroma_cb_enabled || chroma_cr_enabled;
+        if sps.sps_alf_flag && alf_invoked {
             // §7.4.5: when the slice references separate Cb and Cr APS ids
             // (ChromaArrayType == 3 path), the chroma planes may pull from
             // DIFFERENT APS slots than the luma plane. We resolve each
@@ -1316,7 +1327,7 @@ impl EvcDecoder {
 /// slice enable), the whole-plane [`alf::apply_alf_chroma`] is invoked —
 /// matching §8.9 lines 18099-18116.
 #[allow(clippy::too_many_arguments)]
-fn apply_chroma_alf_masked_or_whole_plane(
+pub(crate) fn apply_chroma_alf_masked_or_whole_plane(
     pic: &mut crate::picture::YuvPicture,
     alf_map: &alf::AlfCtbMap,
     cb_alf: Option<&alf::AlfData>,

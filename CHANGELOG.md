@@ -4,6 +4,52 @@
 
 ### Other
 
+- **Encoder: ALF — adaptive-loop-filter design, APS emission, per-CTB
+  election (round 458), default on.** New `alf_enc` module. Luma: the
+  decoder's §8.8.4.2 filter with its unity-gain DC term substituted
+  (`out − p₀ = Σ c_k · ( p_k + p'_k − 2 p₀ ) / 512`) is a 12-tap linear
+  regression per §8.8.4.3 class, accumulated with the regressors in the
+  canonical tap order (the inverse of each sample's `transposeIdx`) over
+  the decoder's own §8.8.4.5 padded per-CTB inputs and classification
+  under the slice's edge availability (§6.4.4: no grid on an IDR, the
+  motion grid on P/B); the 25 classes merge greedily (the pair whose
+  joint filter loses the least energy first) and every candidate count
+  (1, 2, 3, 4, 6, 8, 12, 16, 25) is quantised (rounded, then refined
+  coordinate-wise on the quadratic), written, its CTBs elected against
+  the decoder's own apply, and costed as `SSE + λ · ( APS + flag bits )`
+  — the cheapest wins, or no ALF. Chroma: one 5×5-diamond filter
+  jointly over Cb and Cr with per-plane election
+  (`slice_alf_chroma_idc`). `alf_data()` writer (§7.3.5: 13-tap type,
+  no fixed filters, all filters coded, delta-prediction and the
+  Exp-Golomb orders chosen for the fewest bits) as the exact dual of
+  the parser — the design is applied from its **parsed-back** APS so
+  the encoder holds exactly what the decoder will — plus the APS RBSP
+  (id 0, type ALF) shipped as an APS NAL ahead of the slice; the slice
+  headers carry the §7.3.4 block, the coding tree units the
+  `alf_ctb_flag` when the map is partial; the reference / output
+  picture is the post-ALF reconstruction. SPS `sps_alf_flag` (Table A.6
+  bit 6); registry option `alf`, default on. **Decoder fix:** the
+  post-filter pass ran the whole-plane legacy apply on any slice with a
+  cached APS even when `slice_alf_enabled_flag == 0` (spec line 16424
+  invokes the ALF process only for `slice_alf_enabled_flag == 1` or
+  `slice_alf_chroma_idc > 0`); it now honours the slice flag — the
+  encoder's second IDR of a GOP exposed it. Measured against the ATS
+  commit (QP 32-50, Y / YUV BD-rate): **intra −0.1 % / −0.1 %, P −0.9 %
+  / −0.6 %, low-delay B −0.8 % / −0.6 %**; with `deblock=1`, P −3.0 % /
+  −2.3 % on top of the deblocked stream. (Side finding, decoder audit
+  item: `deblock=1` itself costs **+73 %** BD-rate on this corpus
+  against `deblock=0` — far beyond a smoothing penalty — the §8.8.2
+  implementation deserves a bS / threshold audit; the encoder default
+  stays off.) Pins: `alf_data()` random filter sets at every signalled
+  count read back into the derived coefficients incl. the eq. 104 /
+  110 DC terms; the Wiener solver recovers a planted filter; `uek`
+  writer/reader duals; I/P/B GOPs with and without deblocking on both
+  entropy shapes decode sample-exactly to the post-ALF reconstruction
+  through the registry, APS NALs present. Fixtures re-pinned (the SPS
+  and slice headers gained the ALF fields; the two Main-profile
+  fixtures elect no filter at their QP and keep their output digests;
+  the Baseline pin now sets `alf=0` and is unchanged).
+
 - **Encoder: ADCC — the §7.3.8.8 advanced residual coding writer and
   its RDOQ (round 458), default off.** `adcc.rs` gains
   `encode_residual_coding_adv`, the exact dual of the reader: the

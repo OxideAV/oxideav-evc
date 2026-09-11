@@ -77,6 +77,26 @@ impl BitWriter {
     /// Append a 0-th order signed Exp-Golomb code (`se(v)` — §9.2.2):
     /// `0 → 0, 1 → 1, −1 → 2, 2 → 3, −2 → 4, …` (the inverse of
     /// [`crate::bitreader::BitReader::se`]).
+    /// `uek(v)` — k-th order Exp-Golomb (§9.2 `ue(v)` generalised): the
+    /// dual of [`crate::bitreader::BitReader::uek`] — `M` leading zeros
+    /// with `((1 << M) − 1) << k <= value`, a one, then `M + k` bits of
+    /// `value − (((1 << M) − 1) << k)`.
+    pub fn uek(&mut self, k: u32, value: u32) {
+        let mut m = 0u32;
+        while ((1u64 << (m + 1)) - 1) << k <= u64::from(value) {
+            m += 1;
+        }
+        for _ in 0..m {
+            self.put_bit(0);
+        }
+        self.put_bit(1);
+        let base = (((1u64 << m) - 1) << k) as u32;
+        let suffix = value - base;
+        for i in (0..(m + k)).rev() {
+            self.put_bit(((suffix >> i) & 1) as u8);
+        }
+    }
+
     pub fn se(&mut self, value: i32) {
         let code = if value > 0 {
             (value as u32) * 2 - 1

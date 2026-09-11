@@ -52,6 +52,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::alf_enc::AlfSliceParams;
 use crate::ats::{self, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
@@ -192,6 +193,24 @@ pub struct IntraToolset {
     /// `sps_adcc_flag` (requires `cm_init`) — the §7.3.8.8 advanced
     /// residual coding instead of the §7.3.8.7 run-length coding.
     pub adcc: bool,
+    /// `sps_alf_flag` — design and apply the adaptive loop filter
+    /// ([`crate::alf_enc`]); the APS and slice fields come back in
+    /// [`IntraEncOutput::alf`].
+    pub alf: bool,
+}
+
+/// Output of [`encode_idr_slice_data_out`].
+pub struct IntraEncOutput {
+    /// The CABAC `slice_data()` payload.
+    pub payload: Vec<u8>,
+    /// The reconstruction the decoder reproduces byte for byte (after
+    /// deblocking and ALF when they are on).
+    pub recon: YuvPicture,
+    pub stats: EncStats,
+    /// The ALF design of this picture (`None`: ALF off, or no filter
+    /// paid for itself — the slice header then codes
+    /// `slice_alf_enabled_flag = 0`).
+    pub alf: Option<AlfSliceParams>,
 }
 
 /// The decode-order state a tree trial rewinds: the block's recon,
@@ -343,6 +362,7 @@ pub fn encode_idr_slice_data_tree(
             iqt: false,
             ats: false,
             adcc: false,
+            alf: false,
         },
     )
 }
@@ -356,6 +376,18 @@ pub fn encode_idr_slice_data_cfg(
     slice_qp: i32,
     tools: IntraToolset,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    let out = encode_idr_slice_data_out(src, slice_qp, tools)?;
+    Ok((out.payload, out.recon, out.stats))
+}
+
+/// [`encode_idr_slice_data_cfg`] returning the full [`IntraEncOutput`]
+/// (the ALF design included) — the entry the registered encoder uses
+/// (round 458).
+pub fn encode_idr_slice_data_out(
+    src: &YuvPicture,
+    slice_qp: i32,
+    tools: IntraToolset,
+) -> Result<IntraEncOutput> {
     let IntraToolset {
         deblock,
         cm_init,
@@ -364,6 +396,7 @@ pub fn encode_idr_slice_data_cfg(
         iqt,
         ats,
         adcc,
+        alf,
     } = tools;
     if ats && !iqt {
         return Err(Error::invalid(
@@ -438,6 +471,36 @@ pub fn encode_idr_slice_data_cfg(
         }
     }
 
+    if deblock {
+        // Mirror the decoder's post-reconstruction §8.8.2 pass: stamp
+        // the side-info grid exactly as `decode_transform_unit` does
+        // for intra luma CUs, arm the single-tile loop-filter bounds,
+        // and run the decoder's own deblock kernels on the recon.
+        let mut side_info = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
+        let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
+        side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
+        for (x0, y0, node) in &roots {
+            stamp_decided(&mut side_info, slice_qp, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
+        }
+        crate::deblock::deblock_luma(&mut ctx.recon, &side_info, slice_qp)?;
+        let off = ctx.chroma_qp_offset;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 1)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 2)?;
+    }
+    // §8.8.4 ALF (round 458): designed on the deblocked reconstruction
+    // under the decoder's IDR edge availability (§6.4.4 with no motion
+    // grid: every CTB edge mirrors), applied in place.
+    let alf_params = if alf {
+        let avail = crate::alf::AlfInputAvailability::all_intra(ctx.pic_w, ctx.pic_h);
+        crate::alf_enc::design_and_apply(src, &mut ctx.recon, &avail, ctx.lambda, CTB_LOG2)?
+    } else {
+        None
+    };
+    let ctb_flags: Option<&[bool]> = alf_params
+        .as_ref()
+        .filter(|p| p.luma_enabled && p.map_flag)
+        .map(|p| p.ctb_luma.as_slice());
+
     // Emit pass: replay the decided tree into the arithmetic coder in
     // the decoder's exact read order. Under `cm_init` the encoder's
     // context table starts from the identical §9.3.2.2 init the decoder
@@ -450,7 +513,13 @@ pub fn encode_idr_slice_data_cfg(
     // The emit-order grid: the §8.4.2 neighbour probes must see exactly
     // the CUs the decoder has already reconstructed at that point.
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
-    for (x0, y0, node) in &roots {
+    for (ctu_idx, (x0, y0, node)) in roots.iter().enumerate() {
+        // §7.3.8.2 lines 2626-2627: the per-CTB luma alf_ctb_flag
+        // (Table 40, ctxInc 0) ahead of the coding tree.
+        if let Some(flags) = ctb_flags {
+            let (t, i) = sel.ctx(MainCtxTable::AlfCtbFlag, 0);
+            enc.encode_decision(t, i, u8::from(flags[ctu_idx]));
+        }
         let mut tree_stats = stats.tree;
         let mut leaf_fn = |enc: &mut CabacEncoder,
                            grid: &mut SideInfoGrid,
@@ -497,24 +566,12 @@ pub fn encode_idr_slice_data_cfg(
     }
     stats.split_flag_bins = stats.tree.split_cu_flag_bins;
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
-
-    if deblock {
-        // Mirror the decoder's post-reconstruction §8.8.2 pass: stamp
-        // the side-info grid exactly as `decode_transform_unit` does
-        // for intra luma CUs, arm the single-tile loop-filter bounds,
-        // and run the decoder's own deblock kernels on the recon.
-        let mut side_info = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
-        let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
-        side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
-        for (x0, y0, node) in &roots {
-            stamp_decided(&mut side_info, slice_qp, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
-        }
-        crate::deblock::deblock_luma(&mut ctx.recon, &side_info, slice_qp)?;
-        let off = ctx.chroma_qp_offset;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 1)?;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 2)?;
-    }
-    Ok((enc.finish(), ctx.recon, stats))
+    Ok(IntraEncOutput {
+        payload: enc.finish(),
+        recon: ctx.recon,
+        stats,
+        alf: alf_params,
+    })
 }
 
 /// Stamp the decided tree's leaves into a [`SideInfoGrid`] with the
@@ -1645,6 +1702,7 @@ mod tests {
                             iqt: ats,
                             ats,
                             adcc: true,
+                            alf: false,
                         };
                         let (payload, enc_recon, stats) =
                             encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
@@ -1712,6 +1770,7 @@ mod tests {
                             iqt: true,
                             ats: true,
                             adcc: false,
+                            alf: false,
                         };
                         let (payload, enc_recon, stats) =
                             encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
