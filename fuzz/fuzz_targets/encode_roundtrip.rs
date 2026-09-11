@@ -43,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
     let ats = flags & 0x80 != 0;
     let adcc = cm_init && data[4] & 1 != 0;
     let alf = data[4] & 2 != 0;
+    let sub_gop = if b_pictures { (data[4] >> 2) & 3 } else { 0 };
     let (pf, bytes_per, max_val) = if ten_bit {
         (PixelFormat::Yuv420P10Le, 2usize, 1023u16)
     } else {
@@ -63,6 +64,7 @@ fuzz_target!(|data: &[u8]| {
     p.options.insert("ats", if ats { "1" } else { "0" });
     p.options.insert("adcc", if adcc { "1" } else { "0" });
     p.options.insert("alf", if alf { "1" } else { "0" });
+    p.options.insert("sub_gop", sub_gop.to_string());
     let mut enc = oxideav_evc::encoder::make_evc_encoder(&p).expect("encoder");
     let mut dec = oxideav_evc::decoder::make_decoder(&CodecParameters::video(CodecId::new("evc")))
         .expect("decoder");
@@ -70,6 +72,8 @@ fuzz_target!(|data: &[u8]| {
     let payload = &data[5..];
     let mut cursor = 0usize;
     let (cw, ch) = ((w as usize).div_ceil(2), (h as usize).div_ceil(2));
+    enc.log_recons();
+    let mut packets = Vec::new();
     for t in 0..frames {
         let mut y = plane(payload, &mut cursor, (w * h) as usize, bytes_per);
         let mut cb = plane(payload, &mut cursor, cw * ch, bytes_per);
@@ -100,12 +104,27 @@ fuzz_target!(|data: &[u8]| {
             ],
         };
         enc.send_frame(&Frame::Video(frame)).expect("send_frame");
-        let pkt = enc.receive_packet().expect("packet");
-        dec.send_packet(&pkt).expect("send_packet");
-        let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
-            panic!("expected a video frame")
-        };
-        let recon = enc.last_recon().expect("recon");
+        while let Ok(pkt) = enc.receive_packet() {
+            packets.push(pkt);
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    assert_eq!(packets.len(), frames, "one packet per picture");
+    for pkt in &packets {
+        dec.send_packet(pkt).expect("send_packet");
+    }
+    dec.flush().expect("decoder flush");
+    let mut decoded = 0usize;
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        decoded += 1;
+        let (_, recon) = enc
+            .recon_log()
+            .iter()
+            .find(|(pts, _)| *pts == vf.pts)
+            .expect("a logged reconstruction per output picture");
         let planes = [&recon.y, &recon.cb, &recon.cr];
         for (c, want) in planes.iter().enumerate() {
             let got = &vf.planes[c];
@@ -128,9 +147,14 @@ fuzz_target!(|data: &[u8]| {
                     } else {
                         u16::from(got.data[yy * got.stride + xx])
                     };
-                    assert_eq!(got_v, want_v, "frame {t} plane {c} ({xx},{yy}): decode != recon");
+                    assert_eq!(
+                        got_v, want_v,
+                        "pts {:?} plane {c} ({xx},{yy}): decode != recon",
+                        vf.pts
+                    );
                 }
             }
         }
     }
+    assert_eq!(decoded, frames, "every picture decodes");
 });

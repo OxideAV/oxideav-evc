@@ -853,6 +853,7 @@ mod tests {
                 let mut w = BitWriter::new();
                 w.uek(k, v);
                 assert_eq!(w.bit_position() as u32, uek_bits(k, v), "k{k} v{v}");
+                w.align_to_byte_zero();
                 let bytes = w.into_bytes();
                 let mut r = crate::bitreader::BitReader::new(&bytes);
                 assert_eq!(r.uek(k).unwrap(), v);

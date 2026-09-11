@@ -50,6 +50,16 @@
 //!   (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64) and the
 //!   lookahead RD search over rectangular leaves. `btt=0` restores the
 //!   quad tree.
+//! * `sub_gop` — **hierarchical B sub-GOPs** (round 458): `log2` of the
+//!   sub-GOP length (`0` = the low-delay shape, default; `1..=3` = 2 /
+//!   4 / 8 pictures). The SPS declares `log2_sub_gop_length`; each
+//!   sub-GOP codes its last picture first as the TemporalId-0 anchor,
+//!   then the dyadic middles breadth-first with rising TemporalId (the
+//!   §8.3.1 `DocOffset` order the decoder derives POC from), every
+//!   non-anchor a B slice with the past in list 0 and the future in
+//!   list 1 (§8.3.2.2), QP raised by the TemporalId. Requires `b=1`.
+//!   Packets leave in decode order with `pts` of their picture and no
+//!   `dts`; a source tail shorter than a sub-GOP is coded as anchors.
 //! * `alf` — the **adaptive loop filter** (round 458), default **on**:
 //!   `sps_alf_flag = 1`; every picture designs its §8.8.4 luma
 //!   (per-class Wiener, merged) and chroma filters on the deblocked
@@ -107,9 +117,9 @@ use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Resu
 
 use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
-    append_length_prefixed_nal, iqt_chroma_qp_offset, write_idr_slice_header_alf,
-    write_inter_slice_header_alf, write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
-    EncSequenceConfig, SliceAlfFields,
+    append_length_prefixed_nal, append_length_prefixed_nal_tid, iqt_chroma_qp_offset,
+    write_idr_slice_header_alf, write_inter_slice_header_alf, write_p_slice_header, write_pps_rbsp,
+    write_sps_rbsp, EncSequenceConfig, SliceAlfFields,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
@@ -216,6 +226,18 @@ fn encode_idr_au_coded(
     refs: u32,
     crop: (u32, u32),
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_au_coded_gop(src, slice_qp, tools, refs, 0, crop)
+}
+
+/// [`encode_idr_au_coded`] declaring `log2_sub_gop_length` in the SPS.
+fn encode_idr_au_coded_gop(
+    src: &YuvPicture,
+    slice_qp: i32,
+    tools: IntraToolset,
+    refs: u32,
+    log2_sub_gop_length: u32,
+    crop: (u32, u32),
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     let IntraToolset {
         deblock,
         cm_init,
@@ -249,6 +271,7 @@ fn encode_idr_au_coded(
         ats,
         adcc,
         alf,
+        log2_sub_gop_length,
     };
     let mut bytes = Vec::new();
     append_length_prefixed_nal(&mut bytes, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -424,6 +447,18 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     let adcc = parse_bool("adcc", false)?;
     // Round 458: the adaptive loop filter — default ON.
     let alf = parse_bool("alf", true)?;
+    // Round 458: hierarchical sub-GOPs (log2 length, 0 = low delay).
+    let sub_gop_log2 = match params.options.get("sub_gop") {
+        None => 0u32,
+        Some(s) => s.parse::<u32>().ok().filter(|&n| n <= 3).ok_or_else(|| {
+            Error::invalid(format!("evc encoder: sub_gop option {s:?} not in 0..=3"))
+        })?,
+    };
+    if sub_gop_log2 > 0 && !b_pictures {
+        return Err(Error::invalid(
+            "evc encoder: sub_gop>0 needs b=1 (the non-anchor pictures are B slices)",
+        ));
+    }
     if adcc && !cm_init {
         return Err(Error::invalid(
             "evc encoder: adcc=1 requires cm_init=1 (§7.3.2.1 codes sps_adcc_flag under sps_cm_init_flag)",
@@ -571,6 +606,9 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         ats,
         adcc,
         alf,
+        sub_gop_log2,
+        pending: Vec::new(),
+        recon_log: None,
         gop,
         refs,
         b_pictures,
@@ -735,6 +773,9 @@ struct EncDpbPic {
     recon: YuvPicture,
     side_info: Option<SideInfoGrid>,
     poc: i32,
+    /// `TemporalId` — the §8.3.2.2 list construction and the eq. 169
+    /// marking key on it.
+    temporal_id: u8,
     ref_pocs_l0: Vec<i32>,
 }
 
@@ -772,6 +813,13 @@ pub struct EvcEncoder {
     adcc: bool,
     /// `sps_alf_flag`.
     alf: bool,
+    /// `log2_sub_gop_length` — 0 low delay, else hierarchical B.
+    sub_gop_log2: u32,
+    /// Source pictures of the sub-GOP under construction (display
+    /// order), coded once the sub-GOP is complete or at flush.
+    pending: Vec<(YuvPicture, Option<i64>)>,
+    /// Test hook: every coded picture's `(pts, reconstruction)`.
+    recon_log: Option<Vec<(Option<i64>, YuvPicture)>>,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
     /// units, the rest low-delay P/B pictures.
     gop: u32,
@@ -804,35 +852,176 @@ impl EvcEncoder {
         self.dpb.iter().max_by_key(|e| e.poc).map(|e| &e.recon)
     }
 
+    /// Test hook: record every coded picture's reconstruction (with
+    /// its `pts`), in coding order — [`Self::recon_log`] reads them.
+    #[doc(hidden)]
+    pub fn log_recons(&mut self) {
+        self.recon_log = Some(Vec::new());
+    }
+
+    #[doc(hidden)]
+    pub fn recon_log(&self) -> &[(Option<i64>, YuvPicture)] {
+        self.recon_log.as_deref().unwrap_or(&[])
+    }
+
+    /// Code the pending sub-GOP: the last picture first as the
+    /// TemporalId-0 anchor, then the dyadic middles breadth-first with
+    /// rising TemporalId — position `( 2 j + 1 ) · L / 2^t` at
+    /// TemporalId `t`, the §8.3.1 `DocOffset` sequence. A partial
+    /// sub-GOP (flush / IDR boundary) codes every picture as an anchor.
+    fn code_pending(&mut self) -> Result<()> {
+        let l = 1usize << self.sub_gop_log2;
+        let frames = std::mem::take(&mut self.pending);
+        if frames.len() < l {
+            for (src, pts) in frames {
+                self.emit_picture(&src, pts, false, 0)?;
+            }
+            return Ok(());
+        }
+        let mut order: Vec<(usize, u8)> = vec![(l - 1, 0)];
+        for t in 1..=self.sub_gop_log2 {
+            let step = l >> t;
+            let mut pos = step;
+            while pos < l {
+                order.push((pos - 1, t as u8));
+                pos += 2 * step;
+            }
+        }
+        for (idx, tid) in order {
+            let (src, pts) = &frames[idx];
+            self.emit_picture(src, *pts, false, tid)?;
+        }
+        Ok(())
+    }
+
+    /// Code one picture (IDR or inter at `temporal_id`) and queue its
+    /// packet: the QP pick (rate control, then the TemporalId cascade),
+    /// the encode, the rate-control feedback and the first-pass record.
+    fn emit_picture(
+        &mut self,
+        src: &YuvPicture,
+        pts: Option<i64>,
+        is_idr: bool,
+        temporal_id: u8,
+    ) -> Result<()> {
+        let class = usize::from(!is_idr);
+        let base_qp = match (&mut self.two_pass, &self.rc) {
+            (Some(tp), _) => tp.pick_qp(self.frame_idx as usize),
+            (None, Some(rc)) => rc.pick_qp(class),
+            (None, None) => self.qp,
+        };
+        let frame_qp = (base_qp + i32::from(temporal_id)).min(51);
+        let data = if is_idr {
+            let (data, recon, _stats) = encode_idr_au_coded_gop(
+                src,
+                frame_qp,
+                IntraToolset {
+                    deblock: self.deblock,
+                    cm_init: self.cm_init,
+                    eipd: self.eipd,
+                    btt: self.btt,
+                    iqt: self.iqt,
+                    ats: self.ats,
+                    adcc: self.adcc,
+                    alf: self.alf,
+                },
+                self.refs,
+                self.sub_gop_log2,
+                (self.coded_w - self.width, self.coded_h - self.height),
+            )?;
+            // §8.3.1 eqs. 155/156 + the IDR DPB flush.
+            self.dpb.clear();
+            if let Some(log) = &mut self.recon_log {
+                log.push((pts, recon.clone()));
+            }
+            self.dpb.push(EncDpbPic {
+                recon,
+                side_info: None,
+                poc: 0,
+                temporal_id: 0,
+                ref_pocs_l0: Vec::new(),
+            });
+            self.prev_tid0_poc = 0;
+            self.prev_doc_offset = -1;
+            data
+        } else {
+            self.encode_inter_picture(src, pts, frame_qp, temporal_id)?
+        };
+        let bits = data.len() as f64 * 8.0;
+        if let Some(rc) = &mut self.rc {
+            rc.update(class, frame_qp, bits);
+        }
+        if let Some(tp) = &mut self.two_pass {
+            tp.update(self.frame_idx as usize, frame_qp, bits);
+        }
+        if let Some(fp) = &mut self.first_pass {
+            fp.stats.push(FrameStat {
+                idr: is_idr,
+                qp: frame_qp,
+                bits,
+            });
+            fp.write()?;
+        }
+        self.frame_idx += 1;
+        let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
+        pkt.pts = pts;
+        // Low delay: decode order == display order. Hierarchical
+        // sub-GOPs reorder, so no dts is claimed.
+        pkt.dts = if self.sub_gop_log2 == 0 { pts } else { None };
+        pkt.flags.keyframe = is_idr;
+        self.queue.push_back(pkt);
+        Ok(())
+    }
+
     /// Encode one non-key picture against the mirror DPB: the §8.3.3.2
     /// marking, the §8.3.2.2 lists, the P/B slice encode, the header,
     /// and the DPB update — every step the decoder repeats on its side.
-    fn encode_inter_picture(&mut self, src: &YuvPicture, frame_qp: i32) -> Result<Vec<u8>> {
-        let (poc, doc_offset) =
-            derive_poc_pocs_flag0(self.prev_tid0_poc, self.prev_doc_offset, 0, 1);
-        // §8.3.3.2 (TemporalId 0, log2_sub_gop_length 0, RefPicGapLength 1).
+    fn encode_inter_picture(
+        &mut self,
+        src: &YuvPicture,
+        pts: Option<i64>,
+        frame_qp: i32,
+        temporal_id: u8,
+    ) -> Result<Vec<u8>> {
+        let sub_gop_len = 1i32 << self.sub_gop_log2;
+        let (poc, doc_offset) = derive_poc_pocs_flag0(
+            self.prev_tid0_poc,
+            self.prev_doc_offset,
+            temporal_id,
+            sub_gop_len,
+        );
+        // §8.3.3.2 — invoked for a TemporalId-0 picture (eq. 169 under
+        // a sub-GOP, eq. 170 with RefPicGapLength 1 in low delay).
+        if temporal_id == 0 {
+            let infos: Vec<RefPicInfo> = self
+                .dpb
+                .iter()
+                .map(|e| RefPicInfo {
+                    poc: e.poc,
+                    temporal_id: e.temporal_id,
+                })
+                .collect();
+            let keep = mark_references_rpl_flag0(&infos, poc, self.sub_gop_log2, 1, self.refs);
+            let mut k = keep.iter();
+            self.dpb.retain(|_| *k.next().unwrap_or(&true));
+        }
         let infos: Vec<RefPicInfo> = self
             .dpb
             .iter()
             .map(|e| RefPicInfo {
                 poc: e.poc,
-                temporal_id: 0,
-            })
-            .collect();
-        let keep = mark_references_rpl_flag0(&infos, poc, 0, 1, self.refs);
-        let mut k = keep.iter();
-        self.dpb.retain(|_| *k.next().unwrap_or(&true));
-        let infos: Vec<RefPicInfo> = self
-            .dpb
-            .iter()
-            .map(|e| RefPicInfo {
-                poc: e.poc,
-                temporal_id: 0,
+                temporal_id: e.temporal_id,
             })
             .collect();
         let is_b = self.b_pictures;
         let n = self.refs as usize;
-        let [pocs_l0, pocs_l1] = construct_ref_pic_lists_rpl_flag0(&infos, poc, 0, [n, n], is_b);
+        let [pocs_l0, pocs_l1] =
+            construct_ref_pic_lists_rpl_flag0(&infos, poc, temporal_id, [n, n], is_b);
+        if pocs_l0.is_empty() || (is_b && pocs_l1.is_empty()) {
+            return Err(Error::invalid(
+                "evc encoder: the mirror DPB yields an empty reference list",
+            ));
+        }
         let find = |p: i32| -> Result<&EncDpbPic> {
             self.dpb
                 .iter()
@@ -901,16 +1090,22 @@ impl EvcEncoder {
         slice_rbsp.extend_from_slice(&out.payload);
         let mut data = Vec::new();
         if let Some(p) = &out.alf {
-            append_length_prefixed_nal(&mut data, NalUnitType::Aps, &p.aps_rbsp);
+            append_length_prefixed_nal_tid(&mut data, NalUnitType::Aps, temporal_id, &p.aps_rbsp);
         }
-        append_length_prefixed_nal(&mut data, NalUnitType::NonIdr, &slice_rbsp);
+        append_length_prefixed_nal_tid(&mut data, NalUnitType::NonIdr, temporal_id, &slice_rbsp);
+        if let Some(log) = &mut self.recon_log {
+            log.push((pts, out.recon.clone()));
+        }
         self.dpb.push(EncDpbPic {
             recon: out.recon,
             side_info: Some(out.side_info),
             poc,
+            temporal_id,
             ref_pocs_l0: pocs_l0,
         });
-        self.prev_tid0_poc = poc;
+        if temporal_id == 0 {
+            self.prev_tid0_poc = poc;
+        }
         self.prev_doc_offset = doc_offset;
         Ok(data)
     }
@@ -938,65 +1133,21 @@ impl Encoder for EvcEncoder {
             self.coded_h,
             self.bit_depth,
         )?;
-        let is_idr = self.gop <= 1 || self.frame_idx % (self.gop as u64) == 0;
-        let class = usize::from(!is_idr);
-        let frame_qp = match (&mut self.two_pass, &self.rc) {
-            (Some(tp), _) => tp.pick_qp(self.frame_idx as usize),
-            (None, Some(rc)) => rc.pick_qp(class),
-            (None, None) => self.qp,
-        };
-        let data = if is_idr {
-            let (data, recon, _stats) = encode_idr_au_coded(
-                &src,
-                frame_qp,
-                IntraToolset {
-                    deblock: self.deblock,
-                    cm_init: self.cm_init,
-                    eipd: self.eipd,
-                    btt: self.btt,
-                    iqt: self.iqt,
-                    ats: self.ats,
-                    adcc: self.adcc,
-                    alf: self.alf,
-                },
-                self.refs,
-                (self.coded_w - self.width, self.coded_h - self.height),
-            )?;
-            // §8.3.1 eqs. 155/156 + the IDR DPB flush.
-            self.dpb.clear();
-            self.dpb.push(EncDpbPic {
-                recon,
-                side_info: None,
-                poc: 0,
-                ref_pocs_l0: Vec::new(),
-            });
-            self.prev_tid0_poc = 0;
-            self.prev_doc_offset = -1;
-            data
-        } else {
-            self.encode_inter_picture(&src, frame_qp)?
-        };
-        let bits = data.len() as f64 * 8.0;
-        if let Some(rc) = &mut self.rc {
-            rc.update(class, frame_qp, bits);
+        // The IDR cadence counts source pictures (display order).
+        let sent = self.frame_idx + self.pending.len() as u64;
+        let is_idr = self.gop <= 1 || sent % (self.gop as u64) == 0;
+        if self.sub_gop_log2 == 0 {
+            return self.emit_picture(&src, v.pts, is_idr, 0);
         }
-        if let Some(tp) = &mut self.two_pass {
-            tp.update(self.frame_idx as usize, frame_qp, bits);
+        if is_idr {
+            // Close the sub-GOP under construction, then the key picture.
+            self.code_pending()?;
+            return self.emit_picture(&src, v.pts, true, 0);
         }
-        if let Some(fp) = &mut self.first_pass {
-            fp.stats.push(FrameStat {
-                idr: is_idr,
-                qp: frame_qp,
-                bits,
-            });
-            fp.write()?;
+        self.pending.push((src, v.pts));
+        if self.pending.len() == 1usize << self.sub_gop_log2 {
+            self.code_pending()?;
         }
-        self.frame_idx += 1;
-        let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), data);
-        pkt.pts = v.pts;
-        pkt.dts = v.pts; // low delay: decode order == display order
-        pkt.flags.keyframe = is_idr;
-        self.queue.push_back(pkt);
         Ok(())
     }
 
@@ -1005,8 +1156,10 @@ impl Encoder for EvcEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // No lookahead: every frame was emitted eagerly. A first pass
-        // re-writes its complete record.
+        // Low delay emits eagerly; a hierarchical tail shorter than a
+        // sub-GOP is coded now as anchors. A first pass re-writes its
+        // complete record.
+        self.code_pending()?;
         if let Some(fp) = &self.first_pass {
             fp.write()?;
         }
@@ -1872,6 +2025,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 458 — **hierarchical sub-GOPs** through the registry: with
+    /// `sub_gop=2` / `3` the packets leave in the §8.3.1 `DocOffset`
+    /// order (anchor first, dyadic middles breadth-first with rising
+    /// `nuh_temporal_id`), the decoder rebuilds every POC and reference
+    /// list from the SPS `log2_sub_gop_length`, outputs the pictures in
+    /// display order and reproduces each encoder reconstruction sample
+    /// for sample — across an IDR boundary and a flushed partial tail.
+    #[test]
+    fn hierarchical_sub_gops_round_trip_through_the_registry() {
+        let (w, h) = (64u32, 48u32);
+        for &sub_gop in &["2", "3"] {
+            let mut p = params(w, h);
+            p.options.insert("gop", "9");
+            p.options.insert("refs", "2");
+            p.options.insert("b", "1");
+            p.options.insert("sub_gop", sub_gop);
+            p.options.insert("qp", "30");
+            p.options.insert("eipd", "1");
+            p.options.insert("btt", "1");
+            let mut enc = make_evc_encoder(&p).unwrap();
+            enc.log_recons();
+            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+            let frames = 15usize;
+            let mut packets = Vec::new();
+            for t in 0..frames {
+                enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                while let Ok(pkt) = enc.receive_packet() {
+                    packets.push(pkt);
+                }
+            }
+            enc.flush().unwrap();
+            while let Ok(pkt) = enc.receive_packet() {
+                packets.push(pkt);
+            }
+            assert_eq!(
+                packets.len(),
+                frames,
+                "sub_gop {sub_gop}: one packet per picture"
+            );
+            let pts_order: Vec<i64> = packets.iter().map(|p| p.pts.unwrap()).collect();
+            assert_ne!(
+                pts_order,
+                (0..frames as i64).collect::<Vec<_>>(),
+                "sub_gop {sub_gop}: packets are reordered"
+            );
+            let l = 1usize << sub_gop.parse::<u32>().unwrap();
+            // The first full sub-GOP: the anchor (pts L) leaves right
+            // after the IDR, the tid-1 middle (pts L/2) next.
+            assert_eq!(pts_order[1], l as i64);
+            assert_eq!(pts_order[2], (l / 2) as i64);
+            let mut tids = Vec::new();
+            for pkt in &packets {
+                let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                tids.push(nals.last().unwrap().header.nuh_temporal_id);
+                dec.send_packet(pkt).unwrap();
+            }
+            assert!(
+                tids.iter().any(|&t| t > 0),
+                "sub_gop {sub_gop}: temporal layers"
+            );
+            dec.flush().unwrap();
+            let mut got = Vec::new();
+            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+                got.push(vf);
+            }
+            assert_eq!(got.len(), frames, "sub_gop {sub_gop}: every picture output");
+            let out_pts: Vec<i64> = got.iter().map(|f| f.pts.unwrap()).collect();
+            assert_eq!(
+                out_pts,
+                (0..frames as i64).collect::<Vec<_>>(),
+                "display order"
+            );
+            let log = enc.recon_log();
+            assert_eq!(log.len(), frames);
+            for vf in &got {
+                let (_, recon) = log.iter().find(|(pts, _)| *pts == vf.pts).unwrap();
+                for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                    let gotp: Vec<u16> = vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                    let stride = if c == 0 {
+                        recon.y_stride()
+                    } else {
+                        recon.c_stride()
+                    };
+                    let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                    let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                    for yy in 0..rows {
+                        assert_eq!(
+                            &gotp[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                            &plane[yy * stride..yy * stride + cols],
+                            "sub_gop {sub_gop} pts {:?} plane {c} row {yy}",
+                            vf.pts
+                        );
+                    }
+                }
+            }
+        }
+        let mut bad = params(w, h);
+        bad.options.insert("sub_gop", "2");
+        assert!(make_encoder(&bad).is_err(), "sub_gop needs b=1");
     }
 
     /// Round 458 — **ALF** through the registry: I, P and B pictures

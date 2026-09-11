@@ -170,6 +170,11 @@ pub struct EvcDecoder {
     /// Parallel POC tracker for `out` so insertion stays sorted even
     /// when the bitstream coding order differs from display order.
     out_pocs: VecDeque<i32>,
+    /// Coded-video-sequence counter (bumped at every IDR) — the output
+    /// queue orders by `(cvs, poc)` so a new IDR's POC 0 never overtakes
+    /// the previous sequence's pictures (round 458).
+    out_cvs: VecDeque<u32>,
+    cvs: u32,
     /// Round-9 DPB: every short-term reference picture (IDR + non-IDR)
     /// indexed by POC. Capped at [`MAX_DPB_ENTRIES`]; eviction is by
     /// lowest POC when a fresh picture would overflow.
@@ -258,6 +263,8 @@ impl EvcDecoder {
             pending_pts: None,
             out: VecDeque::new(),
             out_pocs: VecDeque::new(),
+            out_cvs: VecDeque::new(),
+            cvs: 0,
             dpb: Vec::new(),
             poc_msb: 0,
             prev_poc_lsb: 0,
@@ -459,6 +466,7 @@ impl Decoder for EvcDecoder {
                     } = crate::decode_idr_slice_full(&sps, &pps, nal.rbsp())?;
                     // §8.3.1: IDR resets POC to 0, flushes the DPB.
                     self.dpb_flush();
+                    self.cvs += 1;
                     let dra_aps_id = if pps.pic_dra_enabled_flag {
                         Some(pps.pic_dra_aps_id)
                     } else {
@@ -638,6 +646,7 @@ impl Decoder for EvcDecoder {
         match self.out.pop_front() {
             Some(v) => {
                 self.out_pocs.pop_front();
+                self.out_cvs.pop_front();
                 Ok(Frame::Video(v))
             }
             None => Err(Error::NeedMore),
@@ -671,15 +680,22 @@ impl EvcDecoder {
             None => return,
         };
         let _ = pts; // silence unused
-        let pos = self.out_pocs.iter().position(|&p| p > poc);
+        let cvs = self.cvs;
+        let pos = self
+            .out_pocs
+            .iter()
+            .zip(self.out_cvs.iter())
+            .position(|(&p, &c)| (c, p) > (cvs, poc));
         match pos {
             Some(i) => {
                 self.out.insert(i, frame);
                 self.out_pocs.insert(i, poc);
+                self.out_cvs.insert(i, cvs);
             }
             None => {
                 self.out.push_back(frame);
                 self.out_pocs.push_back(poc);
+                self.out_cvs.push_back(cvs);
             }
         }
         if let Some(entry) = self.dpb.iter_mut().find(|e| e.poc == poc) {

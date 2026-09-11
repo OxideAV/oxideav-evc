@@ -578,8 +578,9 @@ coding order. 4:2:0 input at 8 / 10 / 12 bits; any non-zero **even**
 geometry (multiple-of-8 round-up + §7.4.3.1 conformance-cropping
 window). Options: `qp` 0..=51 (default 30), `gop` (default 1 =
 all-intra), `b`, `refs` 1..=5, `btt` (default **on**), `ats` + `iqt` (default
-**on**), `adcc` (default off), `alf` (default **on**), `eipd` (default
-**on**), `cm_init` (default **on**), `deblock`, `bitrate` + `fps`
+**on**), `adcc` (default off), `alf` (default **on**), `sub_gop` 0..=3
+(hierarchical B, default 0), `eipd` (default **on**), `cm_init`
+(default **on**), `deblock`, `bitrate` + `fps`
 (one-pass rate control), `pass=1|2` + `stats=<path>` + `vbv` (two-pass
 rate control).
 
@@ -634,6 +635,11 @@ core:
   a joint Cb/Cr filter, the `alf_data()` writer (dual of the parser)
   and the APS NAL; the design is applied from its parsed-back APS.
   Intra −0.1 %, P −0.9 %, B −0.8 % (Y BD-rate); −3.0 % on deblocked P.
+* **Hierarchical B sub-GOPs** (`sub_gop=1..3`, round 458) — the
+  §8.3.1 `DocOffset` coding order with rising `nuh_temporal_id`, the
+  §8.3.2.2 past/future lists from the mirror DPB, a TemporalId QP
+  cascade, anchors for a partial tail. Sub-GOP 8 vs low-delay B
+  −0.8 % Y / −6.3 % YUV; vs low-delay P −5.0 % / −10.7 %.
 * **ADCC** (`sps_adcc_flag = 1`, round 458, `adcc=1`, default off) —
   the §7.3.8.8 residual writer (exact dual of the reader, stencils
   over the decoder's progressive coefficient view) with a
@@ -671,8 +677,8 @@ MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
 harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
 Cross-implementation decode remains open until a validator lands.
 
-Encoder follow-ups: hierarchical B sub-GOPs, CU-level QP delta /
-adaptive quantization, an ADCC trellis, the 7-tap ALF luma type and
+Encoder follow-ups: CU-level QP delta / adaptive quantization, a
+`dts` model for the reordered packets, an ADCC trellis, the 7-tap ALF luma type and
 temporal APS reuse, the inferred-orientation ATS-inter shapes once
 the §7.3.8.5/§7.4.9.5 orientation reading is settled; decoder audit:
 `deblock=1` costs +73 % BD-rate on the corpus (§8.8.2 bS /

@@ -121,16 +121,33 @@ fn main() {
             let mut bytes = 0usize;
             let mut sse = [0f64; 3];
             let mut n = [0f64; 3];
-            for t in 0..frames {
-                let src = scene(w as usize, h as usize, t);
+            // Send everything, flush, decode everything, flush: the
+            // hierarchical shapes reorder, so pair by pts.
+            let sources: Vec<VideoFrame> = (0..frames)
+                .map(|t| scene(w as usize, h as usize, t))
+                .collect();
+            let mut packets = Vec::new();
+            for src in &sources {
                 enc.send_frame(&Frame::Video(src.clone()))
                     .expect("send_frame");
-                let pkt = enc.receive_packet().expect("packet");
+                while let Ok(pkt) = enc.receive_packet() {
+                    packets.push(pkt);
+                }
+            }
+            enc.flush().expect("flush");
+            while let Ok(pkt) = enc.receive_packet() {
+                packets.push(pkt);
+            }
+            for pkt in &packets {
                 bytes += pkt.data.len();
-                dec.send_packet(&pkt).expect("send_packet");
-                let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
-                    panic!("expected video")
-                };
+                dec.send_packet(pkt).expect("send_packet");
+            }
+            dec.flush().expect("decoder flush");
+            let mut decoded = 0usize;
+            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+                decoded += 1;
+                let t = (vf.pts.expect("pts") / 3000) as usize;
+                let src = &sources[t];
                 for c in 0..3 {
                     let (pw, ph) = if c == 0 {
                         (w as usize, h as usize)
@@ -149,6 +166,7 @@ fn main() {
                     n[c] += (pw * ph) as f64;
                 }
             }
+            assert_eq!(decoded, frames as usize, "every picture decodes");
             println!(
                 "{w}x{h},{qp},{bytes},{:.3},{:.3},{:.3}",
                 psnr(sse[0], n[0]),

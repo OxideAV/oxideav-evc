@@ -4,6 +4,35 @@
 
 ### Other
 
+- **Encoder: hierarchical B sub-GOPs (round 458).** Registry option
+  `sub_gop` (log2 of the sub-GOP length, `1..=3`; requires `b=1`): the
+  SPS declares `log2_sub_gop_length`, source pictures are buffered per
+  sub-GOP and coded in the §8.3.1 `DocOffset` order — the last picture
+  first as the TemporalId-0 anchor, then the dyadic middles
+  breadth-first with rising `nuh_temporal_id` (position
+  `( 2 j + 1 ) · L / 2^t` at TemporalId `t`, the order the decoder's
+  eqs. 159-163 derive POC from) — every non-anchor a B slice whose
+  §8.3.2.2 lists hold the past in list 0 and the future in list 1 at
+  the TemporalId rule, the mirror DPB marking (eq. 169, TemporalId-0
+  pictures only) run at anchors, QP raised by the TemporalId, a
+  partial tail (flush / IDR boundary) coded as anchors; packets leave
+  in decode order with their picture's `pts` and no `dts`. The
+  `rd_curve` harness now sends everything, flushes and pairs decoded
+  pictures by `pts`. **Decoder fix:** the output queue ordered by POC
+  alone, so after a second IDR its POC 0..n interleaved with the
+  previous sequence's pictures; it now orders by (coded video
+  sequence, POC). Measured (9 frames, IDR period 9, QP 32-50, Y / YUV
+  BD-rate): against low-delay B **sub-GOP 4 −0.7 % / −4.3 %, sub-GOP 8
+  −0.8 % / −6.3 %**; sub-GOP 8 against low-delay P −5.0 % / −10.7 %.
+  The corpus carries independent per-frame noise no bi-prediction can
+  reach, which caps the luma gain; the chroma gain comes from the
+  TemporalId QP cascade. Pins: sub-GOPs 4 and 8 through the registry
+  (15 pictures across an IDR boundary and a flushed tail: one packet
+  per picture, reordered, temporal layers present, every decoded
+  picture in display order and sample-exact to the logged
+  reconstruction; `sub_gop` without `b` refused); the fuzz target
+  drives the sub-GOP shapes and compares by `pts`.
+
 - **Encoder: ALF — adaptive-loop-filter design, APS emission, per-CTB
   election (round 458), default on.** New `alf_enc` module. Luma: the
   decoder's §8.8.4.2 filter with its unity-gain DC term substituted

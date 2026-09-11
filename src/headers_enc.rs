@@ -80,6 +80,11 @@ pub struct EncSequenceConfig {
     /// 458; Table A.6 binIdx 6, `0x40`). The slice headers then carry
     /// the §7.3.4 ALF block and access units may carry ALF APS NALs.
     pub alf: bool,
+    /// `log2_sub_gop_length` (§7.4.3.1, round 458): 0 is the low-delay
+    /// shape (`log2_ref_pic_gap_length = 0` follows); `n > 0` declares
+    /// hierarchical sub-GOPs of `2^n` pictures — the §8.3.1 `DocOffset`
+    /// POC derivation and the §8.3.3.2 eq. 169 marking then apply.
+    pub log2_sub_gop_length: u32,
 }
 
 /// The §7.3.4 slice-header ALF block (present when `sps_alf_flag`).
@@ -167,6 +172,12 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
             cfg.bit_depth
         )));
     }
+    if cfg.log2_sub_gop_length > 5 {
+        return Err(Error::invalid(format!(
+            "evc enc sps: log2_sub_gop_length {} outside 0..=5 (§7.4.3.1)",
+            cfg.log2_sub_gop_length
+        )));
+    }
     if cfg.max_num_tid0_ref_pics > 5 {
         return Err(Error::invalid(format!(
             "evc enc sps: max_num_tid0_ref_pics {} outside 0..=5 (§7.4.3.1)",
@@ -238,11 +249,13 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.u1(false); // sps_dra_flag
                  // !sps_pocs_flag || !sps_rpl_flag → log2_sub_gop_length; == 0 →
                  // log2_ref_pic_gap_length (all-intra stream: sub-GOP length 1).
-    w.ue(0); // log2_sub_gop_length = 0
-    w.ue(0); // log2_ref_pic_gap_length
-             // !sps_rpl_flag → max_num_tid0_ref_pics: the §8.3.3.2
-             // marking depth (eq. 170 with RefPicGapLength 1 keeps the
-             // most recent max_num_tid0_ref_pics pictures).
+    w.ue(cfg.log2_sub_gop_length); // log2_sub_gop_length
+    if cfg.log2_sub_gop_length == 0 {
+        w.ue(0); // log2_ref_pic_gap_length
+    }
+    // !sps_rpl_flag → max_num_tid0_ref_pics: the §8.3.3.2
+    // marking depth (eq. 170 with RefPicGapLength 1 keeps the
+    // most recent max_num_tid0_ref_pics pictures).
     w.ue(cfg.max_num_tid0_ref_pics);
     let cropping = cfg.crop_right != 0 || cfg.crop_bottom != 0;
     w.u1(cropping); // picture_cropping_flag
@@ -465,12 +478,24 @@ pub fn write_inter_slice_header_alf(
 }
 
 /// Wrap an RBSP in the 2-byte §7.3.1.2 NAL header plus the Annex B
-/// 4-byte big-endian `nal_unit_length` prefix, appending to `out`.
+/// 4-byte big-endian `nal_unit_length` prefix, appending to `out`
+/// (`nuh_temporal_id = 0`).
 pub fn append_length_prefixed_nal(out: &mut Vec<u8>, nut: NalUnitType, rbsp: &[u8]) {
+    append_length_prefixed_nal_tid(out, nut, 0, rbsp)
+}
+
+/// [`append_length_prefixed_nal`] with an explicit `nuh_temporal_id`
+/// (round 458 hierarchical sub-GOPs).
+pub fn append_length_prefixed_nal_tid(
+    out: &mut Vec<u8>,
+    nut: NalUnitType,
+    temporal_id: u8,
+    rbsp: &[u8],
+) {
     let nut_plus1 = (nut.as_u8() as u16) + 1;
     // forbidden_zero_bit(1) | nal_unit_type_plus1(6) | nuh_temporal_id(3)
     // | nuh_reserved_zero_5bits(5) | nuh_extension_flag(1), MSB-first.
-    let hdr_word: u16 = (nut_plus1 & 0x3F) << 9;
+    let hdr_word: u16 = ((nut_plus1 & 0x3F) << 9) | ((u16::from(temporal_id) & 0x7) << 6);
     let hdr = [(hdr_word >> 8) as u8, (hdr_word & 0xFF) as u8];
     let len = (2 + rbsp.len()) as u32;
     out.extend_from_slice(&len.to_be_bytes());
@@ -503,6 +528,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -562,6 +588,7 @@ mod tests {
                 ats: false,
                 adcc: false,
                 alf: false,
+                log2_sub_gop_length: 0,
             };
             let rbsp = write_sps_rbsp(&cfg).unwrap();
             let sps = crate::sps::parse(&rbsp).unwrap();
@@ -598,6 +625,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.profile_idc, 1);
@@ -663,6 +691,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -709,6 +738,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -790,6 +820,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -851,6 +882,7 @@ mod tests {
             ats: false,
             adcc: false,
             alf: false,
+            log2_sub_gop_length: 0,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(
