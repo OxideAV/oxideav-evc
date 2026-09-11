@@ -189,6 +189,9 @@ pub struct IntraToolset {
     pub iqt: bool,
     /// `sps_ats_flag`.
     pub ats: bool,
+    /// `sps_adcc_flag` (requires `cm_init`) — the §7.3.8.8 advanced
+    /// residual coding instead of the §7.3.8.7 run-length coding.
+    pub adcc: bool,
 }
 
 /// The decode-order state a tree trial rewinds: the block's recon,
@@ -339,6 +342,7 @@ pub fn encode_idr_slice_data_tree(
             btt,
             iqt: false,
             ats: false,
+            adcc: false,
         },
     )
 }
@@ -359,10 +363,16 @@ pub fn encode_idr_slice_data_cfg(
         btt,
         iqt,
         ats,
+        adcc,
     } = tools;
     if ats && !iqt {
         return Err(Error::invalid(
             "evc encoder: sps_ats_flag requires sps_iqt_flag (§7.3.2.1)",
+        ));
+    }
+    if adcc && !cm_init {
+        return Err(Error::invalid(
+            "evc encoder: sps_adcc_flag requires sps_cm_init_flag (§7.3.2.1)",
         ));
     }
     if src.chroma_format_idc != 1 {
@@ -382,7 +392,7 @@ pub fn encode_idr_slice_data_cfg(
         )));
     }
     let recon = YuvPicture::new(src.width, src.height, 1, src.bit_depth)?;
-    let sel = CtxSel::new(cm_init, InitType::I);
+    let sel = CtxSel::new(cm_init, InitType::I).with_adcc(adcc);
     let mut ctx = EncCtx {
         src,
         recon,
@@ -706,10 +716,10 @@ fn decide_leaf(
                 let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
                 m.encode_decision(t, i, u8::from(cbf_cr));
                 if cbf_cb {
-                    emit_residual_rle(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
+                    emit_residual(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
                 }
                 if cbf_cr {
-                    emit_residual_rle(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
+                    emit_residual(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
                 }
             });
             let cost = d_cb + d_cr + ctx.lambda * bits;
@@ -860,7 +870,7 @@ fn decide_leaf(
                 let (t, i) = sel.ctx(table, 0);
                 m.encode_decision(t, i, u8::from(cbf));
                 if cbf {
-                    emit_residual_rle(m, sel, c_idx, &levels, log2_w - 1, log2_h - 1);
+                    emit_residual(m, sel, c_idx, &levels, log2_w - 1, log2_h - 1);
                 }
             });
             cost += dist + ctx.lambda * bits;
@@ -962,7 +972,7 @@ pub(crate) fn luma_tail_bits(
             if ats_present {
                 ats::write_ats_intra(m, EipdCtx::for_slice(sel.cm_init, sel.init_type), ats);
             }
-            emit_residual_rle(m, sel, 0, levels, log2_w, log2_h);
+            emit_residual(m, sel, 0, levels, log2_w, log2_h);
         }
     })
 }
@@ -1052,7 +1062,13 @@ pub(crate) fn quantize_residual(
         Some(inp) => {
             let frac = forward_transform_fractional_typed(diff, w, h, qp, bit_depth, spec)?;
             let weights = level_unit_sse_weights_typed(w, h, qp, bit_depth, spec);
-            let (levels, cbf, _cost) = rdoq_rle(&frac, &weights, w, h, inp);
+            // The residual syntax the selector carries decides the
+            // optimiser: the RLE trellis or the ADCC candidate search.
+            let (levels, cbf, _cost) = if inp.sel.adcc {
+                crate::adcc::rdoq_adcc(&frac, &weights, w, h, 1, inp)
+            } else {
+                rdoq_rle(&frac, &weights, w, h, inp)
+            };
             Ok((levels, cbf))
         }
         None => {
@@ -1318,13 +1334,33 @@ fn emit_leaf<S: BinSink>(
                 plan.ats,
             );
         }
-        emit_residual_rle(enc, sel, 0, &plan.levels_y, log2_w, log2_h);
+        emit_residual(enc, sel, 0, &plan.levels_y, log2_w, log2_h);
     }
     if plan.cbf_cb {
-        emit_residual_rle(enc, sel, 1, &plan.levels_cb, log2_w - 1, log2_h - 1);
+        emit_residual(enc, sel, 1, &plan.levels_cb, log2_w - 1, log2_h - 1);
     }
     if plan.cbf_cr {
-        emit_residual_rle(enc, sel, 2, &plan.levels_cr, log2_w - 1, log2_h - 1);
+        emit_residual(enc, sel, 2, &plan.levels_cr, log2_w - 1, log2_h - 1);
+    }
+}
+
+/// §7.3.8.6 `residual_coding()` writer (round 458): the §7.3.8.8
+/// advanced coding ([`crate::adcc::encode_residual_coding_adv`]) when
+/// the selector carries `sps_adcc_flag`, else the §7.3.8.7 run-length
+/// coding ([`emit_residual_rle`]). 4:2:0 (`ChromaArrayType == 1`).
+#[doc(hidden)]
+pub fn emit_residual<S: BinSink>(
+    enc: &mut S,
+    sel: CtxSel,
+    c_idx: u32,
+    levels: &[i32],
+    log2_w: u32,
+    log2_h: u32,
+) {
+    if sel.adcc {
+        crate::adcc::encode_residual_coding_adv(enc, sel, c_idx, 1, levels, log2_w, log2_h);
+    } else {
+        emit_residual_rle(enc, sel, c_idx, levels, log2_w, log2_h);
     }
 }
 
@@ -1589,6 +1625,71 @@ mod tests {
         }
     }
 
+    /// Round 458 — **ADCC**: the §7.3.8.8 residual writer with its
+    /// candidate-set RDOQ round-trips recon-exactly through the
+    /// decoder's `sps_adcc_flag == 1` walker (both trees, with and
+    /// without ATS) and the syntax counts match; the run-length shape is
+    /// untouched (`adcc` off keeps the RLE bins).
+    #[test]
+    fn adcc_round_trip_recon_exact_matrix() {
+        for &btt in &[false, true] {
+            for &ats in &[false, true] {
+                for &(w, h) in &[(64u32, 64u32), (72, 40), (176, 144)] {
+                    for &qp in &[8i32, 26, 44] {
+                        let src = synth_picture(w, h, 0xADC ^ (w * 31 + h * 7 + qp as u32));
+                        let tools = IntraToolset {
+                            deblock: false,
+                            cm_init: true,
+                            eipd: true,
+                            btt,
+                            iqt: ats,
+                            ats,
+                            adcc: true,
+                        };
+                        let (payload, enc_recon, stats) =
+                            encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
+                        let mut walk = if btt {
+                            walk_inputs_btt(w, h, true)
+                        } else {
+                            walk_inputs_cm(w, h, true)
+                        };
+                        walk.sps_eipd_flag = true;
+                        walk.sps_adcc_flag = true;
+                        walk.tree_gates.sps_ats_flag = ats;
+                        let off = crate::headers_enc::iqt_chroma_qp_offset(qp, ats);
+                        let dec_in = SliceDecodeInputs {
+                            sps_iqt_flag: ats,
+                            slice_cb_qp_offset: off,
+                            slice_cr_qp_offset: off,
+                            ..decode_inputs(qp)
+                        };
+                        let (dec, dec_stats) = decode_baseline_idr_slice(&payload, walk, dec_in)
+                            .unwrap_or_else(|e| panic!("{w}x{h} qp{qp} btt{btt} ats{ats}: {e}"));
+                        assert_eq!(dec.y, enc_recon.y, "{w}x{h} qp{qp} btt{btt} ats{ats}: luma");
+                        assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp} btt{btt} ats{ats}: cb");
+                        assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp} btt{btt} ats{ats}: cr");
+                        assert_eq!(dec_stats.coding_units, stats.leaves);
+                        assert!(
+                            dec_stats.adcc.blocks > 0,
+                            "{w}x{h} qp{qp}: ADCC blocks coded"
+                        );
+                        assert_eq!(dec_stats.coeff_runs, 0, "no run-length bins under ADCC");
+                    }
+                }
+            }
+        }
+        let src = synth_picture(64, 64, 2);
+        assert!(encode_idr_slice_data_cfg(
+            &src,
+            30,
+            IntraToolset {
+                adcc: true,
+                ..IntraToolset::default()
+            }
+        )
+        .is_err());
+    }
+
     /// Round 458 — **IQT + ATS-intra**: the improved quantization /
     /// transform chain with the balancing chroma QP offset and the
     /// Table-30 kernel search round-trip recon-exactly through the
@@ -1610,6 +1711,7 @@ mod tests {
                             btt,
                             iqt: true,
                             ats: true,
+                            adcc: false,
                         };
                         let (payload, enc_recon, stats) =
                             encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
@@ -1868,7 +1970,7 @@ mod tests {
                 if cm_init {
                     enc.init_main_profile(crate::cabac::InitType::I, 27);
                 }
-                emit_residual_rle(&mut enc, sel, c_idx, &levels, 2, 2);
+                emit_residual(&mut enc, sel, c_idx, &levels, 2, 2);
                 enc.encode_terminate(true);
                 let bytes = enc.finish();
                 let mut eng = CabacEngine::new(&bytes).unwrap();

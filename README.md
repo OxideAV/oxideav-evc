@@ -578,8 +578,8 @@ coding order. 4:2:0 input at 8 / 10 / 12 bits; any non-zero **even**
 geometry (multiple-of-8 round-up + §7.4.3.1 conformance-cropping
 window). Options: `qp` 0..=51 (default 30), `gop` (default 1 =
 all-intra), `b`, `refs` 1..=5, `btt` (default **on**), `ats` + `iqt` (default
-**on**), `eipd` (default **on**), `cm_init` (default **on**),
-`deblock`, `bitrate` + `fps`
+**on**), `adcc` (default off), `eipd` (default **on**), `cm_init`
+(default **on**), `deblock`, `bitrate` + `fps`
 (one-pass rate control), `pass=1|2` + `stats=<path>` + `vbv` (two-pass
 rate control).
 
@@ -627,6 +627,13 @@ core:
   candidate; the slice headers carry the chroma QP offset that keeps
   the Table-6 chroma step at the Baseline balance. Intra −1.5 %,
   P −0.6 %, B −0.6 % (Y BD-rate) on top of BTT.
+* **ADCC** (`sps_adcc_flag = 1`, round 458, `adcc=1`, default off) —
+  the §7.3.8.8 residual writer (exact dual of the reader, stencils
+  over the decoder's progressive coefficient view) with a
+  candidate-set RDOQ. A measured loss on the noise-heavy corpus
+  (intra +1.0 %, P +2.9 % Y BD-rate): the run-length syntax's
+  context-adaptive unary levels beat ADCC's fixed-length escapes on
+  dense large-magnitude residuals.
 * **Two-pass rate control** (`rate_plan`) — pass 1 records `idr qp
   bits` per frame; pass 2 plans one dithered sequence-wide base QP under
   a leaky-bucket buffer and re-plans every frame with an
@@ -657,10 +664,10 @@ MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
 harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
 Cross-implementation decode remains open until a validator lands.
 
-Encoder follow-ups: hierarchical B sub-GOPs, ADCC residual coding
-with its own RDOQ, ALF filter design, CU-level QP delta / adaptive
-quantization, the inferred-orientation ATS-inter shapes once the
-§7.3.8.5/§7.4.9.5 orientation reading is settled.
+Encoder follow-ups: hierarchical B sub-GOPs, ALF filter design,
+CU-level QP delta / adaptive quantization, an ADCC trellis, the
+inferred-orientation ATS-inter shapes once the §7.3.8.5/§7.4.9.5
+orientation reading is settled.
 
 ## Usage
 

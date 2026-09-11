@@ -26,7 +26,7 @@ fn plane(bytes: &[u8], cursor: &mut usize, n: usize, bytes_per: usize) -> Vec<u8
 }
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 4 {
+    if data.len() < 5 {
         return;
     }
     let w = 8 * (1 + u32::from(data[0] % 8)); // 8..=64
@@ -41,6 +41,7 @@ fuzz_target!(|data: &[u8]| {
     let frames = 2 + usize::from((flags >> 5) & 1);
     let btt = flags & 0x40 != 0;
     let ats = flags & 0x80 != 0;
+    let adcc = cm_init && data[4] & 1 != 0;
     let (pf, bytes_per, max_val) = if ten_bit {
         (PixelFormat::Yuv420P10Le, 2usize, 1023u16)
     } else {
@@ -59,11 +60,12 @@ fuzz_target!(|data: &[u8]| {
     p.options.insert("b", if b_pictures { "1" } else { "0" });
     p.options.insert("btt", if btt { "1" } else { "0" });
     p.options.insert("ats", if ats { "1" } else { "0" });
+    p.options.insert("adcc", if adcc { "1" } else { "0" });
     let mut enc = oxideav_evc::encoder::make_evc_encoder(&p).expect("encoder");
     let mut dec = oxideav_evc::decoder::make_decoder(&CodecParameters::video(CodecId::new("evc")))
         .expect("decoder");
 
-    let payload = &data[4..];
+    let payload = &data[5..];
     let mut cursor = 0usize;
     let (cw, ch) = ((w as usize).div_ceil(2), (h as usize).div_ceil(2));
     for t in 0..frames {

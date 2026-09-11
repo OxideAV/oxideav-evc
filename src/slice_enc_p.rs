@@ -80,7 +80,7 @@ use crate::slice_data::{
     mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
 };
 use crate::slice_enc::{
-    emit_intra_pred_mode, emit_residual_rle, gather_block, luma_tail_bits, quantize_block,
+    emit_intra_pred_mode, emit_residual, gather_block, luma_tail_bits, quantize_block,
     quantize_pred, quantize_residual, rd_lambda_at_qp_prime, refine_luma_ats, restore_region,
     save_region, IntraQuantCtx, LumaChoice, RegionSave, MODES,
 };
@@ -171,6 +171,9 @@ pub struct InterEncInputs<'a> {
     /// `sps_ats_flag` — ATS-intra kernels on the intra candidates and
     /// the ATS-inter sub-block transform on inter residuals (round 458).
     pub ats: bool,
+    /// `sps_adcc_flag` (requires `cm_init`) — the §7.3.8.8 advanced
+    /// residual coding (round 458).
+    pub adcc: bool,
 }
 
 /// Output of [`encode_inter_slice_data`].
@@ -402,6 +405,7 @@ pub fn encode_p_slice_data(
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         },
     )?;
     Ok((out.payload, out.recon, out.stats))
@@ -434,6 +438,11 @@ pub fn encode_inter_slice_data(
     if inputs.ats && !inputs.iqt {
         return Err(Error::invalid(
             "evc p encoder: sps_ats_flag requires sps_iqt_flag (§7.3.2.1)",
+        ));
+    }
+    if inputs.adcc && !inputs.cm_init {
+        return Err(Error::invalid(
+            "evc p encoder: sps_adcc_flag requires sps_cm_init_flag (§7.3.2.1)",
         ));
     }
     if inputs.refs_l0.is_empty() || (inputs.slice_is_b && inputs.refs_l1.is_empty()) {
@@ -492,7 +501,7 @@ pub fn encode_inter_slice_data(
             pic_height: src.height,
             ..Default::default()
         },
-        sel: CtxSel::new(inputs.cm_init, InitType::Pb),
+        sel: CtxSel::new(inputs.cm_init, InitType::Pb).with_adcc(inputs.adcc),
         eipd: inputs.eipd,
         geom: TreeGeometry::encoder(src.width, src.height, inputs.btt),
         iqt: inputs.iqt,
@@ -1785,10 +1794,10 @@ fn decide_leaf(
                 let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
                 m.encode_decision(t, i, u8::from(cbf_cr));
                 if cbf_cb {
-                    emit_residual_rle(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
+                    emit_residual(m, sel, 1, &lv_cb, log2_w - 1, log2_h - 1);
                 }
                 if cbf_cr {
-                    emit_residual_rle(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
+                    emit_residual(m, sel, 2, &lv_cr, log2_w - 1, log2_h - 1);
                 }
             });
             let cost = d_cb + d_cr + ctx.lambda * bits;
@@ -1929,10 +1938,10 @@ fn decide_leaf(
             let (t, i) = sel.ctx(MainCtxTable::CbfCr, 0);
             m.encode_decision(t, i, u8::from(i_cbf_cr));
             if i_cbf_cb {
-                emit_residual_rle(m, sel, 1, &i_levels_cb, log2_w - 1, log2_h - 1);
+                emit_residual(m, sel, 1, &i_levels_cb, log2_w - 1, log2_h - 1);
             }
             if i_cbf_cr {
-                emit_residual_rle(m, sel, 2, &i_levels_cr, log2_w - 1, log2_h - 1);
+                emit_residual(m, sel, 2, &i_levels_cr, log2_w - 1, log2_h - 1);
             }
         });
         (
@@ -2294,13 +2303,13 @@ fn emit_inter_residual<S: BinSink>(
             debug_assert!(res.ats_inter.is_none());
         }
         if res.cbf_y {
-            emit_residual_rle(enc, sel, 0, &res.levels_y, lw, lh);
+            emit_residual(enc, sel, 0, &res.levels_y, lw, lh);
         }
         if res.cbf_cb {
-            emit_residual_rle(enc, sel, 1, &res.levels_cb, lw - 1, lh - 1);
+            emit_residual(enc, sel, 1, &res.levels_cb, lw - 1, lh - 1);
         }
         if res.cbf_cr {
-            emit_residual_rle(enc, sel, 2, &res.levels_cr, lw - 1, lh - 1);
+            emit_residual(enc, sel, 2, &res.levels_cr, lw - 1, lh - 1);
         }
     }
 }
@@ -2411,13 +2420,13 @@ fn emit_leaf_bins<S: BinSink>(
                 if ats::ats_intra_flag_present(ctx.ats, log2_w, log2_h, true) {
                     ats::write_ats_intra(enc, EipdCtx::for_slice(sel.cm_init, sel.init_type), *ats);
                 }
-                emit_residual_rle(enc, sel, 0, &res.levels_y, log2_w, log2_h);
+                emit_residual(enc, sel, 0, &res.levels_y, log2_w, log2_h);
             }
             if res.cbf_cb {
-                emit_residual_rle(enc, sel, 1, &res.levels_cb, log2_w - 1, log2_h - 1);
+                emit_residual(enc, sel, 1, &res.levels_cb, log2_w - 1, log2_h - 1);
             }
             if res.cbf_cr {
-                emit_residual_rle(enc, sel, 2, &res.levels_cr, log2_w - 1, log2_h - 1);
+                emit_residual(enc, sel, 2, &res.levels_cr, log2_w - 1, log2_h - 1);
             }
         }
     }
@@ -2971,6 +2980,7 @@ mod tests {
                 btt: false,
                 iqt: false,
                 ats: false,
+                adcc: false,
             },
         );
         assert!(bad.is_err());
@@ -2990,6 +3000,7 @@ mod tests {
                 btt: false,
                 iqt: false,
                 ats: false,
+                adcc: false,
             },
         );
         assert!(bad_b.is_err());
@@ -3029,6 +3040,7 @@ mod tests {
                     btt: false,
                     iqt: false,
                     ats: false,
+                    adcc: false,
                 },
             )
             .unwrap();
@@ -3124,6 +3136,7 @@ mod tests {
                             btt: false,
                             iqt: false,
                             ats: false,
+                            adcc: false,
                         },
                     )
                     .unwrap();
@@ -3167,6 +3180,7 @@ mod tests {
                                 btt: false,
                                 iqt: false,
                                 ats: false,
+                                adcc: false,
                             },
                         )
                         .unwrap();
@@ -3246,6 +3260,7 @@ mod tests {
                 btt: false,
                 iqt: false,
                 ats: false,
+                adcc: false,
             },
         )
         .unwrap();
@@ -3278,6 +3293,7 @@ mod tests {
                 btt: false,
                 iqt: false,
                 ats: false,
+                adcc: false,
             },
         )
         .unwrap();
@@ -3343,6 +3359,7 @@ mod tests {
                     btt: false,
                     iqt: false,
                     ats: false,
+                    adcc: false,
                 },
             )
             .unwrap()

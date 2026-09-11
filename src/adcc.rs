@@ -42,7 +42,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::cabac::CabacEngine;
+use crate::cabac::{BinSink, CabacEngine};
 use crate::cabac_init::{
     ctx_inc_coeff_abs_level_greater_a, ctx_inc_coeff_abs_level_greater_b,
     ctx_inc_last_sig_coeff_prefix, ctx_inc_sig_coeff_flag, rice_param_coeff_abs_level_remaining,
@@ -381,10 +381,545 @@ pub(crate) fn decode_residual_coding_adv(
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Round 458 — the encoder's write side.
+// ---------------------------------------------------------------------
+
+/// The `last_sig_coeff_{x,y}` prefix / suffix pair of a coordinate
+/// (eqs. 149-152 inverted): `v < 4` is the prefix alone; otherwise with
+/// `g = ⌊log2 v⌋` the prefix is `2g + ((v >> (g − 1)) & 1)` and the
+/// suffix the low `g − 1` bits.
+fn last_sig_prefix_suffix(v: u32) -> (u32, u32, u32) {
+    if v < 4 {
+        return (v, 0, 0);
+    }
+    let g = 31 - v.leading_zeros();
+    let suffix_len = g - 1;
+    let prefix = 2 * g + ((v >> suffix_len) & 1);
+    (prefix, v & ((1 << suffix_len) - 1), suffix_len)
+}
+
+/// Write one `last_sig_coeff_{x,y}_prefix` (TR, Tables 87/88 — the
+/// prefix's `cMax` ones carry no terminator) plus its FL bypass suffix.
+fn encode_last_sig_coord<S: BinSink>(
+    enc: &mut S,
+    sel: CtxSel,
+    table: MainCtxTable,
+    c_idx: u32,
+    chroma_array_type: u32,
+    log2_trafo_size: u32,
+    v: u32,
+) {
+    let c_max = (log2_trafo_size << 1) - 1;
+    let (prefix, suffix, suffix_len) = last_sig_prefix_suffix(v);
+    debug_assert!(prefix <= c_max);
+    let (t, ctx_of): (usize, Box<dyn Fn(u32) -> usize>) = if sel.cm_init {
+        let off = table.ctx_idx_offset(sel.init_type);
+        (
+            table.as_usize(),
+            Box::new(move |b| {
+                off + ctx_inc_last_sig_coeff_prefix(b, c_idx, log2_trafo_size, chroma_array_type)
+            }),
+        )
+    } else {
+        let off = table.cm0_ctx_idx_offset(sel.init_type);
+        (
+            0,
+            Box::new(move |b| {
+                off + if c_idx == 0 {
+                    b as usize
+                } else {
+                    11 + b as usize
+                }
+            }),
+        )
+    };
+    for b in 0..prefix {
+        enc.encode_decision(t, ctx_of(b), 1);
+    }
+    if prefix < c_max {
+        enc.encode_decision(t, ctx_of(prefix), 0);
+    }
+    for i in (0..suffix_len).rev() {
+        enc.encode_bypass(((suffix >> i) & 1) as u8);
+    }
+}
+
+/// §9.3.3.8 — write one `coeff_abs_level_remaining` (all bypass): the
+/// TR prefix over `cMax = numBinRem << cRiceParam` chained to the
+/// `k = cRiceParam + 1` EGk suffix — the dual of `decode_abs_level_remaining`.
+fn encode_abs_level_remaining<S: BinSink>(enc: &mut S, c_rice_param: u32, value: u32) {
+    let num_bin_rem = NUM_BIN_REM[c_rice_param.min(3) as usize];
+    let c_max = num_bin_rem << c_rice_param;
+    if value < c_max {
+        let prefix = value >> c_rice_param;
+        for _ in 0..prefix {
+            enc.encode_bypass(1);
+        }
+        enc.encode_bypass(0);
+        for i in (0..c_rice_param).rev() {
+            enc.encode_bypass(((value >> i) & 1) as u8);
+        }
+    } else {
+        for _ in 0..num_bin_rem {
+            enc.encode_bypass(1);
+        }
+        encode_egk_bypass(enc, c_rice_param + 1, value - c_max);
+    }
+}
+
+/// §9.3.3.4 EGk bypass writer — the dual of `CabacEngine::decode_egk_bypass`.
+fn encode_egk_bypass<S: BinSink>(enc: &mut S, k_in: u32, mut value: u32) {
+    let mut k = k_in;
+    while value >= (1u32 << k) {
+        enc.encode_bypass(1);
+        value -= 1u32 << k;
+        k += 1;
+    }
+    enc.encode_bypass(0);
+    for i in (0..k).rev() {
+        enc.encode_bypass(((value >> i) & 1) as u8);
+    }
+}
+
+/// §7.3.8.8 `residual_coding_adv()` **writer** (round 458 encoder) —
+/// the exact dual of [`decode_residual_coding_adv`]: the last
+/// significant coordinate, then per 16-coefficient group in reverse
+/// scan order the significance map, the greaterA / greaterB flags, the
+/// escape remainders and the sign group. Every context is derived over
+/// a mirror of the decoder's progressively filled `TransCoeffLevel`
+/// array (`1` at a significant position until its greater flags land,
+/// the full magnitude once the remainder does), so the stencils see
+/// exactly what the reader sees. `levels` is row-major, non-empty in at
+/// least one position (the caller signals `cbf = 1`).
+#[doc(hidden)]
+pub fn encode_residual_coding_adv<S: BinSink>(
+    enc: &mut S,
+    sel: CtxSel,
+    c_idx: u32,
+    chroma_array_type: u32,
+    levels: &[i32],
+    log2_tb_width: u32,
+    log2_tb_height: u32,
+) {
+    let blk_w = 1usize << log2_tb_width;
+    let blk_h = 1usize << log2_tb_height;
+    let total = blk_w * blk_h;
+    debug_assert_eq!(levels.len(), total);
+    let scan = crate::scan::zig_zag_scan(blk_w, blk_h);
+    let scan_pos_last = scan
+        .iter()
+        .rposition(|&p| levels[p as usize] != 0)
+        .expect("cbf set with all-zero levels");
+    let raster_last = scan[scan_pos_last] as usize;
+    let last_x = (raster_last & (blk_w - 1)) as u32;
+    let last_y = (raster_last >> log2_tb_width) as u32;
+    encode_last_sig_coord(
+        enc,
+        sel,
+        MainCtxTable::LastSigCoeffXPrefix,
+        c_idx,
+        chroma_array_type,
+        log2_tb_width,
+        last_x,
+    );
+    encode_last_sig_coord(
+        enc,
+        sel,
+        MainCtxTable::LastSigCoeffYPrefix,
+        c_idx,
+        chroma_array_type,
+        log2_tb_height,
+        last_y,
+    );
+
+    // The decoder's view of TransCoeffLevel as it fills in.
+    let mut dv = vec![0i32; total];
+    let last_coef_group = scan_pos_last >> 4;
+    let mut i_pos = scan_pos_last as i64;
+    for cg_idx in (0..=last_coef_group as i64).rev() {
+        let sub_block_pos = cg_idx << 4;
+        let mut escape_data_present = false;
+        let mut nz: Vec<(usize, u32, u32)> = Vec::with_capacity(16);
+        while i_pos >= sub_block_pos {
+            let blk_pos = scan[i_pos as usize] as usize;
+            let xc = (blk_pos & (blk_w - 1)) as u32;
+            let yc = (blk_pos >> log2_tb_width) as u32;
+            let sig = levels[blk_pos] != 0;
+            if i_pos as usize != scan_pos_last {
+                let cm1_inc = if sel.cm_init {
+                    let num_flags = stencil_sum(&dv, xc, yc, log2_tb_width, log2_tb_height, |v| {
+                        (v != 0) as u32
+                    });
+                    ctx_inc_sig_coeff_flag(c_idx, xc, yc, num_flags)
+                } else {
+                    0
+                };
+                let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+                let (t, i) = sel.ctx_shaped(MainCtxTable::SigCoeffFlag, cm1_inc, cm0_inc);
+                enc.encode_decision(t, i, u8::from(sig));
+            }
+            if sig {
+                dv[blk_pos] = 1;
+                nz.push((blk_pos, xc, yc));
+            }
+            i_pos -= 1;
+        }
+        let num_nz = nz.len();
+        if num_nz == 0 {
+            continue;
+        }
+        let mut last_greater_a: Option<usize> = None;
+        for (n, &(blk_pos, xc, yc)) in nz.iter().enumerate().take(num_nz.min(8)) {
+            let is_last = n == 0 && cg_idx as usize == last_coef_group;
+            let cm1_inc = if sel.cm_init {
+                let num_flags = stencil_sum(&dv, xc, yc, log2_tb_width, log2_tb_height, |v| {
+                    (v.unsigned_abs() > 1) as u32
+                });
+                ctx_inc_coeff_abs_level_greater_a(c_idx, xc, yc, is_last, num_flags)
+            } else {
+                0
+            };
+            let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, i) = sel.ctx_shaped(MainCtxTable::CoeffAbsLevelGreaterFlag, cm1_inc, cm0_inc);
+            let flag = levels[blk_pos].unsigned_abs() > 1;
+            enc.encode_decision(t, i, u8::from(flag));
+            dv[blk_pos] += flag as i32;
+            if flag {
+                if last_greater_a.is_none() {
+                    last_greater_a = Some(n);
+                } else {
+                    escape_data_present = true;
+                }
+            }
+        }
+        if let Some(n) = last_greater_a {
+            let (blk_pos, xc, yc) = nz[n];
+            let is_last = n == 0 && cg_idx as usize == last_coef_group;
+            let cm1_inc = if sel.cm_init {
+                let num_flags = stencil_sum(&dv, xc, yc, log2_tb_width, log2_tb_height, |v| {
+                    (v.unsigned_abs() > 2) as u32
+                });
+                ctx_inc_coeff_abs_level_greater_b(c_idx, xc, yc, is_last, num_flags)
+            } else {
+                0
+            };
+            let cm0_inc = if c_idx == 0 { 0 } else { 1 };
+            let (t, i) = sel.ctx_shaped(MainCtxTable::CoeffAbsLevelGreaterFlag, cm1_inc, cm0_inc);
+            let flag = levels[blk_pos].unsigned_abs() > 2;
+            enc.encode_decision(t, i, u8::from(flag));
+            dv[blk_pos] += flag as i32;
+            if flag {
+                escape_data_present = true;
+            }
+        }
+        let escape_data_present = escape_data_present || num_nz > 8;
+        let mut count_first_b_coef = 1i32;
+        if escape_data_present {
+            for (n, &(blk_pos, xc, yc)) in nz.iter().enumerate() {
+                let base_level = if n < 8 { 2 + count_first_b_coef } else { 1 };
+                if dv[blk_pos] >= base_level {
+                    let loc_sum = stencil_sum(&dv, xc, yc, log2_tb_width, log2_tb_height, |v| {
+                        v.unsigned_abs()
+                    }) as i32;
+                    let loc_sum_abs = (loc_sum - base_level * 5).clamp(0, 31) as u32;
+                    let c_rice = rice_param_coeff_abs_level_remaining(loc_sum_abs);
+                    let magnitude = levels[blk_pos].unsigned_abs().min(32767) as i32;
+                    debug_assert!(magnitude >= base_level);
+                    encode_abs_level_remaining(enc, c_rice, (magnitude - base_level) as u32);
+                    dv[blk_pos] = magnitude;
+                }
+                if dv[blk_pos] >= 2 {
+                    count_first_b_coef = 0;
+                }
+            }
+        }
+        for &(blk_pos, _, _) in nz.iter() {
+            enc.encode_bypass(u8::from(levels[blk_pos] < 0));
+            if levels[blk_pos] < 0 {
+                dv[blk_pos] = -dv[blk_pos];
+            }
+        }
+    }
+}
+
+/// Rate-distortion optimised quantization for the §7.3.8.8 advanced
+/// residual syntax (round 458) — a candidate-set search rather than a
+/// trellis: the ADCC rate of a coefficient depends on the significance
+/// and magnitude stencils of its already-coded neighbours, the
+/// per-group greaterA/B budget and the escape state, so the run-length
+/// trellis's linear structure does not carry over. Candidates:
+/// nearest rounding; the run-length trellis's level vector (a
+/// well-shaped `D + λ · R` proxy that already trims small tails); the
+/// rounding with every `|level| == 1` coefficient of fractional
+/// magnitude below 0.6 dropped; and the rounding with its last one,
+/// two or three non-zero coefficients (scan order) dropped. Each is
+/// costed as `Σ w · ( c − level )² + λ · R` with `R` the exact bin
+/// string of [`encode_residual_coding_adv`] at the model's context
+/// state plus the `cbf` bin; the all-zero block competes under its
+/// `cbf = 0` cost. Returns `(levels, cbf, cost)` like
+/// [`crate::rdoq::rdoq_rle`].
+pub fn rdoq_adcc(
+    frac: &[f64],
+    weights: &[f64],
+    blk_w: usize,
+    blk_h: usize,
+    chroma_array_type: u32,
+    inputs: &crate::rdoq::RdoqInputs<'_>,
+) -> (Vec<i32>, bool, f64) {
+    let n = blk_w * blk_h;
+    debug_assert_eq!(frac.len(), n);
+    debug_assert_eq!(weights.len(), n);
+    let lambda = inputs.lambda;
+    let sel = inputs.sel;
+    let (cbf_t, cbf_i) = inputs.cbf_ctx;
+    let cbf_cost = |bin: u8| crate::bin_cost::bin_cost(inputs.model.context(cbf_t, cbf_i), bin);
+    let log2_w = (blk_w as u32).trailing_zeros();
+    let log2_h = (blk_h as u32).trailing_zeros();
+    let dist = |levels: &[i32]| -> f64 {
+        frac.iter()
+            .zip(levels.iter())
+            .zip(weights.iter())
+            .map(|((&c, &l), &w)| {
+                let e = c - f64::from(l);
+                w * e * e
+            })
+            .sum()
+    };
+    let zero_cost = dist(&vec![0i32; n]) + lambda * cbf_cost(0);
+    let rounded: Vec<i32> = frac
+        .iter()
+        .map(|v| v.round().clamp(-32767.0, 32767.0) as i32)
+        .collect();
+    if rounded.iter().all(|&l| l == 0) {
+        return (rounded, false, zero_cost);
+    }
+    let scan = crate::scan::zig_zag_scan(blk_w, blk_h);
+    let mut candidates: Vec<Vec<i32>> = Vec::with_capacity(6);
+    candidates.push(rounded.clone());
+    let (proxy, proxy_cbf, _) = crate::rdoq::rdoq_rle(frac, weights, blk_w, blk_h, inputs);
+    if proxy_cbf {
+        candidates.push(proxy);
+    }
+    let biased: Vec<i32> = rounded
+        .iter()
+        .zip(frac.iter())
+        .map(|(&l, &c)| if l.abs() == 1 && c.abs() < 0.6 { 0 } else { l })
+        .collect();
+    candidates.push(biased);
+    let nz_scan: Vec<usize> = scan
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|&p| rounded[p] != 0)
+        .collect();
+    for k in 1..=3usize.min(nz_scan.len().saturating_sub(1)) {
+        let mut trimmed = rounded.clone();
+        for &p in &nz_scan[nz_scan.len() - k..] {
+            trimmed[p] = 0;
+        }
+        candidates.push(trimmed);
+    }
+    let mut best: Option<(Vec<i32>, f64)> = None;
+    for cand in candidates {
+        if cand.iter().all(|&l| l == 0) {
+            continue;
+        }
+        let mut model = inputs.model.clone();
+        let bits = model.measure(|m| {
+            encode_residual_coding_adv(
+                m,
+                sel,
+                inputs.c_idx,
+                chroma_array_type,
+                &cand,
+                log2_w,
+                log2_h,
+            )
+        });
+        let cost = dist(&cand) + lambda * (bits + cbf_cost(1));
+        if best.as_ref().map_or(true, |b| cost < b.1) {
+            best = Some((cand, cost));
+        }
+    }
+    match best {
+        Some((levels, cost)) if cost < zero_cost => (levels, true, cost),
+        _ => (vec![0i32; n], false, zero_cost),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cabac::{CabacEncoder, CabacEngine, InitType};
+
+    /// Round 458: the writer is the exact dual of the reader — random
+    /// level blocks of every size (skewed toward small magnitudes with
+    /// occasional large escapes), both entropy shapes, both init types,
+    /// luma and chroma — and the last-coordinate binarisation inverts
+    /// eqs. 149-152 for every coordinate up to 63.
+    #[test]
+    fn adcc_writer_reads_back() {
+        for v in 0..64u32 {
+            let (prefix, suffix, len) = last_sig_prefix_suffix(v);
+            let back = if prefix > 3 {
+                (1u32 << len) * (2 + (prefix & 1)) + suffix
+            } else {
+                prefix
+            };
+            assert_eq!(back, v);
+            if prefix > 3 {
+                assert_eq!((prefix >> 1) - 1, len);
+            }
+        }
+        let mut seed = 0xADCC_0458u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for &cm in &[false, true] {
+            for &init in &[InitType::I, InitType::Pb] {
+                let sel = CtxSel::new(cm, init);
+                let mut enc = CabacEncoder::new();
+                if cm {
+                    enc.init_main_profile(init, 27);
+                }
+                let mut written: Vec<(u32, u32, u32, Vec<i32>)> = Vec::new();
+                for &(lw, lh) in &[
+                    (1u32, 1u32),
+                    (2, 2),
+                    (3, 2),
+                    (2, 4),
+                    (3, 3),
+                    (4, 4),
+                    (5, 3),
+                    (6, 6),
+                ] {
+                    for c_idx in 0..3u32 {
+                        for density in [1u32, 4, 12, 40] {
+                            let n = 1usize << (lw + lh);
+                            let mut levels = vec![0i32; n];
+                            for l in levels.iter_mut() {
+                                let r = next();
+                                if r % 64 < density {
+                                    let mag = match r % 16 {
+                                        0..=8 => 1,
+                                        9..=12 => 2,
+                                        13 => 3 + (r % 5) as i32,
+                                        14 => 20 + (r % 200) as i32,
+                                        _ => 1000 + (r % 31000) as i32,
+                                    };
+                                    *l = if r & 0x100 != 0 { -mag } else { mag };
+                                }
+                            }
+                            if levels.iter().all(|&l| l == 0) {
+                                levels[(next() as usize) % n] = 1;
+                            }
+                            encode_residual_coding_adv(&mut enc, sel, c_idx, 1, &levels, lw, lh);
+                            written.push((lw, lh, c_idx, levels));
+                        }
+                    }
+                }
+                enc.encode_terminate(true);
+                let bytes = enc.finish();
+                let mut eng = CabacEngine::new(&bytes).unwrap();
+                if cm {
+                    crate::cabac_init::init_main_profile_contexts(&mut eng, init, 27).unwrap();
+                }
+                let mut stats = AdccStats::default();
+                for (lw, lh, c_idx, want) in &written {
+                    let mut got = vec![0i32; want.len()];
+                    decode_residual_coding_adv(
+                        &mut eng, sel, *c_idx, 1, &mut got, &mut stats, *lw, *lh,
+                    )
+                    .unwrap();
+                    assert_eq!(&got, want, "cm{cm} {init:?} {lw}x{lh} c{c_idx}");
+                }
+                assert!(eng.decode_terminate().unwrap());
+            }
+        }
+    }
+
+    /// The candidate search never scores worse than plain rounding under
+    /// its own objective, and its output re-measures to the cost it
+    /// reports.
+    #[test]
+    fn rdoq_adcc_beats_rounding_and_accounts_exactly() {
+        use crate::bin_cost::BitCostModel;
+        use crate::quant_enc::{forward_transform_fractional, level_unit_sse_weights};
+        use crate::rdoq::RdoqInputs;
+        let mut seed = 0x0458_ADCCu32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) as i32 % 121) - 60
+        };
+        for &cm in &[false, true] {
+            for &(w, h, qp) in &[(4usize, 4usize, 20), (8, 8, 30), (16, 8, 38), (32, 32, 44)] {
+                let sel = CtxSel::new(cm, InitType::I).with_adcc(true);
+                let mut model = BitCostModel::new();
+                if cm {
+                    model.init_main_profile(InitType::I, qp);
+                }
+                let res: Vec<i32> = (0..w * h).map(|_| next() / 4).collect();
+                let frac = forward_transform_fractional(&res, w, h, qp, 8).unwrap();
+                let weights = level_unit_sse_weights(w, h, qp, 8);
+                let lambda = crate::slice_enc::rd_lambda(qp, 8);
+                let inp = RdoqInputs::new(&model, lambda, sel, 0, MainCtxTable::CbfLuma);
+                let (levels, cbf, cost) = rdoq_adcc(&frac, &weights, w, h, 1, &inp);
+                let dist = |l: &[i32]| -> f64 {
+                    frac.iter()
+                        .zip(l.iter())
+                        .zip(weights.iter())
+                        .map(|((&c, &v), &wt)| wt * (c - f64::from(v)).powi(2))
+                        .sum()
+                };
+                let (ct, ci) = inp.cbf_ctx;
+                let rounded: Vec<i32> = frac.iter().map(|v| v.round() as i32).collect();
+                let round_cost = if rounded.iter().all(|&v| v == 0) {
+                    dist(&rounded) + lambda * model.decision_cost(ct, ci, 0)
+                } else {
+                    let mut m = model.clone();
+                    let bits = m.measure(|m| {
+                        encode_residual_coding_adv(
+                            m,
+                            sel,
+                            0,
+                            1,
+                            &rounded,
+                            w.trailing_zeros(),
+                            h.trailing_zeros(),
+                        )
+                    });
+                    dist(&rounded) + lambda * (bits + model.decision_cost(ct, ci, 1))
+                };
+                assert!(
+                    cost <= round_cost + 1e-9,
+                    "cm{cm} {w}x{h} qp{qp}: {cost} > {round_cost}"
+                );
+                let remeasured = if cbf {
+                    let mut m = model.clone();
+                    let bits = m.measure(|m| {
+                        encode_residual_coding_adv(
+                            m,
+                            sel,
+                            0,
+                            1,
+                            &levels,
+                            w.trailing_zeros(),
+                            h.trailing_zeros(),
+                        )
+                    });
+                    dist(&levels) + lambda * (bits + model.decision_cost(ct, ci, 1))
+                } else {
+                    assert!(levels.iter().all(|&v| v == 0));
+                    dist(&levels) + lambda * model.decision_cost(ct, ci, 0)
+                };
+                assert!(
+                    (remeasured - cost).abs() < 1e-6,
+                    "cm{cm} {w}x{h}: {remeasured} vs {cost}"
+                );
+            }
+        }
+    }
 
     /// Single DC coefficient of +1 under the Baseline `(0, 0)` collapse:
     /// `last_sig = (0, 0)` (two single-bin TR prefixes), the sig flag is

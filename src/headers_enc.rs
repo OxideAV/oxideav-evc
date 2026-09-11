@@ -72,6 +72,10 @@ pub struct EncSequenceConfig {
     /// 458; Table A.6 binIdx 15, `0x8000`). §7.3.2.1 reads it only
     /// under `sps_iqt_flag == 1`, so `ats` requires `iqt`.
     pub ats: bool,
+    /// `sps_adcc_flag` (§7.4.3.1) — advanced residual coding (round
+    /// 458; Table A.6 binIdx 9, `0x200`). §7.3.2.1 reads it only under
+    /// `sps_cm_init_flag == 1`, so `adcc` requires `cm_init`.
+    pub adcc: bool,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -126,6 +130,11 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
             "evc enc sps: sps_ats_flag is only coded under sps_iqt_flag == 1 (§7.3.2.1)",
         ));
     }
+    if cfg.adcc && !cfg.cm_init {
+        return Err(Error::invalid(
+            "evc enc sps: sps_adcc_flag is only coded under sps_cm_init_flag == 1 (§7.3.2.1)",
+        ));
+    }
     let main = cfg.cm_init || cfg.eipd || cfg.btt || cfg.iqt || cfg.ats;
     // Table A.6: binIdx 14 = sps_cm_init_flag (0x4000), binIdx 8 =
     // sps_eipd_flag (0x100), binIdx 0 = sps_btt_flag (0x1), binIdx 11 =
@@ -135,7 +144,8 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         | (if cfg.eipd { 0x100 } else { 0 })
         | (if cfg.btt { 0x1 } else { 0 })
         | (if cfg.iqt { 0x800 } else { 0 })
-        | (if cfg.ats { 0x8000 } else { 0 });
+        | (if cfg.ats { 0x8000 } else { 0 })
+        | (if cfg.adcc { 0x200 } else { 0 });
     w.ue(0); // sps_seq_parameter_set_id
     w.u(8, u32::from(main)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
@@ -163,7 +173,7 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     }
     w.u1(cfg.cm_init); // sps_cm_init_flag
     if cfg.cm_init {
-        w.u1(false); // sps_adcc_flag (§7.3.2.1: present when cm_init)
+        w.u1(cfg.adcc); // sps_adcc_flag (§7.3.2.1: present when cm_init)
     }
     w.u1(cfg.iqt); // sps_iqt_flag
     if cfg.iqt {
@@ -396,6 +406,7 @@ mod tests {
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -453,6 +464,7 @@ mod tests {
                 btt: false,
                 iqt: false,
                 ats: false,
+                adcc: false,
             };
             let rbsp = write_sps_rbsp(&cfg).unwrap();
             let sps = crate::sps::parse(&rbsp).unwrap();
@@ -487,6 +499,7 @@ mod tests {
             btt: true,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.profile_idc, 1);
@@ -501,6 +514,16 @@ mod tests {
         let sps = crate::sps::parse(&write_sps_rbsp(&with_ats).unwrap()).unwrap();
         assert!(sps.sps_iqt_flag && sps.sps_ats_flag);
         assert_eq!(sps.toolset_idc_h, 0x4101 | 0x800 | 0x8000);
+        let with_adcc = EncSequenceConfig { adcc: true, ..cfg };
+        let sps = crate::sps::parse(&write_sps_rbsp(&with_adcc).unwrap()).unwrap();
+        assert!(sps.sps_adcc_flag);
+        assert_eq!(sps.toolset_idc_h, 0x4101 | 0x200);
+        assert!(write_sps_rbsp(&EncSequenceConfig {
+            cm_init: false,
+            adcc: true,
+            ..cfg
+        })
+        .is_err());
         assert!(write_sps_rbsp(&EncSequenceConfig {
             iqt: false,
             ats: true,
@@ -540,6 +563,7 @@ mod tests {
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -584,6 +608,7 @@ mod tests {
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -663,6 +688,7 @@ mod tests {
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -722,6 +748,7 @@ mod tests {
             btt: false,
             iqt: false,
             ats: false,
+            adcc: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

@@ -50,6 +50,14 @@
 //!   (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64) and the
 //!   lookahead RD search over rectangular leaves. `btt=0` restores the
 //!   quad tree.
+//! * `adcc` — **advanced residual coding** (round 458), default
+//!   **off**: `sps_adcc_flag = 1`, the §7.3.8.8 last-position /
+//!   significance / greater-flag / escape syntax with its candidate-set
+//!   RDOQ instead of the §7.3.8.7 run-length coding. Requires
+//!   `cm_init`; `adcc=1 cm_init=0` is refused. Off by default because
+//!   on the crate's noise-heavy corpus it costs more bits than the
+//!   run-length syntax at the same reconstruction (see the CHANGELOG
+//!   round-458 entry).
 //! * `ats` — **adaptive transform selection** (round 458), default
 //!   **on**: `sps_ats_flag = 1` — every intra luma TB up to 32×32 also
 //!   trials the four DST-VII / DCT-VIII kernel pairs, every inter
@@ -210,6 +218,7 @@ fn encode_idr_au_coded(
         btt,
         iqt,
         ats,
+        adcc,
     } = tools;
     let (payload, recon, stats) =
         crate::slice_enc::encode_idr_slice_data_cfg(src, slice_qp, tools)?;
@@ -230,6 +239,7 @@ fn encode_idr_au_coded(
         btt,
         iqt,
         ats,
+        adcc,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -396,6 +406,14 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
             "evc encoder: ats=1 requires iqt=1 (§7.3.2.1 codes sps_ats_flag under sps_iqt_flag)",
         ));
     }
+    // Round 458: advanced residual coding — default OFF (a measured
+    // loss on the corpus; see the module doc).
+    let adcc = parse_bool("adcc", false)?;
+    if adcc && !cm_init {
+        return Err(Error::invalid(
+            "evc encoder: adcc=1 requires cm_init=1 (§7.3.2.1 codes sps_adcc_flag under sps_cm_init_flag)",
+        ));
+    }
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -536,6 +554,7 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         btt,
         iqt,
         ats,
+        adcc,
         gop,
         refs,
         b_pictures,
@@ -733,6 +752,8 @@ pub struct EvcEncoder {
     iqt: bool,
     /// `sps_ats_flag`.
     ats: bool,
+    /// `sps_adcc_flag`.
+    adcc: bool,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
     /// units, the rest low-delay P/B pictures.
     gop: u32,
@@ -843,6 +864,7 @@ impl EvcEncoder {
                 btt: self.btt,
                 iqt: self.iqt,
                 ats: self.ats,
+                adcc: self.adcc,
             },
         )?;
         let off = iqt_chroma_qp_offset(frame_qp, self.iqt);
@@ -909,6 +931,7 @@ impl Encoder for EvcEncoder {
                     btt: self.btt,
                     iqt: self.iqt,
                     ats: self.ats,
+                    adcc: self.adcc,
                 },
                 self.refs,
                 (self.coded_w - self.width, self.coded_h - self.height),
@@ -1082,6 +1105,7 @@ mod tests {
         p.options.insert("eipd", "0");
         p.options.insert("btt", "0");
         p.options.insert("ats", "0");
+        p.options.insert("adcc", "0");
         p
     }
 
@@ -1821,6 +1845,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 458 — **ADCC** through the registry: P and B GOPs with the
+    /// §7.3.8.8 residual syntax (on top of BTT / EIPD / IQT+ATS) decode
+    /// sample-exactly; `adcc=1 cm_init=0` is refused.
+    #[test]
+    fn adcc_gop_round_trips_through_the_registry() {
+        let (w, h) = (72u32, 40u32);
+        for &b in &[false, true] {
+            let mut p = params(w, h);
+            p.options.insert("gop", "4");
+            p.options.insert("refs", "2");
+            p.options.insert("qp", "22");
+            p.options.insert("btt", "1");
+            p.options.insert("eipd", "1");
+            p.options.insert("ats", "1");
+            p.options.insert("adcc", "1");
+            p.options.insert("deblock", "1");
+            p.options.insert("b", if b { "1" } else { "0" });
+            let mut enc = make_evc_encoder(&p).unwrap();
+            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+            for t in 0..5usize {
+                enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                let pkt = enc.receive_packet().unwrap();
+                if t == 0 {
+                    let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                    let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                    assert!(sps.sps_adcc_flag && sps.sps_cm_init_flag);
+                }
+                dec.send_packet(&pkt).unwrap();
+                let vf = match dec.receive_frame().unwrap() {
+                    Frame::Video(vf) => vf,
+                    other => panic!("expected video frame, got {other:?}"),
+                };
+                let recon = enc.last_recon().unwrap();
+                for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                    let got: Vec<u16> = vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                    let stride = if c == 0 {
+                        recon.y_stride()
+                    } else {
+                        recon.c_stride()
+                    };
+                    let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                    let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                    for yy in 0..rows {
+                        assert_eq!(
+                            &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                            &plane[yy * stride..yy * stride + cols],
+                            "b{b} frame {t} plane {c} row {yy}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut bad = params(w, h);
+        bad.options.insert("adcc", "1");
+        bad.options.insert("cm_init", "0");
+        assert!(make_encoder(&bad).is_err());
     }
 
     /// Round 458 — **IQT + ATS** through the registry: P and B GOPs

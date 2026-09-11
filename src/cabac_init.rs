@@ -670,12 +670,26 @@ pub struct CtxSel {
     /// §9.3.2.2 `initType`: [`InitType::I`] for I slices, [`InitType::Pb`]
     /// for P/B slices.
     pub init_type: InitType,
+    /// `sps_adcc_flag` (§7.4.3.1) — the residual syntax the encoder
+    /// writes: the §7.3.8.8 advanced coding when set, the §7.3.8.7
+    /// run-length coding otherwise (round 458; the decoder gates on its
+    /// walker inputs and ignores this field).
+    pub adcc: bool,
 }
 
 impl CtxSel {
-    /// Build the selector for a slice.
+    /// Build the selector for a slice (run-length residual syntax).
     pub fn new(cm_init: bool, init_type: InitType) -> Self {
-        Self { cm_init, init_type }
+        Self {
+            cm_init,
+            init_type,
+            adcc: false,
+        }
+    }
+
+    /// The same selector with the residual syntax chosen.
+    pub fn with_adcc(self, adcc: bool) -> Self {
+        Self { adcc, ..self }
     }
 
     /// The Baseline shape: `sps_cm_init_flag == 0`, I-slice init type.

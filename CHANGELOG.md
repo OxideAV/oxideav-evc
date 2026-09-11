@@ -4,6 +4,42 @@
 
 ### Other
 
+- **Encoder: ADCC — the §7.3.8.8 advanced residual coding writer and
+  its RDOQ (round 458), default off.** `adcc.rs` gains
+  `encode_residual_coding_adv`, the exact dual of the reader: the
+  last-significant coordinate as TR prefix (no terminator at `cMax`)
+  plus FL bypass suffix (eqs. 149-152 inverted), then per
+  16-coefficient group in reverse scan order the significance map, the
+  first-eight greaterA flags with the single greaterB, the §9.3.3.8
+  Rice/EGk escape remainders and the sign group — every context derived
+  over a mirror of the decoder's progressively filled
+  `TransCoeffLevel` array so the stencils see what the reader sees.
+  `rdoq_adcc` is a candidate-set optimiser (nearest rounding, the
+  run-length trellis's vector, biased rounding, one-to-three-coefficient
+  tail trims, the all-zero block), each costed with the exact ADCC bin
+  string at the model's context state — the ADCC rate depends on the
+  neighbour stencils, the per-group greater budget and the escape
+  state, so the run-length trellis's linear recurrence does not carry
+  over. `CtxSel` carries the residual syntax (`with_adcc`), the shared
+  `emit_residual` writer dispatches on it, the SPS codes `sps_adcc_flag`
+  under `sps_cm_init_flag` (Table A.6 bit 9); registry option `adcc`
+  (`adcc=1 cm_init=0` refused). **Measured: a loss on this corpus** —
+  intra +1.0 % Y, P +2.9 % Y BD-rate against the run-length syntax,
+  and on identical level vectors the ADCC string costs 1-2 % more bits
+  on sparse blocks and 10-19 % more on dense large-magnitude ones: the
+  run-length `coeff_abs_level_minus1` is a context-coded unary whose
+  continuation bin adapts toward certainty on consistently large
+  levels, while the ADCC escape is bypass-coded at a fixed Rice/EGk
+  length, and this corpus (±5 noise on every sample, a 41-level noise
+  band) is exactly the dense, large-magnitude regime. Hence off by
+  default; the writer is pinned (random level blocks of every shape
+  read back on both entropy shapes and init types, intra size × QP ×
+  tree × ATS matrix through the decoder's `sps_adcc_flag == 1` walker
+  with the run-length bins asserted absent, P/B GOPs through the
+  registry, the candidate search never worse than rounding under its
+  own objective). Follow-up: a proper ADCC trellis (group-aware
+  greaterA/B budget) would narrow the gap on sparse content.
+
 - **Encoder: IQT + ATS — the improved quantization / transform chain
   and adaptive transform selection (round 458).** The forward
   quantizer (`quant_enc`) is generalised over a `TransformSpec`: the
