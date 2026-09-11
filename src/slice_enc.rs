@@ -52,16 +52,21 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::ats::{self, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
-use crate::dequant::scale_and_inverse_transform;
+use crate::dequant::scale_and_inverse_transform_ats;
 use crate::eipd_mode::{derive_chroma_mode, ModeSelector};
+use crate::eipd_syntax::EipdCtx;
 use crate::intra::{predict, IntraMode, RefSamples};
 use crate::intra_enc::{self, IntraSel};
 use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile, YuvPicture};
-use crate::quant_enc::{forward_quantize, forward_transform_fractional, level_unit_sse_weights};
+use crate::quant_enc::{
+    forward_quantize_typed, forward_transform_fractional_typed, level_unit_sse_weights_typed,
+    TransformSpec,
+};
 use crate::rdoq::{rdoq_rle, RdoqInputs};
 use crate::slice_data::zigzag_scan;
 use crate::tree_enc::{self, TreeCoder, TreeGeometry, TreeNode, TreeStats};
@@ -125,6 +130,10 @@ impl Default for EncStats {
 /// exact bin stream whose decode lands on the already-committed recon.
 struct LeafPlan {
     intra: IntraSel,
+    /// The §7.3.8.5 ATS-intra decision of the luma TB (round 458;
+    /// `disabled` = plain DCT-II, and nothing signalled unless
+    /// `sps_ats_flag` gates it in).
+    ats: AtsIntra,
     levels_y: Vec<i32>,
     cbf_y: bool,
     levels_cb: Vec<i32>,
@@ -154,6 +163,32 @@ struct EncCtx<'a> {
     side_info: SideInfoGrid,
     /// The coding-tree shape (`sps_btt_flag`) and its size limits.
     geom: TreeGeometry,
+    /// `sps_iqt_flag` — the §8.7 improved quantization / transform chain.
+    iqt: bool,
+    /// `sps_ats_flag` — the ATS-intra kernel search on every luma TB.
+    ats: bool,
+    /// `slice_cb_qp_offset == slice_cr_qp_offset` the slice header
+    /// carries ([`crate::headers_enc::iqt_chroma_qp_offset`]).
+    chroma_qp_offset: i32,
+}
+
+/// The SPS tool set an IDR picture is coded under (round 458) — the
+/// switches of [`encode_idr_slice_data_cfg`]; the SPS the caller
+/// writes must declare the same flags ([`crate::headers_enc`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntraToolset {
+    /// `slice_deblocking_filter_flag`.
+    pub deblock: bool,
+    /// `sps_cm_init_flag`.
+    pub cm_init: bool,
+    /// `sps_eipd_flag`.
+    pub eipd: bool,
+    /// `sps_btt_flag`.
+    pub btt: bool,
+    /// `sps_iqt_flag` (required by `ats`).
+    pub iqt: bool,
+    /// `sps_ats_flag`.
+    pub ats: bool,
 }
 
 /// The decode-order state a tree trial rewinds: the block's recon,
@@ -294,6 +329,42 @@ pub fn encode_idr_slice_data_tree(
     eipd: bool,
     btt: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_slice_data_cfg(
+        src,
+        slice_qp,
+        IntraToolset {
+            deblock,
+            cm_init,
+            eipd,
+            btt,
+            iqt: false,
+            ats: false,
+        },
+    )
+}
+
+/// The general IDR `slice_data()` encoder over an [`IntraToolset`]
+/// (round 458): every earlier entry point is a projection of this one.
+/// `ats` requires `iqt` (§7.3.2.1 reads `sps_ats_flag` only under
+/// `sps_iqt_flag == 1`).
+pub fn encode_idr_slice_data_cfg(
+    src: &YuvPicture,
+    slice_qp: i32,
+    tools: IntraToolset,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    let IntraToolset {
+        deblock,
+        cm_init,
+        eipd,
+        btt,
+        iqt,
+        ats,
+    } = tools;
+    if ats && !iqt {
+        return Err(Error::invalid(
+            "evc encoder: sps_ats_flag requires sps_iqt_flag (§7.3.2.1)",
+        ));
+    }
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
             "evc encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
@@ -324,6 +395,9 @@ pub fn encode_idr_slice_data_tree(
         eipd,
         side_info: SideInfoGrid::new(src.width, src.height),
         geom: TreeGeometry::encoder(src.width, src.height, btt),
+        iqt,
+        ats,
+        chroma_qp_offset: crate::headers_enc::iqt_chroma_qp_offset(slice_qp, iqt),
     };
     let mut stats = EncStats::default();
     // The decide pass's rate model: the same context table the emit
@@ -375,7 +449,9 @@ pub fn encode_idr_slice_data_tree(
                            lw: u32,
                            lh: u32,
                            plan: &LeafPlan| {
-            emit_leaf(enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, x0, y0, lw, lh);
+            emit_leaf(
+                enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, ctx.ats, x0, y0, lw, lh,
+            );
             grid.stamp_block(
                 x0,
                 y0,
@@ -424,8 +500,9 @@ pub fn encode_idr_slice_data_tree(
             stamp_decided(&mut side_info, slice_qp, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
         }
         crate::deblock::deblock_luma(&mut ctx.recon, &side_info, slice_qp)?;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, 0, 1)?;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, 0, 2)?;
+        let off = ctx.chroma_qp_offset;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 1)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 2)?;
     }
     Ok((enc.finish(), ctx.recon, stats))
 }
@@ -499,8 +576,10 @@ fn decide_leaf(
     // luma bit-depth offset and the chroma ChromaQpTable mapping (the
     // encoder's SPS declares sps_iqt_flag = 0 and zero chroma offsets).
     let qp_y = crate::dequant::qp_prime_y(ctx.qp, bd);
-    let qp_c = crate::dequant::qp_prime_c(ctx.qp, 0, bd, false);
+    let qp_c = crate::dequant::qp_prime_c(ctx.qp, ctx.chroma_qp_offset, bd, ctx.iqt);
     let lambda_c = rd_lambda_at_qp_prime(qp_c);
+    let spec = TransformSpec::dct(ctx.iqt);
+    let ats_present = ctx.ats && log2_w <= 5 && log2_h <= 5;
     let wc = 1usize << (log2_w - 1);
     let hc = 1usize << (log2_h - 1);
     let src_cb = gather_block(&ctx.src.cb, ctx.src.c_stride(), x0 >> 1, y0 >> 1, wc, hc);
@@ -523,29 +602,59 @@ fn decide_leaf(
             ctx.lambda,
             |selector| mode_bits(model, selector),
         );
-        let mut best: Option<(i32, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best: Option<EipdLumaCand> = None;
         let mut best_cost = f64::INFINITY;
         for &mode in &cands {
             let pred = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 0, mode);
             let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
             let (levels, cbf, res, dist) =
-                quantize_pred(&pred, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
+                quantize_pred(&pred, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq), spec)?;
             let selector = intra_enc::selector_for(&lists, mode);
-            let bits = model.measure(|m| {
-                intra_enc::emit_luma_selector(m, sel, selector);
-                let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-                m.encode_decision(t, i, u8::from(cbf));
-                if cbf {
-                    emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
-                }
-            });
+            let mode_bits = model.measure(|m| intra_enc::emit_luma_selector(m, sel, selector));
+            let bits = mode_bits
+                + luma_tail_bits(
+                    model,
+                    sel,
+                    ats_present,
+                    AtsIntra::disabled(),
+                    cbf,
+                    &levels,
+                    log2_w,
+                    log2_h,
+                );
             let cost = dist + ctx.lambda * bits;
             if cost < best_cost {
                 best_cost = cost;
-                best = Some((mode, levels, cbf, res));
+                best = Some((mode, levels, cbf, res, pred, mode_bits));
             }
         }
-        let (mode_y, levels_y, cbf_y, res_y) = best.expect("at least one candidate");
+        let (mode_y, levels_y, cbf_y, res_y, pred_y, mode_bits) =
+            best.expect("at least one candidate");
+        let mut luma = LumaChoice {
+            levels: levels_y,
+            cbf: cbf_y,
+            res: res_y,
+            cost: best_cost,
+            ats: AtsIntra::disabled(),
+        };
+        if ats_present {
+            let q = IntraQuantCtx {
+                bit_depth: bd,
+                lambda: ctx.lambda,
+                sel,
+                iqt: ctx.iqt,
+            };
+            refine_luma_ats(
+                &q, model, &pred_y, &src_y, log2_w, log2_h, qp_y, mode_bits, &mut luma,
+            )?;
+        }
+        let LumaChoice {
+            levels: levels_y,
+            cbf: cbf_y,
+            res: res_y,
+            cost: best_cost,
+            ats: ats_y,
+        } = luma;
         intra_reconstruct_cb_eipd_in_tile(
             &mut ctx.recon,
             x0,
@@ -567,11 +676,29 @@ fn decide_leaf(
             let pred_cb = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 1, mode_c);
             let pred_cr = intra_enc::predict(&ctx.recon, x0, y0, log2_w, log2_h, 2, mode_c);
             let rdoq_cb = RdoqInputs::new(model, lambda_c, sel, 1, MainCtxTable::CbfCb);
-            let (lv_cb, cbf_cb, res_cb, d_cb) =
-                quantize_pred(&pred_cb, &src_cb, wc, hc, qp_c, bd, max_val, Some(&rdoq_cb))?;
+            let (lv_cb, cbf_cb, res_cb, d_cb) = quantize_pred(
+                &pred_cb,
+                &src_cb,
+                wc,
+                hc,
+                qp_c,
+                bd,
+                max_val,
+                Some(&rdoq_cb),
+                spec,
+            )?;
             let rdoq_cr = RdoqInputs::new(model, lambda_c, sel, 2, MainCtxTable::CbfCr);
-            let (lv_cr, cbf_cr, res_cr, d_cr) =
-                quantize_pred(&pred_cr, &src_cr, wc, hc, qp_c, bd, max_val, Some(&rdoq_cr))?;
+            let (lv_cr, cbf_cr, res_cr, d_cr) = quantize_pred(
+                &pred_cr,
+                &src_cr,
+                wc,
+                hc,
+                qp_c,
+                bd,
+                max_val,
+                Some(&rdoq_cr),
+                spec,
+            )?;
             let bits = model.measure(|m| {
                 intra_enc::emit_chroma_pred_mode(m, sel, raw);
                 let (t, i) = sel.ctx(MainCtxTable::CbfCb, 0);
@@ -614,6 +741,7 @@ fn decide_leaf(
                     mode_y,
                     chroma_raw: raw,
                 },
+                ats: ats_y,
                 levels_y,
                 cbf_y,
                 levels_cb,
@@ -626,28 +754,68 @@ fn decide_leaf(
     } else {
         // ---- Baseline luma: 5-mode search over the decoder's reference fetch ----
         let refs = ctx.recon.fetch_intra_refs(x0, y0, w, h, 0);
-        let mut best: Option<(usize, Vec<i32>, bool, Vec<i32>)> = None;
+        let mut best: Option<BaselineLumaCand> = None;
         let mut best_cost = f64::INFINITY;
         for (mode_idx, &mode) in MODES.iter().enumerate() {
             let rdoq = RdoqInputs::new(model, ctx.lambda, sel, 0, MainCtxTable::CbfLuma);
-            let (levels, cbf, res, dist) =
-                quantize_block(&refs, mode, &src_y, w, h, qp_y, bd, max_val, Some(&rdoq))?;
-            let bits = model.measure(|m| {
-                emit_intra_pred_mode(m, sel, mode_idx);
-                let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
-                m.encode_decision(t, i, u8::from(cbf));
-                if cbf {
-                    emit_residual_rle(m, sel, 0, &levels, log2_w, log2_h);
-                }
-            });
+            let (levels, cbf, res, dist) = quantize_block(
+                &refs,
+                mode,
+                &src_y,
+                w,
+                h,
+                qp_y,
+                bd,
+                max_val,
+                Some(&rdoq),
+                spec,
+            )?;
+            let mode_bits = model.measure(|m| emit_intra_pred_mode(m, sel, mode_idx));
+            let bits = mode_bits
+                + luma_tail_bits(
+                    model,
+                    sel,
+                    ats_present,
+                    AtsIntra::disabled(),
+                    cbf,
+                    &levels,
+                    log2_w,
+                    log2_h,
+                );
             let cost = dist + ctx.lambda * bits;
             if cost < best_cost {
                 best_cost = cost;
-                best = Some((mode_idx, levels, cbf, res));
+                best = Some((mode_idx, levels, cbf, res, mode_bits));
             }
         }
-        let (mode_idx, levels_y, cbf_y, res_y) = best.expect("5 candidates");
-        let cost_y = best_cost;
+        let (mode_idx, levels_y, cbf_y, res_y, mode_bits) = best.expect("5 candidates");
+        let mut luma = LumaChoice {
+            levels: levels_y,
+            cbf: cbf_y,
+            res: res_y,
+            cost: best_cost,
+            ats: AtsIntra::disabled(),
+        };
+        if ats_present {
+            let mut pred = vec![0i32; w * h];
+            predict(MODES[mode_idx], &refs, w, h, bd, &mut pred);
+            let q = IntraQuantCtx {
+                bit_depth: bd,
+                lambda: ctx.lambda,
+                sel,
+                iqt: ctx.iqt,
+            };
+            refine_luma_ats(
+                &q, model, &pred, &src_y, log2_w, log2_h, qp_y, mode_bits, &mut luma,
+            )?;
+        }
+        let LumaChoice {
+            levels: levels_y,
+            cbf: cbf_y,
+            res: res_y,
+            cost: cost_y,
+            ats: ats_y,
+        } = luma;
         intra_reconstruct_cb_in_tile(
             &mut ctx.recon,
             x0,
@@ -686,6 +854,7 @@ fn decide_leaf(
                 bd,
                 max_val,
                 Some(&rdoq),
+                spec,
             )?;
             let bits = model.measure(|m| {
                 let (t, i) = sel.ctx(table, 0);
@@ -713,6 +882,7 @@ fn decide_leaf(
         (
             LeafPlan {
                 intra: IntraSel::Baseline(mode_idx),
+                ats: ats_y,
                 levels_y,
                 cbf_y,
                 levels_cb,
@@ -736,6 +906,7 @@ fn decide_leaf(
             &ctx.side_info,
             ctx.pic_w,
             ctx.pic_h,
+            ctx.ats,
             x0,
             y0,
             log2_w,
@@ -752,9 +923,122 @@ fn decide_leaf(
     Ok((plan, cost))
 }
 
-/// Quantize one residual block: the RDOQ trellis when `rdoq` is given
-/// (levels chosen under `D + λ · R` at the model's context state), else
-/// nearest-level rounding. Returns `(levels, cbf)`.
+/// An EIPD luma candidate under evaluation: `(mode, levels, cbf,
+/// residual, prediction, mode bits)`.
+pub(crate) type EipdLumaCand = (i32, Vec<i32>, bool, Vec<i32>, Vec<i32>, f64);
+/// A Baseline luma candidate under evaluation: `(mode index, levels,
+/// cbf, residual, mode bits)`.
+pub(crate) type BaselineLumaCand = (usize, Vec<i32>, bool, Vec<i32>, f64);
+
+/// The decided luma transform block of an intra leaf under evaluation.
+pub(crate) struct LumaChoice {
+    pub levels: Vec<i32>,
+    pub cbf: bool,
+    pub res: Vec<i32>,
+    /// `D + λ · R` including the mode syntax.
+    pub cost: f64,
+    pub ats: AtsIntra,
+}
+
+/// The exact rate of an intra luma TB's tail — `cbf_luma`, the
+/// §7.3.8.5 ATS-intra group when it is present (`sps_ats_flag`, both
+/// sides ≤ 32, `cbf_luma == 1`) and the residual string — at the
+/// model's current context state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luma_tail_bits(
+    model: &mut BitCostModel,
+    sel: CtxSel,
+    ats_present: bool,
+    ats: AtsIntra,
+    cbf: bool,
+    levels: &[i32],
+    log2_w: u32,
+    log2_h: u32,
+) -> f64 {
+    model.measure(|m| {
+        let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
+        m.encode_decision(t, i, u8::from(cbf));
+        if cbf {
+            if ats_present {
+                ats::write_ats_intra(m, EipdCtx::for_slice(sel.cm_init, sel.init_type), ats);
+            }
+            emit_residual_rle(m, sel, 0, levels, log2_w, log2_h);
+        }
+    })
+}
+
+/// §7.3.8.5 ATS-intra search (round 458): re-quantize the chosen
+/// mode's luma residual under each Table-30 kernel pair (DST-VII /
+/// DCT-VIII per direction, `sps_iqt_flag` chain) with the RDOQ
+/// trellis, and keep whichever of the five transforms minimises
+/// `D + λ · R` — `R` including the `ats_cu_intra_flag` /
+/// `ats_hor_mode` / `ats_ver_mode` bins at the current context state.
+/// `mode_bits` is the (transform-independent) rate of the mode syntax.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refine_luma_ats(
+    ctx: &IntraQuantCtx,
+    model: &mut BitCostModel,
+    pred: &[i32],
+    src: &[i32],
+    log2_w: u32,
+    log2_h: u32,
+    qp_y: i32,
+    mode_bits: f64,
+    best: &mut LumaChoice,
+) -> Result<()> {
+    let (w, h) = (1usize << log2_w, 1usize << log2_h);
+    let max_val = (1i32 << ctx.bit_depth) - 1;
+    for choice in ats::ATS_INTRA_CHOICES {
+        let spec = TransformSpec {
+            tr_type_hor: choice.tr_type_hor,
+            tr_type_ver: choice.tr_type_ver,
+            sps_iqt_flag: ctx.iqt,
+        };
+        let rdoq = RdoqInputs::new(model, ctx.lambda, ctx.sel, 0, MainCtxTable::CbfLuma);
+        let (levels, cbf, res, dist) = quantize_pred(
+            pred,
+            src,
+            w,
+            h,
+            qp_y,
+            ctx.bit_depth,
+            max_val,
+            Some(&rdoq),
+            spec,
+        )?;
+        if !cbf {
+            // A silent TB signals no kernel; the DCT-II candidate
+            // already covers it.
+            continue;
+        }
+        let bits =
+            mode_bits + luma_tail_bits(model, ctx.sel, true, choice, cbf, &levels, log2_w, log2_h);
+        let cost = dist + ctx.lambda * bits;
+        if cost < best.cost {
+            *best = LumaChoice {
+                levels,
+                cbf,
+                res,
+                cost,
+                ats: choice,
+            };
+        }
+    }
+    Ok(())
+}
+
+/// What [`refine_luma_ats`] needs of a slice encoder's state.
+#[derive(Clone, Copy)]
+pub(crate) struct IntraQuantCtx {
+    pub bit_depth: u32,
+    pub lambda: f64,
+    pub sel: CtxSel,
+    pub iqt: bool,
+}
+
+/// Quantize one residual block under `spec`: the RDOQ trellis when
+/// `rdoq` is given (levels chosen under `D + λ · R` at the model's
+/// context state), else nearest-level rounding. Returns `(levels, cbf)`.
 pub(crate) fn quantize_residual(
     diff: &[i32],
     w: usize,
@@ -762,17 +1046,18 @@ pub(crate) fn quantize_residual(
     qp: i32,
     bit_depth: u32,
     rdoq: Option<&RdoqInputs<'_>>,
+    spec: TransformSpec,
 ) -> Result<(Vec<i32>, bool)> {
     match rdoq {
         Some(inp) => {
-            let frac = forward_transform_fractional(diff, w, h, qp, bit_depth)?;
-            let weights = level_unit_sse_weights(w, h, qp, bit_depth);
+            let frac = forward_transform_fractional_typed(diff, w, h, qp, bit_depth, spec)?;
+            let weights = level_unit_sse_weights_typed(w, h, qp, bit_depth, spec);
             let (levels, cbf, _cost) = rdoq_rle(&frac, &weights, w, h, inp);
             Ok((levels, cbf))
         }
         None => {
             let mut levels = vec![0i32; w * h];
-            let cbf = forward_quantize(diff, &mut levels, w, h, qp, bit_depth)?;
+            let cbf = forward_quantize_typed(diff, &mut levels, w, h, qp, bit_depth, spec)?;
             Ok((levels, cbf))
         }
     }
@@ -833,11 +1118,12 @@ pub(crate) fn quantize_block(
     bit_depth: u32,
     max_val: i32,
     rdoq: Option<&RdoqInputs<'_>>,
+    spec: TransformSpec,
 ) -> Result<(Vec<i32>, bool, Vec<i32>, f64)> {
     let n = w * h;
     let mut pred = vec![0i32; n];
     predict(mode, refs, w, h, bit_depth, &mut pred);
-    quantize_pred(&pred, src, w, h, qp, bit_depth, max_val, rdoq)
+    quantize_pred(&pred, src, w, h, qp, bit_depth, max_val, rdoq, spec)
 }
 
 /// Transform + quantize + reconstruct the residual of `src` against an
@@ -853,13 +1139,24 @@ pub(crate) fn quantize_pred(
     bit_depth: u32,
     max_val: i32,
     rdoq: Option<&RdoqInputs<'_>>,
+    spec: TransformSpec,
 ) -> Result<(Vec<i32>, bool, Vec<i32>, f64)> {
     let n = w * h;
     let diff: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
-    let (levels, cbf) = quantize_residual(&diff, w, h, qp, bit_depth, rdoq)?;
+    let (levels, cbf) = quantize_residual(&diff, w, h, qp, bit_depth, rdoq, spec)?;
     let mut res = vec![0i32; n];
     if cbf {
-        scale_and_inverse_transform(&levels, &mut res, w, h, qp, bit_depth, false)?;
+        scale_and_inverse_transform_ats(
+            &levels,
+            &mut res,
+            w,
+            h,
+            qp,
+            bit_depth,
+            spec.tr_type_hor,
+            spec.tr_type_ver,
+            spec.sps_iqt_flag,
+        )?;
     }
     let mut dist = 0f64;
     for i in 0..n {
@@ -986,6 +1283,7 @@ fn emit_leaf<S: BinSink>(
     grid: &SideInfoGrid,
     pic_w: u32,
     pic_h: u32,
+    ats_enabled: bool,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -1011,6 +1309,15 @@ fn emit_leaf<S: BinSink>(
     let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
     enc.encode_decision(t, i, u8::from(plan.cbf_y));
     if plan.cbf_y {
+        // §7.3.8.5 lines 3080-3087: the ATS-intra group, after the
+        // (absent) cu_qp_delta block and before the residuals.
+        if ats::ats_intra_flag_present(ats_enabled, log2_w, log2_h, true) {
+            ats::write_ats_intra(
+                enc,
+                EipdCtx::for_slice(sel.cm_init, sel.init_type),
+                plan.ats,
+            );
+        }
         emit_residual_rle(enc, sel, 0, &plan.levels_y, log2_w, log2_h);
     }
     if plan.cbf_cb {
@@ -1280,6 +1587,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 458 — **IQT + ATS-intra**: the improved quantization /
+    /// transform chain with the balancing chroma QP offset and the
+    /// Table-30 kernel search round-trip recon-exactly through the
+    /// decoder's `sps_iqt_flag == 1` / `sps_ats_flag == 1` walker on
+    /// both entropy shapes and both trees; the streams actually use the
+    /// alternative kernels and the ATS syntax bins match the decoder's
+    /// counts.
+    #[test]
+    fn iqt_ats_round_trip_recon_exact_matrix() {
+        for &cm_init in &[false, true] {
+            for &btt in &[false, true] {
+                for &(w, h) in &[(64u32, 64u32), (72, 40), (176, 144)] {
+                    for &qp in &[10i32, 30, 44] {
+                        let src = synth_picture(w, h, 0xA75 ^ (w * 31 + h * 7 + qp as u32));
+                        let tools = IntraToolset {
+                            deblock: qp == 30,
+                            cm_init,
+                            eipd: true,
+                            btt,
+                            iqt: true,
+                            ats: true,
+                        };
+                        let (payload, enc_recon, stats) =
+                            encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
+                        let mut walk = if btt {
+                            walk_inputs_btt(w, h, cm_init)
+                        } else {
+                            walk_inputs_cm(w, h, cm_init)
+                        };
+                        walk.sps_eipd_flag = true;
+                        walk.tree_gates.sps_ats_flag = true;
+                        let off = crate::headers_enc::iqt_chroma_qp_offset(qp, true);
+                        let dec_in = SliceDecodeInputs {
+                            sps_iqt_flag: true,
+                            slice_cb_qp_offset: off,
+                            slice_cr_qp_offset: off,
+                            enable_deblock: qp == 30,
+                            ..decode_inputs(qp)
+                        };
+                        let (dec, dec_stats) = decode_baseline_idr_slice(&payload, walk, dec_in)
+                            .unwrap_or_else(|e| panic!("{w}x{h} qp{qp} cm{cm_init} btt{btt}: {e}"));
+                        assert_eq!(
+                            dec.y, enc_recon.y,
+                            "{w}x{h} qp{qp} cm{cm_init} btt{btt}: luma"
+                        );
+                        assert_eq!(
+                            dec.cb, enc_recon.cb,
+                            "{w}x{h} qp{qp} cm{cm_init} btt{btt}: cb"
+                        );
+                        assert_eq!(
+                            dec.cr, enc_recon.cr,
+                            "{w}x{h} qp{qp} cm{cm_init} btt{btt}: cr"
+                        );
+                        assert_eq!(dec_stats.coding_units, stats.leaves);
+                        assert!(
+                            dec_stats.ats_intra.cu_intra_flag_bins > 0,
+                            "{w}x{h} qp{qp}: the ATS-intra flag is coded"
+                        );
+                        if qp <= 30 {
+                            assert!(
+                                dec_stats.ats_intra.hor_mode_bins > 0,
+                                "{w}x{h} qp{qp}: an alternative kernel is chosen somewhere"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // ats without iqt is refused (§7.3.2.1).
+        let src = synth_picture(64, 64, 1);
+        assert!(encode_idr_slice_data_cfg(
+            &src,
+            30,
+            IntraToolset {
+                ats: true,
+                ..IntraToolset::default()
+            }
+        )
+        .is_err());
     }
 
     /// Round 455 — **EIPD**: the 33-mode search + MPM / PIMS / rem-mode

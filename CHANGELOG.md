@@ -4,6 +4,50 @@
 
 ### Other
 
+- **Encoder: IQT + ATS — the improved quantization / transform chain
+  and adaptive transform selection (round 458).** The forward
+  quantizer (`quant_enc`) is generalised over a `TransformSpec`: the
+  §8.7.4.1 per-direction kernel type (DCT-II / DST-VII / DCT-VIII,
+  inverted by the same near-orthogonal row-norm scheme with the exact
+  decode chain as the refinement oracle) and `sps_iqt_flag` (the
+  `levelScale` tail, the eq. 1060 / 1054 shift split); the RDOQ
+  trellis runs unchanged over the typed fractional levels and unit-SSE
+  weights. `ats.rs` gains the write-side duals of its readers
+  (`write_ats_intra`, `write_ats_inter`, both read back element for
+  element on every CB shape and entropy shape). **ATS-intra:** every
+  intra luma TB up to 32×32, on I slices and the P/B intra candidates,
+  re-quantizes its best mode's residual under the four Table-30 kernel
+  pairs and keeps the `D + λ · R` winner with the exact
+  `ats_cu_intra_flag` / `ats_hor_mode` / `ats_ver_mode` bins.
+  **ATS-inter:** the better of a leaf's direct / explicit candidates is
+  re-quantized under every *signallable* sub-block transform (half and
+  quarter, both positions, luma under the Table-31 pair, chroma at the
+  co-located half-size sub-block), the rest of the CU pure prediction —
+  the single-orientation shapes whose `ats_cu_inter_horizontal_flag`
+  the decoder infers are deliberately never chosen: the §7.3.8.5 syntax
+  table reduces the *width* on `horizontal_flag == 1` (lines 3104-3108)
+  while the §7.4.9.5 semantics call it a *height* split and infer the
+  absent flag from `allowAtsInterHor*` (line 6144), and the two agree
+  only while the flag is coded (docs ask filed). **Chroma balance:**
+  the improved chain's ChromaQpTable (Table 6, `QpC = qPi − 3` above
+  43) quantizes chroma several steps coarser than Table 5 at the same
+  slice QP — measured first as −6 % luma BD-rate bought with a 3-7 dB
+  chroma loss — so the slice headers now carry `slice_cb/cr_qp_offset
+  = iqt_chroma_qp_offset( slice_qp )`, the smallest offset whose
+  Table-6 `QpC` does not exceed the Baseline Table-5 value (−2 at QP
+  32, −10 at QP 50), restoring the Baseline luma/chroma balance. SPS:
+  `sps_iqt_flag` + `sps_ats_flag` (Table A.6 bits 11 / 15). Registry
+  options `ats` (default **on**) and `iqt` (default follows `ats`;
+  `ats=1 iqt=0` is refused per §7.3.2.1). Measured against the BTT
+  commit at equal PSNR (QP 32-50, three geometries, Y / YUV BD-rate):
+  **intra −1.5 % / −1.3 %, P −0.6 % / −0.2 %, low-delay B −0.6 % /
+  −0.4 %**; IQT alone with the balanced offset is within ±0.1 %. Pins:
+  the intra size × QP × entropy × tree matrix through the decoder's
+  IQT/ATS walker (deblocking included, ATS bins counted), P/B GOPs
+  through the registry, the typed-kernel round trips and unit weights,
+  the chroma-offset rule; the fuzz target gained the flag. Fixtures
+  re-pinned (the default tool set changed).
+
 - **Encoder: BTT — the binary / ternary coding tree (round 458).** New
   `tree_enc` module: the §7.3.8.3 `split_unit()` decision prefix shared
   by the I and P/B slice encoders under both SPS shapes — the round-429

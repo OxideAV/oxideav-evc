@@ -168,7 +168,7 @@ pub fn inverse_transform_ats(
 /// Look up the transform matrix for `(n_tb_s, tr_type)`. trType 0 reuses
 /// the DCT-II matrices; trType 1 (DST-VII) / trType 2 (DCT-VIII) cover
 /// the full §8.7.4.3 eqs. 1077-1090 range `nTbS ∈ {4, 8, 16, 32}`.
-fn trans_matrix_typed(n_tb_s: usize, tr_type: u32) -> Result<&'static [i16]> {
+pub(crate) fn trans_matrix_typed(n_tb_s: usize, tr_type: u32) -> Result<&'static [i16]> {
     match tr_type {
         0 => Ok(trans_matrix(n_tb_s)),
         1 => match n_tb_s {

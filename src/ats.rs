@@ -420,6 +420,131 @@ pub fn read_ats_inter(
     })
 }
 
+/// Write the §7.3.8.5 ATS-intra group — the dual of [`read_ats_intra`]
+/// (round 458 encoder): `ats_cu_intra_flag` (bypass), then on 1 the
+/// `ats_hor_mode` / `ats_ver_mode` pair (Table 79) as `trType − 1`.
+/// The caller must have established [`ats_intra_flag_present`].
+pub fn write_ats_intra<S: crate::cabac::BinSink>(enc: &mut S, ctx: EipdCtx, ats: AtsIntra) {
+    enc.encode_bypass(u8::from(ats.used));
+    if !ats.used {
+        return;
+    }
+    debug_assert!((1..=2).contains(&ats.tr_type_hor) && (1..=2).contains(&ats.tr_type_ver));
+    let (t, i) = ctx.ats_mode_ctx();
+    enc.encode_decision(t, i, (ats.tr_type_hor - 1) as u8);
+    enc.encode_decision(t, i, (ats.tr_type_ver - 1) as u8);
+}
+
+/// The four ATS-intra kernel pairs an encoder may choose (Table 30):
+/// `(trTypeHor, trTypeVer)` over `{DST-VII, DCT-VIII}²`.
+pub const ATS_INTRA_CHOICES: [AtsIntra; 4] = [
+    AtsIntra {
+        used: true,
+        tr_type_hor: 1,
+        tr_type_ver: 1,
+    },
+    AtsIntra {
+        used: true,
+        tr_type_hor: 2,
+        tr_type_ver: 1,
+    },
+    AtsIntra {
+        used: true,
+        tr_type_hor: 1,
+        tr_type_ver: 2,
+    },
+    AtsIntra {
+        used: true,
+        tr_type_hor: 2,
+        tr_type_ver: 2,
+    },
+];
+
+impl AtsInter {
+    /// Every sub-block transform an encoder may choose on a CB under
+    /// `allow` (round 458): each (quad, horizontal) pair whose
+    /// orientation flag is **signalled** — both orientations allowed at
+    /// that granularity — with both `pos` values, geometry resolved per
+    /// spec lines 3103-3127.
+    ///
+    /// The single-orientation shapes are deliberately left out. The
+    /// §7.3.8.5 syntax table reduces the *width* on
+    /// `ats_cu_inter_horizontal_flag == 1` (lines 3104-3108) while the
+    /// §7.4.9.5 semantics say the flag marks a *height* split and infer
+    /// the absent flag from `allowAtsInterHor{Half,Quad}` (line 6144) —
+    /// the two readings agree only while the flag is signalled, so the
+    /// encoder never relies on the inference (docs ask filed in the
+    /// round-458 report).
+    pub fn choices(allow: AllowAtsInter, log2_cb_width: u32, log2_cb_height: u32) -> Vec<Self> {
+        let mut out = Vec::with_capacity(8);
+        for quad in [false, true] {
+            if !allow.horizontal_flag_present(quad) {
+                continue;
+            }
+            if quad && !allow.quad_flag_present() {
+                continue;
+            }
+            for horizontal in [false, true] {
+                for pos in [false, true] {
+                    let (trafo_log2_w, trafo_log2_h, trafo_x0, trafo_y0) =
+                        Self::derive_geometry(quad, horizontal, pos, log2_cb_width, log2_cb_height);
+                    out.push(Self {
+                        used: true,
+                        quad,
+                        horizontal,
+                        pos,
+                        trafo_log2_w,
+                        trafo_log2_h,
+                        trafo_x0,
+                        trafo_y0,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Write the §7.3.8.5 ATS-inter group — the dual of [`read_ats_inter`]
+/// (round 458 encoder), element by element under the same presence
+/// gates; absent elements must agree with the reader's inference,
+/// which [`AtsInter::choices`] guarantees. The caller must have
+/// established the `MODE_INTER && sps_ats_flag && cbf && allow.any()`
+/// gate.
+pub fn write_ats_inter<S: crate::cabac::BinSink>(
+    enc: &mut S,
+    ctx: EipdCtx,
+    allow: AllowAtsInter,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+    ats: &AtsInter,
+) {
+    let (t, i) = ctx.ats_cu_inter_flag_ctx(log2_cb_width, log2_cb_height);
+    enc.encode_decision(t, i, u8::from(ats.used));
+    if !ats.used {
+        return;
+    }
+    if allow.quad_flag_present() {
+        let (t, i) = ctx.ats_cu_inter_quad_flag_ctx();
+        enc.encode_decision(t, i, u8::from(ats.quad));
+    } else {
+        debug_assert!(!ats.quad);
+    }
+    if allow.horizontal_flag_present(ats.quad) {
+        let (t, i) = ctx.ats_cu_inter_horizontal_flag_ctx(log2_cb_width, log2_cb_height);
+        enc.encode_decision(t, i, u8::from(ats.horizontal));
+    } else {
+        let inferred = if ats.quad {
+            allow.hor_quad
+        } else {
+            allow.hor_half
+        };
+        debug_assert_eq!(ats.horizontal, inferred);
+    }
+    let (t, i) = ctx.ats_cu_inter_pos_flag_ctx();
+    enc.encode_decision(t, i, u8::from(ats.pos));
+}
+
 /// Extension of [`EipdCtx`] that exposes the Table 79 (`AtsMode`)
 /// context, shared by `ats_hor_mode` and `ats_ver_mode`.
 trait AtsModeCtx {
@@ -475,6 +600,70 @@ impl AtsModeCtx for EipdCtx {
 mod tests {
     use super::*;
     use crate::cabac::CabacEncoder;
+
+    /// Round 458: every encoder-choosable ATS-intra and ATS-inter
+    /// decision, on every CB shape and both entropy shapes, reads back
+    /// through the decoder's readers as the same decision.
+    #[test]
+    fn ats_writers_read_back() {
+        use crate::cabac::{CabacEngine, InitType};
+        use crate::cabac_init::init_main_profile_contexts;
+        for &cm in &[false, true] {
+            let ctx = EipdCtx::for_slice(cm, InitType::Pb);
+            let mut enc = CabacEncoder::new();
+            if cm {
+                enc.init_main_profile(InitType::Pb, 28);
+            }
+            enum Written {
+                Intra(AtsIntra),
+                Inter(u32, u32, AllowAtsInter, AtsInter),
+            }
+            let mut written = Vec::new();
+            for lw in 2..=6u32 {
+                for lh in 2..=6u32 {
+                    if lw <= 5 && lh <= 5 {
+                        write_ats_intra(&mut enc, ctx, AtsIntra::disabled());
+                        written.push(Written::Intra(AtsIntra::disabled()));
+                        for a in ATS_INTRA_CHOICES {
+                            write_ats_intra(&mut enc, ctx, a);
+                            written.push(Written::Intra(a));
+                        }
+                    }
+                    let allow = AllowAtsInter::derive(lw, lh, 2, 6);
+                    if !allow.any() {
+                        continue;
+                    }
+                    let mut list = vec![AtsInter::disabled(lw, lh)];
+                    list.extend(AtsInter::choices(allow, lw, lh));
+                    for a in list {
+                        write_ats_inter(&mut enc, ctx, allow, lw, lh, &a);
+                        written.push(Written::Inter(lw, lh, allow, a));
+                    }
+                }
+            }
+            enc.encode_terminate(true);
+            let bytes = enc.finish();
+            let mut eng = CabacEngine::new(&bytes).unwrap();
+            if cm {
+                init_main_profile_contexts(&mut eng, InitType::Pb, 28).unwrap();
+            }
+            let mut st_i = AtsSyntaxStats::default();
+            let mut st_p = AtsInterStats::default();
+            for w in &written {
+                match w {
+                    Written::Intra(want) => {
+                        assert_eq!(read_ats_intra(&mut eng, ctx, &mut st_i).unwrap(), *want);
+                    }
+                    Written::Inter(lw, lh, allow, want) => {
+                        let got =
+                            read_ats_inter(&mut eng, ctx, *allow, *lw, *lh, &mut st_p).unwrap();
+                        assert_eq!(got, *want, "cm{cm} {lw}x{lh}");
+                    }
+                }
+            }
+            assert!(eng.decode_terminate().unwrap());
+        }
+    }
 
     fn regular_bins(bins: &[u8]) -> Vec<u8> {
         let mut enc = CabacEncoder::new();

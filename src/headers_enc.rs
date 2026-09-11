@@ -65,6 +65,13 @@ pub struct EncSequenceConfig {
     /// `sps_btt_flag == 0` defaults give, ternary splits from 16 to 64).
     /// Main-profile only (Table A.6 binIdx 0, `0x1`).
     pub btt: bool,
+    /// `sps_iqt_flag` (§7.4.3.1) — the improved quantization /
+    /// transform chain (round 458; Table A.6 binIdx 11, `0x800`).
+    pub iqt: bool,
+    /// `sps_ats_flag` (§7.4.3.1) — adaptive transform selection (round
+    /// 458; Table A.6 binIdx 15, `0x8000`). §7.3.2.1 reads it only
+    /// under `sps_iqt_flag == 1`, so `ats` requires `iqt`.
+    pub ats: bool,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -114,13 +121,21 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         )));
     }
     let mut w = BitWriter::new();
-    let main = cfg.cm_init || cfg.eipd || cfg.btt;
+    if cfg.ats && !cfg.iqt {
+        return Err(Error::invalid(
+            "evc enc sps: sps_ats_flag is only coded under sps_iqt_flag == 1 (§7.3.2.1)",
+        ));
+    }
+    let main = cfg.cm_init || cfg.eipd || cfg.btt || cfg.iqt || cfg.ats;
     // Table A.6: binIdx 14 = sps_cm_init_flag (0x4000), binIdx 8 =
-    // sps_eipd_flag (0x100), binIdx 0 = sps_btt_flag (0x1); Baseline
+    // sps_eipd_flag (0x100), binIdx 0 = sps_btt_flag (0x1), binIdx 11 =
+    // sps_iqt_flag (0x800), binIdx 15 = sps_ats_flag (0x8000); Baseline
     // (A.3.2) requires toolset_idc_h = 0.
     let toolset_h = (if cfg.cm_init { 0x4000 } else { 0 })
         | (if cfg.eipd { 0x100 } else { 0 })
-        | (if cfg.btt { 0x1 } else { 0 });
+        | (if cfg.btt { 0x1 } else { 0 })
+        | (if cfg.iqt { 0x800 } else { 0 })
+        | (if cfg.ats { 0x8000 } else { 0 });
     w.ue(0); // sps_seq_parameter_set_id
     w.u(8, u32::from(main)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
@@ -150,7 +165,10 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     if cfg.cm_init {
         w.u1(false); // sps_adcc_flag (§7.3.2.1: present when cm_init)
     }
-    w.u1(false); // sps_iqt_flag
+    w.u1(cfg.iqt); // sps_iqt_flag
+    if cfg.iqt {
+        w.u1(cfg.ats); // sps_ats_flag (§7.3.2.1: present when sps_iqt_flag)
+    }
     w.u1(false); // sps_addb_flag
     w.u1(false); // sps_alf_flag
     w.u1(false); // sps_htdf_flag
@@ -201,6 +219,27 @@ pub fn write_pps_rbsp() -> Result<Vec<u8>> {
     Ok(w.into_bytes())
 }
 
+/// The `slice_cb_qp_offset` / `slice_cr_qp_offset` the encoder signals
+/// under `sps_iqt_flag` (round 458). The §8.7.1 ChromaQpTable of the
+/// improved chain (Table 6) runs `QpC = qPi − 3` above 43 where the
+/// Baseline Table 5 flattens toward 41, i.e. at the same slice QP the
+/// improved chain quantizes chroma several steps coarser. The offset is
+/// the smallest-magnitude value in `[−12, 0]` whose Table-6 `QpC` does
+/// not exceed the Table-5 `QpC` of the plain slice QP — the same
+/// luma/chroma balance the Baseline chain codes at, so the tool gains
+/// measure as such and the chroma planes keep their quality. `0` under
+/// `sps_iqt_flag == 0` (the historical headers byte for byte).
+pub fn iqt_chroma_qp_offset(slice_qp: i32, sps_iqt_flag: bool) -> i32 {
+    if !sps_iqt_flag {
+        return 0;
+    }
+    let target = crate::dra::table5_qp_c(slice_qp.clamp(0, 57));
+    (-12..=0)
+        .rev()
+        .find(|&off| crate::dra::table6_qp_c((slice_qp + off).clamp(0, 57)) <= target)
+        .unwrap_or(-12)
+}
+
 /// Write the §7.3.4 slice header for a Baseline IDR slice (single tile,
 /// no ALF/ADDB/RPL fields under the all-zero SPS toolset), then pad to
 /// the byte boundary — `slice_data()` starts byte-aligned (§7.4.5).
@@ -208,6 +247,22 @@ pub fn write_pps_rbsp() -> Result<Vec<u8>> {
 /// `deblock` sets `slice_deblocking_filter_flag` (with the Baseline
 /// `sps_addb_flag == 0` no alpha/beta offsets follow).
 pub fn write_idr_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
+    write_idr_slice_header_with(slice_qp, deblock, 0, 0)
+}
+
+/// [`write_idr_slice_header`] with explicit `slice_cb_qp_offset` /
+/// `slice_cr_qp_offset` (§7.4.5: −12..=12; round 458).
+pub fn write_idr_slice_header_with(
+    slice_qp: u32,
+    deblock: bool,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+) -> Result<Vec<u8>> {
+    if !(-12..=12).contains(&cb_qp_offset) || !(-12..=12).contains(&cr_qp_offset) {
+        return Err(Error::invalid(
+            "evc enc slice header: chroma QP offsets outside −12..=12 (§7.4.5)",
+        ));
+    }
     if slice_qp > 51 {
         return Err(Error::invalid(format!(
             "evc enc slice header: slice_qp {slice_qp} > 51"
@@ -219,8 +274,8 @@ pub fn write_idr_slice_header(slice_qp: u32, deblock: bool) -> Result<Vec<u8>> {
     w.u1(false); // no_output_of_prior_pics_flag
     w.u1(deblock); // slice_deblocking_filter_flag
     w.u(6, slice_qp); // slice_qp
-    w.se(0); // slice_cb_qp_offset
-    w.se(0); // slice_cr_qp_offset
+    w.se(cb_qp_offset); // slice_cb_qp_offset
+    w.se(cr_qp_offset); // slice_cr_qp_offset
     w.align_to_byte_zero(); // byte_alignment() before slice_data()
     Ok(w.into_bytes())
 }
@@ -255,6 +310,24 @@ pub fn write_inter_slice_header(
     slice_qp: u32,
     deblock: bool,
 ) -> Result<Vec<u8>> {
+    write_inter_slice_header_with(slice_is_b, num_active, slice_qp, deblock, 0, 0)
+}
+
+/// [`write_inter_slice_header`] with explicit chroma QP offsets (round
+/// 458).
+pub fn write_inter_slice_header_with(
+    slice_is_b: bool,
+    num_active: [u32; 2],
+    slice_qp: u32,
+    deblock: bool,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+) -> Result<Vec<u8>> {
+    if !(-12..=12).contains(&cb_qp_offset) || !(-12..=12).contains(&cr_qp_offset) {
+        return Err(Error::invalid(
+            "evc enc slice header: chroma QP offsets outside −12..=12 (§7.4.5)",
+        ));
+    }
     if slice_qp > 51 {
         return Err(Error::invalid(format!(
             "evc enc slice header: slice_qp {slice_qp} > 51"
@@ -280,8 +353,8 @@ pub fn write_inter_slice_header(
     }
     w.u1(deblock); // slice_deblocking_filter_flag
     w.u(6, slice_qp); // slice_qp
-    w.se(0); // slice_cb_qp_offset
-    w.se(0); // slice_cr_qp_offset
+    w.se(cb_qp_offset); // slice_cb_qp_offset
+    w.se(cr_qp_offset); // slice_cr_qp_offset
     w.align_to_byte_zero(); // byte_alignment() before slice_data()
     Ok(w.into_bytes())
 }
@@ -321,6 +394,8 @@ mod tests {
             crop_bottom: 0,
             eipd: false,
             btt: false,
+            iqt: false,
+            ats: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -376,6 +451,8 @@ mod tests {
                 crop_bottom: 0,
                 eipd: true,
                 btt: false,
+                iqt: false,
+                ats: false,
             };
             let rbsp = write_sps_rbsp(&cfg).unwrap();
             let sps = crate::sps::parse(&rbsp).unwrap();
@@ -408,11 +485,28 @@ mod tests {
             crop_bottom: 0,
             eipd: true,
             btt: true,
+            iqt: false,
+            ats: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.profile_idc, 1);
         assert!(sps.sps_btt_flag);
         assert_eq!(sps.toolset_idc_h, 0x4101);
+        // Round 458: IQT + ATS ride the same shape (binIdx 11 / 15).
+        let with_ats = EncSequenceConfig {
+            iqt: true,
+            ats: true,
+            ..cfg
+        };
+        let sps = crate::sps::parse(&write_sps_rbsp(&with_ats).unwrap()).unwrap();
+        assert!(sps.sps_iqt_flag && sps.sps_ats_flag);
+        assert_eq!(sps.toolset_idc_h, 0x4101 | 0x800 | 0x8000);
+        assert!(write_sps_rbsp(&EncSequenceConfig {
+            iqt: false,
+            ats: true,
+            ..cfg
+        })
+        .is_err());
         assert_eq!(sps.log2_ctu_size_minus5, 1);
         assert_eq!(sps.log2_min_cb_size_minus2, 0);
         let gates = crate::slice_data::CodingTreeGates::from_sps(&sps);
@@ -444,6 +538,8 @@ mod tests {
             crop_bottom: 0,
             eipd: false,
             btt: false,
+            iqt: false,
+            ats: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -486,6 +582,8 @@ mod tests {
             crop_bottom: 0,
             eipd: false,
             btt: false,
+            iqt: false,
+            ats: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -525,6 +623,77 @@ mod tests {
         );
     }
 
+    /// Round 458: the IQT chroma offset keeps Table 6 at or under the
+    /// Table-5 chroma QP of the plain slice QP, is 0 without IQT, and
+    /// round-trips through the header parser.
+    #[test]
+    fn iqt_chroma_offset_matches_baseline_balance() {
+        for qp in 0..=51 {
+            assert_eq!(iqt_chroma_qp_offset(qp, false), 0);
+            let off = iqt_chroma_qp_offset(qp, true);
+            assert!((-12..=0).contains(&off), "qp {qp}: {off}");
+            let t5 = crate::dra::table5_qp_c(qp);
+            let t6 = crate::dra::table6_qp_c(qp + off);
+            assert!(
+                t6 <= t5,
+                "qp {qp}: Table 6 {t6} at offset {off} > Table 5 {t5}"
+            );
+            if off < 0 && qp + off < 57 {
+                assert!(
+                    crate::dra::table6_qp_c(qp + off + 1) > t5,
+                    "qp {qp}: offset {off} is not the smallest"
+                );
+            }
+        }
+        // Table 5: QpC(32) = 29, QpC(50) = 38; Table 6 reaches 29 at
+        // qPi 30 and 38 at qPi 40.
+        assert_eq!(iqt_chroma_qp_offset(32, true), -2);
+        assert_eq!(iqt_chroma_qp_offset(50, true), -10);
+        let hdr = write_idr_slice_header_with(30, false, -3, -5).unwrap();
+        let cfg = EncSequenceConfig {
+            width: 64,
+            height: 64,
+            level_idc: 30,
+            bit_depth: 8,
+            cm_init: false,
+            max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
+            eipd: false,
+            btt: false,
+            iqt: false,
+            ats: false,
+        };
+        let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
+        let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
+        let ctx = crate::slice_header::SliceParseContext {
+            single_tile_in_pic_flag: pps.single_tile_in_pic_flag,
+            arbitrary_slice_present_flag: pps.arbitrary_slice_present_flag,
+            tile_id_len_minus1: pps.tile_id_len_minus1,
+            num_tile_columns_minus1: pps.num_tile_columns_minus1,
+            num_tile_rows_minus1: pps.num_tile_rows_minus1,
+            sps_pocs_flag: sps.sps_pocs_flag,
+            sps_rpl_flag: sps.sps_rpl_flag,
+            sps_alf_flag: sps.sps_alf_flag,
+            sps_mmvd_flag: sps.sps_mmvd_flag,
+            sps_admvp_flag: sps.sps_admvp_flag,
+            sps_addb_flag: sps.sps_addb_flag,
+            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
+            chroma_array_type: sps.chroma_array_type(),
+            num_ref_pic_lists_in_sps_l0: sps.num_ref_pic_lists_in_sps_l0,
+            num_ref_pic_lists_in_sps_l1: sps.num_ref_pic_lists_in_sps_l1,
+            rpl1_idx_present_flag: pps.rpl1_idx_present_flag,
+            long_term_ref_pics_flag: sps.long_term_ref_pics_flag,
+            additional_lt_poc_lsb_len: pps.additional_lt_poc_lsb_len,
+        };
+        let mut br = crate::bitreader::BitReader::new(&hdr);
+        let parsed =
+            crate::slice_header::parse_consume(&mut br, nal::NalUnitType::Idr, &ctx).unwrap();
+        assert_eq!(parsed.slice_cb_qp_offset, -3);
+        assert_eq!(parsed.slice_cr_qp_offset, -5);
+        assert!(write_idr_slice_header_with(30, false, -13, 0).is_err());
+    }
+
     /// Out-of-range slice QP is refused.
     #[test]
     fn slice_header_rejects_bad_qp() {
@@ -551,6 +720,8 @@ mod tests {
             crop_bottom: 0,
             eipd: false,
             btt: false,
+            iqt: false,
+            ats: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

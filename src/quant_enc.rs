@@ -29,8 +29,65 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::dequant::{rect_norm, scaling_bd_shift, LEVEL_SCALE_BASELINE};
-use crate::transform::trans_matrix;
+use crate::dequant::{rect_norm, scaling_bd_shift, LEVEL_SCALE_BASELINE, LEVEL_SCALE_IQT};
+use crate::transform::trans_matrix_typed;
+
+/// The transform / quantization shape one block is coded under (round
+/// 458): the §8.7.4.1 per-direction kernel types (`0` DCT-II, `1`
+/// DST-VII, `2` DCT-VIII — the ATS selections of Tables 30 / 31) and
+/// `sps_iqt_flag` (the §8.7.3 `levelScale` tail, the eq. 1060
+/// intermediate renorm, the eq. 1054 final shift). The inversion below
+/// is kernel-agnostic: every integer kernel of §8.7.4.3 has
+/// near-orthogonal rows, and the refinement pass runs the exact decode
+/// chain of the same shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransformSpec {
+    pub tr_type_hor: u32,
+    pub tr_type_ver: u32,
+    pub sps_iqt_flag: bool,
+}
+
+impl TransformSpec {
+    /// Plain DCT-II under `sps_iqt_flag`.
+    pub fn dct(sps_iqt_flag: bool) -> Self {
+        Self {
+            tr_type_hor: 0,
+            tr_type_ver: 0,
+            sps_iqt_flag,
+        }
+    }
+
+    fn level_scale(self, qp: i32) -> f64 {
+        let table = if self.sps_iqt_flag {
+            &LEVEL_SCALE_IQT
+        } else {
+            &LEVEL_SCALE_BASELINE
+        };
+        f64::from(table[(qp % 6) as usize])
+    }
+
+    fn inverse(
+        self,
+        levels: &[i32],
+        dst: &mut [i32],
+        w: usize,
+        h: usize,
+        qp: i32,
+        bd: u32,
+    ) -> Result<()> {
+        crate::dequant::scale_and_inverse_transform_ats(
+            levels,
+            dst,
+            w,
+            h,
+            qp,
+            bd,
+            self.tr_type_hor,
+            self.tr_type_ver,
+            self.sps_iqt_flag,
+        )
+    }
+}
 
 /// Forward-transform + quantize one TB of residual samples into
 /// `TransCoeffLevel`s that the decoder's
@@ -49,6 +106,27 @@ pub fn forward_quantize(
     qp: i32,
     bit_depth: u32,
 ) -> Result<bool> {
+    forward_quantize_typed(
+        residual,
+        levels,
+        n_tb_w,
+        n_tb_h,
+        qp,
+        bit_depth,
+        TransformSpec::default(),
+    )
+}
+
+/// [`forward_quantize`] under an explicit [`TransformSpec`].
+pub fn forward_quantize_typed(
+    residual: &[i32],
+    levels: &mut [i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+    spec: TransformSpec,
+) -> Result<bool> {
     let n = n_tb_w * n_tb_h;
     if residual.len() != n || levels.len() != n {
         return Err(Error::invalid(format!(
@@ -57,7 +135,7 @@ pub fn forward_quantize(
             levels.len()
         )));
     }
-    forward_quantize_pass(residual, levels, n_tb_w, n_tb_h, qp, bit_depth)?;
+    forward_quantize_pass(residual, levels, n_tb_w, n_tb_h, qp, bit_depth, spec)?;
 
     // One refinement iteration against the *exact* decode chain: the
     // Mᵀ·D⁻¹ inversion is approximate for nTbS ≥ 8 (rows of the integer
@@ -65,11 +143,7 @@ pub fn forward_quantize(
     // error and fold the correction in. This squares the approximation
     // error away, leaving only the irreducible quantization rounding.
     let mut back = vec![0i32; n];
-    // The encoder's SPS always declares sps_iqt_flag = 0, so the
-    // inversion targets the eq. 1053/1061 chain.
-    crate::dequant::scale_and_inverse_transform(
-        levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth, false,
-    )?;
+    spec.inverse(levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth)?;
     let err: Vec<i32> = residual
         .iter()
         .zip(back.iter())
@@ -77,7 +151,7 @@ pub fn forward_quantize(
         .collect();
     if err.iter().any(|&e| e != 0) {
         let mut delta = vec![0i32; n];
-        forward_quantize_pass(&err, &mut delta, n_tb_w, n_tb_h, qp, bit_depth)?;
+        forward_quantize_pass(&err, &mut delta, n_tb_w, n_tb_h, qp, bit_depth, spec)?;
         for (lvl, d) in levels.iter_mut().zip(delta.iter()) {
             *lvl = (*lvl + *d).clamp(-32768, 32767);
         }
@@ -98,6 +172,25 @@ pub fn forward_transform_fractional(
     qp: i32,
     bit_depth: u32,
 ) -> Result<Vec<f64>> {
+    forward_transform_fractional_typed(
+        residual,
+        n_tb_w,
+        n_tb_h,
+        qp,
+        bit_depth,
+        TransformSpec::default(),
+    )
+}
+
+/// [`forward_transform_fractional`] under an explicit [`TransformSpec`].
+pub fn forward_transform_fractional_typed(
+    residual: &[i32],
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+    spec: TransformSpec,
+) -> Result<Vec<f64>> {
     let n = n_tb_w * n_tb_h;
     if residual.len() != n {
         return Err(Error::invalid(format!(
@@ -106,15 +199,13 @@ pub fn forward_transform_fractional(
         )));
     }
     let mut frac = vec![0f64; n];
-    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth)?;
+    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth, spec)?;
     let levels: Vec<i32> = frac
         .iter()
         .map(|v| v.round().clamp(-32768.0, 32767.0) as i32)
         .collect();
     let mut back = vec![0i32; n];
-    crate::dequant::scale_and_inverse_transform(
-        &levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth, false,
-    )?;
+    spec.inverse(&levels, &mut back, n_tb_w, n_tb_h, qp, bit_depth)?;
     let err: Vec<i32> = residual
         .iter()
         .zip(back.iter())
@@ -125,7 +216,7 @@ pub fn forward_transform_fractional(
         // refines the rounded levels — `round( levels + delta )` is
         // exactly what `forward_quantize` produces.
         let mut delta = vec![0f64; n];
-        forward_pass_fractional(&err, &mut delta, n_tb_w, n_tb_h, qp, bit_depth)?;
+        forward_pass_fractional(&err, &mut delta, n_tb_w, n_tb_h, qp, bit_depth, spec)?;
         for ((f, d), l) in frac.iter_mut().zip(delta.iter()).zip(levels.iter()) {
             *f = (f64::from(*l) + *d).clamp(-32768.0, 32767.0);
         }
@@ -143,15 +234,27 @@ pub fn forward_transform_fractional(
 /// is `( fractional − level )² · weight`, which this makes commensurate
 /// with the pixel-domain SSE of the mode decisions.
 pub fn level_unit_sse_weights(n_tb_w: usize, n_tb_h: usize, qp: i32, bit_depth: u32) -> Vec<f64> {
-    let a = trans_matrix(n_tb_h);
-    let b = trans_matrix(n_tb_w);
+    level_unit_sse_weights_typed(n_tb_w, n_tb_h, qp, bit_depth, TransformSpec::default())
+}
+
+/// [`level_unit_sse_weights`] under an explicit [`TransformSpec`] (the
+/// DST-VII / DCT-VIII row norms, the `sps_iqt_flag` `levelScale`).
+pub fn level_unit_sse_weights_typed(
+    n_tb_w: usize,
+    n_tb_h: usize,
+    qp: i32,
+    bit_depth: u32,
+    spec: TransformSpec,
+) -> Vec<f64> {
+    let a = trans_matrix_typed(n_tb_h, spec.tr_type_ver).expect("kernel size");
+    let b = trans_matrix_typed(n_tb_w, spec.tr_type_hor).expect("kernel size");
     let d_a = row_norms(a, n_tb_h);
     let d_b = row_norms(b, n_tb_w);
+    // The eq. 1053 / (1060 + 1054) shifts total the same 27 − BitDepth.
     let bd_shift_post = (20 - bit_depth) + 7;
     let bd_shift = scaling_bd_shift(n_tb_w, n_tb_h, bit_depth);
     let rect = rect_norm(n_tb_w, n_tb_h) as f64;
-    let q_step =
-        (LEVEL_SCALE_BASELINE[(qp % 6) as usize] as f64) * f64::from(1u32 << (qp / 6) as u32);
+    let q_step = spec.level_scale(qp) * f64::from(1u32 << (qp / 6) as u32);
     // d per unit level (eq. 1059, pre-rounding), then the two shifts.
     let d_unit = q_step * rect / f64::from(1u32 << bd_shift);
     let gain = d_unit / f64::from(1u32 << bd_shift_post);
@@ -173,11 +276,12 @@ fn forward_quantize_pass(
     n_tb_h: usize,
     qp: i32,
     bit_depth: u32,
+    spec: TransformSpec,
 ) -> Result<bool> {
     let n = n_tb_w * n_tb_h;
     debug_assert_eq!(levels.len(), n);
     let mut frac = vec![0f64; n];
-    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth)?;
+    forward_pass_fractional(residual, &mut frac, n_tb_w, n_tb_h, qp, bit_depth, spec)?;
     let mut any = false;
     for (lvl, f) in levels.iter_mut().zip(frac.iter()) {
         *lvl = f.round().clamp(-32768.0, 32767.0) as i32;
@@ -195,6 +299,7 @@ fn forward_pass_fractional(
     n_tb_h: usize,
     qp: i32,
     bit_depth: u32,
+    spec: TransformSpec,
 ) -> Result<()> {
     let n = n_tb_w * n_tb_h;
     if !matches!(n_tb_w, 2 | 4 | 8 | 16 | 32 | 64) || !matches!(n_tb_h, 2 | 4 | 8 | 16 | 32 | 64) {
@@ -210,8 +315,8 @@ fn forward_pass_fractional(
     debug_assert_eq!(residual.len(), n);
     debug_assert_eq!(frac.len(), n);
 
-    let a = trans_matrix(n_tb_h); // vertical kernel (H×H)
-    let b = trans_matrix(n_tb_w); // horizontal kernel (W×W)
+    let a = trans_matrix_typed(n_tb_h, spec.tr_type_ver)?; // vertical kernel (H×H)
+    let b = trans_matrix_typed(n_tb_w, spec.tr_type_hor)?; // horizontal kernel (W×W)
     let d_a = row_norms(a, n_tb_h);
     let d_b = row_norms(b, n_tb_w);
 
@@ -229,13 +334,14 @@ fn forward_pass_fractional(
         }
     }
 
-    // Undo the decoder's two shifts: multiply by 2^bdShiftPost (eq.
-    // 1055) and 2^bdShift / (levelScale·2^(qp/6)·rectNorm) (eq. 1059).
+    // Undo the decoder's shifts: multiply by 2^bdShiftPost (eq. 1055;
+    // under sps_iqt_flag the eq. 1060 `>> 7` and the eq. 1054 shift
+    // total the same) and 2^bdShift / (levelScale·2^(qp/6)·rectNorm)
+    // (eq. 1059).
     let bd_shift_post = (20 - bit_depth) + 7;
     let bd_shift = scaling_bd_shift(n_tb_w, n_tb_h, bit_depth);
     let rect = rect_norm(n_tb_w, n_tb_h) as f64;
-    let q_step =
-        (LEVEL_SCALE_BASELINE[(qp % 6) as usize] as f64) * f64::from(1u32 << (qp / 6) as u32);
+    let q_step = spec.level_scale(qp) * f64::from(1u32 << (qp / 6) as u32);
     let gain = f64::from(1u32 << bd_shift_post) * f64::from(1u32 << bd_shift) / (q_step * rect);
 
     for i in 0..n_tb_h {
@@ -395,6 +501,59 @@ mod tests {
             let frac = forward_transform_fractional(&res, w, h, qp, 8).unwrap();
             let rounded: Vec<i32> = frac.iter().map(|v| v.round() as i32).collect();
             assert_eq!(levels, rounded, "{w}x{h} qp{qp}");
+        }
+    }
+
+    /// Round 458: every §8.7.4.1 kernel pair under both `sps_iqt_flag`
+    /// shapes round-trips through the decode chain of the same shape
+    /// within the quantization step, and the unit-level weights track
+    /// that chain.
+    #[test]
+    fn typed_kernels_round_trip_and_weights_match() {
+        let mut seed = 0x5eed_5eedu32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) as i32 % 201) - 100
+        };
+        for &iqt in &[false, true] {
+            for &(w, h) in &[(4usize, 4usize), (8, 8), (16, 8), (32, 32), (4, 16)] {
+                for tr_hor in 0..3u32 {
+                    for tr_ver in 0..3u32 {
+                        let spec = TransformSpec {
+                            tr_type_hor: tr_hor,
+                            tr_type_ver: tr_ver,
+                            sps_iqt_flag: iqt,
+                        };
+                        let res: Vec<i32> = (0..w * h).map(|_| next()).collect();
+                        let mut levels = vec![0i32; w * h];
+                        forward_quantize_typed(&res, &mut levels, w, h, 6, 8, spec).unwrap();
+                        let mut back = vec![0i32; w * h];
+                        spec.inverse(&levels, &mut back, w, h, 6, 8).unwrap();
+                        let err = res
+                            .iter()
+                            .zip(back.iter())
+                            .map(|(&a, &b)| (a - b).abs())
+                            .max()
+                            .unwrap();
+                        assert!(err <= 3, "{w}x{h} {spec:?}: max err {err}");
+                        let frac =
+                            forward_transform_fractional_typed(&res, w, h, 6, 8, spec).unwrap();
+                        let rounded: Vec<i32> = frac.iter().map(|v| v.round() as i32).collect();
+                        assert_eq!(levels, rounded, "{w}x{h} {spec:?}");
+                        let weights = level_unit_sse_weights_typed(w, h, 45, 8, spec);
+                        for pos in [0usize, 1, w * h / 2 + 1, w * h - 1] {
+                            let mut lv = vec![0i32; w * h];
+                            lv[pos] = 64;
+                            let mut back = vec![0i32; w * h];
+                            spec.inverse(&lv, &mut back, w, h, 45, 8).unwrap();
+                            let sse: f64 = back.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                            let want = weights[pos] * 64.0 * 64.0;
+                            let rel = (sse - want).abs() / want;
+                            assert!(rel < 0.03, "{w}x{h} {spec:?} pos {pos}: {sse} vs {want}");
+                        }
+                    }
+                }
+            }
         }
     }
 

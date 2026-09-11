@@ -79,8 +79,8 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "3"), ("qp", "24")],
-        stream_md5: "82dd83533db5eac01a9ff6d7d14fbbe0",
-        output_md5: "e1f252b173bcedc175644810103dcc68",
+        stream_md5: "e88a0f5a69f7201a709333a4f4720b86",
+        output_md5: "16b4c3f389418b9aee166cf122a30d2c",
     },
     Case {
         name: "b_low_delay",
@@ -88,12 +88,13 @@ const CASES: &[Case] = &[
         h: 48,
         frames: 6,
         options: &[("gop", "6"), ("refs", "2"), ("b", "1"), ("qp", "24")],
-        stream_md5: "72feac679766b35392d5eb8a546a992b",
-        output_md5: "cfa18193b48cff5711c4c78ad094eb97",
+        stream_md5: "ec0abe3625b0569128d02f630eaa2270",
+        output_md5: "4ada98bc95cbc05294c553b1216e75a6",
     },
     Case {
-        // The one pure Baseline-profile stream (`cm_init=0 eipd=0 btt=0`)
-        // — the quad-tree regression pin (unchanged by round 458).
+        // The one pure Baseline-profile stream (`cm_init=0 eipd=0 btt=0
+        // ats=0`) — the quad-tree / DCT-II regression pin (unchanged by
+        // round 458).
         name: "b_low_delay_baseline_deblock",
         w: 64,
         h: 48,
@@ -106,6 +107,7 @@ const CASES: &[Case] = &[
             ("cm_init", "0"),
             ("eipd", "0"),
             ("btt", "0"),
+            ("ats", "0"),
             ("deblock", "1"),
         ],
         stream_md5: "cbc0d5eb74e0448960d83f7457f1cf78",

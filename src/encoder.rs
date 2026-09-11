@@ -50,6 +50,12 @@
 //!   (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64) and the
 //!   lookahead RD search over rectangular leaves. `btt=0` restores the
 //!   quad tree.
+//! * `ats` — **adaptive transform selection** (round 458), default
+//!   **on**: `sps_ats_flag = 1` — every intra luma TB up to 32×32 also
+//!   trials the four DST-VII / DCT-VIII kernel pairs, every inter
+//!   residual the sub-block transforms. Requires `iqt`.
+//! * `iqt` — `sps_iqt_flag` (round 458), the §8.7 improved
+//!   quantization / transform chain; default follows `ats`.
 //! * `eipd` — **EIPD** intra prediction (round 455), default **on**:
 //!   every intra CU runs the 33-mode §8.4.4 search with the §7.3.8.4
 //!   MPM / PIMS / rem-mode luma syntax and `intra_chroma_pred_mode`;
@@ -88,8 +94,9 @@ use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Resu
 
 use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
-    append_length_prefixed_nal, write_idr_slice_header, write_inter_slice_header,
-    write_p_slice_header, write_pps_rbsp, write_sps_rbsp, EncSequenceConfig,
+    append_length_prefixed_nal, iqt_chroma_qp_offset, write_idr_slice_header_with,
+    write_inter_slice_header_with, write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
+    EncSequenceConfig,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
@@ -100,7 +107,7 @@ use crate::rate_plan::{
 use crate::ref_lists::{
     construct_ref_pic_lists_rpl_flag0, derive_poc_pocs_flag0, mark_references_rpl_flag0, RefPicInfo,
 };
-use crate::slice_enc::EncStats;
+use crate::slice_enc::{EncStats, IntraToolset};
 use crate::slice_enc_p::{encode_inter_slice_data, ColMotion, InterEncInputs, PEncStats, RefEntry};
 use crate::CODEC_ID_STR;
 
@@ -176,10 +183,11 @@ pub fn encode_idr_access_unit_refs(
     encode_idr_au_coded(
         coded_src,
         slice_qp,
-        deblock,
-        cm_init,
-        false,
-        false,
+        IntraToolset {
+            deblock,
+            cm_init,
+            ..IntraToolset::default()
+        },
         refs,
         (coded_w - src.width, coded_h - src.height),
     )
@@ -188,20 +196,25 @@ pub fn encode_idr_access_unit_refs(
 /// The coded-geometry IDR access-unit writer: `src` is already the
 /// §7.4.3.1 multiple-of-8 picture and `crop` the (right, bottom)
 /// conformance-window offsets in luma samples.
-#[allow(clippy::too_many_arguments)]
 fn encode_idr_au_coded(
     src: &YuvPicture,
     slice_qp: i32,
-    deblock: bool,
-    cm_init: bool,
-    eipd: bool,
-    btt: bool,
+    tools: IntraToolset,
     refs: u32,
     crop: (u32, u32),
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    let IntraToolset {
+        deblock,
+        cm_init,
+        eipd,
+        btt,
+        iqt,
+        ats,
+    } = tools;
     let (payload, recon, stats) =
-        crate::slice_enc::encode_idr_slice_data_tree(src, slice_qp, deblock, cm_init, eipd, btt)?;
-    let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
+        crate::slice_enc::encode_idr_slice_data_cfg(src, slice_qp, tools)?;
+    let off = iqt_chroma_qp_offset(slice_qp, iqt);
+    let mut slice_rbsp = write_idr_slice_header_with(slice_qp as u32, deblock, off, off)?;
     slice_rbsp.extend_from_slice(&payload);
 
     let cfg = EncSequenceConfig {
@@ -215,6 +228,8 @@ fn encode_idr_au_coded(
         crop_bottom: crop.1,
         eipd,
         btt,
+        iqt,
+        ats,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -372,6 +387,15 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     let eipd = parse_bool("eipd", true)?;
     // Round 458: the binary / ternary coding tree — default ON.
     let btt = parse_bool("btt", true)?;
+    // Round 458: adaptive transform selection (default ON) over the
+    // improved quantization / transform chain it requires.
+    let ats = parse_bool("ats", true)?;
+    let iqt = parse_bool("iqt", ats)?;
+    if ats && !iqt {
+        return Err(Error::invalid(
+            "evc encoder: ats=1 requires iqt=1 (§7.3.2.1 codes sps_ats_flag under sps_iqt_flag)",
+        ));
+    }
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -510,6 +534,8 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         cm_init,
         eipd,
         btt,
+        iqt,
+        ats,
         gop,
         refs,
         b_pictures,
@@ -703,6 +729,10 @@ pub struct EvcEncoder {
     eipd: bool,
     /// `sps_btt_flag` — the binary / ternary coding tree.
     btt: bool,
+    /// `sps_iqt_flag`.
+    iqt: bool,
+    /// `sps_ats_flag`.
+    ats: bool,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
     /// units, the rest low-delay P/B pictures.
     gop: u32,
@@ -811,13 +841,18 @@ impl EvcEncoder {
                 cm_init: self.cm_init,
                 eipd: self.eipd,
                 btt: self.btt,
+                iqt: self.iqt,
+                ats: self.ats,
             },
         )?;
-        let mut slice_rbsp = write_inter_slice_header(
+        let off = iqt_chroma_qp_offset(frame_qp, self.iqt);
+        let mut slice_rbsp = write_inter_slice_header_with(
             is_b,
             [refs_l0.len() as u32, refs_l1.len() as u32],
             frame_qp as u32,
             self.deblock,
+            off,
+            off,
         )?;
         slice_rbsp.extend_from_slice(&out.payload);
         let mut data = Vec::new();
@@ -867,10 +902,14 @@ impl Encoder for EvcEncoder {
             let (data, recon, _stats) = encode_idr_au_coded(
                 &src,
                 frame_qp,
-                self.deblock,
-                self.cm_init,
-                self.eipd,
-                self.btt,
+                IntraToolset {
+                    deblock: self.deblock,
+                    cm_init: self.cm_init,
+                    eipd: self.eipd,
+                    btt: self.btt,
+                    iqt: self.iqt,
+                    ats: self.ats,
+                },
                 self.refs,
                 (self.coded_w - self.width, self.coded_h - self.height),
             )?;
@@ -1042,6 +1081,7 @@ mod tests {
         p.pixel_format = Some(PixelFormat::Yuv420P);
         p.options.insert("eipd", "0");
         p.options.insert("btt", "0");
+        p.options.insert("ats", "0");
         p
     }
 
@@ -1781,6 +1821,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 458 — **IQT + ATS** through the registry: P and B GOPs
+    /// (ATS-intra on the intra candidates, the ATS-inter sub-block
+    /// transforms on the inter residuals) on both entropy shapes decode
+    /// sample-exactly to the encoder's reconstruction; the SPS declares
+    /// `sps_iqt_flag = sps_ats_flag = 1` and the slice headers carry the
+    /// balancing chroma QP offset; `ats=1 iqt=0` is refused.
+    #[test]
+    fn ats_gop_round_trips_through_the_registry() {
+        let (w, h) = (72u32, 40u32);
+        for &cm in &[false, true] {
+            for &b in &[false, true] {
+                let mut p = params(w, h);
+                p.options.insert("gop", "4");
+                p.options.insert("refs", "2");
+                p.options.insert("qp", "24");
+                p.options.insert("btt", "1");
+                p.options.insert("eipd", "1");
+                p.options.insert("ats", "1");
+                p.options.insert("deblock", "1");
+                p.options.insert("cm_init", if cm { "1" } else { "0" });
+                p.options.insert("b", if b { "1" } else { "0" });
+                let mut enc = make_evc_encoder(&p).unwrap();
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                for t in 0..5usize {
+                    enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                    let pkt = enc.receive_packet().unwrap();
+                    if t == 0 {
+                        let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                        let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                        assert!(sps.sps_iqt_flag && sps.sps_ats_flag);
+                    }
+                    dec.send_packet(&pkt).unwrap();
+                    let vf = match dec.receive_frame().unwrap() {
+                        Frame::Video(vf) => vf,
+                        other => panic!("expected video frame, got {other:?}"),
+                    };
+                    let recon = enc.last_recon().unwrap();
+                    for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                        let got: Vec<u16> =
+                            vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                        let stride = if c == 0 {
+                            recon.y_stride()
+                        } else {
+                            recon.c_stride()
+                        };
+                        let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                        let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                        for yy in 0..rows {
+                            assert_eq!(
+                                &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                                &plane[yy * stride..yy * stride + cols],
+                                "cm{cm} b{b} frame {t} plane {c} row {yy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut bad = params(w, h);
+        bad.options.insert("ats", "1");
+        bad.options.insert("iqt", "0");
+        assert!(make_encoder(&bad).is_err());
     }
 
     /// The noisy moving scene the rate-control pins run on.
