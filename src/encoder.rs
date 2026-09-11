@@ -45,6 +45,11 @@
 //!   direct mode and the two-slot skip join the ladder) instead of P
 //!   (round 452).
 //!
+//! * `btt` — the **binary / ternary coding tree** (round 458), default
+//!   **on**: `sps_btt_flag = 1` with the [`crate::tree_enc`] geometry
+//!   (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64) and the
+//!   lookahead RD search over rectangular leaves. `btt=0` restores the
+//!   quad tree.
 //! * `eipd` — **EIPD** intra prediction (round 455), default **on**:
 //!   every intra CU runs the 33-mode §8.4.4 search with the §7.3.8.4
 //!   MPM / PIMS / rem-mode luma syntax and `intra_chroma_pred_mode`;
@@ -174,6 +179,7 @@ pub fn encode_idr_access_unit_refs(
         deblock,
         cm_init,
         false,
+        false,
         refs,
         (coded_w - src.width, coded_h - src.height),
     )
@@ -189,11 +195,12 @@ fn encode_idr_au_coded(
     deblock: bool,
     cm_init: bool,
     eipd: bool,
+    btt: bool,
     refs: u32,
     crop: (u32, u32),
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     let (payload, recon, stats) =
-        crate::slice_enc::encode_idr_slice_data_full(src, slice_qp, deblock, cm_init, eipd)?;
+        crate::slice_enc::encode_idr_slice_data_tree(src, slice_qp, deblock, cm_init, eipd, btt)?;
     let mut slice_rbsp = write_idr_slice_header(slice_qp as u32, deblock)?;
     slice_rbsp.extend_from_slice(&payload);
 
@@ -207,6 +214,7 @@ fn encode_idr_au_coded(
         crop_right: crop.0,
         crop_bottom: crop.1,
         eipd,
+        btt,
     };
     let mut out = Vec::new();
     append_length_prefixed_nal(&mut out, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
@@ -362,6 +370,8 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     // default ON (−10 % intra BD-rate on the corpus). `eipd=0` with
     // `cm_init=0` restores the pure Baseline-profile stream.
     let eipd = parse_bool("eipd", true)?;
+    // Round 458: the binary / ternary coding tree — default ON.
+    let btt = parse_bool("btt", true)?;
     let qp = match params.options.get("qp") {
         None => DEFAULT_QP,
         Some(s) => s
@@ -499,6 +509,7 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         deblock,
         cm_init,
         eipd,
+        btt,
         gop,
         refs,
         b_pictures,
@@ -690,6 +701,8 @@ pub struct EvcEncoder {
     cm_init: bool,
     /// `sps_eipd_flag` — EIPD intra on every intra CU.
     eipd: bool,
+    /// `sps_btt_flag` — the binary / ternary coding tree.
+    btt: bool,
     /// GOP length: frame indices `0, gop, 2·gop, …` are IDR access
     /// units, the rest low-delay P/B pictures.
     gop: u32,
@@ -797,6 +810,7 @@ impl EvcEncoder {
                 deblock: self.deblock,
                 cm_init: self.cm_init,
                 eipd: self.eipd,
+                btt: self.btt,
             },
         )?;
         let mut slice_rbsp = write_inter_slice_header(
@@ -856,6 +870,7 @@ impl Encoder for EvcEncoder {
                 self.deblock,
                 self.cm_init,
                 self.eipd,
+                self.btt,
                 self.refs,
                 (self.coded_w - self.width, self.coded_h - self.height),
             )?;
@@ -1018,13 +1033,15 @@ mod tests {
     /// Registry parameters with `eipd=0`: the round-429/431/452 pins
     /// below compare the registry against the direct Baseline-mode
     /// entry points (`encode_idr_access_unit_opts` & co., which stay
-    /// `sps_eipd_flag = 0`); the EIPD tests opt in explicitly.
+    /// `sps_eipd_flag = 0` / `sps_btt_flag = 0`); the EIPD and BTT tests
+    /// opt in explicitly.
     fn params(w: u32, h: u32) -> CodecParameters {
         let mut p = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         p.width = Some(w);
         p.height = Some(h);
         p.pixel_format = Some(PixelFormat::Yuv420P);
         p.options.insert("eipd", "0");
+        p.options.insert("btt", "0");
         p
     }
 
@@ -1697,6 +1714,67 @@ mod tests {
                                 &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
                                 &plane[yy * stride..yy * stride + cols],
                                 "cm{cm} b{b} frame {t} plane {c} row {yy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Round 458 — **BTT** through the registry: P and B GOPs on both
+    /// entropy shapes, with and without deblocking, on a geometry whose
+    /// CTUs straddle both picture edges (implicit boundary binary
+    /// splits), decode sample-exactly to the encoder's reconstruction;
+    /// the SPS declares `sps_btt_flag = 1` in the Main profile.
+    #[test]
+    fn btt_gop_round_trips_through_the_registry() {
+        let (w, h) = (72u32, 40u32);
+        for &cm in &[false, true] {
+            for &(b, deblock) in &[(false, false), (true, true)] {
+                let mut p = params(w, h);
+                p.options.insert("gop", "4");
+                p.options.insert("refs", "2");
+                p.options.insert("qp", "26");
+                p.options.insert("btt", "1");
+                p.options.insert("eipd", "1");
+                p.options.insert("cm_init", if cm { "1" } else { "0" });
+                p.options.insert("b", if b { "1" } else { "0" });
+                p.options.insert("deblock", if deblock { "1" } else { "0" });
+                let mut enc = make_evc_encoder(&p).unwrap();
+                let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+                for t in 0..5usize {
+                    enc.send_frame(&Frame::Video(rc_scene(w, h, t))).unwrap();
+                    let pkt = enc.receive_packet().unwrap();
+                    if t == 0 {
+                        let info = crate::probe(&pkt.data).unwrap();
+                        assert_eq!(info.profile_idc, 1, "BTT forces Main");
+                        let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                        let sps = crate::sps::parse(nals[0].rbsp()).unwrap();
+                        assert!(sps.sps_btt_flag);
+                    }
+                    dec.send_packet(&pkt).unwrap();
+                    let vf = match dec.receive_frame().unwrap() {
+                        Frame::Video(vf) => vf,
+                        other => panic!("expected video frame, got {other:?}"),
+                    };
+                    let recon = enc.last_recon().unwrap();
+                    for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                        let got: Vec<u16> =
+                            vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                        let stride = if c == 0 {
+                            recon.y_stride()
+                        } else {
+                            recon.c_stride()
+                        };
+                        let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                        let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                        for yy in 0..rows {
+                            assert_eq!(
+                                &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                                &plane[yy * stride..yy * stride + cols],
+                                "cm{cm} b{b} deblock{deblock} frame {t} plane {c} row {yy}"
                             );
                         }
                     }

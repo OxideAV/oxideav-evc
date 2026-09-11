@@ -78,15 +78,15 @@ use crate::slice_data::{
 };
 use crate::slice_enc::{
     emit_intra_pred_mode, emit_residual_rle, gather_block, quantize_block, quantize_pred,
-    quantize_residual, rd_lambda_at_qp_prime, restore_region, save_region, MODES,
+    quantize_residual, rd_lambda_at_qp_prime, restore_region, save_region, RegionSave, MODES,
 };
+use crate::tree_enc::{self, TreeCoder, TreeGeometry, TreeStats};
 
 /// Geometry constants of the encoder SPS (§7.4.3.1 `sps_btt_flag == 0`
 /// defaults): 64×64 CTU, 4×4 minimum CB. With `MaxTbLog2SizeY == 6`
 /// (eq. 51) no leaf ever TB-splits, so every CU is a single
 /// `transform_unit()`.
 const CTB_LOG2: u32 = 6;
-const MIN_CB_LOG2: u32 = 2;
 
 /// Per-picture P/B-encode statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,8 +101,10 @@ pub struct PEncStats {
     pub cbf_all_zero_cus: u32,
     /// MODE_INTRA leaves.
     pub intra_cus: u32,
-    /// `split_cu_flag` bins emitted.
+    /// `split_cu_flag` bins emitted (`sps_btt_flag == 0`).
     pub split_flag_bins: u32,
+    /// The `sps_btt_flag == 1` tree syntax (round 458).
+    pub tree: TreeStats,
     /// B-slice leaves coded `direct_mode_flag = 1` (subset of
     /// `inter_cus`).
     pub direct_cus: u32,
@@ -156,6 +158,9 @@ pub struct InterEncInputs<'a> {
     /// `sps_eipd_flag` — the intra candidates run the 33-mode EIPD
     /// search and write the §7.3.8.4 EIPD syntax (round 455).
     pub eipd: bool,
+    /// `sps_btt_flag` — the binary / ternary coding tree of
+    /// [`crate::tree_enc`] (round 458).
+    pub btt: bool,
 }
 
 /// Output of [`encode_inter_slice_data`].
@@ -226,12 +231,6 @@ struct Explicit {
     cost: f64,
 }
 
-/// A decided `split_unit()` subtree.
-enum Node {
-    Split(Vec<(u32, u32, u32, u32, Node)>),
-    Leaf(PLeaf),
-}
-
 struct PCtx<'a> {
     src: &'a YuvPicture,
     recon: YuvPicture,
@@ -255,6 +254,67 @@ struct PCtx<'a> {
     sel: CtxSel,
     /// `sps_eipd_flag`.
     eipd: bool,
+    /// The coding-tree shape (`sps_btt_flag`) and its size limits.
+    geom: TreeGeometry,
+}
+
+/// The decode-order state a tree trial rewinds: the block's recon,
+/// the side-info grid, the HMVP list and the rate model.
+struct InterSnap {
+    pixels: RegionSave,
+    grid: SideInfoGrid,
+    hmvp: HmvpCandList,
+    model: BitCostModel,
+}
+
+impl TreeCoder for PCtx<'_> {
+    type Leaf = PLeaf;
+    type Snap = InterSnap;
+
+    fn geometry(&self) -> &TreeGeometry {
+        &self.geom
+    }
+    fn sel(&self) -> CtxSel {
+        self.sel
+    }
+    fn lambda(&self) -> f64 {
+        self.lambda
+    }
+    fn grid(&self) -> &SideInfoGrid {
+        &self.side_info
+    }
+    fn snapshot(&self, model: &BitCostModel, x0: u32, y0: u32, lw: u32, lh: u32) -> InterSnap {
+        InterSnap {
+            pixels: save_region(&self.recon, x0, y0, lw, lh),
+            grid: self.side_info.clone(),
+            hmvp: self.hmvp.clone(),
+            model: model.clone(),
+        }
+    }
+    fn restore(
+        &mut self,
+        model: &mut BitCostModel,
+        snap: &InterSnap,
+        x0: u32,
+        y0: u32,
+        lw: u32,
+        lh: u32,
+    ) {
+        restore_region(&mut self.recon, &snap.pixels, x0, y0, lw, lh);
+        self.side_info = snap.grid.clone();
+        self.hmvp = snap.hmvp.clone();
+        *model = snap.model.clone();
+    }
+    fn decide_leaf(
+        &mut self,
+        model: &mut BitCostModel,
+        x0: u32,
+        y0: u32,
+        lw: u32,
+        lh: u32,
+    ) -> Result<(PLeaf, f64)> {
+        decide_leaf(self, model, x0, y0, lw, lh)
+    }
 }
 
 impl<'a> PCtx<'a> {
@@ -316,6 +376,7 @@ pub fn encode_p_slice_data(
             deblock,
             cm_init,
             eipd: false,
+            btt: false,
         },
     )?;
     Ok((out.payload, out.recon, out.stats))
@@ -403,6 +464,7 @@ pub fn encode_inter_slice_data(
         },
         sel: CtxSel::new(inputs.cm_init, InitType::Pb),
         eipd: inputs.eipd,
+        geom: TreeGeometry::encoder(src.width, src.height, inputs.btt),
     };
     let mut stats = PEncStats::default();
     // The decide pass's rate model — the emit pass's context table,
@@ -423,10 +485,9 @@ pub fn encode_inter_slice_data(
             if cx == 0 {
                 ctx.hmvp.reset();
             }
-            let (node, _cost) = decide_split_unit(
+            let (node, _cost) = tree_enc::search_split_unit(
                 &mut ctx,
                 &mut model,
-                &mut stats,
                 cx << CTB_LOG2,
                 cy << CTB_LOG2,
                 CTB_LOG2,
@@ -447,19 +508,32 @@ pub fn encode_inter_slice_data(
     }
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
     for (x0, y0, node) in &roots {
-        emit_split_unit(
+        let mut tree_stats = stats.tree;
+        let mut leaf_fn = |enc: &mut CabacEncoder,
+                           grid: &mut SideInfoGrid,
+                           x0: u32,
+                           y0: u32,
+                           lw: u32,
+                           lh: u32,
+                           plan: &PLeaf| {
+            emit_leaf(enc, &mut stats, &ctx, sel, grid, x0, y0, lw, lh, plan);
+        };
+        tree_enc::emit_tree(
             &mut enc,
-            &mut stats,
-            &ctx,
             sel,
+            &ctx.geom,
             &mut emit_grid,
             *x0,
             *y0,
             CTB_LOG2,
             CTB_LOG2,
             node,
+            &mut tree_stats,
+            &mut leaf_fn,
         );
+        stats.tree = tree_stats;
     }
+    stats.split_flag_bins = stats.tree.split_cu_flag_bins;
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
 
     if inputs.deblock {
@@ -482,99 +556,6 @@ pub fn encode_inter_slice_data(
 // ---------------------------------------------------------------------
 // Decide pass.
 // ---------------------------------------------------------------------
-
-fn split_geometry(ctx: &PCtx<'_>, x0: u32, y0: u32, log2_w: u32, log2_h: u32) -> (bool, bool) {
-    let within = x0 + (1 << log2_w) <= ctx.pic_w && y0 + (1 << log2_h) <= ctx.pic_h;
-    let can_recurse = log2_w > MIN_CB_LOG2 && log2_h > MIN_CB_LOG2;
-    (within, can_recurse)
-}
-
-fn decide_split_unit(
-    ctx: &mut PCtx<'_>,
-    model: &mut BitCostModel,
-    stats: &mut PEncStats,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-) -> Result<(Node, f64)> {
-    let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
-    let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
-
-    if can_recurse && !within {
-        let (children, cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
-        return Ok((Node::Split(children), cost));
-    }
-    if !flag_present {
-        let (plan, cost) = decide_leaf(ctx, model, x0, y0, log2_w, log2_h)?;
-        return Ok((Node::Leaf(plan), cost));
-    }
-
-    // Trial the leaf (its split_cu_flag = 0 bin committed first, in
-    // emit order), snapshot, rewind, trial the split, keep the cheaper
-    // state (recon + grid + HMVP + rate model all roll back together).
-    let (split_t, split_i) = ctx.sel.ctx(MainCtxTable::SplitCuFlag, 0);
-    let before_pix = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
-    let before_grid = ctx.side_info.clone();
-    let before_hmvp = ctx.hmvp.clone();
-    let before_model = model.clone();
-
-    let leaf_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 0));
-    let (leaf_plan, leaf_cost) = decide_leaf(ctx, model, x0, y0, log2_w, log2_h)?;
-    let leaf_cost = leaf_cost + ctx.lambda * leaf_flag_bits;
-    let after_leaf_pix = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
-    let after_leaf_grid = ctx.side_info.clone();
-    let after_leaf_hmvp = ctx.hmvp.clone();
-    let after_leaf_model = model.clone();
-
-    restore_region(&mut ctx.recon, &before_pix, x0, y0, log2_w, log2_h);
-    ctx.side_info = before_grid;
-    ctx.hmvp = before_hmvp;
-    *model = before_model;
-
-    let split_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 1));
-    let (children, split_cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
-    let split_cost = split_cost + ctx.lambda * split_flag_bits;
-
-    if leaf_cost <= split_cost {
-        restore_region(&mut ctx.recon, &after_leaf_pix, x0, y0, log2_w, log2_h);
-        ctx.side_info = after_leaf_grid;
-        ctx.hmvp = after_leaf_hmvp;
-        *model = after_leaf_model;
-        Ok((Node::Leaf(leaf_plan), leaf_cost))
-    } else {
-        Ok((Node::Split(children), split_cost))
-    }
-}
-
-#[allow(clippy::type_complexity)]
-fn decide_children(
-    ctx: &mut PCtx<'_>,
-    model: &mut BitCostModel,
-    stats: &mut PEncStats,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-) -> Result<(Vec<(u32, u32, u32, u32, Node)>, f64)> {
-    let mut out = Vec::with_capacity(4);
-    let mut cost = 0f64;
-    for ch in crate::split::quad_split_children(x0, y0, log2_w, log2_h, 0, 0, ctx.pic_w, ctx.pic_h)
-    {
-        let (node, c) = decide_split_unit(
-            ctx,
-            model,
-            stats,
-            ch.x0,
-            ch.y0,
-            ch.log2_cb_width,
-            ch.log2_cb_height,
-        )?;
-        cost += c;
-        out.push((ch.x0, ch.y0, ch.log2_cb_width, ch.log2_cb_height, node));
-    }
-    Ok((out, cost))
-}
 
 /// Motion-compensated prediction planes of one CU: `(Y, Cb, Cr)`.
 type Pred = (Vec<i32>, Vec<i32>, Vec<i32>);
@@ -1776,42 +1757,6 @@ fn decide_leaf(
 // Emit pass — decoder-exact bin order.
 // ---------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn emit_split_unit<S: BinSink>(
-    enc: &mut S,
-    stats: &mut PEncStats,
-    ctx: &PCtx<'_>,
-    sel: CtxSel,
-    grid: &mut SideInfoGrid,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-    node: &Node,
-) {
-    let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
-    let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
-    let (split_t, split_i) = sel.ctx(MainCtxTable::SplitCuFlag, 0);
-    match node {
-        Node::Split(children) => {
-            if flag_present {
-                enc.encode_decision(split_t, split_i, 1);
-                stats.split_flag_bins += 1;
-            }
-            for (cx, cy, clw, clh, child) in children {
-                emit_split_unit(enc, stats, ctx, sel, grid, *cx, *cy, *clw, *clh, child);
-            }
-        }
-        Node::Leaf(plan) => {
-            if flag_present {
-                enc.encode_decision(split_t, split_i, 0);
-                stats.split_flag_bins += 1;
-            }
-            emit_leaf(enc, stats, ctx, sel, grid, x0, y0, log2_w, log2_h, plan);
-        }
-    }
-}
-
 /// `cu_skip_flag` / `pred_mode_flag` context — the decoder's Table 47 /
 /// Table 61 §9.3.4.2.4 neighbour ctxIncs over the emit-order grid
 /// (Baseline collapse: `(0, 0)`).
@@ -2191,7 +2136,7 @@ mod tests {
             pic_width: w,
             pic_height: h,
             ctb_log2_size_y: CTB_LOG2,
-            min_cb_log2_size_y: MIN_CB_LOG2,
+            min_cb_log2_size_y: 2,
             max_tb_log2_size_y: 6,
             chroma_format_idc: 1,
             tree_gates: CodingTreeGates {
@@ -2636,6 +2581,7 @@ mod tests {
                 deblock: false,
                 cm_init: true,
                 eipd: false,
+                btt: false,
             },
         );
         assert!(bad.is_err());
@@ -2652,6 +2598,7 @@ mod tests {
                 deblock: false,
                 cm_init: true,
                 eipd: false,
+                btt: false,
             },
         );
         assert!(bad_b.is_err());
@@ -2688,6 +2635,7 @@ mod tests {
                     deblock: false,
                     cm_init,
                     eipd: false,
+                    btt: false,
                 },
             )
             .unwrap();
@@ -2780,6 +2728,7 @@ mod tests {
                             deblock,
                             cm_init,
                             eipd: false,
+                            btt: false,
                         },
                     )
                     .unwrap();
@@ -2820,6 +2769,7 @@ mod tests {
                                 deblock,
                                 cm_init,
                                 eipd: false,
+                                btt: false,
                             },
                         )
                         .unwrap();
@@ -2896,6 +2846,7 @@ mod tests {
                 deblock: false,
                 cm_init: true,
                 eipd: false,
+                btt: false,
             },
         )
         .unwrap();
@@ -2925,6 +2876,7 @@ mod tests {
                 deblock: false,
                 cm_init: true,
                 eipd: false,
+                btt: false,
             },
         )
         .unwrap();
@@ -2987,6 +2939,7 @@ mod tests {
                     deblock: false,
                     cm_init: true,
                     eipd: false,
+                    btt: false,
                 },
             )
             .unwrap()

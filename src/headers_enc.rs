@@ -57,6 +57,14 @@ pub struct EncSequenceConfig {
     /// (Table A.6 binIdx 8, `0x100`): setting it forces `profile_idc =
     /// 1` even with `cm_init` off.
     pub eipd: bool,
+    /// `sps_btt_flag` (§7.4.3.1) — the binary / ternary coding tree
+    /// (round 458). The SPS then carries the explicit geometry
+    /// `log2_ctu_size_minus5 = 1`, `log2_min_cb_size_minus2 = 0` and
+    /// the three `log2_diff_*` fields at 0 (the [`crate::tree_enc`]
+    /// constants: the same 64×64 CTU / 4×4 minimum CB the
+    /// `sps_btt_flag == 0` defaults give, ternary splits from 16 to 64).
+    /// Main-profile only (Table A.6 binIdx 0, `0x1`).
+    pub btt: bool,
 }
 
 /// Write the §7.3.2.1 SPS RBSP for the intra encoder configuration:
@@ -106,10 +114,13 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
         )));
     }
     let mut w = BitWriter::new();
-    let main = cfg.cm_init || cfg.eipd;
+    let main = cfg.cm_init || cfg.eipd || cfg.btt;
     // Table A.6: binIdx 14 = sps_cm_init_flag (0x4000), binIdx 8 =
-    // sps_eipd_flag (0x100); Baseline (A.3.2) requires toolset_idc_h = 0.
-    let toolset_h = (if cfg.cm_init { 0x4000 } else { 0 }) | (if cfg.eipd { 0x100 } else { 0 });
+    // sps_eipd_flag (0x100), binIdx 0 = sps_btt_flag (0x1); Baseline
+    // (A.3.2) requires toolset_idc_h = 0.
+    let toolset_h = (if cfg.cm_init { 0x4000 } else { 0 })
+        | (if cfg.eipd { 0x100 } else { 0 })
+        | (if cfg.btt { 0x1 } else { 0 });
     w.ue(0); // sps_seq_parameter_set_id
     w.u(8, u32::from(main)); // profile_idc: 0 Baseline / 1 Main (A.3.2/A.3.3)
     w.u(8, cfg.level_idc as u32); // level_idc
@@ -120,7 +131,15 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.ue(cfg.height); // pic_height_in_luma_samples
     w.ue(cfg.bit_depth - 8); // bit_depth_luma_minus8
     w.ue(cfg.bit_depth - 8); // bit_depth_chroma_minus8 (decoder requires ==)
-    w.u1(false); // sps_btt_flag → CtbLog2SizeY=6, MinCbLog2SizeY=2 defaults
+    w.u1(cfg.btt); // sps_btt_flag (0 → CtbLog2SizeY=6, MinCbLog2SizeY=2 defaults)
+    if cfg.btt {
+        // §7.3.2.1: the explicit tree geometry (the tree_enc limits).
+        w.ue(crate::tree_enc::BTT_LOG2_CTU_SIZE_MINUS5); // log2_ctu_size_minus5
+        w.ue(crate::tree_enc::BTT_LOG2_MIN_CB_SIZE_MINUS2); // log2_min_cb_size_minus2
+        w.ue(crate::tree_enc::BTT_LOG2_DIFF_CTU_MAX_14_CB_SIZE); // log2_diff_ctu_max_14_cb_size
+        w.ue(crate::tree_enc::BTT_LOG2_DIFF_CTU_MAX_TT_CB_SIZE); // log2_diff_ctu_max_tt_cb_size
+        w.ue(crate::tree_enc::BTT_LOG2_DIFF_MIN_CB_MIN_TT_CB_SIZE_MINUS2); // log2_diff_min_cb_min_tt_cb_size_minus2
+    }
     w.u1(false); // sps_suco_flag
     w.u1(false); // sps_admvp_flag
     w.u1(cfg.eipd); // sps_eipd_flag
@@ -301,6 +320,7 @@ mod tests {
             crop_right: 0,
             crop_bottom: 0,
             eipd: false,
+            btt: false,
         };
         let rbsp = write_sps_rbsp(&cfg).unwrap();
         let sps = crate::sps::parse(&rbsp).expect("own SPS must parse");
@@ -355,6 +375,7 @@ mod tests {
                 crop_right: 0,
                 crop_bottom: 0,
                 eipd: true,
+                btt: false,
             };
             let rbsp = write_sps_rbsp(&cfg).unwrap();
             let sps = crate::sps::parse(&rbsp).unwrap();
@@ -370,6 +391,46 @@ mod tests {
         }
     }
 
+    /// Round 458: the BTT SPS shape — Main profile with the Table A.6
+    /// binIdx-0 bit, `sps_btt_flag = 1` and the explicit tree geometry,
+    /// parsed back into the same `CodingTreeGates` the encoder's tree
+    /// search assumed.
+    #[test]
+    fn sps_parse_back_btt() {
+        let cfg = EncSequenceConfig {
+            width: 64,
+            height: 48,
+            level_idc: 30,
+            bit_depth: 8,
+            cm_init: true,
+            max_num_tid0_ref_pics: 1,
+            crop_right: 0,
+            crop_bottom: 0,
+            eipd: true,
+            btt: true,
+        };
+        let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
+        assert_eq!(sps.profile_idc, 1);
+        assert!(sps.sps_btt_flag);
+        assert_eq!(sps.toolset_idc_h, 0x4101);
+        assert_eq!(sps.log2_ctu_size_minus5, 1);
+        assert_eq!(sps.log2_min_cb_size_minus2, 0);
+        let gates = crate::slice_data::CodingTreeGates::from_sps(&sps);
+        let geom = crate::tree_enc::TreeGeometry::encoder(64, 48, true);
+        assert_eq!(gates.btt_limits, geom.btt.unwrap());
+        assert!(!gates.sps_suco_flag && !gates.sps_admvp_flag);
+        // The Baseline-shape writer is byte-identical to before.
+        let off = EncSequenceConfig {
+            btt: false,
+            cm_init: false,
+            eipd: false,
+            ..cfg
+        };
+        let sps = crate::sps::parse(&write_sps_rbsp(&off).unwrap()).unwrap();
+        assert_eq!(sps.profile_idc, 0);
+        assert!(!sps.sps_btt_flag);
+    }
+
     #[test]
     fn sps_parse_back_10bit() {
         let cfg = EncSequenceConfig {
@@ -382,6 +443,7 @@ mod tests {
             crop_right: 0,
             crop_bottom: 0,
             eipd: false,
+            btt: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         assert_eq!(sps.bit_depth_y(), 10);
@@ -423,6 +485,7 @@ mod tests {
             crop_right: 0,
             crop_bottom: 0,
             eipd: false,
+            btt: false,
         };
         let sps = crate::sps::parse(&write_sps_rbsp(&cfg).unwrap()).unwrap();
         let pps = crate::pps::parse(&write_pps_rbsp().unwrap()).unwrap();
@@ -487,6 +550,7 @@ mod tests {
             crop_right: 0,
             crop_bottom: 0,
             eipd: false,
+            btt: false,
         };
         let mut bs = Vec::new();
         append_length_prefixed_nal(

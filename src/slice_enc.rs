@@ -64,6 +64,7 @@ use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_
 use crate::quant_enc::{forward_quantize, forward_transform_fractional, level_unit_sse_weights};
 use crate::rdoq::{rdoq_rle, RdoqInputs};
 use crate::slice_data::zigzag_scan;
+use crate::tree_enc::{self, TreeCoder, TreeGeometry, TreeNode, TreeStats};
 
 /// The five Table-13 Baseline intra modes in syntax-index order.
 pub(crate) const MODES: [IntraMode; 5] = [
@@ -77,7 +78,6 @@ pub(crate) const MODES: [IntraMode; 5] = [
 /// Geometry constants of the all-zero-toolset SPS the header writer
 /// emits (§7.4.3.1 sps_btt_flag == 0 defaults + eq. 51).
 const CTB_LOG2: u32 = 6;
-const MIN_CB_LOG2: u32 = 2;
 
 /// Per-picture encode statistics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +99,10 @@ pub struct EncStats {
     pub cbf_luma_set: u32,
     /// Chroma CBFs signalled 1 (cb + cr).
     pub cbf_chroma_set: u32,
-    /// `split_cu_flag` bins emitted.
+    /// `split_cu_flag` bins emitted (`sps_btt_flag == 0`).
     pub split_flag_bins: u32,
+    /// The `sps_btt_flag == 1` tree syntax (round 458).
+    pub tree: TreeStats,
 }
 
 impl Default for EncStats {
@@ -114,6 +116,7 @@ impl Default for EncStats {
             cbf_luma_set: 0,
             cbf_chroma_set: 0,
             split_flag_bins: 0,
+            tree: TreeStats::default(),
         }
     }
 }
@@ -131,10 +134,7 @@ struct LeafPlan {
 }
 
 /// A decided `split_unit()` subtree.
-enum Node {
-    Split(Vec<(u32, u32, u32, u32, Node)>),
-    Leaf(LeafPlan),
-}
+type Node = TreeNode<LeafPlan>;
 
 struct EncCtx<'a> {
     src: &'a YuvPicture,
@@ -152,6 +152,64 @@ struct EncCtx<'a> {
     /// Decode-order side-info grid — the §8.4.2 neighbour modes the
     /// EIPD lists derive from (and the §8.8.2 deblocking inputs).
     side_info: SideInfoGrid,
+    /// The coding-tree shape (`sps_btt_flag`) and its size limits.
+    geom: TreeGeometry,
+}
+
+/// The decode-order state a tree trial rewinds: the block's recon,
+/// the side-info grid and the rate model.
+struct IntraSnap {
+    pixels: RegionSave,
+    grid: SideInfoGrid,
+    model: BitCostModel,
+}
+
+impl TreeCoder for EncCtx<'_> {
+    type Leaf = LeafPlan;
+    type Snap = IntraSnap;
+
+    fn geometry(&self) -> &TreeGeometry {
+        &self.geom
+    }
+    fn sel(&self) -> CtxSel {
+        self.sel
+    }
+    fn lambda(&self) -> f64 {
+        self.lambda
+    }
+    fn grid(&self) -> &SideInfoGrid {
+        &self.side_info
+    }
+    fn snapshot(&self, model: &BitCostModel, x0: u32, y0: u32, lw: u32, lh: u32) -> IntraSnap {
+        IntraSnap {
+            pixels: save_region(&self.recon, x0, y0, lw, lh),
+            grid: self.side_info.clone(),
+            model: model.clone(),
+        }
+    }
+    fn restore(
+        &mut self,
+        model: &mut BitCostModel,
+        snap: &IntraSnap,
+        x0: u32,
+        y0: u32,
+        lw: u32,
+        lh: u32,
+    ) {
+        restore_region(&mut self.recon, &snap.pixels, x0, y0, lw, lh);
+        self.side_info = snap.grid.clone();
+        *model = snap.model.clone();
+    }
+    fn decide_leaf(
+        &mut self,
+        model: &mut BitCostModel,
+        x0: u32,
+        y0: u32,
+        lw: u32,
+        lh: u32,
+    ) -> Result<(LeafPlan, f64)> {
+        decide_leaf(self, model, x0, y0, lw, lh)
+    }
 }
 
 /// [`encode_idr_slice_data_with`] with deblocking off — the historical
@@ -220,6 +278,22 @@ pub fn encode_idr_slice_data_full(
     cm_init: bool,
     eipd: bool,
 ) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
+    encode_idr_slice_data_tree(src, slice_qp, deblock, cm_init, eipd, false)
+}
+
+/// [`encode_idr_slice_data_full`] plus `sps_btt_flag` (round 458): with
+/// `btt` the coding tree is the binary / ternary tree of
+/// [`crate::tree_enc`] (the SPS must declare `sps_btt_flag = 1` with the
+/// [`crate::tree_enc`] size limits — [`crate::headers_enc`] does);
+/// without it the round-429 quad tree.
+pub fn encode_idr_slice_data_tree(
+    src: &YuvPicture,
+    slice_qp: i32,
+    deblock: bool,
+    cm_init: bool,
+    eipd: bool,
+    btt: bool,
+) -> Result<(Vec<u8>, YuvPicture, EncStats)> {
     if src.chroma_format_idc != 1 {
         return Err(Error::unsupported(
             "evc encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
@@ -249,6 +323,7 @@ pub fn encode_idr_slice_data_full(
         sel,
         eipd,
         side_info: SideInfoGrid::new(src.width, src.height),
+        geom: TreeGeometry::encoder(src.width, src.height, btt),
     };
     let mut stats = EncStats::default();
     // The decide pass's rate model: the same context table the emit
@@ -266,10 +341,9 @@ pub fn encode_idr_slice_data_full(
     let mut roots = Vec::with_capacity((ctus_x * ctus_y) as usize);
     for cy in 0..ctus_y {
         for cx in 0..ctus_x {
-            let (node, _cost) = decide_split_unit(
+            let (node, _cost) = tree_enc::search_split_unit(
                 &mut ctx,
                 &mut model,
-                &mut stats,
                 cx << CTB_LOG2,
                 cy << CTB_LOG2,
                 CTB_LOG2,
@@ -293,19 +367,49 @@ pub fn encode_idr_slice_data_full(
     // the CUs the decoder has already reconstructed at that point.
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
     for (x0, y0, node) in &roots {
-        emit_split_unit(
+        let mut tree_stats = stats.tree;
+        let mut leaf_fn = |enc: &mut CabacEncoder,
+                           grid: &mut SideInfoGrid,
+                           x0: u32,
+                           y0: u32,
+                           lw: u32,
+                           lh: u32,
+                           plan: &LeafPlan| {
+            emit_leaf(enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, x0, y0, lw, lh);
+            grid.stamp_block(
+                x0,
+                y0,
+                1u32 << lw,
+                1u32 << lh,
+                leaf_side_info(plan, ctx.qp, x0, y0, lw, lh),
+            );
+            stats.leaves += 1;
+            stats.cbf_luma_set += u32::from(plan.cbf_y);
+            stats.cbf_chroma_set += u32::from(plan.cbf_cb) + u32::from(plan.cbf_cr);
+            match plan.intra {
+                IntraSel::Baseline(mode_idx) => stats.mode_histogram[mode_idx] += 1,
+                IntraSel::Eipd { mode_y, chroma_raw } => {
+                    stats.eipd_mode_histogram[mode_y as usize] += 1;
+                    stats.eipd_chroma_non_dm += u32::from(chroma_raw != 0);
+                }
+            }
+        };
+        tree_enc::emit_tree(
             &mut enc,
-            &mut stats,
-            &ctx,
             sel,
+            &ctx.geom,
             &mut emit_grid,
             *x0,
             *y0,
             CTB_LOG2,
             CTB_LOG2,
             node,
+            &mut tree_stats,
+            &mut leaf_fn,
         );
+        stats.tree = tree_stats;
     }
+    stats.split_flag_bins = stats.tree.split_cu_flag_bins;
     enc.encode_terminate(true); // §7.3.8.1 end_of_tile_one_bit
 
     if deblock {
@@ -338,129 +442,38 @@ fn stamp_decided(
     log2_h: u32,
     node: &Node,
 ) {
-    match node {
-        Node::Split(children) => {
-            for (cx, cy, clw, clh, child) in children {
-                stamp_decided(side_info, slice_qp, *cx, *cy, *clw, *clh, child);
-            }
-        }
-        Node::Leaf(plan) => side_info.stamp_block(
-            x0,
-            y0,
-            1u32 << log2_w,
-            1u32 << log2_h,
-            CuSideInfo {
-                pred_mode: CuPredMode::Intra,
-                cbf_luma: u8::from(plan.cbf_y),
-                cu_x0: x0 as u16,
-                cu_y0: y0 as u16,
-                cu_log2_w: log2_w as u8,
-                cu_log2_h: log2_h as u8,
-                intra_luma_mode: plan.intra.stamp_value(),
-                qp_y: slice_qp.clamp(0, 51) as u8,
-                ..Default::default()
-            },
-        ),
-    }
+    tree_enc::for_each_leaf(x0, y0, log2_w, log2_h, node, &mut |x, y, lw, lh, plan| {
+        side_info.stamp_block(
+            x,
+            y,
+            1u32 << lw,
+            1u32 << lh,
+            leaf_side_info(plan, slice_qp, x, y, lw, lh),
+        );
+    });
 }
 
-/// Mirror of the decoder's Baseline `resolve_split_unit` presence rules
-/// (§7.3.8.3, `sps_btt_flag == 0`): whether this block reads a
-/// `split_cu_flag`, may recurse, and lies fully inside the picture.
-fn split_geometry(ctx: &EncCtx<'_>, x0: u32, y0: u32, log2_w: u32, log2_h: u32) -> (bool, bool) {
-    let within = x0 + (1 << log2_w) <= ctx.pic_w && y0 + (1 << log2_h) <= ctx.pic_h;
-    let can_recurse = log2_w > MIN_CB_LOG2 && log2_h > MIN_CB_LOG2;
-    (within, can_recurse)
-}
-
-/// Decide one `split_unit()`: leaf vs quad split under RD cost,
-/// committing the winning reconstruction into `ctx.recon` and the
-/// winning bins into `model`. Returns the decided subtree and its cost
-/// (distortion + λ·bits).
-fn decide_split_unit(
-    ctx: &mut EncCtx<'_>,
-    model: &mut BitCostModel,
-    stats: &mut EncStats,
+/// The side info of one decided intra leaf — what the decoder's
+/// `decode_transform_unit` stamps for a MODE_INTRA CU.
+fn leaf_side_info(
+    plan: &LeafPlan,
+    qp: i32,
     x0: u32,
     y0: u32,
     log2_w: u32,
     log2_h: u32,
-) -> Result<(Node, f64)> {
-    let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
-    let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
-
-    if can_recurse && !within {
-        // Implicit split at the picture edge — no flag, no leaf option.
-        let (children, cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
-        return Ok((Node::Split(children), cost));
+) -> CuSideInfo {
+    CuSideInfo {
+        pred_mode: CuPredMode::Intra,
+        cbf_luma: u8::from(plan.cbf_y),
+        cu_x0: x0 as u16,
+        cu_y0: y0 as u16,
+        cu_log2_w: log2_w as u8,
+        cu_log2_h: log2_h as u8,
+        intra_luma_mode: plan.intra.stamp_value(),
+        qp_y: qp.clamp(0, 51) as u8,
+        ..Default::default()
     }
-    if !flag_present {
-        // 4×4 in-picture leaf: nothing signalled, one coding_unit().
-        return decide_leaf(ctx, model, stats, x0, y0, log2_w, log2_h)
-            .map(|(plan, cost)| (Node::Leaf(plan), cost));
-    }
-
-    // Both options are open. Trial the leaf first (its split_cu_flag =
-    // 0 bin committed ahead of it, exactly as the emit pass orders the
-    // bins), snapshot its recon + context state, rewind, trial the
-    // split, then keep the cheaper reconstruction.
-    let (split_t, split_i) = ctx.sel.ctx(MainCtxTable::SplitCuFlag, 0);
-    let before = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
-    let model_before = model.clone();
-    let grid_before = ctx.side_info.clone();
-    let leaf_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 0));
-    let (leaf_plan, leaf_cost) = decide_leaf(ctx, model, stats, x0, y0, log2_w, log2_h)?;
-    let leaf_cost = leaf_cost + ctx.lambda * leaf_flag_bits;
-    let after_leaf = save_region(&ctx.recon, x0, y0, log2_w, log2_h);
-    let model_after_leaf = model.clone();
-    let grid_after_leaf = ctx.side_info.clone();
-    restore_region(&mut ctx.recon, &before, x0, y0, log2_w, log2_h);
-    *model = model_before;
-    ctx.side_info = grid_before;
-
-    let split_flag_bits = model.commit(|m| m.encode_decision(split_t, split_i, 1));
-    let (children, split_cost) = decide_children(ctx, model, stats, x0, y0, log2_w, log2_h)?;
-    let split_cost = split_cost + ctx.lambda * split_flag_bits;
-
-    if leaf_cost <= split_cost {
-        restore_region(&mut ctx.recon, &after_leaf, x0, y0, log2_w, log2_h);
-        *model = model_after_leaf;
-        ctx.side_info = grid_after_leaf;
-        Ok((Node::Leaf(leaf_plan), leaf_cost))
-    } else {
-        Ok((Node::Split(children), split_cost))
-    }
-}
-
-/// Decide the four (in-picture) quad children in the decoder's child
-/// enumeration order (`split::quad_split_children`, SUCO order 0).
-#[allow(clippy::type_complexity)]
-fn decide_children(
-    ctx: &mut EncCtx<'_>,
-    model: &mut BitCostModel,
-    stats: &mut EncStats,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-) -> Result<(Vec<(u32, u32, u32, u32, Node)>, f64)> {
-    let mut out = Vec::with_capacity(4);
-    let mut cost = 0f64;
-    for ch in crate::split::quad_split_children(x0, y0, log2_w, log2_h, 0, 0, ctx.pic_w, ctx.pic_h)
-    {
-        let (node, c) = decide_split_unit(
-            ctx,
-            model,
-            stats,
-            ch.x0,
-            ch.y0,
-            ch.log2_cb_width,
-            ch.log2_cb_height,
-        )?;
-        cost += c;
-        out.push((ch.x0, ch.y0, ch.log2_cb_width, ch.log2_cb_height, node));
-    }
-    Ok((out, cost))
 }
 
 /// Decide one leaf: 5-mode luma search + §8.4.3 DM chroma, committing the
@@ -471,7 +484,6 @@ fn decide_children(
 fn decide_leaf(
     ctx: &mut EncCtx<'_>,
     model: &mut BitCostModel,
-    stats: &mut EncStats,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -596,8 +608,6 @@ fn decide_leaf(
                 None,
             )?;
         }
-        stats.eipd_mode_histogram[mode_y as usize] += 1;
-        stats.eipd_chroma_non_dm += u32::from(raw != 0);
         (
             LeafPlan {
                 intra: IntraSel::Eipd {
@@ -700,7 +710,6 @@ fn decide_leaf(
         }
         let (levels_cr, cbf_cr) = chroma.pop().expect("cr");
         let (levels_cb, cbf_cb) = chroma.pop().expect("cb");
-        stats.mode_histogram[mode_idx] += 1;
         (
             LeafPlan {
                 intra: IntraSel::Baseline(mode_idx),
@@ -714,10 +723,6 @@ fn decide_leaf(
             cost,
         )
     };
-
-    stats.leaves += 1;
-    stats.cbf_luma_set += u32::from(plan.cbf_y);
-    stats.cbf_chroma_set += u32::from(plan.cbf_cb) + u32::from(plan.cbf_cr);
 
     // Advance the rate model over the decided leaf's exact bin string
     // (the §8.4.2 probes read the L/A/R neighbours, which this CU's own
@@ -742,17 +747,7 @@ fn decide_leaf(
         y0,
         w as u32,
         h as u32,
-        CuSideInfo {
-            pred_mode: CuPredMode::Intra,
-            cbf_luma: u8::from(plan.cbf_y),
-            cu_x0: x0 as u16,
-            cu_y0: y0 as u16,
-            cu_log2_w: log2_w as u8,
-            cu_log2_h: log2_h as u8,
-            intra_luma_mode: plan.intra.stamp_value(),
-            qp_y: ctx.qp.clamp(0, 51) as u8,
-            ..Default::default()
-        },
+        leaf_side_info(&plan, ctx.qp, x0, y0, log2_w, log2_h),
     );
     Ok((plan, cost))
 }
@@ -963,64 +958,6 @@ pub(crate) fn restore_region(
 // Emit pass — decoder-exact bin order.
 // ---------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn emit_split_unit<S: BinSink>(
-    enc: &mut S,
-    stats: &mut EncStats,
-    ctx: &EncCtx<'_>,
-    sel: CtxSel,
-    grid: &mut SideInfoGrid,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-    node: &Node,
-) {
-    let (within, can_recurse) = split_geometry(ctx, x0, y0, log2_w, log2_h);
-    let flag_present = can_recurse && within && (log2_w > 2 || log2_h > 2);
-    // Table 41, ctxInc 0 (Table 95) — the decoder's `resolve_split_unit`
-    // routing; the Baseline shape lands on the shared ctxTable 0.
-    let (split_t, split_i) = sel.ctx(MainCtxTable::SplitCuFlag, 0);
-    match node {
-        Node::Split(children) => {
-            if flag_present {
-                enc.encode_decision(split_t, split_i, 1);
-                stats.split_flag_bins += 1;
-            }
-            // (implicit split when !within: no bin, matching the decoder)
-            for (cx, cy, clw, clh, child) in children {
-                emit_split_unit(enc, stats, ctx, sel, grid, *cx, *cy, *clw, *clh, child);
-            }
-        }
-        Node::Leaf(plan) => {
-            if flag_present {
-                enc.encode_decision(split_t, split_i, 0);
-                stats.split_flag_bins += 1;
-            }
-            emit_leaf(
-                enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, x0, y0, log2_w, log2_h,
-            );
-            grid.stamp_block(
-                x0,
-                y0,
-                1u32 << log2_w,
-                1u32 << log2_h,
-                CuSideInfo {
-                    pred_mode: CuPredMode::Intra,
-                    cbf_luma: u8::from(plan.cbf_y),
-                    cu_x0: x0 as u16,
-                    cu_y0: y0 as u16,
-                    cu_log2_w: log2_w as u8,
-                    cu_log2_h: log2_h as u8,
-                    intra_luma_mode: plan.intra.stamp_value(),
-                    qp_y: ctx.qp.clamp(0, 51) as u8,
-                    ..Default::default()
-                },
-            );
-        }
-    }
-}
-
 /// `intra_pred_mode` — U over Table 62 with the Table 95 ctxInc (bin0
 /// → 0, later bins → 1) under `cm_init`; all bins on (0, 0) under the
 /// Baseline collapse. The decoder reads it via `decode_u_regular`
@@ -1177,7 +1114,7 @@ mod tests {
             pic_width: w,
             pic_height: h,
             ctb_log2_size_y: CTB_LOG2,
-            min_cb_log2_size_y: MIN_CB_LOG2,
+            min_cb_log2_size_y: 2,
             max_tb_log2_size_y: 6,
             chroma_format_idc: 1,
             cu_qp_delta_enabled: false,
@@ -1198,6 +1135,15 @@ mod tests {
                 ..CodingTreeGates::default()
             },
         }
+    }
+
+    /// The `sps_btt_flag == 1` walker gates — what the decoder derives
+    /// from the encoder's BTT SPS.
+    fn walk_inputs_btt(w: u32, h: u32, cm_init: bool) -> SliceWalkInputs {
+        let mut inputs = walk_inputs_cm(w, h, cm_init);
+        inputs.tree_gates.sps_btt_flag = true;
+        inputs.tree_gates.btt_limits = TreeGeometry::encoder(w, h, true).btt.unwrap();
+        inputs
     }
 
     fn decode_inputs(qp: i32) -> SliceDecodeInputs {
@@ -1291,6 +1237,46 @@ mod tests {
                     assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp} cm{cm_init}: cb recon");
                     assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp} cm{cm_init}: cr recon");
                     assert_eq!(dec_stats.ctus, stats.ctus);
+                }
+            }
+        }
+    }
+
+    /// Round 458 — **BTT**: the binary / ternary coding tree round-trips
+    /// recon-exactly through the decoder's `sps_btt_flag == 1` walker
+    /// (the `btt_split_*` group incl. the eq. 1440 `numSmaller` ctxInc,
+    /// rectangular leaves down to 4×8 / 8×4 with 2-wide chroma TBs,
+    /// ternary shapes, the implicit boundary binary splits) on both
+    /// entropy shapes, Baseline and EIPD intra alike; the tree actually
+    /// uses the binary shapes and never emits a `split_cu_flag`.
+    #[test]
+    fn btt_round_trip_recon_exact_size_qp_matrix() {
+        for &cm_init in &[false, true] {
+            for &eipd in &[false, true] {
+                for &(w, h) in &[(64u32, 64u32), (32, 32), (72, 40), (100, 60), (176, 144)] {
+                    for &qp in &[10i32, 30, 44] {
+                        let src = synth_picture(w, h, 0xB77 ^ (w * 31 + h * 7 + qp as u32));
+                        let (payload, enc_recon, stats) =
+                            encode_idr_slice_data_tree(&src, qp, false, cm_init, eipd, true)
+                                .expect("encode");
+                        assert_eq!(stats.split_flag_bins, 0, "no split_cu_flag under BTT");
+                        assert!(stats.tree.bt_splits > 0, "{w}x{h} qp{qp}: binary splits");
+                        let mut walk = walk_inputs_btt(w, h, cm_init);
+                        walk.sps_eipd_flag = eipd;
+                        let (dec, dec_stats) =
+                            decode_baseline_idr_slice(&payload, walk, decode_inputs(qp))
+                                .unwrap_or_else(|e| {
+                                    panic!("{w}x{h} qp{qp} cm{cm_init} eipd{eipd}: {e}")
+                                });
+                        assert_eq!(dec.y, enc_recon.y, "{w}x{h} qp{qp} cm{cm_init}: luma");
+                        assert_eq!(dec.cb, enc_recon.cb, "{w}x{h} qp{qp} cm{cm_init}: cb");
+                        assert_eq!(dec.cr, enc_recon.cr, "{w}x{h} qp{qp} cm{cm_init}: cr");
+                        assert_eq!(dec_stats.ctus, stats.ctus);
+                        assert_eq!(dec_stats.tree.btt.flag_bins, stats.tree.btt_flag_bins);
+                        assert_eq!(dec_stats.tree.btt.dir_bins, stats.tree.btt_dir_bins);
+                        assert_eq!(dec_stats.tree.btt.type_bins, stats.tree.btt_type_bins);
+                        assert_eq!(dec_stats.coding_units, stats.leaves);
+                    }
                 }
             }
         }

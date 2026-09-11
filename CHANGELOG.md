@@ -4,6 +4,46 @@
 
 ### Other
 
+- **Encoder: BTT — the binary / ternary coding tree (round 458).** New
+  `tree_enc` module: the §7.3.8.3 `split_unit()` decision prefix shared
+  by the I and P/B slice encoders under both SPS shapes — the round-429
+  quad tree (`split_cu_flag`, bit-identical to before: the Baseline
+  fixture keeps its digest) and, with `sps_btt_flag = 1`, the
+  `btt_split_flag` / `btt_split_dir` / `btt_split_type` group as the
+  exact dual of the decoder's `decode_btt_split` (Tables 42-44, the
+  §9.3.4.2.5 eq. 1439/1440 `numSmaller` ctxInc over the decode-order
+  side-info grid, the Table 95 `log2CbWidth − log2CbHeight + 2` dir
+  ctxInc under `cm_init`, the §7.4.8.3 `allowSplit*` presence gating
+  and inference from the decoder's own `split` derivations, the implicit
+  boundary binary splits). The SPS declares the explicit geometry
+  (64×64 CTU, 4×4 minimum CB, ternary splits from 16 to 64, 1:4 binary
+  children; Main profile, Table A.6 binIdx 0). The search is
+  rate-distortion exact at every trial (split bins committed to the
+  rate model in decode order, children decided against the committed
+  reconstruction / grid / HMVP, the winner's state restored bin for
+  bin) under a lookahead policy that keeps it tractable: square nodes
+  search `SPLIT_BT_HOR` exactly (the quad tree lives inside that branch
+  via the halves' orthogonal split), rectangular nodes search the
+  cross-axis binary split exactly, every other shape is trialled with
+  leaf-only children and — when such a trial wins — re-searched exactly
+  before the exact cost decides; ternary trials run only where a binary
+  split already beat the leaf. Rectangular leaves reach 4×8 / 8×4 with
+  2-wide chroma TBs. Registry option `btt`, **default on** (`btt=0`
+  keeps the quad tree; the Baseline stream needs `btt=0 cm_init=0
+  eipd=0`). Measured against the previous commit at equal PSNR (QP
+  32-50, three geometries): **intra −0.8 % Y / −0.9 % YUV, P −2.2 % /
+  −2.1 %, low-delay B −1.7 % / −1.6 %** BD-rate — the synthetic corpus
+  carries ±5 noise on every sample, so residual cost dominates and the
+  block structure buys little; ~5× the quad tree's encode time.
+  Round-trip pins: the intra size × QP × entropy-shape × EIPD matrix
+  through the decoder's `sps_btt_flag == 1` walker with the tree-syntax
+  bin counts matched element for element, P/B GOPs on a geometry whose
+  CTUs straddle both picture edges through the registry (both entropy
+  shapes, deblocking on), every encoder-choosable shape at every block
+  shape read back by the decoder's `decode_btt_split`; the
+  `encode_roundtrip` fuzz target gained the flag. Two fixtures re-pinned
+  (the tree changed); the Baseline pin is unchanged.
+
 - **Encoder: EIPD intra — 33 modes, MPM / PIMS / rem-mode syntax,
   `intra_chroma_pred_mode` (round 455).** New `intra_enc` module: the
   §8.4.2 lists are derived from the encoder's decode-order side-info grid

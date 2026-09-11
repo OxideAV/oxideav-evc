@@ -2423,10 +2423,33 @@ fn btt_num_smaller(
     if !walk.tree_gates.sps_cm_init_flag || !walk.tree_gates.sps_btt_flag {
         return 0;
     }
+    btt_num_smaller_at(
+        side_info,
+        walk.pic_width,
+        walk.pic_height,
+        x0,
+        y0,
+        log2_cb_width,
+        log2_cb_height,
+    )
+}
+
+/// The eq. 1439 `numSmaller` probe over a side-info grid (see
+/// [`btt_num_smaller`]) — shared with the encoder's tree writer, whose
+/// decode-order grids are stamped exactly like the walkers'.
+pub(crate) fn btt_num_smaller_at(
+    side_info: &SideInfoGrid,
+    pic_width: u32,
+    pic_height: u32,
+    x0: u32,
+    y0: u32,
+    log2_cb_width: u32,
+    log2_cb_height: u32,
+) -> u32 {
     let n_cb_w = 1i64 << log2_cb_width;
     let n_cb_h = 1i64 << log2_cb_height;
     let probe = |x: i64, y: i64| -> Option<(u32, u32)> {
-        if x < 0 || y < 0 || x >= walk.pic_width as i64 || y >= walk.pic_height as i64 {
+        if x < 0 || y < 0 || x >= pic_width as i64 || y >= pic_height as i64 {
             return None;
         }
         // §6.4.1 first bullet: a neighbour in a different tile is

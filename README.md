@@ -566,7 +566,7 @@ bypass-formulation asks, and the in-repo #213 (c)
 `sps_cm_init_flag == 0` context-topology entry (corpus-adjudicable
 per its own text) — see the CHANGELOG round-441/444 entries.
 
-## Encoder (round 429 intra; 431 low-delay P; 452 B / multi-ref / RC / cropping; 455 exact-bit RD, RDOQ, EIPD, two-pass)
+## Encoder (round 429 intra; 431 low-delay P; 452 B / multi-ref / RC / cropping; 455 exact-bit RD, RDOQ, EIPD, two-pass; 458 BTT)
 
 The crate registers an **encoder** alongside the decoder (dual API:
 `register(&mut codecs)` wires both factories; `encoder::make_encoder`
@@ -577,9 +577,10 @@ frames single-NAL NonIDR P (or, with `b=1`, low-delay B) pictures in
 coding order. 4:2:0 input at 8 / 10 / 12 bits; any non-zero **even**
 geometry (multiple-of-8 round-up + §7.4.3.1 conformance-cropping
 window). Options: `qp` 0..=51 (default 30), `gop` (default 1 =
-all-intra), `b`, `refs` 1..=5, `eipd` (default **on**), `cm_init`
-(default **on**), `deblock`, `bitrate` + `fps` (one-pass rate control),
-`pass=1|2` + `stats=<path>` + `vbv` (two-pass rate control).
+all-intra), `b`, `refs` 1..=5, `btt` (default **on**), `eipd` (default
+**on**), `cm_init` (default **on**), `deblock`, `bitrate` + `fps`
+(one-pass rate control), `pass=1|2` + `stats=<path>` + `vbv` (two-pass
+rate control).
 
 Pipeline: §7.3 header **writers** that are field-for-field duals of
 the crate's parsers; the exact carry-propagation **CABAC encoder**
@@ -609,6 +610,15 @@ core:
   the §7.3.8.4 MPM / PIMS / rem-mode luma group and all five
   `intra_chroma_pred_mode` values, on I slices and on the P/B intra
   candidates. Intra −10.2 %, P −5.3 %, B −3.7 % (Y BD-rate).
+* **BTT coding tree** (`tree_enc`, `sps_btt_flag = 1`, round 458) —
+  the §7.3.8.3 `btt_split_flag` / `dir` / `type` group as the exact dual
+  of the decoder's reader (`allowSplit*` gating and inference, the
+  eq. 1440 `numSmaller` contexts, implicit boundary splits), searched
+  rate-distortion-exactly under a lookahead policy (square nodes split
+  horizontally with exact children — the quad tree lives inside —
+  every other shape trialled with leaf children and re-searched exactly
+  when it wins). Rectangular leaves down to 4×8 / 8×4. Intra −0.8 %,
+  P −2.2 %, B −1.7 % (Y BD-rate) on the noise-heavy corpus.
 * **Two-pass rate control** (`rate_plan`) — pass 1 records `idr qp
   bits` per frame; pass 2 plans one dithered sequence-wide base QP under
   a leaky-bucket buffer and re-plans every frame with an
@@ -639,9 +649,9 @@ MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
 harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
 Cross-implementation decode remains open until a validator lands.
 
-Encoder follow-ups: BTT/TT splits and ATS (the decoder parses both),
-hierarchical B sub-GOPs, ADCC residual coding with its own RDOQ, ALF
-filter design, CU-level QP delta / adaptive quantization.
+Encoder follow-ups: ATS (the decoder parses it), hierarchical B
+sub-GOPs, ADCC residual coding with its own RDOQ, ALF filter design,
+CU-level QP delta / adaptive quantization.
 
 ## Usage
 

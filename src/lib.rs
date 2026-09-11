@@ -185,6 +185,8 @@ pub mod tiles;
 pub mod tmvp;
 #[doc(hidden)]
 pub mod transform;
+#[doc(hidden)]
+pub mod tree_enc;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry};
