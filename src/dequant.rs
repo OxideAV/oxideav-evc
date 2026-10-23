@@ -61,11 +61,7 @@ pub(crate) fn scaling_bd_shift(n_tb_w: usize, n_tb_h: usize, bit_depth: u32) -> 
 pub(crate) fn rect_norm(n_tb_w: usize, n_tb_h: usize) -> i32 {
     let log2_w = (n_tb_w as u32).trailing_zeros();
     let log2_h = (n_tb_h as u32).trailing_zeros();
-    if (log2_w + log2_h) & 1 == 1 {
-        181
-    } else {
-        1
-    }
+    if (log2_w + log2_h) & 1 == 1 { 181 } else { 1 }
 }
 
 /// Scaling + transformation + final renorm per §8.7.2.

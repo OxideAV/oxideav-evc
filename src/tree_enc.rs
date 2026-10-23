@@ -52,7 +52,7 @@ use oxideav_core::Result;
 
 use crate::bin_cost::BitCostModel;
 use crate::cabac::BinSink;
-use crate::cabac_init::{ctx_inc_btt_split_flag, CtxSel, MainCtxTable};
+use crate::cabac_init::{CtxSel, MainCtxTable, ctx_inc_btt_split_flag};
 use crate::deblock::SideInfoGrid;
 use crate::split::{self, AllowedSplits, BttSizeLimits, PredModeConstraint, SplitMode};
 
@@ -586,7 +586,7 @@ fn search_btt<C: TreeCoder>(
         let is_tt = matches!(mode, SplitMode::SplitTtHor | SplitMode::SplitTtVer);
         if is_tt
             && best_exact.cost >= leaf_cost
-            && best_shallow.as_ref().map_or(true, |b| b.cost >= leaf_cost)
+            && best_shallow.as_ref().is_none_or(|b| b.cost >= leaf_cost)
         {
             continue;
         }
@@ -594,10 +594,10 @@ fn search_btt<C: TreeCoder>(
         if best_exact.snap.is_none() {
             best_exact.snap = Some(c.snapshot(model, x0, y0, lw, lh));
         }
-        if let Some(t) = best_shallow.as_mut() {
-            if t.snap.is_none() {
-                t.snap = Some(c.snapshot(model, x0, y0, lw, lh));
-            }
+        if let Some(t) = best_shallow.as_mut()
+            && t.snap.is_none()
+        {
+            t.snap = Some(c.snapshot(model, x0, y0, lw, lh));
         }
         c.restore(model, &before, x0, y0, lw, lh);
         let kind = SplitKind::Btt(mode);
@@ -613,32 +613,31 @@ fn search_btt<C: TreeCoder>(
             if trial.cost < best_exact.cost {
                 best_exact = trial;
             }
-        } else if best_shallow.as_ref().map_or(true, |b| trial.cost < b.cost) {
+        } else if best_shallow.as_ref().is_none_or(|b| trial.cost < b.cost) {
             best_shallow = Some(trial);
         }
     }
 
     // A shallow winner earns an exact re-search; the exact cost decides.
-    if let Some(shallow) = best_shallow {
-        if shallow.cost < best_exact.cost {
-            let TreeNode::Split(kind, _) = shallow.node else {
-                unreachable!("shallow trials are splits")
+    if let Some(shallow) = best_shallow
+        && shallow.cost < best_exact.cost
+    {
+        let TreeNode::Split(kind, _) = shallow.node else {
+            unreachable!("shallow trials are splits")
+        };
+        if best_exact.snap.is_none() {
+            best_exact.snap = Some(c.snapshot(model, x0, y0, lw, lh));
+        }
+        c.restore(model, &before, x0, y0, lw, lh);
+        let bits = commit_split_bins(c, model, x0, y0, lw, lh, Some(kind));
+        let (children, child_cost) = search_children(c, model, x0, y0, lw, lh, kind, Depth::Full)?;
+        let cost = child_cost + lambda * bits;
+        if cost < best_exact.cost {
+            best_exact = Trial {
+                node: TreeNode::Split(kind, children),
+                cost,
+                snap: None,
             };
-            if best_exact.snap.is_none() {
-                best_exact.snap = Some(c.snapshot(model, x0, y0, lw, lh));
-            }
-            c.restore(model, &before, x0, y0, lw, lh);
-            let bits = commit_split_bins(c, model, x0, y0, lw, lh, Some(kind));
-            let (children, child_cost) =
-                search_children(c, model, x0, y0, lw, lh, kind, Depth::Full)?;
-            let cost = child_cost + lambda * bits;
-            if cost < best_exact.cost {
-                best_exact = Trial {
-                    node: TreeNode::Split(kind, children),
-                    cost,
-                    snap: None,
-                };
-            }
         }
     }
     if let Some(snap) = &best_exact.snap {

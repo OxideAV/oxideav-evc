@@ -23,8 +23,8 @@
 //! honest across CI hosts.
 
 use crate::cabac::{
-    init_contexts_from_init_value, next_state, BinSink, ContextVar, InitType, MAX_CTX_PER_TABLE,
-    MAX_CTX_TABLES,
+    BinSink, ContextVar, InitType, MAX_CTX_PER_TABLE, MAX_CTX_TABLES,
+    init_contexts_from_init_value, next_state,
 };
 use crate::cabac_init::MainCtxTable;
 

@@ -38,7 +38,7 @@
 //! accuracy (the §8.5.3.1 output contract), and `mvCLX` is in
 //! **1/32-pel** chroma accuracy after the §8.5.2.6 `* 2 / SubWC` map.
 
-use crate::inter::{round_motion_vector, MotionVector};
+use crate::inter::{MotionVector, round_motion_vector};
 
 /// A single affine control point motion vector — one of the 2 (4-param)
 /// or 3 (6-param) `cpMvLX[ cpIdx ]`. Components are in 1/4-pel luma
@@ -542,7 +542,7 @@ mod tests {
         let cps = [cp(0, 0), cp(8, 4)];
         let p = affine_model_params(16, 16, 2, &cps);
         assert_eq!(p.d_x, [8 << 3, 4 << 3]); // [64, 32]
-                                             // dY[0] = −dX[1] = −32, dY[1] = dX[0] = 64.
+        // dY[0] = −dX[1] = −32, dY[1] = dX[0] = 64.
         assert_eq!(p.d_y, [-32, 64]);
         assert_eq!(p.mv_base_scaled, [0, 0]);
     }

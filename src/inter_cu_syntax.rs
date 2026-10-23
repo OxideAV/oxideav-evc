@@ -1042,8 +1042,8 @@ mod tests {
         assert_eq!(d.inter_pred_idc, PRED_BI);
         assert_eq!(d.bi_pred_idx, 1);
         assert!(d.l1.is_some()); // L1 active (ref present) but MVD suppressed
-                                 // Only two abs_mvd components consumed (L0 only) — the L1 MVD pair
-                                 // was skipped by the bi_pred_idx == 1 gate.
+        // Only two abs_mvd components consumed (L0 only) — the L1 MVD pair
+        // was skipped by the bi_pred_idx == 1 gate.
         assert_eq!(stats.abs_mvd_bins, 2);
     }
 

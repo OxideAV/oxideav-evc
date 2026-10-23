@@ -421,11 +421,11 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
     while x < pic_w {
         // §8.8.2.1: edges that coincide with tile boundaries are exempt
         // when loop_filter_across_tiles_enabled_flag == 0.
-        if let Some(tb) = &side_info.tile_bounds {
-            if tb.is_col_boundary(x as u32) {
-                x += 4;
-                continue;
-            }
+        if let Some(tb) = &side_info.tile_bounds
+            && tb.is_col_boundary(x as u32)
+        {
+            x += 4;
+            continue;
         }
         let mut y = 0usize;
         while y + 4 <= pic_h {
@@ -460,11 +460,11 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
     let mut y = 4usize;
     while y < pic_h {
         // §8.8.2.1 tile-boundary edge exemption (horizontal edges).
-        if let Some(tb) = &side_info.tile_bounds {
-            if tb.is_row_boundary(y as u32) {
-                y += 4;
-                continue;
-            }
+        if let Some(tb) = &side_info.tile_bounds
+            && tb.is_row_boundary(y as u32)
+        {
+            y += 4;
+            continue;
         }
         let mut x = 0usize;
         while x + 4 <= pic_w {
@@ -580,11 +580,11 @@ pub fn deblock_chroma(
         // §8.8.2.1: tile-boundary edges (compared in the luma domain —
         // tile boundaries are CTB-aligned) are exempt when
         // loop_filter_across_tiles_enabled_flag == 0.
-        if let Some(tb) = &side_info.tile_bounds {
-            if tb.is_col_boundary(x_luma as u32) {
-                xc += chroma_step_x;
-                continue;
-            }
+        if let Some(tb) = &side_info.tile_bounds
+            && tb.is_col_boundary(x_luma as u32)
+        {
+            xc += chroma_step_x;
+            continue;
         }
         let mut yc = 0usize;
         while yc + 4 <= plane_h {
@@ -639,11 +639,11 @@ pub fn deblock_chroma(
     while yc < plane_h {
         let y_luma = yc * sub_h;
         // §8.8.2.1 tile-boundary edge exemption (horizontal edges).
-        if let Some(tb) = &side_info.tile_bounds {
-            if tb.is_row_boundary(y_luma as u32) {
-                yc += chroma_step_y;
-                continue;
-            }
+        if let Some(tb) = &side_info.tile_bounds
+            && tb.is_row_boundary(y_luma as u32)
+        {
+            yc += chroma_step_y;
+            continue;
         }
         let mut xc = 0usize;
         while xc + 4 <= plane_w {
@@ -810,7 +810,7 @@ fn addb_thresholds(
     let scale = 1i32 << (bit_depth - 8);
     let alpha = ADDB_ALPHA_PRIME[index_a] * scale; // eq. 1236
     let beta = ADDB_BETA_PRIME[index_b] * scale; // eq. 1237
-                                                 // eq. 1238.
+    // eq. 1238.
     let filter =
         bs != 0 && (p0 - q0).abs() < alpha && (p1 - p0).abs() < beta && (q1 - q0).abs() < beta;
     (filter, index_a, alpha, beta)
@@ -1147,7 +1147,11 @@ pub fn addb_deblock_picture(
                 let log2_w = cell.cu_log2_w as u32;
                 let log2_h = cell.cu_log2_h as u32;
                 // §8.8.3.1: only 8×8-luma-grid edges are filtered.
-                let on_grid = if vertical { x0 % 8 == 0 } else { y0 % 8 == 0 };
+                let on_grid = if vertical {
+                    x0.is_multiple_of(8)
+                } else {
+                    y0.is_multiple_of(8)
+                };
                 if !on_grid {
                     continue;
                 }
@@ -1179,12 +1183,11 @@ pub fn addb_deblock_picture(
                         // boundaries are exempt when
                         // loop_filter_across_tiles_enabled_flag == 0
                         // (coordinates are luma-domain CB positions).
-                        if let Some(tb) = &grid.tile_bounds {
-                            if (vertical && tb.is_col_boundary(cx))
-                                || (!vertical && tb.is_row_boundary(cy))
-                            {
-                                continue;
-                            }
+                        if let Some(tb) = &grid.tile_bounds
+                            && ((vertical && tb.is_col_boundary(cx))
+                                || (!vertical && tb.is_row_boundary(cy)))
+                        {
+                            continue;
                         }
                         filtered += addb_filter_cb_edge(
                             pic,
@@ -1536,8 +1539,8 @@ mod tests {
         let cb_orig = pic.cb.clone();
         let cr_orig = pic.cr.clone();
         let grid = SideInfoGrid::new(16, 16); // all Intra
-                                              // 8×8 chroma plane, edges at xC=2,4,6 (3 verticals) × 2 row runs
-                                              // (yC=0,4) = 6 vertical; same horizontal → 12 total.
+        // 8×8 chroma plane, edges at xC=2,4,6 (3 verticals) × 2 row runs
+        // (yC=0,4) = 6 vertical; same horizontal → 12 total.
         let n_cb = deblock_chroma(&mut pic, &grid, 32, 0, 1).unwrap();
         let n_cr = deblock_chroma(&mut pic, &grid, 32, 0, 2).unwrap();
         assert_eq!(n_cb, 12);
@@ -1808,8 +1811,8 @@ mod tests {
         assert_eq!(q[0], (100 + 200 + 280 + 280 + 140 + 4) >> 3); // 125
         assert_eq!(q[1], (100 + 140 + 140 + 140 + 2) >> 2); // 130
         assert_eq!(q[2], (280 + 420 + 140 + 140 + 100 + 4) >> 3); // 135
-                                                                  // Strong-gate failure (|p0 − q0| ≥ (α >> 2) + 2) falls back to
-                                                                  // the eqs. 1265/1272 1-tap smoothing.
+        // Strong-gate failure (|p0 − q0| ≥ (α >> 2) + 2) falls back to
+        // the eqs. 1265/1272 1-tap smoothing.
         let mut p2 = [100, 100, 100, 100];
         let mut q2 = [200, 200, 200, 200];
         addb_filter_strong(&mut p2, &mut q2, false, 100, 18, 255);

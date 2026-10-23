@@ -29,7 +29,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::dequant::{rect_norm, scaling_bd_shift, LEVEL_SCALE_BASELINE, LEVEL_SCALE_IQT};
+use crate::dequant::{LEVEL_SCALE_BASELINE, LEVEL_SCALE_IQT, rect_norm, scaling_bd_shift};
 use crate::transform::trans_matrix_typed;
 
 /// The transform / quantization shape one block is coded under (round

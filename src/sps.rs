@@ -18,10 +18,10 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::dra::{
-    build_signalled_chroma_qp_table, ChromaQpTable, SignalledChromaQpTableParams,
-    SignalledChromaQpTablePivots,
+    ChromaQpTable, SignalledChromaQpTableParams, SignalledChromaQpTablePivots,
+    build_signalled_chroma_qp_table,
 };
-use crate::rpl::{parse_ref_pic_list_struct, RefPicListStruct};
+use crate::rpl::{RefPicListStruct, parse_ref_pic_list_struct};
 
 /// Hard sanity bound on the SPS-declared picture dimensions. Larger values
 /// are surfaced as `Error::Invalid` so a hostile bitstream cannot trigger
@@ -504,12 +504,12 @@ pub(crate) mod tests {
         emitter.u(1, 0); // sps_pocs_flag
         emitter.u(1, 0); // sps_dquant_flag
         emitter.u(1, 0); // sps_dra_flag
-                         // !sps_pocs_flag || !sps_rpl_flag → log2_sub_gop_length present
+        // !sps_pocs_flag || !sps_rpl_flag → log2_sub_gop_length present
         emitter.ue(1); // log2_sub_gop_length = 1 (so log2_ref_pic_gap_length skipped)
-                       // !sps_rpl_flag → max_num_tid0_ref_pics
+        // !sps_rpl_flag → max_num_tid0_ref_pics
         emitter.ue(1);
         emitter.u(1, 0); // picture_cropping_flag
-                         // chroma_format_idc != 0 → chroma_qp_table_present_flag
+        // chroma_format_idc != 0 → chroma_qp_table_present_flag
         emitter.u(1, 0); // chroma_qp_table_present_flag
         emitter.u(1, 0); // vui_parameters_present_flag
         emitter.finish_with_trailing_bits();
@@ -615,7 +615,7 @@ pub(crate) mod tests {
         pub fn finish_with_trailing_bits(&mut self) {
             // rbsp_trailing_bits(): one '1' then '0' padding to byte align.
             self.write_bit(1);
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bit(0);
             }
         }
@@ -625,7 +625,7 @@ pub(crate) mod tests {
         }
 
         fn write_bit(&mut self, bit: u8) {
-            if self.bit_pos % 8 == 0 {
+            if self.bit_pos.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             let last = self.bytes.len() - 1;
@@ -879,11 +879,11 @@ pub(crate) mod tests {
         emitter.ue(1); // log2_sub_gop_length
         emitter.ue(1); // max_num_tid0_ref_pics
         emitter.u(1, 0); // picture_cropping_flag
-                         // chroma_qp_table_present_flag = 1
+        // chroma_qp_table_present_flag = 1
         emitter.u(1, 1);
         emitter.u(1, 1); // same_qp_table_for_chroma = 1
         emitter.u(1, 0); // global_offset_flag = 0
-                         // num_points_in_qp_table_minus1[0] = 1 (two pivots)
+        // num_points_in_qp_table_minus1[0] = 1 (two pivots)
         emitter.ue(1);
         // Pivot 0: delta_qp_in_val_minus1 = 10, delta_qp_out_val = 5
         emitter.u(6, 10);

@@ -25,19 +25,19 @@
 
 use std::collections::VecDeque;
 
-use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
+use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
+use crate::CODEC_ID_STR;
 use crate::alf::{self, AlfData};
 use crate::dra::{self, DraData, DraDerived, DraSyntax};
 use crate::inter::RefPictureView;
-use crate::nal::{iter_length_prefixed, NalUnitType};
+use crate::nal::{NalUnitType, iter_length_prefixed};
 use crate::picture::YuvPicture;
 use crate::pps::{self, Pps};
 use crate::slice_data::{InterDecodeInputs, SliceDecodeInputs, SliceWalkInputs};
 use crate::sps::{self, Sps};
-use crate::CODEC_ID_STR;
 
 /// §7.4.3.1 conformance cropping window, held in **luma samples** (the
 /// SPS `picture_crop_*_offset` fields already multiplied by
@@ -905,7 +905,7 @@ impl EvcDecoder {
         let plumbing = crate::resolve_slice_tiles(sps, pps, &header, &mut br)?;
         br.align_to_byte();
         let consumed_bits = br.bit_position();
-        if consumed_bits % 8 != 0 {
+        if !consumed_bits.is_multiple_of(8) {
             return Err(Error::invalid("evc decoder: slice header not byte-aligned"));
         }
         let consumed_bytes = (consumed_bits / 8) as usize;
@@ -1358,40 +1358,36 @@ pub(crate) fn apply_chroma_alf_masked_or_whole_plane(
     }
     let cb_map_on = alf_map.chroma_cb.iter().any(|&b| b);
     let cr_map_on = alf_map.chroma_cr.iter().any(|&b| b);
-    if chroma_cb_enabled {
-        if let Some(cb_data) = cb_alf {
-            if cb_map_on {
-                // §8.8.4.4 per-CTB Cb apply, gated by alf_ctb_chroma_flag,
-                // over the §8.8.4.6 padded inputs (round 416).
-                alf::apply_alf_chroma_availability(
-                    pic,
-                    &cb_data.chroma_filters[0],
-                    alf_map,
-                    avail,
-                    1,
-                    bd_c,
-                );
-            } else {
-                alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
-            }
+    if chroma_cb_enabled && let Some(cb_data) = cb_alf {
+        if cb_map_on {
+            // §8.8.4.4 per-CTB Cb apply, gated by alf_ctb_chroma_flag,
+            // over the §8.8.4.6 padded inputs (round 416).
+            alf::apply_alf_chroma_availability(
+                pic,
+                &cb_data.chroma_filters[0],
+                alf_map,
+                avail,
+                1,
+                bd_c,
+            );
+        } else {
+            alf::apply_alf_chroma(pic, &cb_data.chroma_filters[0], 1, bd_c);
         }
     }
-    if chroma_cr_enabled {
-        if let Some(cr_data) = cr_alf {
-            if cr_map_on {
-                // §8.8.4.4 per-CTB Cr apply, gated by alf_ctb_chroma2_flag,
-                // over the §8.8.4.6 padded inputs (round 416).
-                alf::apply_alf_chroma_availability(
-                    pic,
-                    &cr_data.chroma_filters[0],
-                    alf_map,
-                    avail,
-                    2,
-                    bd_c,
-                );
-            } else {
-                alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
-            }
+    if chroma_cr_enabled && let Some(cr_data) = cr_alf {
+        if cr_map_on {
+            // §8.8.4.4 per-CTB Cr apply, gated by alf_ctb_chroma2_flag,
+            // over the §8.8.4.6 padded inputs (round 416).
+            alf::apply_alf_chroma_availability(
+                pic,
+                &cr_data.chroma_filters[0],
+                alf_map,
+                avail,
+                2,
+                bd_c,
+            );
+        } else {
+            alf::apply_alf_chroma(pic, &cr_data.chroma_filters[0], 2, bd_c);
         }
     }
 }
@@ -1762,7 +1758,7 @@ mod tests {
         dec.alf_aps[3] = Some(a);
         dec.alf_aps[19] = Some(b);
         dec.last_alf_aps_id = Some(19); // simulates round-11 single-APS
-                                        // Slice references id 3 → cache slot 3 (the `a` payload).
+        // Slice references id 3 → cache slot 3 (the `a` payload).
         let resolved = dec.alf_aps_for_slice(Some(3)).expect("slot 3 populated");
         assert_eq!(resolved.luma_filters[0].coef[12], 100);
         // Slice references id 19 → cache slot 19 (the `b` payload).
@@ -1882,7 +1878,7 @@ mod tests {
     /// fields out of the cache.
     #[test]
     fn round151_dra_syntax_aps_cache_holds_spec_faithful_pair() {
-        use crate::dra::{derive_dra_state, DraSyntax, DRA_MAX_RANGES_V2};
+        use crate::dra::{DRA_MAX_RANGES_V2, DraSyntax, derive_dra_state};
         let mut dec = EvcDecoder::new();
         let syn = DraSyntax {
             dra_descriptor1: 4,

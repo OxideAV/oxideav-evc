@@ -65,25 +65,25 @@ use crate::cabac::{BinSink, CabacEncoder, InitType};
 use crate::cabac_init::{CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform_ats;
-use crate::eipd_mode::{derive_chroma_mode, ModeSelector};
+use crate::eipd_mode::{ModeSelector, derive_chroma_mode};
 use crate::eipd_syntax::EipdCtx;
 use crate::hmvp::{HmvpCandList, HmvpCandidate};
 use crate::inter::{
-    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_luma_block,
-    MotionVector, RefPictureView,
+    MotionVector, RefPictureView, average_bipred, derive_chroma_mv, interpolate_chroma_block,
+    interpolate_luma_block,
 };
 use crate::intra_enc::{self, IntraSel};
-use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile, YuvPicture};
+use crate::picture::{YuvPicture, intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile};
 use crate::quant_enc::TransformSpec;
 use crate::rdoq::RdoqInputs;
 use crate::slice_data::{
-    baseline_amvp_select_with_grid_and_hmvp, ctx_inc_neighbour_cells, derive_direct_mode_mvs,
-    mark_cu_skip_cells, ColPicInputs, InterPocs, SliceWalkInputs,
+    ColPicInputs, InterPocs, SliceWalkInputs, baseline_amvp_select_with_grid_and_hmvp,
+    ctx_inc_neighbour_cells, derive_direct_mode_mvs, mark_cu_skip_cells,
 };
 use crate::slice_enc::{
-    emit_intra_pred_mode, emit_residual, gather_block, luma_tail_bits, quantize_block,
-    quantize_pred, quantize_residual, rd_lambda_at_qp_prime, refine_luma_ats, restore_region,
-    save_region, IntraQuantCtx, LumaChoice, RegionSave, MODES,
+    IntraQuantCtx, LumaChoice, MODES, RegionSave, emit_intra_pred_mode, emit_residual,
+    gather_block, luma_tail_bits, quantize_block, quantize_pred, quantize_residual,
+    rd_lambda_at_qp_prime, refine_luma_ats, restore_region, save_region,
 };
 use crate::tree_enc::{self, TreeCoder, TreeGeometry, TreeStats};
 
@@ -431,7 +431,7 @@ pub fn encode_inter_slice_data(
             "evc p encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
         ));
     }
-    if src.width % 4 != 0 || src.height % 4 != 0 {
+    if !src.width.is_multiple_of(4) || !src.height.is_multiple_of(4) {
         return Err(Error::unsupported(format!(
             "evc p encoder: dimensions {}x{} must be multiples of 4",
             src.width, src.height
@@ -2329,7 +2329,7 @@ fn emit_inter_residual<S: BinSink>(
                     lh = sbt.trafo_log2_h;
                 }
             } else {
-                debug_assert!(res.ats_inter.map_or(true, |a| !a.used));
+                debug_assert!(res.ats_inter.is_none_or(|a| !a.used));
             }
         } else {
             debug_assert!(res.ats_inter.is_none());
@@ -2556,7 +2556,7 @@ fn emit_leaf<S: BinSink>(
 mod tests {
     use super::*;
     use crate::slice_data::{
-        decode_baseline_inter_slice, CodingTreeGates, InterDecodeInputs, SliceDecodeInputs,
+        CodingTreeGates, InterDecodeInputs, SliceDecodeInputs, decode_baseline_inter_slice,
     };
 
     fn walk_inputs(w: u32, h: u32, cm_init: bool) -> SliceWalkInputs {

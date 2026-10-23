@@ -44,9 +44,8 @@ use oxideav_core::{Error, Result};
 
 use crate::cabac::{BinSink, CabacEngine};
 use crate::cabac_init::{
-    ctx_inc_coeff_abs_level_greater_a, ctx_inc_coeff_abs_level_greater_b,
+    CtxSel, MainCtxTable, ctx_inc_coeff_abs_level_greater_a, ctx_inc_coeff_abs_level_greater_b,
     ctx_inc_last_sig_coeff_prefix, ctx_inc_sig_coeff_flag, rice_param_coeff_abs_level_remaining,
-    CtxSel, MainCtxTable,
 };
 
 /// Presence-gating tallies for one or more `residual_coding_adv()`
@@ -737,7 +736,7 @@ pub fn rdoq_adcc(
             )
         });
         let cost = dist(&cand) + lambda * (bits + cbf_cost(1));
-        if best.as_ref().map_or(true, |b| cost < b.1) {
+        if best.as_ref().is_none_or(|b| cost < b.1) {
             best = Some((cand, cost));
         }
     }
@@ -1038,7 +1037,7 @@ mod tests {
         }
         enc.encode_decision(0, 4, 0);
         enc.encode_bypass(1); // x_suffix = 1 (1 bin)
-                              // y_prefix = 0.
+        // y_prefix = 0.
         enc.encode_decision(0, 0, 0);
         // The last coefficient at (5, 0): sig walk from scanPosLast down
         // to scan position 0 reads sig flags for every non-last position

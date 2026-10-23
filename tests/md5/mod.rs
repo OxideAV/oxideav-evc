@@ -63,13 +63,13 @@ pub fn digest(data: &[u8]) -> [u8; 16] {
         state[3] = state[3].wrapping_add(d);
     };
 
-    let mut chunks = data.chunks_exact(64);
-    for block in &mut chunks {
+    let (blocks, rest) = data.as_chunks::<64>();
+    for block in blocks {
         process(block);
     }
-    let mut last = chunks.remainder().to_vec();
+    let mut last = rest.to_vec();
     last.extend_from_slice(&tail);
-    for block in last.chunks_exact(64) {
+    for block in last.as_chunks::<64>().0 {
         process(block);
     }
 

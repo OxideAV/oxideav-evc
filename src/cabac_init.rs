@@ -42,7 +42,7 @@
 //! against the printed values in the spec PDF
 //! (`docs/video/evc/ISO_IEC_23094-1-EVC-2020.pdf` §9.3.5 Tables 40-90).
 
-use crate::cabac::{init_contexts_from_init_value, CabacEngine, InitType};
+use crate::cabac::{CabacEngine, InitType, init_contexts_from_init_value};
 
 // =====================================================================
 // Init-value tables (Tables 40 through 90 in ISO/IEC 23094-1:2020 §9.3.5).
@@ -953,11 +953,7 @@ pub fn rice_param_coeff_abs_level_remaining(loc_sum_abs: u32) -> u32 {
 pub fn ctx_inc_ats_cu_inter_flag(n_cb_w: u32, n_cb_h: u32) -> usize {
     let log2w = n_cb_w.trailing_zeros();
     let log2h = n_cb_h.trailing_zeros();
-    if log2w + log2h >= 8 {
-        0
-    } else {
-        1
-    }
+    if log2w + log2h >= 8 { 0 } else { 1 }
 }
 
 /// §9.3.4.2.12 — ctxInc for `ats_cu_inter_horizontal_flag` (eq. 1473).

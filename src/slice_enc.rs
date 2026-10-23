@@ -56,19 +56,19 @@ use crate::alf_enc::AlfSliceParams;
 use crate::ats::{self, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
-use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
+use crate::cabac_init::{CtxSel, MainCtxTable, ctx_inc_coeff_zero_run};
 use crate::deblock::{CuPredMode, CuSideInfo, SideInfoGrid};
 use crate::dequant::scale_and_inverse_transform_ats;
-use crate::eipd_mode::{derive_chroma_mode, ModeSelector};
+use crate::eipd_mode::{ModeSelector, derive_chroma_mode};
 use crate::eipd_syntax::EipdCtx;
-use crate::intra::{predict, IntraMode, RefSamples};
+use crate::intra::{IntraMode, RefSamples, predict};
 use crate::intra_enc::{self, IntraSel};
-use crate::picture::{intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile, YuvPicture};
+use crate::picture::{YuvPicture, intra_reconstruct_cb_eipd_in_tile, intra_reconstruct_cb_in_tile};
 use crate::quant_enc::{
-    forward_quantize_typed, forward_transform_fractional_typed, level_unit_sse_weights_typed,
-    TransformSpec,
+    TransformSpec, forward_quantize_typed, forward_transform_fractional_typed,
+    level_unit_sse_weights_typed,
 };
-use crate::rdoq::{rdoq_rle, RdoqInputs};
+use crate::rdoq::{RdoqInputs, rdoq_rle};
 use crate::slice_data::zigzag_scan;
 use crate::tree_enc::{self, TreeCoder, TreeGeometry, TreeNode, TreeStats};
 
@@ -413,7 +413,7 @@ pub fn encode_idr_slice_data_out(
             "evc encoder: only 4:2:0 (chroma_format_idc == 1) is supported",
         ));
     }
-    if src.width % 4 != 0 || src.height % 4 != 0 {
+    if !src.width.is_multiple_of(4) || !src.height.is_multiple_of(4) {
         return Err(Error::unsupported(format!(
             "evc encoder: dimensions {}x{} must be multiples of the 4-sample minimum CB",
             src.width, src.height
@@ -1502,7 +1502,7 @@ pub fn emit_residual_rle<S: BinSink>(
 mod tests {
     use super::*;
     use crate::slice_data::{
-        decode_baseline_idr_slice, CodingTreeGates, SliceDecodeInputs, SliceWalkInputs,
+        CodingTreeGates, SliceDecodeInputs, SliceWalkInputs, decode_baseline_idr_slice,
     };
 
     fn walk_inputs(w: u32, h: u32) -> SliceWalkInputs {
@@ -1737,15 +1737,17 @@ mod tests {
             }
         }
         let src = synth_picture(64, 64, 2);
-        assert!(encode_idr_slice_data_cfg(
-            &src,
-            30,
-            IntraToolset {
-                adcc: true,
-                ..IntraToolset::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_idr_slice_data_cfg(
+                &src,
+                30,
+                IntraToolset {
+                    adcc: true,
+                    ..IntraToolset::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     /// Round 458 — **IQT + ATS-intra**: the improved quantization /
@@ -1820,15 +1822,17 @@ mod tests {
         }
         // ats without iqt is refused (§7.3.2.1).
         let src = synth_picture(64, 64, 1);
-        assert!(encode_idr_slice_data_cfg(
-            &src,
-            30,
-            IntraToolset {
-                ats: true,
-                ..IntraToolset::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_idr_slice_data_cfg(
+                &src,
+                30,
+                IntraToolset {
+                    ats: true,
+                    ..IntraToolset::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     /// Round 455 — **EIPD**: the 33-mode search + MPM / PIMS / rem-mode

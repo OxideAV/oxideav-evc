@@ -57,11 +57,11 @@
 //! [`crate::tmvp`]) and supplies it as the corner's [`CornerMv`], so this
 //! module's corner logic is uniform over spatial and temporal sources.
 
-use crate::affine::{inherited_cp_mvs, ControlPointMv, NeighbourAffineSource};
+use crate::affine::{ControlPointMv, NeighbourAffineSource, inherited_cp_mvs};
 use crate::inter::MotionVector;
 use crate::merge::NeighbourMv;
 use crate::neighbour::AvailLr;
-use crate::tmvp::{tmvp_collocated_mv, AvailableFlagCol, CollocatedMv, PicBounds, PocContext};
+use crate::tmvp::{AvailableFlagCol, CollocatedMv, PicBounds, PocContext, tmvp_collocated_mv};
 
 /// `Clip3(−2¹⁵, 2¹⁵ − 1, ·)` — the eqs. 808/809/814/815/820/821/834/835/872
 /// 16-bit CPMV clip applied to constructed-candidate components.
@@ -991,24 +991,24 @@ pub fn build_affine_mvp_cand_list(
     };
 
     // Step 4 — first matched group-A neighbour.
-    if let Some(nb) = neigh.group_a.iter().find(|n| n.matched) {
-        if list.len() < 2 {
-            list.push(project(nb.src));
-        }
+    if let Some(nb) = neigh.group_a.iter().find(|n| n.matched)
+        && list.len() < 2
+    {
+        list.push(project(nb.src));
     }
 
     // Step 5 — first matched group-B neighbour.
-    if let Some(nb) = neigh.group_b.iter().find(|n| n.matched) {
-        if list.len() < 2 {
-            list.push(project(nb.src));
-        }
+    if let Some(nb) = neigh.group_b.iter().find(|n| n.matched)
+        && list.len() < 2
+    {
+        list.push(project(nb.src));
     }
 
     // Step 6 — first matched group-C neighbour (only while < 2).
-    if list.len() < 2 {
-        if let Some(nb) = neigh.group_c.iter().find(|n| n.matched) {
-            list.push(project(nb.src));
-        }
+    if list.len() < 2
+        && let Some(nb) = neigh.group_c.iter().find(|n| n.matched)
+    {
+        list.push(project(nb.src));
     }
 
     // Step 7 — constructed predictor (only while < 2 AND numCpMvpCand == 0).
@@ -1566,8 +1566,8 @@ mod tests {
         assert_eq!(cand.corner[1].mv_l0, mv(7, 8)); // B1
         assert!(cand.corner[2].available);
         assert_eq!(cand.corner[2].mv_l0, mv(9, 10)); // A0
-                                                     // Corner 3 is the collocated branch (LR_10 ≠ LR_01/LR_11) and
-                                                     // `no_col` yields nothing → absent.
+        // Corner 3 is the collocated branch (LR_10 ≠ LR_01/LR_11) and
+        // `no_col` yields nothing → absent.
         assert!(!cand.corner[3].available);
     }
 

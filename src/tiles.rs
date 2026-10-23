@@ -130,12 +130,12 @@ impl PicTileLayout {
             let mut out = Vec::with_capacity(bd.len());
             for (i, &b) in bd.iter().enumerate() {
                 let luma = (b << ctb_log2_size_y).min(extent);
-                if let Some(&prev) = out.last() {
-                    if luma <= prev {
-                        return Err(Error::invalid(format!(
-                            "evc tiles: {axis} boundary {i} ({luma}) not increasing"
-                        )));
-                    }
+                if let Some(&prev) = out.last()
+                    && luma <= prev
+                {
+                    return Err(Error::invalid(format!(
+                        "evc tiles: {axis} boundary {i} ({luma}) not increasing"
+                    )));
                 }
                 out.push(luma);
             }

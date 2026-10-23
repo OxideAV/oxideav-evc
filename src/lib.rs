@@ -325,7 +325,7 @@ pub fn walk_idr_slice(
     // Align to the next byte boundary (slice_data() starts byte-aligned).
     hdr_br.align_to_byte();
     let consumed_bits = hdr_br.bit_position();
-    if consumed_bits % 8 != 0 {
+    if !consumed_bits.is_multiple_of(8) {
         return Err(Error::invalid(
             "evc walk_idr_slice: slice header not byte-aligned after parse",
         ));
@@ -430,7 +430,7 @@ pub fn decode_idr_slice(
     let slice_qp = parse_slice_header_for_decode(&mut hdr_br, sps, pps)?;
     hdr_br.align_to_byte();
     let consumed_bits = hdr_br.bit_position();
-    if consumed_bits % 8 != 0 {
+    if !consumed_bits.is_multiple_of(8) {
         return Err(Error::invalid(
             "evc decode_idr_slice: slice header not byte-aligned after parse",
         ));
@@ -629,7 +629,7 @@ pub fn decode_idr_slice_full(
     let plumbing = resolve_slice_tiles(sps, pps, &header, &mut br)?;
     br.align_to_byte();
     let consumed_bits = br.bit_position();
-    if consumed_bits % 8 != 0 {
+    if !consumed_bits.is_multiple_of(8) {
         return Err(Error::invalid(
             "evc decode_idr_slice_full: slice header not byte-aligned after parse",
         ));
@@ -999,7 +999,7 @@ mod tests {
         hdr.u(6, 22); // slice_qp = 22
         hdr.ue(0); // slice_cb_qp_offset (se: 0)
         hdr.ue(0); // slice_cr_qp_offset
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut slice_rbsp = hdr.into_bytes();
@@ -1149,8 +1149,8 @@ mod tests {
         sps_body.ue(height);
         sps_body.ue(0); // bit_depth_luma_minus8
         sps_body.ue(0); // bit_depth_chroma_minus8
-                        // 13 toolset bit-flags up to (and including) sps_cm_init/sps_iqt
-                        // — all default to 0 except sps_rpl_flag and sps_pocs_flag.
+        // 13 toolset bit-flags up to (and including) sps_cm_init/sps_iqt
+        // — all default to 0 except sps_rpl_flag and sps_pocs_flag.
         sps_body.u(1, 0); // sps_btt
         sps_body.u(1, 0); // sps_suco
         sps_body.u(1, 0); // sps_admvp
@@ -1164,12 +1164,12 @@ mod tests {
         sps_body.u(1, 1); // sps_pocs ← enable
         sps_body.u(1, 0); // sps_dquant
         sps_body.u(1, 0); // sps_dra
-                          // sps_pocs_flag=1 → log2_max_pic_order_cnt_lsb_minus4
+        // sps_pocs_flag=1 → log2_max_pic_order_cnt_lsb_minus4
         sps_body.ue(4); // log2_max_pic_order_cnt_lsb_minus4 = 4 → 8 bits
-                        // sps_rpl_flag=1 path:
-                        //   sps_max_dec_pic_buffering_minus1, long_term_ref_pics_flag,
-                        //   rpl1_same_as_rpl0_flag, num_ref_pic_lists_in_sps[0],
-                        //   (num_ref_pic_lists_in_sps[1] when not same).
+        // sps_rpl_flag=1 path:
+        //   sps_max_dec_pic_buffering_minus1, long_term_ref_pics_flag,
+        //   rpl1_same_as_rpl0_flag, num_ref_pic_lists_in_sps[0],
+        //   (num_ref_pic_lists_in_sps[1] when not same).
         sps_body.ue(1); // sps_max_dec_pic_buffering_minus1
         sps_body.u(1, 0); // long_term_ref_pics_flag
         sps_body.u(1, 0); // rpl1_same_as_rpl0_flag (need both lists explicitly)
@@ -1227,7 +1227,7 @@ mod tests {
         hdr.u(6, 22);
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut slice_rbsp = hdr.into_bytes();
@@ -1238,7 +1238,7 @@ mod tests {
         enc.encode_decision(0, 0, 1); // CTB split_cu_flag = 1
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // child split_cu_flag = 0 (leaf)
-                                          // one SINGLE_TREE CU per leaf (§7.3.8.3 lines 2788-2795)
+            // one SINGLE_TREE CU per leaf (§7.3.8.3 lines 2788-2795)
             enc.encode_decision(0, 0, 0); // intra_pred_mode_idx = 0 (one "0" bin)
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
@@ -1310,13 +1310,13 @@ mod tests {
         hdr.u(6, 51);
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut slice_rbsp = hdr.into_bytes();
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 → unsplit 64×64 CB
-                                      // one SINGLE_TREE CU: DC mode + one DC coefficient.
+        // one SINGLE_TREE CU: DC mode + one DC coefficient.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
@@ -1376,7 +1376,7 @@ mod tests {
         hdr.u(6, 22);
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut idr_rbsp = hdr.into_bytes();
@@ -1452,7 +1452,7 @@ mod tests {
         idr_hdr.u(6, 22); // slice_qp
         idr_hdr.ue(0);
         idr_hdr.ue(0);
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -1463,7 +1463,7 @@ mod tests {
         // With ctb_log2 = 5 and min_cb_log2 = 4, the CTU is 32×32, and
         // we want a single 32x32 leaf → split_cu_flag = 0.
         idr_enc.encode_decision(0, 0, 0); // split_cu_flag = 0 at CTB
-                                          // one SINGLE_TREE CU (32x32):
+        // one SINGLE_TREE CU (32x32):
         idr_enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
         idr_enc.encode_decision(0, 0, 0); // cbf_cb
         idr_enc.encode_decision(0, 0, 0); // cbf_cr
@@ -1475,21 +1475,21 @@ mod tests {
         let mut p_hdr = BitEmitter::new();
         p_hdr.ue(0); // slice_pps_id
         p_hdr.ue(1); // slice_type = P
-                     // Not IDR + sps_pocs_flag = 0 → no POC LSB.
-                     // Not IDR + slice_type=P → ref-idx + admvp branch.
+        // Not IDR + sps_pocs_flag = 0 → no POC LSB.
+        // Not IDR + slice_type=P → ref-idx + admvp branch.
         p_hdr.u(1, 0); // num_ref_idx_active_override_flag = 0
-                       // sps_admvp_flag = 0 → skip temporal_mvp.
+        // sps_admvp_flag = 0 → skip temporal_mvp.
         p_hdr.u(1, 0); // slice_deblocking_filter_flag
         p_hdr.u(6, 22); // slice_qp
         p_hdr.ue(0);
         p_hdr.ue(0);
-        while p_hdr.bit_position() % 8 != 0 {
+        while !p_hdr.bit_position().is_multiple_of(8) {
             p_hdr.u(1, 0);
         }
         let mut p_rbsp = p_hdr.into_bytes();
         let mut p_enc = CabacEncoder::new();
         p_enc.encode_decision(0, 1, 0); // split_cu_flag = 0 at CTB
-                                        // Single-tree inter CU:
+        // Single-tree inter CU:
         p_enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         for b in 0..3usize {
             p_enc.encode_decision(0, 3 + b.min(2), 1); // mvp_idx_l0 = 3 prefix (3 ones)
@@ -1580,7 +1580,7 @@ mod tests {
         idr_hdr.u(6, 22); // slice_qp
         idr_hdr.ue(0);
         idr_hdr.ue(0);
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -1597,7 +1597,7 @@ mod tests {
         let mut p_hdr = BitEmitter::new();
         p_hdr.ue(0); // slice_pps_id
         p_hdr.ue(1); // slice_type = P
-                     // sps_pocs_flag = 1 + non-IDR → POC LSB (8 bits).
+        // sps_pocs_flag = 1 + non-IDR → POC LSB (8 bits).
         p_hdr.u(8, 1);
         // sps_rpl_flag = 1 path — for both i = 0 and i = 1:
         //   ref_pic_list_sps_flag[i] omitted because
@@ -1609,24 +1609,24 @@ mod tests {
         p_hdr.ue(1); // num_strp_entries
         p_hdr.ue(1); // delta_poc_st = 1
         p_hdr.u(1, 0); // sign negative → -1
-                       // RPL L1 inline: same shape (delta=1, sign=0).
+        // RPL L1 inline: same shape (delta=1, sign=0).
         p_hdr.ue(1);
         p_hdr.ue(1);
         p_hdr.u(1, 0);
         // P slice → ref_idx + admvp branch:
         p_hdr.u(1, 0); // num_ref_idx_active_override_flag
-                       // sps_admvp_flag = 0 → no temporal_mvp.
+        // sps_admvp_flag = 0 → no temporal_mvp.
         p_hdr.u(1, 0); // slice_deblocking_filter_flag
         p_hdr.u(6, 22); // slice_qp
         p_hdr.ue(0);
         p_hdr.ue(0);
-        while p_hdr.bit_position() % 8 != 0 {
+        while !p_hdr.bit_position().is_multiple_of(8) {
             p_hdr.u(1, 0);
         }
         let mut p_rbsp = p_hdr.into_bytes();
         let mut p_enc = CabacEncoder::new();
         p_enc.encode_decision(0, 1, 0); // split_cu_flag = 0
-                                        // Single-tree inter CU:
+        // Single-tree inter CU:
         p_enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         for b in 0..3usize {
             p_enc.encode_decision(0, 3 + b.min(2), 1); // mvp_idx_l0 = 3 prefix
@@ -1704,7 +1704,7 @@ mod tests {
         idr_hdr.u(6, 22); // slice_qp
         idr_hdr.ue(0);
         idr_hdr.ue(0);
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -1724,7 +1724,7 @@ mod tests {
             p_hdr.ue(0); // slice_pps_id
             p_hdr.ue(1); // slice_type = P
             p_hdr.u(8, cur_poc_lsb); // POC LSB
-                                     // RPL L0 inline: 1 STRP, delta=1, sign=0 → ref = cur - 1.
+            // RPL L0 inline: 1 STRP, delta=1, sign=0 → ref = cur - 1.
             p_hdr.ue(1);
             p_hdr.ue(1);
             p_hdr.u(1, 0);
@@ -1737,7 +1737,7 @@ mod tests {
             p_hdr.u(6, 22); // slice_qp
             p_hdr.ue(0);
             p_hdr.ue(0);
-            while p_hdr.bit_position() % 8 != 0 {
+            while !p_hdr.bit_position().is_multiple_of(8) {
                 p_hdr.u(1, 0);
             }
             let mut p_rbsp = p_hdr.into_bytes();
@@ -1820,7 +1820,7 @@ mod tests {
         idr_hdr.u(6, 22);
         idr_hdr.ue(0);
         idr_hdr.ue(0);
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -1848,7 +1848,7 @@ mod tests {
         p_hdr.u(6, 22);
         p_hdr.ue(0);
         p_hdr.ue(0);
-        while p_hdr.bit_position() % 8 != 0 {
+        while !p_hdr.bit_position().is_multiple_of(8) {
             p_hdr.u(1, 0);
         }
         let mut p_rbsp = p_hdr.into_bytes();
@@ -1963,7 +1963,7 @@ mod tests {
         idr_hdr.u(6, 22); // slice_qp
         idr_hdr.ue(0);
         idr_hdr.ue(0);
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -1994,18 +1994,18 @@ mod tests {
         p_hdr.u(6, 22); // slice_qp
         p_hdr.ue(0);
         p_hdr.ue(0);
-        while p_hdr.bit_position() % 8 != 0 {
+        while !p_hdr.bit_position().is_multiple_of(8) {
             p_hdr.u(1, 0);
         }
         let mut p_rbsp = p_hdr.into_bytes();
         let mut p_enc = CabacEncoder::new();
         p_enc.encode_decision(0, 1, 0); // split_cu_flag = 0
         p_enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
-                                        // read_cu_skip_main: sps_mmvd off → no mmvd bin;
-                                        // affine gate on (32×32) → affine_flag bin.
+        // read_cu_skip_main: sps_mmvd off → no mmvd bin;
+        // affine gate on (32×32) → affine_flag bin.
         p_enc.encode_decision(0, 1, 0); // affine_flag = 0
         p_enc.encode_decision(0, 5, 0); // merge_idx = 0
-                                        // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         p_enc.encode_terminate(true);
         p_rbsp.extend_from_slice(&p_enc.finish());
 
@@ -2096,7 +2096,7 @@ mod tests {
         hdr.u(6, 22);
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut slice_rbsp = hdr.into_bytes();
@@ -2173,7 +2173,7 @@ mod tests {
         hdr.u(6, 30); // slice_qp = 30
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut slice_rbsp = hdr.into_bytes();
@@ -2297,9 +2297,9 @@ mod tests {
         idr_hdr.u(6, 51); // slice_qp (51 → visible DC shift)
         idr_hdr.ue(0); // slice_cb_qp_offset
         idr_hdr.ue(0); // slice_cr_qp_offset
-                       // §7.3.4 entry point: NumTilesInSlice − 1 = 1 offset, 16 bits.
+        // §7.3.4 entry point: NumTilesInSlice − 1 = 1 offset, 16 bits.
         idr_hdr.u(16, subset_a.len() as u32 - 1); // entry_point_offset_minus1[0]
-        while idr_hdr.bit_position() % 8 != 0 {
+        while !idr_hdr.bit_position().is_multiple_of(8) {
             idr_hdr.u(1, 0);
         }
         let mut idr_rbsp = idr_hdr.into_bytes();
@@ -2332,7 +2332,7 @@ mod tests {
         p_hdr.ue(0); // cb offset
         p_hdr.ue(0); // cr offset
         p_hdr.u(16, p_subset_a.len() as u32 - 1); // entry point
-        while p_hdr.bit_position() % 8 != 0 {
+        while !p_hdr.bit_position().is_multiple_of(8) {
             p_hdr.u(1, 0);
         }
         let mut p_rbsp = p_hdr.into_bytes();
@@ -2497,7 +2497,7 @@ mod tests {
         hdr.u(6, 22);
         hdr.ue(0);
         hdr.ue(0);
-        while hdr.bit_position() % 8 != 0 {
+        while !hdr.bit_position().is_multiple_of(8) {
             hdr.u(1, 0);
         }
         let mut idr_rbsp = hdr.into_bytes();
@@ -2544,15 +2544,23 @@ mod tests {
         // Byte stride = 2 × width; every sample is LE 512 (0x00, 0x02).
         assert_eq!(video.planes[0].stride, 64);
         assert_eq!(video.planes[0].data.len(), 32 * 32 * 2);
-        assert!(video.planes[0]
-            .data
-            .chunks_exact(2)
-            .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512));
+        assert!(
+            video.planes[0]
+                .data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512)
+        );
         assert_eq!(video.planes[1].stride, 32);
         assert_eq!(video.planes[1].data.len(), 16 * 16 * 2);
-        assert!(video.planes[1]
-            .data
-            .chunks_exact(2)
-            .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512));
+        assert!(
+            video.planes[1]
+                .data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|c| u16::from_le_bytes([c[0], c[1]]) == 512)
+        );
     }
 }

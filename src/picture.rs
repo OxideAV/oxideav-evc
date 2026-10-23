@@ -14,7 +14,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::intra::{predict, IntraMode, RefSamples};
+use crate::intra::{IntraMode, RefSamples, predict};
 
 /// Reconstructed picture buffer for a planar YUV frame.
 ///
@@ -226,10 +226,10 @@ impl YuvPicture {
             if ax < 0 || ay < 0 || ax >= wi || ay >= hi {
                 return false;
             }
-            if let Some(r) = &tile_c {
-                if !r.contains(ax, ay) {
-                    return false;
-                }
+            if let Some(r) = &tile_c
+                && !r.contains(ax, ay)
+            {
+                return false;
             }
             if oy < 0 {
                 // Top row / corner: must be above the block (y > 0), and the
@@ -322,7 +322,7 @@ impl YuvPicture {
         tile_luma: Option<crate::tiles::TileRect>,
     ) -> bool {
         use crate::htdf::{
-            derive_htdf_lut, filter_block, htdf_applies, pad_rec_samples, InPictureBorder,
+            InPictureBorder, derive_htdf_lut, filter_block, htdf_applies, pad_rec_samples,
         };
 
         if !htdf_applies(n_cb_w, n_cb_h, qp_y, is_intra) {
@@ -590,7 +590,7 @@ pub fn intra_reconstruct_cb_eipd_in_tile(
     residual: &[i32],
     tile_luma: Option<crate::tiles::TileRect>,
 ) -> Result<()> {
-    use crate::eipd::{predict_eipd, AvailLr};
+    use crate::eipd::{AvailLr, predict_eipd};
 
     let (sub_w, sub_h) = sub_sampling(pic.chroma_format_idc, c_idx)?;
     let x = x_luma / sub_w;

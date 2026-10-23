@@ -449,10 +449,9 @@ where
     };
     if y_col_bot < bounds.pic_height_in_luma_samples
         && (y_cb >> ctb_log2_size_y) == (y_col_bot >> ctb_log2_size_y)
+        && let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot), &mut col_at)
     {
-        if let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot), &mut col_at) {
-            return Some(cand);
-        }
+        return Some(cand);
     }
 
     // Step 3: side collocated position (eqs. 495-498), gated on
@@ -462,10 +461,11 @@ where
     } else {
         (x_cb + n_cb_w, y_cb + n_cb_h - 1) // eqs. 497/498
     };
-    if x_col_side > 0 && x_col_side < bounds.pic_width_in_luma_samples {
-        if let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side), &mut col_at) {
-            return Some(cand);
-        }
+    if x_col_side > 0
+        && x_col_side < bounds.pic_width_in_luma_samples
+        && let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side), &mut col_at)
+    {
+        return Some(cand);
     }
 
     None
@@ -543,10 +543,9 @@ where
     };
     if y_col_bot < bounds.pic_height_in_luma_samples
         && (y_cb >> ctb_log2_size_y) == (y_col_bot >> ctb_log2_size_y)
+        && let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot))
     {
-        if let Some(cand) = try_position(grid8(x_col_bot), grid8(y_col_bot)) {
-            return Some(cand);
-        }
+        return Some(cand);
     }
 
     // Step 3: side collocated position (eqs. 495-498).
@@ -555,10 +554,11 @@ where
     } else {
         (x_cb + n_cb_w, y_cb + n_cb_h - 1)
     };
-    if x_col_side > 0 && x_col_side < bounds.pic_width_in_luma_samples {
-        if let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side)) {
-            return Some(cand);
-        }
+    if x_col_side > 0
+        && x_col_side < bounds.pic_width_in_luma_samples
+        && let Some(cand) = try_position(grid8(x_col_side), grid8(y_col_side))
+    {
+        return Some(cand);
     }
 
     None
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn boundary_clip_clamps_positive_overrun() {
         let b = bounds(); // 1920x1080, padding 144 → padded 2064 x 1224.
-                          // CU at (2000, 1200), MV +200 in x would land at 2200 > 2064.
+        // CU at (2000, 1200), MV +200 in x would land at 2200 > 2064.
         let mv = MotionVector::quarter_pel(200, 200);
         let clipped = constrain_scaled_mv(mv, 2000, 1200, b);
         assert_eq!(clipped.x, 2064 - 2000); // = 64

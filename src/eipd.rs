@@ -337,7 +337,7 @@ fn predict_bi(
                 let yi = y as i64;
                 let p_l = refs.left(y as i32) as i64; // p[-1][y]
                 let p_r = refs.right(y as i32) as i64; // p[nCbW][y]
-                                                       // p[-1][nCbH-1], p[nCbW][nCbH-1]
+                // p[-1][nCbH-1], p[nCbW][nCbH-1]
                 let p_l_b = refs.left(n_cb_h as i32 - 1) as i64;
                 let p_r_b = refs.right(n_cb_h as i32 - 1) as i64;
                 for x in 0..n_cb_w {

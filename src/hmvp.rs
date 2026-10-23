@@ -367,7 +367,7 @@ mod tests {
         h.update(make_cand_l0(16, 0, 2)); // matches our query
         h.update(make_cand_l0(20, 0, 1));
         h.update(make_cand_l0(24, 0, 1)); // most recent
-                                          // Query refIdxLX = 2 → find slot with mv=16,0.
+        // Query refIdxLX = 2 → find slot with mv=16,0.
         let (mv, ridx) = h.derive_default_mv(2, 0).unwrap();
         assert_eq!(mv, MotionVector::quarter_pel(16, 0));
         assert_eq!(ridx, 2);

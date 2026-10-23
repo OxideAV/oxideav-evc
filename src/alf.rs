@@ -235,11 +235,7 @@ pub(crate) const GOLOMB_ORDER_IDX_C: [usize; 6] = [0, 0, 1, 0, 0, 1];
 /// `LumaMaxGolombIdx` per §7.3.5 — `alf_luma_type_flag == 0` → 2, else 3.
 #[inline]
 fn luma_max_golomb_idx(type_flag: bool) -> usize {
-    if type_flag {
-        3
-    } else {
-        2
-    }
+    if type_flag { 3 } else { 2 }
 }
 
 /// `ChromaMaxGolombIdx` per §7.3.5 — fixed at 2.
@@ -2775,14 +2771,14 @@ mod tests {
         e.u(1, 0); // no chroma
         e.ue(0); // num_signalled_minus1 = 0 → 1 filter
         e.u(1, 1); // type_flag = 1
-                   // num_signalled == 1, so alf_luma_coeff_delta_idx loop is skipped.
+        // num_signalled == 1, so alf_luma_coeff_delta_idx loop is skipped.
         e.uek(0, 1); // fixed_filter_usage_pattern = 1
-                     // Every class flagged on automatically; need set_idx per class.
+        // Every class flagged on automatically; need set_idx per class.
         for _ in 0..25 {
             e.u(4, 0);
         }
         e.u(1, 0); // coeff_delta_flag = 0
-                   // num_signalled == 1 ⇒ no coeff_delta_prediction_flag.
+        // num_signalled == 1 ⇒ no coeff_delta_prediction_flag.
         e.ue(0); // alf_luma_min_eg_order_minus1 = 0 ⇒ kMin = 1
         for _ in 0..3 {
             e.u(1, 0);
@@ -2827,7 +2823,7 @@ mod tests {
         e.u(1, 0); // no chroma
         e.ue(2); // num_signalled - 1 = 2 → 3 filters
         e.u(1, 1); // type_flag = 1
-                   // alf_luma_coeff_delta_idx[ 0..24 ] — Ceil(Log2(3)) = 2 bits, identity-clamped.
+        // alf_luma_coeff_delta_idx[ 0..24 ] — Ceil(Log2(3)) = 2 bits, identity-clamped.
         for i in 0..25 {
             e.u(2, (i as u32).min(2));
         }

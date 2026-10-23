@@ -37,8 +37,8 @@ use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
 use crate::eipd_syntax::EipdCtx;
 use crate::inter::{
-    amvr_idx_ctx_inc, bi_pred_idx_ctx_inc, inter_pred_idc_c_max, inter_pred_idc_ctx_inc,
-    merge_idx_c_max, merge_idx_ctx_inc, AMVR_IDX_MAX, BI_PRED_IDX_MAX,
+    AMVR_IDX_MAX, BI_PRED_IDX_MAX, amvr_idx_ctx_inc, bi_pred_idx_ctx_inc, inter_pred_idc_c_max,
+    inter_pred_idc_ctx_inc, merge_idx_c_max, merge_idx_ctx_inc,
 };
 
 /// Per-element read counters for the §7.3.8.4 inter-mode-gating group.

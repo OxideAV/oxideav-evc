@@ -386,11 +386,7 @@ pub fn read_ats_inter(
     } else {
         // Only one orientation is available: pick it. With quad granularity
         // the available quad orientation; with half, the available half.
-        if quad {
-            allow.hor_quad
-        } else {
-            allow.hor_half
-        }
+        if quad { allow.hor_quad } else { allow.hor_half }
     };
 
     // ats_cu_inter_pos_flag — FL cMax=1, ctxInc 0 / Table 83. Read

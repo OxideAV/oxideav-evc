@@ -10,9 +10,11 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_evc::bin_cost::BitCostModel;
 use oxideav_evc::cabac::{BinSink, CabacEncoder, CabacEngine, InitType};
-use oxideav_evc::cabac_init::{init_main_profile_contexts, CtxSel, MainCtxTable};
-use oxideav_evc::quant_enc::{forward_quantize, forward_transform_fractional, level_unit_sse_weights};
-use oxideav_evc::rdoq::{rdoq_rle, RdoqInputs};
+use oxideav_evc::cabac_init::{CtxSel, MainCtxTable, init_main_profile_contexts};
+use oxideav_evc::quant_enc::{
+    forward_quantize, forward_transform_fractional, level_unit_sse_weights,
+};
+use oxideav_evc::rdoq::{RdoqInputs, rdoq_rle};
 use oxideav_evc::slice_data::decode_residual_coding_rle;
 use oxideav_evc::slice_enc::emit_residual_rle;
 
@@ -68,7 +70,11 @@ fuzz_target!(|data: &[u8]| {
                 0
             } else {
                 let b = i32::from(payload[i % payload.len()]);
-                let sign = if (i / payload.len()) % 2 == 0 { 1 } else { -1 };
+                let sign = if (i / payload.len()).is_multiple_of(2) {
+                    1
+                } else {
+                    -1
+                };
                 (sign * b * amp / 256).clamp(-amp, amp)
             }
         })
@@ -105,7 +111,10 @@ fuzz_target!(|data: &[u8]| {
         // Never further from the fractional value than rounding is, on
         // the same side (or zero).
         assert!(*l == 0 || (*l > 0) == (*c > 0.0), "sign: {l} vs {c}");
-        assert!((f64::from(*l) - c).abs() <= c.abs() + 1.0, "magnitude: {l} vs {c}");
+        assert!(
+            (f64::from(*l) - c).abs() <= c.abs() + 1.0,
+            "magnitude: {l} vs {c}"
+        );
     }
 
     // (b) never worse than rounding under the model's objective
@@ -113,8 +122,14 @@ fuzz_target!(|data: &[u8]| {
     forward_quantize(&residual, &mut plain, w, h, qp, bit_depth).expect("quantize");
     let own = account(&levels, &frac, &weights, log2_w, log2_h, &inp);
     let rounded = account(&plain, &frac, &weights, log2_w, log2_h, &inp);
-    assert!((own - cost).abs() <= 1e-6 * cost.max(1.0), "accounting {own} vs {cost}");
-    assert!(own <= rounded + 1e-6 * rounded.max(1.0), "trellis {own} worse than rounding {rounded}");
+    assert!(
+        (own - cost).abs() <= 1e-6 * cost.max(1.0),
+        "accounting {own} vs {cost}"
+    );
+    assert!(
+        own <= rounded + 1e-6 * rounded.max(1.0),
+        "trellis {own} worse than rounding {rounded}"
+    );
 
     // (c) the RLE string round-trips through the decoder
     if cbf {
@@ -131,8 +146,16 @@ fuzz_target!(|data: &[u8]| {
         }
         let mut decoded = vec![0i32; n];
         let mut runs = 0u32;
-        decode_residual_coding_rle(&mut eng, sel, c_idx, &mut decoded, &mut runs, log2_w, log2_h)
-            .expect("decode");
+        decode_residual_coding_rle(
+            &mut eng,
+            sel,
+            c_idx,
+            &mut decoded,
+            &mut runs,
+            log2_w,
+            log2_h,
+        )
+        .expect("decode");
         assert_eq!(decoded, levels, "RLE duality");
     }
 });

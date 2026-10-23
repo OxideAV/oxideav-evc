@@ -73,7 +73,7 @@ pub fn parse_stats(text: &str) -> Result<Vec<FrameStat>> {
         _ => {
             return Err(Error::invalid(
                 "evc two-pass: stats file lacks the `# oxideav-evc first-pass stats v1` header",
-            ))
+            ));
         }
     }
     let mut out = Vec::new();
@@ -423,17 +423,19 @@ mod tests {
         assert!(plan_two_pass(&[], 1000.0, buf, buf.vbv, DEFAULT_SLOPE).is_err());
         let stats = synth_stats(4, 4);
         assert!(plan_two_pass(&stats, 0.0, buf, buf.vbv, DEFAULT_SLOPE).is_err());
-        assert!(plan_two_pass(
-            &stats,
-            1000.0,
-            BufferModel {
-                inflow: 0.0,
-                vbv: 1.0
-            },
-            1.0,
-            DEFAULT_SLOPE,
-        )
-        .is_err());
+        assert!(
+            plan_two_pass(
+                &stats,
+                1000.0,
+                BufferModel {
+                    inflow: 0.0,
+                    vbv: 1.0
+                },
+                1.0,
+                DEFAULT_SLOPE,
+            )
+            .is_err()
+        );
         assert!(plan_two_pass(&stats, 1000.0, buf, buf.vbv, 5.0).is_err());
     }
 }

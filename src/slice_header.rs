@@ -15,7 +15,7 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::BitReader;
 use crate::nal::NalUnitType;
 use crate::pps::TileIndexMaps;
-use crate::rpl::{parse_ref_pic_list_struct, RefPicListStruct};
+use crate::rpl::{RefPicListStruct, parse_ref_pic_list_struct};
 
 /// Slice type values from §7.4.5 Table 8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -986,14 +986,14 @@ mod tests {
         e.u(5, 11); // slice_alf_luma_aps_id
         e.u(1, 0); // slice_alf_map_flag
         e.u(2, 3); // slice_alf_chroma_idc = 3 (both Cb and Cr)
-                   // §7.4.5: on ChromaArrayType != 3 the chroma APS id is
-                   // signalled inside the enabled-flag block. On ChromaArrayType
-                   // == 3 it is signalled per-component below instead, so the
-                   // enabled-flag-block chroma id read is SKIPPED in this path.
-                   //
-                   // The ChromaArrayType == 3 fork re-reads (in this case
-                   // re-skips) chroma_idc, then reads chroma map flags + APS
-                   // ids per component.
+        // §7.4.5: on ChromaArrayType != 3 the chroma APS id is
+        // signalled inside the enabled-flag block. On ChromaArrayType
+        // == 3 it is signalled per-component below instead, so the
+        // enabled-flag-block chroma id read is SKIPPED in this path.
+        //
+        // The ChromaArrayType == 3 fork re-reads (in this case
+        // re-skips) chroma_idc, then reads chroma map flags + APS
+        // ids per component.
         e.u(5, 13); // slice_alf_chroma_aps_id  (idc ∈ {1, 3} → Cb path)
         e.u(1, 1); // slice_alf_chroma_map_flag
         e.u(5, 17); // slice_alf_chroma2_aps_id (idc ∈ {2, 3} → Cr path)
@@ -1106,13 +1106,13 @@ mod tests {
         let mut e = BitEmitter::new();
         e.ue(0); // pps id
         e.ue(1); // slice_type = P
-                 // not IDR → no no_output_of_prior_pics_flag
-                 // sps_mmvd_flag = false → no mmvd_group_enable_flag
-                 // sps_alf_flag = false → no slice_alf_enabled_flag
+        // not IDR → no no_output_of_prior_pics_flag
+        // sps_mmvd_flag = false → no mmvd_group_enable_flag
+        // sps_alf_flag = false → no slice_alf_enabled_flag
         e.u(8, 0xAB); // slice_pic_order_cnt_lsb (8 bits)
-                      // not IDR + slice_type == P → ref-idx + admvp branch
+        // not IDR + slice_type == P → ref-idx + admvp branch
         e.u(1, 0); // num_ref_idx_active_override_flag
-                   // sps_admvp_flag = false → skip
+        // sps_admvp_flag = false → skip
         e.u(1, 0); // slice_deblocking_filter_flag
         e.u(6, 22); // slice_qp
         e.ue(0); // cb offset
@@ -1147,7 +1147,7 @@ mod tests {
         let mut e = BitEmitter::new();
         e.ue(0); // pps id
         e.ue(1); // slice_type = P
-                 // not IDR + sps_pocs_flag = 1 → POC LSB (8 bits)
+        // not IDR + sps_pocs_flag = 1 → POC LSB (8 bits)
         e.u(8, 0x42);
         // sps_rpl_flag = 1 path: num_ref_pic_lists_in_sps[i] = 0 →
         // ref_pic_list_sps_flag NOT signalled (stays at 0) → inline RPL.
@@ -1155,13 +1155,13 @@ mod tests {
         e.ue(1); // num_strp_entries (long_term=0 so no num_ltrp)
         e.ue(1); // delta_poc_st = 1
         e.u(1, 1); // sign positive
-                   // Inline RPL for L1: same shape, 1 STRP, delta=1, sign=0 (negative).
+        // Inline RPL for L1: same shape, 1 STRP, delta=1, sign=0 (negative).
         e.ue(1);
         e.ue(1);
         e.u(1, 0);
         // P slice ref_idx + admvp branch:
         e.u(1, 0); // num_ref_idx_active_override_flag
-                   // sps_admvp_flag = 0 → no temporal_mvp.
+        // sps_admvp_flag = 0 → no temporal_mvp.
         e.u(1, 0); // slice_deblocking_filter_flag
         e.u(6, 22); // slice_qp
         e.ue(0); // cb offset
@@ -1208,7 +1208,7 @@ mod tests {
         e.ue(0); // pps id
         e.ue(1); // P
         e.u(8, 0xAB); // POC LSB
-                      // ref_pic_list_sps_flag[0] = 1
+        // ref_pic_list_sps_flag[0] = 1
         e.u(1, 1);
         // ref_pic_list_idx[0] = 2 → 2 bits "10"
         e.u(2, 2);

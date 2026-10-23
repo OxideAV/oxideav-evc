@@ -40,7 +40,7 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn is_byte_aligned(&self) -> bool {
-        self.bits_in_acc % 8 == 0
+        self.bits_in_acc.is_multiple_of(8)
     }
 
     /// Discard bits up to the next byte boundary (§7.2 byte_aligned()).
@@ -125,11 +125,7 @@ impl<'a> BitReader<'a> {
         let k = self.ue()?;
         // 0 -> 0, 1 -> 1, 2 -> -1, 3 -> 2, 4 -> -2, ...
         let val = ((k + 1) >> 1) as i32;
-        if k & 1 == 1 {
-            Ok(val)
-        } else {
-            Ok(-val)
-        }
+        if k & 1 == 1 { Ok(val) } else { Ok(-val) }
     }
 
     /// Read a k-th order unsigned Exp-Golomb code, `uek(v)` (§9.2 with k > 0).

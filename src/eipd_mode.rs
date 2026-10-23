@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(derive_chroma_mode(1, INTRA_DC), INTRA_BI); // 1 < 2: no skip
         assert_eq!(derive_chroma_mode(2, INTRA_DC), INTRA_HOR); // 2 >= 2: +1 → HOR
         assert_eq!(derive_chroma_mode(3, INTRA_DC), INTRA_VER); // 3 >= 2: +1 → VER
-                                                                // luma = INTRA_BI → modeIdx = 1: every index bumps.
+        // luma = INTRA_BI → modeIdx = 1: every index bumps.
         assert_eq!(derive_chroma_mode(1, INTRA_BI), INTRA_DC); // 1 >= 1: +1 → DC
         assert_eq!(derive_chroma_mode(2, INTRA_BI), INTRA_HOR); // 2 >= 1: +1 → HOR
     }

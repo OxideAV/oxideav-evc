@@ -39,8 +39,8 @@
 use crate::cabac::BinSink;
 use crate::cabac_init::{CtxSel, MainCtxTable};
 use crate::deblock::{CuPredMode, SideInfoGrid};
-use crate::eipd::{predict_eipd, AvailLr};
-use crate::eipd_mode::{derive_mode_lists, EipdModeLists, ModeSelector, NeighbourMode};
+use crate::eipd::{AvailLr, predict_eipd};
+use crate::eipd_mode::{EipdModeLists, ModeSelector, NeighbourMode, derive_mode_lists};
 use crate::picture::YuvPicture;
 
 /// Number of EIPD luma modes (Table 15: 0..=32).
@@ -277,7 +277,7 @@ mod tests {
     use crate::cabac::{CabacEncoder, CabacEngine, InitType};
     use crate::cabac_init::init_main_profile_contexts;
     use crate::eipd_syntax::{
-        read_intra_chroma_pred_mode, read_luma_mode_selector, EipdCtx, EipdSyntaxStats,
+        EipdCtx, EipdSyntaxStats, read_intra_chroma_pred_mode, read_luma_mode_selector,
     };
 
     /// Every mode of every list shape maps to a selector the decoder

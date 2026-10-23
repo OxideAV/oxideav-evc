@@ -274,8 +274,8 @@ fn write_alf_data(
         }
         w.uek(0, 0); // alf_luma_fixed_filter_usage_pattern = 0
         w.u1(false); // alf_luma_coeff_delta_flag = 0
-                     // Delta prediction: code either the filters or their successive
-                     // differences (eq. 97), whichever is cheaper.
+        // Delta prediction: code either the filters or their successive
+        // differences (eq. 97), whichever is cheaper.
         let diffs: Vec<[i32; NL]> = (0..n)
             .map(|i| {
                 if i == 0 {
@@ -549,7 +549,7 @@ fn merge_levels(classes: &[Stats<NL>]) -> Vec<[u8; NUM_ALF_FILTERS]> {
                 let merged = groups[i].1.merge(&groups[j].1);
                 let s = sse_opt(&merged);
                 let delta = s - groups[i].2 - groups[j].2;
-                if best.as_ref().map_or(true, |b| delta < b.2) {
+                if best.as_ref().is_none_or(|b| delta < b.2) {
                     best = Some((i, j, delta, merged, s));
                 }
             }
@@ -639,7 +639,7 @@ pub fn design_and_apply(
         let all = flags.iter().all(|&f| f);
         let flag_bits = if all { 0.0 } else { n_ctb as f64 };
         let cost = on_sse + lambda * (8.0 * aps.len() as f64 + nal_overhead_bits + flag_bits);
-        if best_luma.as_ref().map_or(true, |b| cost < b.0) {
+        if best_luma.as_ref().is_none_or(|b| cost < b.0) {
             best_luma = Some((cost, filters, map, flags, !all));
         }
     }

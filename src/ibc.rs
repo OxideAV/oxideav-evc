@@ -311,7 +311,7 @@ pub fn predict_ibc_block(
             return Err(Error::invalid(format!(
                 "evc ibc: unsupported chroma_format_idc {}",
                 cur_pic.chroma_format_idc
-            )))
+            )));
         }
     };
     let n_cb_w_c = n_cb_w_l / sub_w;

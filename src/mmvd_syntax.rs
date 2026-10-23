@@ -44,8 +44,8 @@ use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
 use crate::eipd_syntax::EipdCtx;
 use crate::inter::{
-    mmvd_direction_idx_ctx_inc, mmvd_distance_idx_ctx_inc, mmvd_group_idx_ctx_inc,
-    mmvd_merge_idx_ctx_inc, MMVD_DISTANCE_IDX_MAX, MMVD_GROUP_IDX_MAX, MMVD_MERGE_IDX_MAX,
+    MMVD_DISTANCE_IDX_MAX, MMVD_GROUP_IDX_MAX, MMVD_MERGE_IDX_MAX, mmvd_direction_idx_ctx_inc,
+    mmvd_distance_idx_ctx_inc, mmvd_group_idx_ctx_inc, mmvd_merge_idx_ctx_inc,
 };
 
 /// The decoded §7.3.8.4 MMVD syntax group for one CU.

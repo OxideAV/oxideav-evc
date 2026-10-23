@@ -32,7 +32,7 @@
 use oxideav_core::Result;
 
 use crate::cabac::CabacEngine;
-use crate::cabac_init::{ctx_inc_btt_split_flag, MainCtxTable};
+use crate::cabac_init::{MainCtxTable, ctx_inc_btt_split_flag};
 
 /// The five coding-tree split shapes (§7.4.8.3, `SplitMode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1761,9 +1761,10 @@ mod tests {
         assert_eq!((c[1].x0, c[1].y0), (32, 0));
         assert_eq!((c[2].x0, c[2].y0), (0, 32));
         assert_eq!((c[3].x0, c[3].y0), (32, 32));
-        assert!(c
-            .iter()
-            .all(|ch| ch.log2_cb_width == 5 && ch.log2_cb_height == 5 && ch.ct_depth == 1));
+        assert!(
+            c.iter()
+                .all(|ch| ch.log2_cb_width == 5 && ch.log2_cb_height == 5 && ch.ct_depth == 1)
+        );
     }
 
     #[test]
@@ -1861,7 +1862,7 @@ mod tests {
     #[test]
     fn suco_order_disallowed_outside_size_window() {
         let s = suco_window_4_6(); // window [4, 6]
-                                   // Longer side 7 > MaxSuco 6 → condition 1.
+        // Longer side 7 > MaxSuco 6 → condition 1.
         assert!(!allow_split_unit_coding_order(
             &s,
             0,

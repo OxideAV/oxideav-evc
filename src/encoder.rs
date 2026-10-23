@@ -115,24 +115,24 @@ use std::collections::VecDeque;
 use oxideav_core::format::PixelFormat;
 use oxideav_core::{CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, TimeBase};
 
+use crate::CODEC_ID_STR;
 use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
-    append_length_prefixed_nal, append_length_prefixed_nal_tid, iqt_chroma_qp_offset,
-    write_idr_slice_header_alf, write_inter_slice_header_alf, write_p_slice_header, write_pps_rbsp,
-    write_sps_rbsp, EncSequenceConfig, SliceAlfFields,
+    EncSequenceConfig, SliceAlfFields, append_length_prefixed_nal, append_length_prefixed_nal_tid,
+    iqt_chroma_qp_offset, write_idr_slice_header_alf, write_inter_slice_header_alf,
+    write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
 use crate::rate_plan::{
-    format_stats, log2_ratio, parse_stats, plan_two_pass, pow2_qp_over6, BufferModel, FrameStat,
-    DEFAULT_SLOPE, SLOPE_RANGE,
+    BufferModel, DEFAULT_SLOPE, FrameStat, SLOPE_RANGE, format_stats, log2_ratio, parse_stats,
+    plan_two_pass, pow2_qp_over6,
 };
 use crate::ref_lists::{
-    construct_ref_pic_lists_rpl_flag0, derive_poc_pocs_flag0, mark_references_rpl_flag0, RefPicInfo,
+    RefPicInfo, construct_ref_pic_lists_rpl_flag0, derive_poc_pocs_flag0, mark_references_rpl_flag0,
 };
 use crate::slice_enc::{EncStats, IntraToolset};
-use crate::slice_enc_p::{encode_inter_slice_data, ColMotion, InterEncInputs, PEncStats, RefEntry};
-use crate::CODEC_ID_STR;
+use crate::slice_enc_p::{ColMotion, InterEncInputs, PEncStats, RefEntry, encode_inter_slice_data};
 
 /// Default slice QP when the caller doesn't pass the `qp` option.
 pub const DEFAULT_QP: i32 = 30;
@@ -293,7 +293,7 @@ fn coded_dims(w: u32, h: u32) -> Result<(u32, u32)> {
     if w == 0 || h == 0 {
         return Err(Error::invalid("evc encoder: zero dimensions"));
     }
-    if w % 2 != 0 || h % 2 != 0 {
+    if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
         return Err(Error::unsupported(format!(
             "evc encoder: odd dimensions {w}x{h} are unrepresentable in the 4:2:0              conformance-cropping window (offsets count SubWidthC/SubHeightC pairs)"
         )));
@@ -407,7 +407,7 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
             return Err(Error::unsupported(format!(
                 "evc encoder: pixel format {pf:?} unsupported \
                  (Yuv420P / Yuv420P10Le / Yuv420P12Le)"
-            )))
+            )));
         }
     };
     let parse_bool = |name: &str, default: bool| -> Result<bool> {
@@ -1135,7 +1135,7 @@ impl Encoder for EvcEncoder {
         )?;
         // The IDR cadence counts source pictures (display order).
         let sent = self.frame_idx + self.pending.len() as u64;
-        let is_idr = self.gop <= 1 || sent % (self.gop as u64) == 0;
+        let is_idr = self.gop <= 1 || sent.is_multiple_of(self.gop as u64);
         if self.sub_gop_log2 == 0 {
             return self.emit_picture(&src, v.pts, is_idr, 0);
         }

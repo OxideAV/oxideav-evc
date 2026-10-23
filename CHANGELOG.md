@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 ### Other
 
 - **Encoder: hierarchical B sub-GOPs (round 458).** Registry option

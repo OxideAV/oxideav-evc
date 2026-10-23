@@ -234,7 +234,7 @@ pub fn mmvd_motion_vector(
             let curr_poc_diff_l1 = pocs.curr_poc_diff(1, m.ref_idx_l1)?; // eq. 570
             let dsf = dist_scale_factor(curr_poc_diff_l1, curr_poc_diff_l0)?; // eq. 571
             m.mv_l1 = scale_mv(dsf, m.mv_l0); // eqs. 572/573
-                                              // "refIdxL0 is set equal to −1, and predFlagL0, mMvL0 are 0."
+            // "refIdxL0 is set equal to −1, and predFlagL0, mMvL0 are 0."
             m.ref_idx_l0 = -1;
             m.pred_flag_l0 = false;
             m.mv_l0 = MotionVector::default();
@@ -265,7 +265,7 @@ pub fn mmvd_motion_vector(
             let curr_poc_diff_l1 = pocs.curr_poc_diff(1, m.ref_idx_l1)?; // eq. 587
             let dsf = dist_scale_factor(curr_poc_diff_l0, curr_poc_diff_l1)?; // eq. 588
             m.mv_l0 = scale_mv(dsf, m.mv_l1); // eqs. 589/590
-                                              // "refIdxL1 is set equal to −1, and predFlagL1, mMvL1 are 0."
+            // "refIdxL1 is set equal to −1, and predFlagL1, mMvL1 are 0."
             m.ref_idx_l1 = -1;
             m.pred_flag_l1 = false;
             m.mv_l1 = MotionVector::default();

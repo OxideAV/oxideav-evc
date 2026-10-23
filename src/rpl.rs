@@ -177,7 +177,7 @@ mod tests {
     fn roundtrip_strp_only() {
         let mut e = BitEmitter::new();
         e.ue(2); // num_strp_entries
-                 // entry 0: delta_poc_st = 1, sign = 1 (positive)
+        // entry 0: delta_poc_st = 1, sign = 1 (positive)
         e.ue(1);
         e.u(1, 1);
         // entry 1: delta_poc_st = 3, sign = 0 (negative)
@@ -220,7 +220,7 @@ mod tests {
         let mut e = BitEmitter::new();
         e.ue(1); // num_strp_entries
         e.ue(1); // num_ltrp_entries
-                 // entry 0: lt_ref_pic_flag = 0 (STRP), delta = 2, sign = 1
+        // entry 0: lt_ref_pic_flag = 0 (STRP), delta = 2, sign = 1
         e.u(1, 0);
         e.ue(2);
         e.u(1, 1);

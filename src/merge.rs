@@ -41,7 +41,7 @@
 //! §6.4.3 motion-vector-candidate availability plus the stored
 //! `MvLX`/`RefIdxLX`/`PredFlagLX` at that position.
 
-use crate::inter::{merge_cand_redundancy_check, MergeCand, MotionVector};
+use crate::inter::{MergeCand, MotionVector, merge_cand_redundancy_check};
 use crate::neighbour::AvailLr;
 use oxideav_core::error::Result;
 
@@ -211,51 +211,49 @@ where
     let mut n = num_curr_merge_cand;
 
     // A1 — always probed; appended with no trim (first spatial cand).
-    if let Some(cand) = mv_at(pos.a1.0, pos.a1.1).to_merge_cand(small_block) {
-        if n < merge_cand_list.len() {
-            merge_cand_list[n] = cand;
-            n += 1;
-        }
+    if let Some(cand) = mv_at(pos.a1.0, pos.a1.1).to_merge_cand(small_block)
+        && n < merge_cand_list.len()
+    {
+        merge_cand_list[n] = cand;
+        n += 1;
     }
 
     // B1 — probed; appended then trimmed when numCurrMergeCand > 1.
-    if let Some(cand) = mv_at(pos.b1.0, pos.b1.1).to_merge_cand(small_block) {
-        if n < merge_cand_list.len() {
-            merge_cand_list[n] = cand;
-            n += 1;
-            n = merge_cand_redundancy_check(merge_cand_list, n)?;
-        }
+    if let Some(cand) = mv_at(pos.b1.0, pos.b1.1).to_merge_cand(small_block)
+        && n < merge_cand_list.len()
+    {
+        merge_cand_list[n] = cand;
+        n += 1;
+        n = merge_cand_redundancy_check(merge_cand_list, n)?;
     }
 
     // B0 — probed; appended then trimmed.
-    if let Some(cand) = mv_at(pos.b0.0, pos.b0.1).to_merge_cand(small_block) {
-        if n < merge_cand_list.len() {
-            merge_cand_list[n] = cand;
-            n += 1;
-            n = merge_cand_redundancy_check(merge_cand_list, n)?;
-        }
+    if let Some(cand) = mv_at(pos.b0.0, pos.b0.1).to_merge_cand(small_block)
+        && n < merge_cand_list.len()
+    {
+        merge_cand_list[n] = cand;
+        n += 1;
+        n = merge_cand_redundancy_check(merge_cand_list, n)?;
     }
 
     // A0 — probed only when numCurrMergeCand < mLSize − 1.
-    if n + 1 < m_l_size {
-        if let Some(cand) = mv_at(pos.a0.0, pos.a0.1).to_merge_cand(small_block) {
-            if n < merge_cand_list.len() {
-                merge_cand_list[n] = cand;
-                n += 1;
-                n = merge_cand_redundancy_check(merge_cand_list, n)?;
-            }
-        }
+    if n + 1 < m_l_size
+        && let Some(cand) = mv_at(pos.a0.0, pos.a0.1).to_merge_cand(small_block)
+        && n < merge_cand_list.len()
+    {
+        merge_cand_list[n] = cand;
+        n += 1;
+        n = merge_cand_redundancy_check(merge_cand_list, n)?;
     }
 
     // B2 — probed only when numCurrMergeCand < mLSize − 1.
-    if n + 1 < m_l_size {
-        if let Some(cand) = mv_at(pos.b2.0, pos.b2.1).to_merge_cand(small_block) {
-            if n < merge_cand_list.len() {
-                merge_cand_list[n] = cand;
-                n += 1;
-                n = merge_cand_redundancy_check(merge_cand_list, n)?;
-            }
-        }
+    if n + 1 < m_l_size
+        && let Some(cand) = mv_at(pos.b2.0, pos.b2.1).to_merge_cand(small_block)
+        && n < merge_cand_list.len()
+    {
+        merge_cand_list[n] = cand;
+        n += 1;
+        n = merge_cand_redundancy_check(merge_cand_list, n)?;
     }
 
     Ok(n)
@@ -482,12 +480,12 @@ where
     )?;
 
     // Step 2: temporal (collocated).
-    if let Some(cand) = temporal {
-        if n < out.len() {
-            out[n] = cand;
-            n += 1;
-            n = merge_cand_redundancy_check(out, n)?;
-        }
+    if let Some(cand) = temporal
+        && n < out.len()
+    {
+        out[n] = cand;
+        n += 1;
+        n = merge_cand_redundancy_check(out, n)?;
     }
 
     // Step 3: history-based (HMVP), gated on numCurrMergeCand < mLSize.

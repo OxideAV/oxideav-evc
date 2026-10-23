@@ -49,7 +49,7 @@ use oxideav_core::Result;
 
 use crate::cabac::CabacEngine;
 use crate::cabac_init::MainCtxTable;
-use crate::eipd_mode::{derive_chroma_mode, derive_mode_lists, ModeSelector, NeighbourMode};
+use crate::eipd_mode::{ModeSelector, NeighbourMode, derive_chroma_mode, derive_mode_lists};
 
 /// Resolves the `(ctxTable, ctxIdx)` pair for a single-context EIPD
 /// syntax element, honouring `sps_cm_init_flag`.
@@ -98,11 +98,7 @@ impl EipdCtx {
     /// `sps_cm_init_flag == 1`, the shared table 0 otherwise.
     #[inline]
     pub fn table(self, table: MainCtxTable) -> usize {
-        if self.cm_init {
-            table.as_usize()
-        } else {
-            0
-        }
+        if self.cm_init { table.as_usize() } else { 0 }
     }
 
     /// §9.3.4.2.1 `ctxIdxOffset` for the named table under this slice's
@@ -425,7 +421,7 @@ mod tests {
     /// proving the syntax → derivation → kernel chain executes coherently.
     #[test]
     fn resolve_then_predict_runs_kernel() {
-        use crate::eipd::{predict_eipd, AvailLr, EipdRefSamples, INTRA_DC};
+        use crate::eipd::{AvailLr, EipdRefSamples, INTRA_DC, predict_eipd};
         // Neighbours all DC → candModeList collapses to {DC, BI}; mpm_idx=0
         // selects DC.
         let bs = engine_with_regular_bins(&[1, 0]);

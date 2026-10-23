@@ -116,11 +116,11 @@ mod tests {
         let mut e = BitEmitter::new();
         e.u(5, id); // adaptation_parameter_set_id
         e.u(3, params_type); // aps_params_type
-                             // alf_data() / dra_data() body — we emit a tiny stub: a single 0 bit
-                             // so the round-1 capture has something to record.
+        // alf_data() / dra_data() body — we emit a tiny stub: a single 0 bit
+        // so the round-1 capture has something to record.
         e.u(1, 0);
         e.u(1, ext); // aps_extension_flag
-                     // No aps_extension_data_flag loop (since ext=0 case).
+        // No aps_extension_data_flag loop (since ext=0 case).
         e.finish_with_trailing_bits();
         e.into_bytes()
     }

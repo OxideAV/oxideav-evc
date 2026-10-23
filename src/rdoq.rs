@@ -50,8 +50,8 @@
 //! Everything is `f64` arithmetic on integer-derived costs, so the
 //! choice — and the emitted bytes — are platform-deterministic.
 
-use crate::bin_cost::{bin_cost, BitCostModel};
-use crate::cabac_init::{ctx_inc_coeff_zero_run, CtxSel, MainCtxTable};
+use crate::bin_cost::{BitCostModel, bin_cost};
+use crate::cabac_init::{CtxSel, MainCtxTable, ctx_inc_coeff_zero_run};
 use crate::slice_data::zigzag_scan;
 
 /// Per-bucket static bin costs of the run and level U strings.

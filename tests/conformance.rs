@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use oxideav_core::{Decoder, Packet, TimeBase};
 use oxideav_evc::decoder::EvcDecoder;
-use oxideav_evc::nal::{iter_length_prefixed, NalUnitType};
+use oxideav_evc::nal::{NalUnitType, iter_length_prefixed};
 
 /// One `.opl` row: output-order picture dimensions + per-plane hashes.
 struct OplRow {
@@ -157,7 +157,7 @@ fn check_stream(dir: &Path, name: &str) -> StreamResult {
                 name: name.into(),
                 pics: 0,
                 detail: Some(format!("opl parse: {e}")),
-            }
+            };
         }
     };
     let bytes = match std::fs::read(&bit) {
@@ -167,7 +167,7 @@ fn check_stream(dir: &Path, name: &str) -> StreamResult {
                 name: name.into(),
                 pics: 0,
                 detail: Some(format!("read .bit: {e}")),
-            }
+            };
         }
     };
     let pics = match decode_stream(&bytes) {
@@ -177,7 +177,7 @@ fn check_stream(dir: &Path, name: &str) -> StreamResult {
                 name: name.into(),
                 pics: 0,
                 detail: Some(format!("decode: {e}")),
-            }
+            };
         }
     };
     if pics.len() != rows.len() {
@@ -210,7 +210,11 @@ fn check_stream(dir: &Path, name: &str) -> StreamResult {
                     let _ = writeln!(
                         divergences,
                         "  pic {i} (poc {}) {name_c}: geometry {}x{} stride {} len {} vs opl {w}x{h}",
-                        row.poc, w, h, stride, plane.len()
+                        row.poc,
+                        w,
+                        h,
+                        stride,
+                        plane.len()
                     );
                 }
                 continue;

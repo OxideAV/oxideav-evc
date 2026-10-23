@@ -2457,7 +2457,7 @@ mod tests {
             e.u(10, 0); // range_l[0] = 0
             e.u(11, 8); // dra_scale[0] = 8 (Q8.3 → scale = 1.0)
             e.u(1, 0); // luma_inverted = 0
-                       // 0 chroma entries (num_ranges-1 = 0 → loop runs 0 times)
+            // 0 chroma entries (num_ranges-1 = 0 → loop runs 0 times)
         }
         e.finish_with_trailing_bits();
         e.into_bytes()
@@ -2489,10 +2489,10 @@ mod tests {
         e.u(10, 0); // range_l[0] = 0
         e.u(10, 128); // range_l[1] = 128
         e.u(11, 8); // scale[0] = 8 (1.0)
-                    // scale_delta[1] = +4 → scale[1] = 12
+        // scale_delta[1] = +4 → scale[1] = 12
         e.u(12, 4); // delta = +4, unsigned 12-bit (positive)
         e.u(1, 0); // not inverted
-                   // 1 chroma entry (i in 0..num_ranges-1 = 0..1)
+        // 1 chroma entry (i in 0..num_ranges-1 = 0..1)
         e.u(8, 16); // chroma_qp_scale[0] = 16
         e.u(8, 255); // chroma_qp_offset[0] = -1 (signed 8-bit: 0xFF)
         e.finish_with_trailing_bits();
@@ -3433,7 +3433,7 @@ mod tests {
         // overshoots: invScale * 1023 + (dra_offset + 256) >> 9 ≫ 1023.
         der.inv_luma_scales[0] = 1024; // 2× nominal
         der.dra_offsets[0] = 100_000; // bias upward
-                                      // ranges array for find_range_idx.
+        // ranges array for find_range_idx.
         let mapped = map_one_luma_sample(1023, &out_ranges_l_as_i32(&der), &der, 1023);
         assert_eq!(mapped, 1023, "Clip1Y caps at (1<<10) − 1");
     }
@@ -4823,7 +4823,7 @@ mod tests {
         // (set by `derive_dra_state` from `dra_table_idx`), NOT off
         // any SPS field.
         let sps = round207_sps_for_adapter(1, false, 2, 2, None); // 10-bit
-                                                                  // Unjoined branch.
+        // Unjoined branch.
         let syn_u = three_range_unjoined_chroma_syntax(sps.bit_depth_y());
         let der_u = derive_dra_state(&syn_u, sps.bit_depth_y()).unwrap();
         assert!(!der_u.joined_scale_flag);

@@ -147,13 +147,13 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     if cfg.width == 0 || cfg.height == 0 {
         return Err(Error::invalid("evc enc sps: zero dimensions"));
     }
-    if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
+    if !cfg.width.is_multiple_of(8) || !cfg.height.is_multiple_of(8) {
         return Err(Error::invalid(format!(
             "evc enc sps: coded dimensions {}x{} must be multiples of Max( MinCbSizeY, 8 ) = 8              (§7.4.3.1) — pad and crop",
             cfg.width, cfg.height
         )));
     }
-    if cfg.crop_right % 2 != 0 || cfg.crop_bottom % 2 != 0 {
+    if !cfg.crop_right.is_multiple_of(2) || !cfg.crop_bottom.is_multiple_of(2) {
         return Err(Error::invalid(
             "evc enc sps: crop offsets are signalled in SubWidthC/SubHeightC units (4:2:0: 2              luma samples) — odd luma offsets are unrepresentable",
         ));
@@ -247,8 +247,8 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
     w.u1(false); // sps_pocs_flag
     w.u1(false); // sps_dquant_flag
     w.u1(false); // sps_dra_flag
-                 // !sps_pocs_flag || !sps_rpl_flag → log2_sub_gop_length; == 0 →
-                 // log2_ref_pic_gap_length (all-intra stream: sub-GOP length 1).
+    // !sps_pocs_flag || !sps_rpl_flag → log2_sub_gop_length; == 0 →
+    // log2_ref_pic_gap_length (all-intra stream: sub-GOP length 1).
     w.ue(cfg.log2_sub_gop_length); // log2_sub_gop_length
     if cfg.log2_sub_gop_length == 0 {
         w.ue(0); // log2_ref_pic_gap_length
@@ -644,18 +644,22 @@ mod tests {
         let sps = crate::sps::parse(&write_sps_rbsp(&with_adcc).unwrap()).unwrap();
         assert!(sps.sps_adcc_flag);
         assert_eq!(sps.toolset_idc_h, 0x4101 | 0x200);
-        assert!(write_sps_rbsp(&EncSequenceConfig {
-            cm_init: false,
-            adcc: true,
-            ..cfg
-        })
-        .is_err());
-        assert!(write_sps_rbsp(&EncSequenceConfig {
-            iqt: false,
-            ats: true,
-            ..cfg
-        })
-        .is_err());
+        assert!(
+            write_sps_rbsp(&EncSequenceConfig {
+                cm_init: false,
+                adcc: true,
+                ..cfg
+            })
+            .is_err()
+        );
+        assert!(
+            write_sps_rbsp(&EncSequenceConfig {
+                iqt: false,
+                ats: true,
+                ..cfg
+            })
+            .is_err()
+        );
         assert_eq!(sps.log2_ctu_size_minus5, 1);
         assert_eq!(sps.log2_min_cb_size_minus2, 0);
         let gates = crate::slice_data::CodingTreeGates::from_sps(&sps);

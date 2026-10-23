@@ -315,7 +315,7 @@ fn resolve_split_unit(
     tree_stats: &mut TreeSplitStats,
 ) -> Result<SplitResolution> {
     use crate::cabac::InitType;
-    use crate::cabac_init::{ctx_inc_suco_flag, CtxSel, MainCtxTable};
+    use crate::cabac_init::{CtxSel, MainCtxTable, ctx_inc_suco_flag};
     use crate::split::{self, SplitMode};
 
     let gates = &walk.tree_gates;
@@ -1417,7 +1417,7 @@ pub fn decode_residual_coding_rle(
     // §7.3.8.7: PrevLevel starts at 6 and tracks the previous non-zero
     // coefficient's absolute level (feeds the §9.3.4.2.2 ctxInc).
     let mut prev_level: u32 = 6;
-    use crate::cabac_init::{ctx_inc_coeff_zero_run, MainCtxTable};
+    use crate::cabac_init::{MainCtxTable, ctx_inc_coeff_zero_run};
     // Table 91: coeff_zero_run cMax = (1 << (log2W + log2H)) − 1;
     // coeff_abs_level_minus1 is unbounded in Table 91 but the
     // TransCoeffLevel storage window [−32768, 32767] bounds it.
@@ -2469,20 +2469,20 @@ pub(crate) fn btt_num_smaller_at(
         Some((1u32 << cell.cu_log2_w, 1u32 << cell.cu_log2_h))
     };
     let mut n = 0u32;
-    if let Some((_, h)) = probe(x0 as i64 - 1, y0 as i64) {
-        if (h as i64) < n_cb_h {
-            n += 1;
-        }
+    if let Some((_, h)) = probe(x0 as i64 - 1, y0 as i64)
+        && (h as i64) < n_cb_h
+    {
+        n += 1;
     }
-    if let Some((w, _)) = probe(x0 as i64, y0 as i64 - 1) {
-        if (w as i64) < n_cb_w {
-            n += 1;
-        }
+    if let Some((w, _)) = probe(x0 as i64, y0 as i64 - 1)
+        && (w as i64) < n_cb_w
+    {
+        n += 1;
     }
-    if let Some((_, h)) = probe(x0 as i64 + n_cb_w, y0 as i64) {
-        if (h as i64) < n_cb_h {
-            n += 1;
-        }
+    if let Some((_, h)) = probe(x0 as i64 + n_cb_w, y0 as i64)
+        && (h as i64) < n_cb_h
+    {
+        n += 1;
     }
     n
 }
@@ -3725,7 +3725,7 @@ fn add_chroma_residual_to_block(
         (n, _) => {
             return Err(Error::invalid(format!(
                 "evc ibc decode: unsupported chroma_format_idc {n}"
-            )))
+            )));
         }
     };
     let x = x_luma / sub_w;
@@ -3783,8 +3783,8 @@ use crate::eipd_syntax::EipdCtx;
 #[cfg(test)]
 use crate::inter::build_amvp_list_baseline;
 use crate::inter::{
-    average_bipred, derive_chroma_mv, interpolate_chroma_block, interpolate_chroma_block_main,
-    interpolate_luma_block, interpolate_luma_block_main, MotionVector, RefPictureView,
+    MotionVector, RefPictureView, average_bipred, derive_chroma_mv, interpolate_chroma_block,
+    interpolate_chroma_block_main, interpolate_luma_block, interpolate_luma_block_main,
 };
 use crate::inter_cu_syntax::{CuSkipDecision, InterCuSyntaxStats, InterToolGates, MergeBranch};
 
@@ -6101,23 +6101,23 @@ pub(crate) fn derive_direct_mode_mvs(
     };
     let mut mv_temp = MotionVector::default();
     let mut diff_poc_denorm = 0i32;
-    if let Some(col) = col_pic {
-        if col.col_poc == temp_poc {
-            let xc = ((x0 + n_cb_w - 1) >> 2) as usize;
-            let yc = ((y0 + n_cb_h - 1) >> 2) as usize;
-            if xc < col.grid.w_cells && yc < col.grid.h_cells {
-                let cell = col.grid.at(xc, yc);
-                if cell.pred_mode == crate::deblock::CuPredMode::Inter && cell.ref_idx_l0 >= 0 {
-                    // MvDmvrL0 in 1/4-pel: refMv(1/16) >> 2 (eq. 423),
-                    // with refMv = (mv << 2) + delta (eqs. 395/400).
-                    mv_temp = MotionVector {
-                        x: ((cell.mv_l0_x << 2) + cell.ref_mv_delta_l0_x) >> 2,
-                        y: ((cell.mv_l0_y << 2) + cell.ref_mv_delta_l0_y) >> 2,
-                    };
-                    // eq. 665: DiffPicOrderCnt( TempPic, refPicListTemp[0] ).
-                    if let Some(&col_ref0) = col.ref_pocs_l0.first() {
-                        diff_poc_denorm = col.col_poc - col_ref0;
-                    }
+    if let Some(col) = col_pic
+        && col.col_poc == temp_poc
+    {
+        let xc = ((x0 + n_cb_w - 1) >> 2) as usize;
+        let yc = ((y0 + n_cb_h - 1) >> 2) as usize;
+        if xc < col.grid.w_cells && yc < col.grid.h_cells {
+            let cell = col.grid.at(xc, yc);
+            if cell.pred_mode == crate::deblock::CuPredMode::Inter && cell.ref_idx_l0 >= 0 {
+                // MvDmvrL0 in 1/4-pel: refMv(1/16) >> 2 (eq. 423),
+                // with refMv = (mv << 2) + delta (eqs. 395/400).
+                mv_temp = MotionVector {
+                    x: ((cell.mv_l0_x << 2) + cell.ref_mv_delta_l0_x) >> 2,
+                    y: ((cell.mv_l0_y << 2) + cell.ref_mv_delta_l0_y) >> 2,
+                };
+                // eq. 665: DiffPicOrderCnt( TempPic, refPicListTemp[0] ).
+                if let Some(&col_ref0) = col.ref_pocs_l0.first() {
+                    diff_poc_denorm = col.col_poc - col_ref0;
                 }
             }
         }
@@ -7384,10 +7384,11 @@ fn baseline_amvp_select_with_hmvp(
     let list = build_amvp_list_baseline(0, 0, 0, 0, |_, _| None, MotionVector::default());
     let chosen = list[mvp_idx.min(3) as usize].0;
     let unavailable = MotionVector::quarter_pel(1, 1);
-    if chosen == unavailable && !hmvp.is_empty() {
-        if let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x) {
-            return mv;
-        }
+    if chosen == unavailable
+        && !hmvp.is_empty()
+        && let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x)
+    {
+        return mv;
     }
     chosen
 }
@@ -7490,10 +7491,11 @@ pub(crate) fn baseline_amvp_select_with_grid_and_hmvp(
         MotionVector::default(), // temporal/zero
     ];
     let chosen = list[mvp_idx.min(3) as usize];
-    if chosen == unavailable && !hmvp.is_empty() {
-        if let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x) {
-            return mv;
-        }
+    if chosen == unavailable
+        && !hmvp.is_empty()
+        && let Some((mv, _)) = hmvp.derive_default_mv(cur_ref_idx_lx, list_x)
+    {
+        return mv;
     }
     chosen
 }
@@ -7565,7 +7567,7 @@ fn admvp_merge_motion_from_grid(
     n_cb_w: u32,
     n_cb_h: u32,
 ) -> Option<crate::merge::MergedMotion> {
-    use crate::merge::{build_merge_cand_list, select_merge_candidate, MergeSliceType};
+    use crate::merge::{MergeSliceType, build_merge_cand_list, select_merge_candidate};
     let slice_type = if slice_is_b {
         MergeSliceType::B
     } else {
@@ -8990,15 +8992,17 @@ mod tests {
         let order = SliceTileWalkOrder {
             segments: vec![seg.clone()],
         };
-        assert!(decode_baseline_idr_slice_tiled(
-            &rbsp,
-            walk,
-            decode,
-            &order,
-            &[0..rbsp.len(), 0..rbsp.len()],
-            &layout
-        )
-        .is_err());
+        assert!(
+            decode_baseline_idr_slice_tiled(
+                &rbsp,
+                walk,
+                decode,
+                &order,
+                &[0..rbsp.len(), 0..rbsp.len()],
+                &layout
+            )
+            .is_err()
+        );
         // Empty order.
         let empty = SliceTileWalkOrder { segments: vec![] };
         assert!(
@@ -9006,15 +9010,17 @@ mod tests {
         );
         // Subset range outside the RBSP.
         let past_end = 0..rbsp.len() + 4;
-        assert!(decode_baseline_idr_slice_tiled(
-            &rbsp,
-            walk,
-            decode,
-            &order,
-            core::slice::from_ref(&past_end),
-            &layout
-        )
-        .is_err());
+        assert!(
+            decode_baseline_idr_slice_tiled(
+                &rbsp,
+                walk,
+                decode,
+                &order,
+                core::slice::from_ref(&past_end),
+                &layout
+            )
+            .is_err()
+        );
         // CTB address outside the picture grid.
         let bad_seg = SliceTileWalkSegment {
             ctb_addr_in_rs: vec![9],
@@ -9024,15 +9030,17 @@ mod tests {
             segments: vec![bad_seg],
         };
         let whole = 0..rbsp.len();
-        assert!(decode_baseline_idr_slice_tiled(
-            &rbsp,
-            walk,
-            decode,
-            &bad_order,
-            core::slice::from_ref(&whole),
-            &layout
-        )
-        .is_err());
+        assert!(
+            decode_baseline_idr_slice_tiled(
+                &rbsp,
+                walk,
+                decode,
+                &bad_order,
+                core::slice::from_ref(&whole),
+                &layout
+            )
+            .is_err()
+        );
     }
 
     /// Verify the walker reaches the terminate decision on a tiny hand
@@ -9268,7 +9276,7 @@ mod tests {
         for _ in 0..4 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode
             enc.encode_decision(0, 0, 0); // cbf_luma
-                                          // No cbf_cb / cbf_cr (chroma_format_idc == 0).
+            // No cbf_cb / cbf_cr (chroma_format_idc == 0).
         }
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -9342,7 +9350,7 @@ mod tests {
         enc.encode_decision(0, 1, 1); // CTB split
         for _ in 0..4 {
             enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
-                                          // mvp_idx_l0 = 3 (TR cMax=3, rice=0): 3 ones then nothing else.
+            // mvp_idx_l0 = 3 (TR cMax=3, rice=0): 3 ones then nothing else.
             for b in 0..3usize {
                 enc.encode_decision(0, 3 + b.min(2), 1);
             }
@@ -9901,7 +9909,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // cbf_cb
         enc.encode_decision(0, 0, 0); // cbf_cr
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
-                                      // residual_coding_rle:
+        // residual_coding_rle:
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0 → level=1
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +1
@@ -9964,11 +9972,11 @@ mod tests {
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
-                                      // §7.3.8.5 ATS-intra group:
+        // §7.3.8.5 ATS-intra group:
         enc.encode_bypass(1); // ats_cu_intra_flag = 1 (bypass)
         enc.encode_decision(0, 0, 1); // ats_hor_mode = 1 → trTypeHor = 2
         enc.encode_decision(0, 0, 0); // ats_ver_mode = 0 → trTypeVer = 1
-                                      // residual_coding_rle: single DC coeff:
+        // residual_coding_rle: single DC coeff:
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 0); // coeff_abs_level_minus1 = 0 → level 1
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +1
@@ -10282,11 +10290,11 @@ mod tests {
         enc.encode_decision(0, 1, 1); // cbf_all = 1
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0 → cbf_luma inferred 1
-                                      // §7.3.8.5 ATS-inter group (8×8 → no quad flag):
+        // §7.3.8.5 ATS-inter group (8×8 → no quad flag):
         enc.encode_decision(0, 1, 1); // ats_cu_inter_flag = 1
         enc.encode_decision(0, 1, 0); // ats_cu_inter_horizontal_flag = 0
         enc.encode_decision(0, 1, 0); // ats_cu_inter_pos_flag = 0
-                                      // luma residual at the 8×4 sub-block (single DC coeff):
+        // luma residual at the 8×4 sub-block (single DC coeff):
         enc.encode_decision(0, 4, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 4, 0); // coeff_abs_level_minus1 = 0
         enc.encode_bypass(0); // coeff_sign_flag = 0
@@ -10333,8 +10341,8 @@ mod tests {
         assert_eq!(stats.coding_units, 1);
         assert_eq!(stats.cbf_luma_bins, 0);
         assert_eq!(stats.coeff_runs, 1); // inferred 1, no bin (round 431)
-                                         // The ATS-inter syntax group was consumed with the exact presence
-                                         // gating: flag + horizontal + pos, and NO quad bin on 8×8.
+        // The ATS-inter syntax group was consumed with the exact presence
+        // gating: flag + horizontal + pos, and NO quad bin on 8×8.
         assert_eq!(stats.ats_inter.cu_inter_flag_bins, 1);
         assert_eq!(stats.ats_inter.quad_flag_bins, 0);
         assert_eq!(stats.ats_inter.horizontal_flag_bins, 1);
@@ -10378,12 +10386,12 @@ mod tests {
         enc.encode_decision(0, 1, 1); // cbf_all = 1
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0 → cbf_luma inferred 1
-                                      // ATS-inter group (16×16 → quad flag present):
+        // ATS-inter group (16×16 → quad flag present):
         enc.encode_decision(0, 1, 1); // ats_cu_inter_flag = 1
         enc.encode_decision(0, 1, 1); // ats_cu_inter_quad_flag = 1
         enc.encode_decision(0, 1, 1); // ats_cu_inter_horizontal_flag = 1
         enc.encode_decision(0, 1, 1); // ats_cu_inter_pos_flag = 1
-                                      // luma residual at the 4×16 sub-block (single DC coeff):
+        // luma residual at the 4×16 sub-block (single DC coeff):
         enc.encode_decision(0, 4, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 4, 0); // coeff_abs_level_minus1 = 0
         enc.encode_bypass(0); // coeff_sign_flag = 0
@@ -10430,7 +10438,7 @@ mod tests {
         assert_eq!(stats.coding_units, 1);
         assert_eq!(stats.cbf_luma_bins, 0);
         assert_eq!(stats.coeff_runs, 1); // inferred 1, no bin (round 431)
-                                         // All four ATS-inter flags were present and consumed on 16×16.
+        // All four ATS-inter flags were present and consumed on 16×16.
         assert_eq!(stats.ats_inter.cu_inter_flag_bins, 1);
         assert_eq!(stats.ats_inter.quad_flag_bins, 1);
         assert_eq!(stats.ats_inter.horizontal_flag_bins, 1);
@@ -10470,11 +10478,11 @@ mod tests {
         enc.encode_decision(0, 1, 0); // cbf_cb = 0 (round 431: chroma first)
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 1, 1); // cbf_luma = 1
-                                      // §7.3.8.5 ATS-intra group:
+        // §7.3.8.5 ATS-intra group:
         enc.encode_bypass(1); // ats_cu_intra_flag = 1
         enc.encode_decision(0, 1, 0); // ats_hor_mode = 0 → trTypeHor = 1
         enc.encode_decision(0, 1, 1); // ats_ver_mode = 1 → trTypeVer = 2
-                                      // luma residual (single DC coeff):
+        // luma residual (single DC coeff):
         enc.encode_decision(0, 4, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 4, 0); // coeff_abs_level_minus1 = 0
         enc.encode_bypass(0); // coeff_sign_flag = 0
@@ -10551,8 +10559,8 @@ mod tests {
         enc.encode_decision(0, 1, 0); // cu_skip_flag = 0
         enc.encode_decision(0, 1, 1); // pred_mode_flag = 1 (INTRA)
         enc.encode_decision(0, 2, 0); // intra_pred_mode = 0 (DC)
-                                      // TUs 1-3: quiet single-tree bodies (round 431 §7.3.8.5
-                                      // order: cbf_cb, cbf_cr, then cbf_luma).
+        // TUs 1-3: quiet single-tree bodies (round 431 §7.3.8.5
+        // order: cbf_cb, cbf_cr, then cbf_luma).
         for _ in 0..3 {
             enc.encode_decision(0, 1, 0); // cbf_cb = 0
             enc.encode_decision(0, 1, 0); // cbf_cr = 0
@@ -10685,7 +10693,7 @@ mod tests {
         // 64×64 picture, log2 = 6, min_cb = 4, max_tb = 6 (allow 64×64 TB).
         // Single CTU at log2 = 6 → split_cu_flag = 0 (no split needed).
         enc.encode_decision(0, 0, 0); // CTB split = 0 → leaf 64×64
-                                      // One SINGLE_TREE CU:
+        // One SINGLE_TREE CU:
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
         enc.encode_decision(0, 0, 0); // cbf_cb
         enc.encode_decision(0, 0, 0); // cbf_cr
@@ -10755,13 +10763,13 @@ mod tests {
         use crate::cabac::CabacEncoder;
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
-                                      // One SINGLE_TREE CU: DC mode, then four TUs.
+        // One SINGLE_TREE CU: DC mode, then four TUs.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-                                      // TU 1 (top-left): no residual.
+        // TU 1 (top-left): no residual.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 2 (top-right): one luma coefficient.
+        // TU 2 (top-right): one luma coefficient.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
@@ -10773,11 +10781,11 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 20
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // TU 3 (bottom-left): no residual.
+        // TU 3 (bottom-left): no residual.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 4 (bottom-right): one luma coefficient.
+        // TU 4 (bottom-right): one luma coefficient.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
@@ -10929,11 +10937,11 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-                                      // TU 1 (top-left): quiet → no cu_qp_delta read.
+        // TU 1 (top-left): quiet → no cu_qp_delta read.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 2 (top-right): cbf → delta_abs = 0 (single U "0").
+        // TU 2 (top-right): cbf → delta_abs = 0 (single U "0").
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
@@ -10946,11 +10954,11 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // TU 3 (bottom-left): quiet.
+        // TU 3 (bottom-left): quiet.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // TU 4 (bottom-right): cbf → delta_abs = 21, sign +.
+        // TU 4 (bottom-right): cbf → delta_abs = 21, sign +.
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
@@ -11232,8 +11240,8 @@ mod tests {
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
-                                      // Luma run/level U bins: ctxIdx 0 for bin 0, 1 for later bins
-                                      // (Table 95, cm_init == 0 row).
+        // Luma run/level U bins: ctxIdx 0 for bin 0, 1 for later bins
+        // (Table 95, cm_init == 0 row).
         enc.encode_decision(0, 0, 1); // coeff_zero_run bin 0
         for _ in 1..100 {
             enc.encode_decision(0, 1, 1); // coeff_zero_run prefix
@@ -11279,7 +11287,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // CTB split = 0 → 64×64 leaf
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-                                      // TUs 1-3: all quiet.
+        // TUs 1-3: all quiet.
         for _ in 0..3 {
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
@@ -11289,8 +11297,8 @@ mod tests {
         enc.encode_decision(0, 0, 1); // cbf_cb = 1
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // Chroma run/level U bins: ctxIdx 2 for bin 0, 3 for later bins;
-                                      // chroma coeff_last_flag at ctxIdx 1 (Table 95, cm_init == 0).
+        // Chroma run/level U bins: ctxIdx 2 for bin 0, 3 for later bins;
+        // chroma coeff_last_flag at ctxIdx 1 (Table 95, cm_init == 0).
         enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
         for _ in 1..39 {
@@ -12043,7 +12051,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 0, 0); // mvp_idx_l0 = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -12112,11 +12120,11 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
-                                      // admvp merge tree: sps_mmvd off (no mmvd_flag), sps_affine off
-                                      // (no affine_flag) → merge_idx TR cMax = (nCbW*nCbH<=32?4:6)-1.
-                                      // 32×32 → cMax 5; merge_idx "0" = single 0 bin.
+        // admvp merge tree: sps_mmvd off (no mmvd_flag), sps_affine off
+        // (no affine_flag) → merge_idx TR cMax = (nCbW*nCbH<=32?4:6)-1.
+        // 32×32 → cMax 5; merge_idx "0" = single 0 bin.
         enc.encode_decision(0, 0, 0); // merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -12193,14 +12201,14 @@ mod tests {
         enc.encode_decision(0, 1, 0); // split_cu_flag = 0
         enc.encode_decision(0, 1, 0); // cu_skip_flag = 0
         enc.encode_decision(0, 1, 0); // pred_mode_flag = 0 (MODE_INTER)
-                                      // admvp non-skip: sps_amvr off → no amvr_idx; merge_mode_flag "1";
-                                      // sps_mmvd off → no mmvd_flag; sps_affine off → no affine_flag;
-                                      // merge_idx "0".
+        // admvp non-skip: sps_amvr off → no amvr_idx; merge_mode_flag "1";
+        // sps_mmvd off → no mmvd_flag; sps_affine off → no affine_flag;
+        // merge_idx "0".
         enc.encode_decision(0, 1, 1); // merge_mode_flag = 1
         enc.encode_decision(0, 5, 0); // merge_idx = 0
-                                      // round 431: merge CU → cbf_all inferred 1; §7.3.8.5 reads
-                                      // cbf_cb, cbf_cr, and with both quiet infers cbf_luma = 1 —
-                                      // a minimal one-coefficient luma residual follows.
+        // round 431: merge CU → cbf_all inferred 1; §7.3.8.5 reads
+        // cbf_cb, cbf_cr, and with both quiet infers cbf_luma = 1 —
+        // a minimal one-coefficient luma residual follows.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 4, 0); // coeff_zero_run = 0
@@ -12284,13 +12292,13 @@ mod tests {
         enc.encode_decision(0, 1, 0); // pred_mode_flag = 0 (MODE_INTER)
         enc.encode_decision(0, 1, 1); // merge_mode_flag = 1
         enc.encode_decision(0, 5, 0); // merge_idx = 0 → zero-MV candidate
-                                      // Round 431 §7.3.8.5 order per TU: cbf_cb, cbf_cr, then
-                                      // cbf_luma (always present here — the TB split sets isSplit).
-                                      // TU 1 (top-left): all quiet.
+        // Round 431 §7.3.8.5 order per TU: cbf_cb, cbf_cr, then
+        // cbf_luma (always present here — the TB split sets isSplit).
+        // TU 1 (top-left): all quiet.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 1, 0); // cbf_luma = 0
-                                      // TU 2 (top-right): one luma coefficient.
+        // TU 2 (top-right): one luma coefficient.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 1, 1); // cbf_luma = 1
@@ -12302,11 +12310,11 @@ mod tests {
         enc.encode_decision(0, 5, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 2, 1); // coeff_last_flag = 1
-                                      // TU 3 (bottom-left): all quiet.
+        // TU 3 (bottom-left): all quiet.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 1, 0); // cbf_luma = 0
-                                      // TU 4 (bottom-right): one luma coefficient.
+        // TU 4 (bottom-right): one luma coefficient.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
         enc.encode_decision(0, 1, 1); // cbf_luma = 1
@@ -12405,14 +12413,14 @@ mod tests {
         enc.encode_decision(0, 1, 0); // split_cu_flag = 0
         enc.encode_decision(0, 1, 0); // cu_skip_flag = 0
         enc.encode_decision(0, 1, 0); // pred_mode_flag = 0 (MODE_INTER)
-                                      // admvp non-skip: merge_mode_flag "0" → explicit-AMVP. P slice →
-                                      // no inter_pred_idc (PRED_L0). num_ref_idx=0 → no ref_idx. MVD:
-                                      // abs_mvd_x "0" (EG0 → no sign), abs_mvd_y "0".
+        // admvp non-skip: merge_mode_flag "0" → explicit-AMVP. P slice →
+        // no inter_pred_idc (PRED_L0). num_ref_idx=0 → no ref_idx. MVD:
+        // abs_mvd_x "0" (EG0 → no sign), abs_mvd_y "0".
         enc.encode_decision(0, 1, 0); // merge_mode_flag = 0
         enc.encode_decision(0, 1, 0); // abs_mvd_l0[0] EG0 = 0 (bin 0 regular)
         enc.encode_decision(0, 1, 0); // abs_mvd_l0[1] EG0 = 0 (bin 0 regular)
-                                      // round 431: explicit CU signals cbf_all (§7.3.8.4 line 3028);
-                                      // 0 elides the whole transform_unit().
+        // round 431: explicit CU signals cbf_all (§7.3.8.4 line 3028);
+        // 0 elides the whole transform_unit().
         enc.encode_decision(0, 1, 0); // cbf_all = 0
         enc.encode_terminate(true);
         let rbsp = enc.finish();
@@ -12693,7 +12701,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 0, 0); // merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -12907,7 +12915,7 @@ mod tests {
         enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 1, 1); // affine_flag = 1 (32×32 ≥ 8×8)
         enc.encode_decision(0, 5, 0); // affine_merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         // The range decoder may renormalise past the committed bytes on
         // the final bins; pad so the bitreader never hard-ends.
@@ -13129,7 +13137,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // affine_mode_flag = 0 (4-param)
         enc.encode_decision(0, 0, 0); // affine_mvp_flag_l0 = 0
         enc.encode_decision(0, 0, 0); // affine_mvd_flag_l0 = 0
-                                      // round 431: explicit CU → cbf_all = 0 elides the TU.
+        // round 431: explicit CU → cbf_all = 0 elides the TU.
         enc.encode_decision(0, 0, 0); // cbf_all = 0
         enc.encode_terminate(true);
         let mut rbsp = enc.finish();
@@ -13425,10 +13433,10 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
-                                      // admvp cu_skip: sps_mmvd/affine off → merge_idx only. 32×32 →
-                                      // mLSize 6, cMax 5; merge_idx "0".
+        // admvp cu_skip: sps_mmvd/affine off → merge_idx only. 32×32 →
+        // mLSize 6, cMax 5; merge_idx "0".
         enc.encode_decision(0, 0, 0); // merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -13496,7 +13504,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 0, 0); // mvp_idx_l0 = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -13886,7 +13894,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 0, 0); // mvp_idx_l0 = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -14291,8 +14299,8 @@ mod tests {
         enc.encode_decision(0, 0, 1); // alf_ctb_flag (luma) = 1
         enc.encode_decision(0, 0, 0); // alf_ctb_chroma_flag (Cb) = 0
         enc.encode_decision(0, 0, 1); // alf_ctb_chroma2_flag (Cr) = 1
-                                      // A couple of trailing zero bins so the M-coder has enough body
-                                      // to flush; the helper only reads the three ALF flags above.
+        // A couple of trailing zero bins so the M-coder has enough body
+        // to flush; the helper only reads the three ALF flags above.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0);
         enc.encode_terminate(true);
@@ -14462,7 +14470,7 @@ mod tests {
         enc.encode_decision(0, 0, 1); // alf_ctb_flag = 1
         enc.encode_decision(0, 0, 0); // intra_pred_mode
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // CTU 1: alf_ctb_flag = 0, then its single leaf.
+        // CTU 1: alf_ctb_flag = 0, then its single leaf.
         enc.encode_decision(0, 0, 0); // alf_ctb_flag = 0
         enc.encode_decision(0, 0, 0); // intra_pred_mode
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
@@ -15326,7 +15334,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0 (CB == CTB)
         enc.encode_decision(0, 0, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 0, 0); // merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         enc.finish()
     }
@@ -15772,13 +15780,13 @@ mod tests {
         enc.encode_eg0_first_regular(0, 1, 8); // v1 mvd_x abs = 8
         enc.encode_bypass(0); //            v1 mvd_x sign = +
         enc.encode_eg0_first_regular(0, 1, 0); // v1 mvd_y abs = 0
-                                               // round 431: explicit CU → cbf_all = 0 elides the TU.
+        // round 431: explicit CU → cbf_all = 0 elides the TU.
         enc.encode_decision(0, 1, 0); // cbf_all = 0
-                                      // --- CU1 (16, 0): skip, affine merge, merge_idx 0 (inherited).
+        // --- CU1 (16, 0): skip, affine merge, merge_idx 0 (inherited).
         enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 1, 1); // affine_flag = 1
         enc.encode_decision(0, 5, 0); // affine_merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let mut rbsp = enc.finish();
         rbsp.extend_from_slice(&[0xFF; 4]);
@@ -16039,7 +16047,7 @@ mod tests {
         enc.encode_decision(0, 0, 1);
         enc.encode_decision(0, 0, 0); // horizontal
         enc.encode_decision(0, 0, 0); // binary → SPLIT_BT_HOR
-                                      // Top child (0,0) 32×16: flag present (BT allowed) → 0 = leaf.
+        // Top child (0,0) 32×16: flag present (BT allowed) → 0 = leaf.
         enc.encode_decision(0, 0, 0);
         leaf(&mut enc);
         // Bottom child (0,16) 32×16: flag=1; both axes available → dir
@@ -16127,17 +16135,17 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator
         enc.encode_bypass(0); // coeff_sign_flag = 0 → +20
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Second-decoded 16×16 child (the LEFT one at x=0): plain leaf.
+        // Second-decoded 16×16 child (the LEFT one at x=0): plain leaf.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // Bottom child (0,16) 32×16: NO_SPLIT leaf (SUCO suppressed by
-                                      // condition 4 — NO_SPLIT without quad split). INTRA_HOR (U bins
-                                      // "10") copies the unavailable-left 128 column — shape-neutral
-                                      // on this rectangular leaf, and independent of the
-                                      // residual-carrying row 15 above it (INTRA_VER would copy it).
+        // Bottom child (0,16) 32×16: NO_SPLIT leaf (SUCO suppressed by
+        // condition 4 — NO_SPLIT without quad split). INTRA_HOR (U bins
+        // "10") copies the unavailable-left 128 column — shape-neutral
+        // on this rectangular leaf, and independent of the
+        // residual-carrying row 15 above it (INTRA_VER would copy it).
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 1); // intra_pred_mode ...
         enc.encode_decision(0, 1, 0); //   = 1 (INTRA_HOR)
@@ -16275,7 +16283,7 @@ mod tests {
         // Tree-split point: one DUAL_TREE_CHROMA CU covering the 8×8.
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0
-                                      // (0,8) 16×8 leaf.
+        // (0,8) 16×8 leaf.
         enc.encode_decision(0, 1, 0);
         skip_leaf(&mut enc);
         // A2 (16,0) 16×16 leaf.
@@ -16428,7 +16436,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 3, 0); // mvp_idx_l0 = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
         let walk = SliceWalkInputs {
@@ -16474,7 +16482,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 1); // split_cu_flag = 1 at the CTB
         enc.encode_decision(0, 0, 1); // split_unit_coding_order_flag = 1
-                                      // First-decoded quadrant (TR at (16,0)): DC + level +20.
+        // First-decoded quadrant (TR at (16,0)): DC + level +20.
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
         enc.encode_decision(0, 0, 0); // cbf_cb = 0
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
@@ -16487,7 +16495,7 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 20
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // TL, BR, BL: plain DC leaves.
+        // TL, BR, BL: plain DC leaves.
         for _ in 0..3 {
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
@@ -16609,7 +16617,7 @@ mod tests {
     #[test]
     fn round397_cm_init_idr_btt_residual_decodes_with_main_contexts() {
         use crate::cabac::{CabacEncoder, InitType};
-        use crate::cabac_init::{ctx_inc_btt_split_flag, ctx_inc_coeff_zero_run, MainCtxTable};
+        use crate::cabac_init::{MainCtxTable, ctx_inc_btt_split_flag, ctx_inc_coeff_zero_run};
         let t_flag = MainCtxTable::BttSplitFlag as usize;
         let t_dir = MainCtxTable::BttSplitDir as usize;
         let t_type = MainCtxTable::BttSplitType as usize;
@@ -17137,7 +17145,7 @@ mod tests {
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
         enc.encode_decision(0, 0, 0); // cu_qp_delta_abs = 0 (code-2 arm)
-                                      // Second leaf: latch set → no delta read anywhere.
+        // Second leaf: latch set → no delta read anywhere.
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 1); // intra_pred_mode = 2 again
         enc.encode_decision(0, 1, 1);
@@ -17222,16 +17230,16 @@ mod tests {
         }
         enc.encode_decision(0, 1, 0);
         enc.encode_bypass(1); // negative
-                              // cb residual: single DC coefficient (+1).
+        // cb residual: single DC coefficient (+1).
         enc.encode_decision(0, 6, 0); // coeff_zero_run = 0 (chroma)
         enc.encode_decision(0, 6, 0); // coeff_abs_level_minus1 = 0
         enc.encode_bypass(0); // sign = +
         enc.encode_decision(0, 3, 1); // coeff_last_flag = 1 (chroma)
-                                      // Second leaf: latch suppressed.
+        // Second leaf: latch suppressed.
         enc.encode_decision(0, 1, 0);
         enc.encode_decision(0, 1, 1); // cu_skip_flag = 1
         enc.encode_decision(0, 5, 0); // merge_idx = 0
-                                      // round 431: skip CU — no residual syntax (§7.3.8.4).
+        // round 431: skip CU — no residual syntax (§7.3.8.4).
         enc.encode_terminate(true);
         let rbsp = enc.finish();
 
@@ -17293,7 +17301,7 @@ mod tests {
     #[test]
     fn round397_eipd_idr_mpm_group_decodes_to_pixels() {
         use crate::cabac::CabacEncoder;
-        use crate::eipd_mode::{derive_mode_lists, NeighbourMode};
+        use crate::eipd_mode::{NeighbourMode, derive_mode_lists};
         let inv = NeighbourMode::invalid();
         let expected_mode = derive_mode_lists(inv, inv, inv).cand_mode_list[0];
         assert_eq!(
@@ -17362,7 +17370,7 @@ mod tests {
     fn round397_eipd_idr_ver_copies_neighbour_row() {
         use crate::cabac::CabacEncoder;
         use crate::eipd::{INTRA_DC, INTRA_VER};
-        use crate::eipd_mode::{derive_mode_lists, NeighbourMode};
+        use crate::eipd_mode::{NeighbourMode, derive_mode_lists};
         let mut enc = CabacEncoder::new();
         // CTU0: split=0; MPM-DC luma with a +60 DC residual; chroma DM.
         enc.encode_decision(0, 0, 0); // split_cu_flag
@@ -17380,9 +17388,9 @@ mod tests {
         enc.encode_decision(0, 1, 0);
         enc.encode_bypass(0);
         enc.encode_decision(0, 0, 1); // last
-                                      // CTU1 at (0, 32): neighbours A invalid (x = −1), B = CTU0 (DC),
-                                      // C invalid → find INTRA_VER in the derived lists and encode the
-                                      // matching selector.
+        // CTU1 at (0, 32): neighbours A invalid (x = −1), B = CTU0 (DC),
+        // C invalid → find INTRA_VER in the derived lists and encode the
+        // matching selector.
         let lists = derive_mode_lists(
             NeighbourMode::invalid(),
             NeighbourMode::valid(INTRA_DC),
@@ -17528,7 +17536,7 @@ mod tests {
     fn round397_adcc_idr_dc_coefficient_decodes_to_pixels() {
         use crate::cabac::{CabacEncoder, InitType};
         use crate::cabac_init::{
-            ctx_inc_coeff_abs_level_greater_a, ctx_inc_last_sig_coeff_prefix, MainCtxTable,
+            MainCtxTable, ctx_inc_coeff_abs_level_greater_a, ctx_inc_last_sig_coeff_prefix,
         };
         let slice_qp = 51;
         let mut enc = CabacEncoder::new();
@@ -17546,12 +17554,12 @@ mod tests {
         enc.encode_decision(t76, 0, 0); // cbf_cb = 0
         enc.encode_decision(t77, 0, 0); // cbf_cr = 0
         enc.encode_decision(t75, 0, 1); // cbf_luma = 1
-                                        // residual_coding_adv: last = (0,0).
+        // residual_coding_adv: last = (0,0).
         let xi = |b: u32| ctx_inc_last_sig_coeff_prefix(b, 0, 5, 1);
         enc.encode_decision(t87, xi(0), 0); // x_prefix = 0
         enc.encode_decision(t88, xi(0), 0); // y_prefix = 0
-                                            // greaterA[0] + greaterB[0] at the last position (ctxInc 0) then
-                                            // a Rice-0 remaining of 2 → DC level +5 (visible at this QP).
+        // greaterA[0] + greaterB[0] at the last position (ctxInc 0) then
+        // a Rice-0 remaining of 2 → DC level +5 (visible at this QP).
         enc.encode_decision(t90, ctx_inc_coeff_abs_level_greater_a(0, 0, 0, true, 0), 1);
         enc.encode_decision(t90, 0, 1); // greaterB (last → ctxInc 0)
         enc.encode_bypass(1); // remaining = 2 → TR bypass "110"
@@ -17607,7 +17615,7 @@ mod tests {
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 0, 0); // split_cu_flag = 0
         enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
-                                      // cbf group: cbf_cb = 1, cbf_cr = 0, cbf_luma = 0.
+        // cbf group: cbf_cb = 1, cbf_cr = 0, cbf_luma = 0.
         enc.encode_decision(0, 0, 1);
         enc.encode_decision(0, 0, 0);
         enc.encode_decision(0, 0, 0);
@@ -17683,15 +17691,15 @@ mod tests {
         };
         let mut enc = CabacEncoder::new();
         enc.encode_decision(0, 1, 0); // split_cu_flag = 0
-                                      // Round 431: residual rides a non-skip merge CU (a skip CU
-                                      // carries no residual syntax); quiet chroma infers cbf_luma = 1.
+        // Round 431: residual rides a non-skip merge CU (a skip CU
+        // carries no residual syntax); quiet chroma infers cbf_luma = 1.
         enc.encode_decision(0, 1, 0); // cu_skip_flag = 0
         enc.encode_decision(0, 1, 0); // pred_mode_flag = 0 (MODE_INTER)
         enc.encode_decision(0, 1, 1); // merge_mode_flag = 1
         enc.encode_decision(0, 5, 0); // merge_idx = 0
         enc.encode_decision(0, 1, 0); // cbf_cb = 0
         enc.encode_decision(0, 1, 0); // cbf_cr = 0 → cbf_luma inferred 1
-                                      // adcc: DC +5 (A + B + remaining 2).
+        // adcc: DC +5 (A + B + remaining 2).
         enc.encode_decision(0, 1, 0); // x_prefix = 0 (luma, Pb offset 1 + binIdx)
         enc.encode_decision(0, 1, 0); // y_prefix = 0
         enc.encode_decision(0, 1, 1); // greaterA[0] = 1
@@ -17756,7 +17764,7 @@ mod tests {
         let encode = || {
             let mut enc = CabacEncoder::new();
             enc.encode_decision(0, 0, 1); // split_cu_flag = 1 → 4× 16×16
-                                          // CU (0,0): DC + strong residual (level 60 at qp 40).
+            // CU (0,0): DC + strong residual (level 60 at qp 40).
             enc.encode_decision(0, 0, 0); // intra_pred_mode = 0 (DC)
             enc.encode_decision(0, 0, 0); // cbf_cb = 0
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
@@ -17769,8 +17777,8 @@ mod tests {
             enc.encode_decision(0, 1, 0);
             enc.encode_bypass(0); // +60
             enc.encode_decision(0, 0, 1); // coeff_last_flag
-                                          // CU (16,0): INTRA_VER (copies the unavailable-top 128
-                                          // column, keeping a sharp step against the shifted CU 1).
+            // CU (16,0): INTRA_VER (copies the unavailable-top 128
+            // column, keeping a sharp step against the shifted CU 1).
             enc.encode_decision(0, 0, 1); // intra_pred_mode ...
             enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
             enc.encode_decision(0, 1, 0);
@@ -17844,7 +17852,7 @@ mod tests {
         enc.encode_decision(0, 0, 1); // cbf_cb = 1
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 1); // cbf_luma = 1
-                                      // Luma residual: DC level +40.
+        // Luma residual: DC level +40.
         enc.encode_decision(0, 0, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 0, 1); // coeff_abs_level_minus1 bin 0
         for _ in 1..39 {
@@ -17853,7 +17861,7 @@ mod tests {
         enc.encode_decision(0, 1, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign +
         enc.encode_decision(0, 0, 1); // coeff_last_flag = 1
-                                      // Cb residual (2×2): DC level +40 on the chroma contexts.
+        // Cb residual (2×2): DC level +40 on the chroma contexts.
         enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
         enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
         for _ in 1..39 {
@@ -17862,8 +17870,8 @@ mod tests {
         enc.encode_decision(0, 3, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign +
         enc.encode_decision(0, 1, 1); // coeff_last_flag = 1 (chroma ctx)
-                                      // CU 1 (4×4 at (4,0)): MODE_IBC, BV = (−4, 0). The abs_mvd
-                                      // binarization is EG0 with a regular bin 0 (Table 95).
+        // CU 1 (4×4 at (4,0)): MODE_IBC, BV = (−4, 0). The abs_mvd
+        // binarization is EG0 with a regular bin 0 (Table 95).
         enc.encode_decision(0, 0, 1); // ibc_flag = 1
         enc.encode_eg0_first_regular(0, 0, 4); // abs_mvd_l0[0] = 4
         enc.encode_bypass(1); // mvd_l0_sign_flag → −4
@@ -17965,7 +17973,7 @@ mod tests {
             enc.encode_decision(0, 0, 1); // cbf_cb = 1
             enc.encode_decision(0, 0, 0); // cbf_cr = 0
             enc.encode_decision(0, 0, 0); // cbf_luma = 0 (read: cbf_cb set)
-                                          // Cb residual: DC level +40 (chroma contexts).
+            // Cb residual: DC level +40 (chroma contexts).
             enc.encode_decision(0, 2, 0); // coeff_zero_run = 0
             enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
             for _ in 1..39 {
@@ -18034,7 +18042,7 @@ mod tests {
         enc.encode_decision(0, 0, 1); // cbf_cb = 1
         enc.encode_decision(0, 0, 0); // cbf_cr = 0
         enc.encode_decision(0, 0, 0); // cbf_luma = 0
-                                      // Cb residual: coeff_zero_run = 1 → scan position 1 = (1, 0).
+        // Cb residual: coeff_zero_run = 1 → scan position 1 = (1, 0).
         enc.encode_decision(0, 2, 1); // coeff_zero_run bin 0
         enc.encode_decision(0, 3, 0); // U terminator → run = 1
         enc.encode_decision(0, 2, 1); // coeff_abs_level_minus1 bin 0
@@ -18044,7 +18052,7 @@ mod tests {
         enc.encode_decision(0, 3, 0); // U terminator → level 40
         enc.encode_bypass(0); // sign +
         enc.encode_decision(0, 1, 1); // coeff_last_flag = 1
-                                      // CU 1 at (0,4): INTRA_VER (U "110"), no residual.
+        // CU 1 at (0,4): INTRA_VER (U "110"), no residual.
         enc.encode_decision(0, 0, 1); // intra_pred_mode ...
         enc.encode_decision(0, 1, 1); //   = 2 (INTRA_VER)
         enc.encode_decision(0, 1, 0); //   U terminator
