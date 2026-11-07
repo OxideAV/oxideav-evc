@@ -8,6 +8,28 @@
 
 ### Other
 
+- **Decoder: stream output parameters + `Frame::StreamParams` (core
+  0.1.43 contract, round 483).** The decoder answered `None` from
+  `output_params()` / `output_pixel_format()` and never signalled a
+  shape change, though a new SPS at an IDR may change the picture size,
+  the cropping window, the chroma format or the bit depth. It now
+  tracks the shape of every queued output picture (cropped display
+  size, chroma format, bit depth → `Yuv420P` / `Yuv420P10Le` /
+  `Yuv420P12Le`, the 4:2:2 / 4:4:4 / Gray equivalents) and reports it:
+  from the active SPS before the first frame, then the shape of the
+  frame last returned. A change after the first frame returns one
+  `Frame::StreamParams` event immediately before the first frame of the
+  new shape, with `output_params()` and `output_params_generation()`
+  already moved (one bump per event; the ordering holds while draining
+  after `flush()`). 4:0:0 frames now carry the luma plane only (the
+  Gray layout the parameters state). The encoder refuses a
+  `StreamParams` event with `Error::Unsupported` (it cannot
+  re-configure mid-stream). Pinned by `tests/stream_params.rs`: four
+  spliced sequences (64×48 → 96×64 → 96×64 10-bit → 62×46 cropped
+  10-bit) decoded with eager and with late draining — exactly three
+  events, each payload equal to `output_params()`, every frame's plane
+  geometry matching the stated shape.
+
 - **Encoder: hierarchical B sub-GOPs (round 458).** Registry option
   `sub_gop` (log2 of the sub-GOP length, `1..=3`; requires `b=1`): the
   SPS declares `log2_sub_gop_length`, source pictures are buffered per

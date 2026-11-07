@@ -1123,6 +1123,13 @@ impl Encoder for EvcEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let v = match frame {
             Frame::Video(v) => v,
+            // core 0.1.43: an encoder that cannot re-configure for a
+            // mid-stream input shape change refuses the event.
+            Frame::StreamParams(_) => {
+                return Err(Error::unsupported(
+                    "evc encoder: mid-stream input shape change (open a new encoder)",
+                ));
+            }
             _ => return Err(Error::invalid("evc encoder: expected a video frame")),
         };
         let src = video_frame_to_picture(

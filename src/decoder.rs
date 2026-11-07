@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result};
 
 use crate::CODEC_ID_STR;
 use crate::alf::{self, AlfData};
@@ -167,6 +167,14 @@ pub struct EvcDecoder {
     pending_pts: Option<i64>,
     /// Frames waiting to be emitted, sorted by ascending POC.
     out: VecDeque<VideoFrame>,
+    /// The output shape of each queued frame (parallel to `out`).
+    out_shapes: VecDeque<OutShape>,
+    /// The shape `output_params()` reports once a frame has been
+    /// returned: that of the frame most recently returned.
+    shown_shape: Option<OutShape>,
+    /// Bumped once per mid-stream shape change, together with the
+    /// `Frame::StreamParams` event (core 0.1.43 contract).
+    generation: u64,
     /// Parallel POC tracker for `out` so insertion stays sorted even
     /// when the bitstream coding order differs from display order.
     out_pocs: VecDeque<i32>,
@@ -262,6 +270,9 @@ impl EvcDecoder {
             pps: None,
             pending_pts: None,
             out: VecDeque::new(),
+            out_shapes: VecDeque::new(),
+            shown_shape: None,
+            generation: 0,
             out_pocs: VecDeque::new(),
             out_cvs: VecDeque::new(),
             cvs: 0,
@@ -643,14 +654,43 @@ impl Decoder for EvcDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.out.pop_front() {
-            Some(v) => {
-                self.out_pocs.pop_front();
-                self.out_cvs.pop_front();
-                Ok(Frame::Video(v))
-            }
-            None => Err(Error::NeedMore),
+        let Some(&next) = self.out_shapes.front() else {
+            return Err(Error::NeedMore);
+        };
+        // A new SPS can change the picture size, the chroma format or
+        // the bit depth at an IDR: announce the new shape once, right
+        // before its first frame (never for the first shape).
+        if let Some(shown) = self.shown_shape
+            && shown != next
+        {
+            self.shown_shape = Some(next);
+            self.generation = self.generation.wrapping_add(1);
+            return Ok(Frame::StreamParams(Box::new(next.params(&self.codec_id))));
         }
+        self.shown_shape = Some(next);
+        self.out_shapes.pop_front();
+        self.out_pocs.pop_front();
+        self.out_cvs.pop_front();
+        let v = self.out.pop_front().expect("parallel output queues");
+        Ok(Frame::Video(v))
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        // After the first frame: the shape of the frame last returned.
+        // Before it: the first queued frame's, else the active SPS's.
+        let shape = self
+            .shown_shape
+            .or_else(|| self.out_shapes.front().copied())
+            .or_else(|| self.sps.as_ref().map(OutShape::of_sps))?;
+        Some(shape.params(&self.codec_id))
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -675,11 +715,13 @@ impl EvcDecoder {
     /// marks the corresponding DPB entry as `output_emitted = true` so
     /// `flush()` doesn't re-push it.
     fn enqueue_for_output(&mut self, poc: i32) {
-        let (frame, pts) = match self.dpb_find(poc) {
-            Some(e) => (picture_to_video_frame_cropped(&e.pic, e.pts, e.crop), e.pts),
+        let (frame, shape) = match self.dpb_find(poc) {
+            Some(e) => (
+                picture_to_video_frame_cropped(&e.pic, e.pts, e.crop),
+                OutShape::of_picture(&e.pic, e.crop),
+            ),
             None => return,
         };
-        let _ = pts; // silence unused
         let cvs = self.cvs;
         let pos = self
             .out_pocs
@@ -689,11 +731,13 @@ impl EvcDecoder {
         match pos {
             Some(i) => {
                 self.out.insert(i, frame);
+                self.out_shapes.insert(i, shape);
                 self.out_pocs.insert(i, poc);
                 self.out_cvs.insert(i, cvs);
             }
             None => {
                 self.out.push_back(frame);
+                self.out_shapes.push_back(shape);
                 self.out_pocs.push_back(poc);
                 self.out_cvs.push_back(cvs);
             }
@@ -1393,6 +1437,67 @@ pub(crate) fn apply_chroma_alf_masked_or_whole_plane(
 }
 
 /// Extract the `w × h` window at `(x0, y0)` from a `stride`-wide plane.
+/// The stream-level shape of an output picture: the cropped display
+/// size, the chroma format and the bit depth (frames carry none of it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutShape {
+    width: u32,
+    height: u32,
+    chroma_format_idc: u32,
+    bit_depth: u32,
+}
+
+impl OutShape {
+    fn of_picture(pic: &YuvPicture, crop: CropWindow) -> Self {
+        Self {
+            width: pic.width - crop.left - crop.right,
+            height: pic.height - crop.top - crop.bottom,
+            chroma_format_idc: pic.chroma_format_idc,
+            bit_depth: pic.bit_depth,
+        }
+    }
+
+    fn of_sps(sps: &Sps) -> Self {
+        let crop = CropWindow::from_sps(sps);
+        Self {
+            width: sps.pic_width_in_luma_samples - crop.left - crop.right,
+            height: sps.pic_height_in_luma_samples - crop.top - crop.bottom,
+            chroma_format_idc: sps.chroma_format_idc,
+            bit_depth: sps.bit_depth_y(),
+        }
+    }
+
+    /// The packed layout [`picture_to_video_frame`] emits: one byte per
+    /// sample at 8 bits, two little-endian bytes above. Depths without
+    /// a named format leave `pixel_format` unset.
+    fn pixel_format(&self) -> Option<PixelFormat> {
+        Some(match (self.chroma_format_idc, self.bit_depth) {
+            (0, 8) => PixelFormat::Gray8,
+            (0, 10) => PixelFormat::Gray10Le,
+            (0, 12) => PixelFormat::Gray12Le,
+            (0, 16) => PixelFormat::Gray16Le,
+            (1, 8) => PixelFormat::Yuv420P,
+            (1, 10) => PixelFormat::Yuv420P10Le,
+            (1, 12) => PixelFormat::Yuv420P12Le,
+            (2, 8) => PixelFormat::Yuv422P,
+            (2, 10) => PixelFormat::Yuv422P10Le,
+            (2, 12) => PixelFormat::Yuv422P12Le,
+            (3, 8) => PixelFormat::Yuv444P,
+            (3, 10) => PixelFormat::Yuv444P10Le,
+            (3, 12) => PixelFormat::Yuv444P12Le,
+            _ => return None,
+        })
+    }
+
+    fn params(&self, codec_id: &CodecId) -> CodecParameters {
+        let mut p = CodecParameters::video(codec_id.clone());
+        p.width = Some(self.width);
+        p.height = Some(self.height);
+        p.pixel_format = self.pixel_format();
+        p
+    }
+}
+
 fn crop_plane(src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize) -> Vec<u16> {
     let mut out = Vec::with_capacity(w * h);
     for y in y0..y0 + h {
@@ -1449,6 +1554,15 @@ fn picture_to_video_frame_cropped(
 }
 
 fn picture_to_video_frame(pic: &crate::picture::YuvPicture, pts: Option<i64>) -> VideoFrame {
+    let mut frame = picture_to_video_frame_planes(pic, pts);
+    if pic.chroma_format_idc == 0 {
+        // 4:0:0 — the Gray layout `output_params` states: luma only.
+        frame.planes.truncate(1);
+    }
+    frame
+}
+
+fn picture_to_video_frame_planes(pic: &crate::picture::YuvPicture, pts: Option<i64>) -> VideoFrame {
     let y_stride = pic.y_stride();
     let c_stride = pic.c_stride();
     if pic.bit_depth <= 8 {
