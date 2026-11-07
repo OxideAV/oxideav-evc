@@ -10,7 +10,9 @@
 //! `refs`, `b`, `qp`, `bitrate`, `fps`, `deblock`, `cm_init`, …);
 //! `qps=22,27,32,37` overrides the QP ladder, `frames=N` the sequence
 //! length, `sizes=176x144,96x64` the corpus geometries, `scene=mixed`
-//! the second corpus (see [`scene_mixed`]). One CSV row per (size, QP):
+//! the second corpus (see [`scene_mixed`]), `out=<prefix>` writes each
+//! (size, QP) stream to `<prefix>-<w>x<h>-q<qp>.evc` (the length-prefixed
+//! NAL framing, for black-box tools). One CSV row per (size, QP):
 //! `size,qp,bytes,psnr_y,psnr_u,psnr_v,ssim_y`, PSNR and luma SSIM over
 //! every decoded frame of the sequence against the source (the stream
 //! is decoded through the registered decoder, so the numbers are the
@@ -182,6 +184,7 @@ fn main() {
     let mut frames = 8u32;
     let mut sizes = vec![(176u32, 144u32), (96, 64), (64, 48)];
     let mut mixed = false;
+    let mut out: Option<String> = None;
     for arg in std::env::args().skip(1) {
         let Some((k, v)) = arg.split_once('=') else {
             eprintln!("ignoring argument {arg:?} (expected k=v)");
@@ -191,6 +194,7 @@ fn main() {
             "qps" => qps = v.split(',').map(|q| q.parse().expect("qp")).collect(),
             "frames" => frames = v.parse().expect("frames"),
             "scene" => mixed = v == "mixed",
+            "out" => out = Some(v.to_string()),
             "sizes" => {
                 sizes = v
                     .split(',')
@@ -246,6 +250,10 @@ fn main() {
             enc.flush().expect("flush");
             while let Ok(pkt) = enc.receive_packet() {
                 packets.push(pkt);
+            }
+            if let Some(prefix) = &out {
+                let all: Vec<u8> = packets.iter().flat_map(|p| p.data.iter().copied()).collect();
+                std::fs::write(format!("{prefix}-{w}x{h}-q{qp}.evc"), all).expect("write stream");
             }
             for pkt in &packets {
                 bytes += pkt.data.len();

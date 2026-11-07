@@ -8,6 +8,14 @@
 
 ### Other
 
+- **`rd_curve out=<prefix>` (round 483)** writes each (size, QP) stream
+  to `<prefix>-<w>x<h>-q<qp>.evc` for black-box tools. Black-box
+  finding (README validation posture): the installed `ffprobe` EVC
+  parser accepts every packet of Baseline-profile streams (with and
+  without `cu_qp_delta`) but rejects the first non-IDR slice header of
+  every `profile_idc = 1` stream, and accepts those very bytes once
+  `profile_idc` is patched to 0.
+
 - **Encoder: ADCC group-trellis RDOQ with exact adaptive rates (round
   483); ADCC stays default off (measured).** `rdoq_adcc` is now a
   trellis over the §7.3.8.8 structure: per 16-coefficient group in

@@ -689,6 +689,17 @@ shape matrix (EIPD and Baseline modes), whole P and B GOPs, 10/12-bit,
 MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
 harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
 Cross-implementation decode remains open until a validator lands.
+The installed `ffprobe` carries an EVC demuxer / parser but no
+decoder; run black-box over `rd_curve out=<prefix>` streams (round
+483) it parses every packet of a Baseline-profile stream (I / P, with
+or without `cu_qp_delta`) but stops at the first non-IDR slice header
+of any `profile_idc = 1` stream — and accepts the same bytes with
+`profile_idc` patched to 0, so the divergence is profile-dependent
+and not in the headers' field layout (which follows §7.3.2.1 / §7.3.4
+field for field). Note also that A.3.3 restricts Main to
+`bit_depth_*_minus8 == 2`; the encoder labels its 8- and 12-bit
+Main-tool streams `profile_idc = 1` all the same (no conformant
+profile exists for them).
 
 Encoder follow-ups: the `sps_dquant_flag = 1` quantisation-group
 signalling (the per-TU delta already costs only 0.1 %), a
