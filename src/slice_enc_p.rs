@@ -96,6 +96,7 @@ const CTB_LOG2: u32 = 6;
 
 /// Per-picture P/B-encode statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PEncStats {
     pub ctus: u32,
     pub leaves: u32,

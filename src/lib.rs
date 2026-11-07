@@ -201,6 +201,7 @@ pub const CODEC_ID_STR: &str = "evc";
 /// Summary info recoverable from a bare EVC SPS — the public return type
 /// of [`probe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EvcFileInfo {
     pub width: u32,
     pub height: u32,

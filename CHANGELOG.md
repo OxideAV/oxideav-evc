@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the `probe` result `EvcFileInfo` and the encoder statistics records `EncStats` / `PEncStats`. The bitstream-level modules were already `#[doc(hidden)]`; nothing new is hidden.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-evc/compare/v0.0.4...v0.0.5) - 2026-11-07
 
 ### Other

@@ -88,6 +88,7 @@ const CTB_LOG2: u32 = 6;
 
 /// Per-picture encode statistics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncStats {
     /// CTUs walked.
     pub ctus: u32,
