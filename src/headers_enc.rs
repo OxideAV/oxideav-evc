@@ -274,6 +274,15 @@ pub fn write_sps_rbsp(cfg: &EncSequenceConfig) -> Result<Vec<u8>> {
 
 /// Write the §7.3.2.2 PPS RBSP: single tile, no DRA, no per-CU QP delta.
 pub fn write_pps_rbsp() -> Result<Vec<u8>> {
+    write_pps_rbsp_dqp(false)
+}
+
+/// [`write_pps_rbsp`] with `cu_qp_delta_enabled_flag` (round 483, the
+/// adaptive-quantisation `cu_qp_delta` of [`crate::aq`]); when set, the
+/// §7.3.2.2 `log2_cu_qp_delta_area_minus6` follows as `ue(0)` — only
+/// consulted under `sps_dquant_flag == 1`, which the encoder's SPS
+/// leaves 0.
+pub fn write_pps_rbsp_dqp(cu_qp_delta_enabled: bool) -> Result<Vec<u8>> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -287,7 +296,10 @@ pub fn write_pps_rbsp() -> Result<Vec<u8>> {
     w.u1(false); // pic_dra_enabled_flag
     w.u1(false); // arbitrary_slice_present_flag
     w.u1(false); // constrained_intra_pred_flag
-    w.u1(false); // cu_qp_delta_enabled_flag
+    w.u1(cu_qp_delta_enabled); // cu_qp_delta_enabled_flag
+    if cu_qp_delta_enabled {
+        w.ue(0); // log2_cu_qp_delta_area_minus6
+    }
     w.rbsp_trailing_bits();
     Ok(w.into_bytes())
 }

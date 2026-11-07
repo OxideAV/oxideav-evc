@@ -8,6 +8,51 @@
 
 ### Other
 
+- **Encoder: CU-level QP delta + adaptive quantisation (round 483),
+  registry option `aq`, default off.** New `aq` module. The PPS
+  declares `cu_qp_delta_enabled_flag = 1` (`log2_cu_qp_delta_area_minus6
+  = 0`, `sps_dquant_flag` stays 0) and every `transform_unit()` with a
+  CBF writes `cu_qp_delta_abs` (U, Table 78 ctxInc 0) + the bypass
+  `cu_qp_delta_sign_flag` after `cbf_luma`, ahead of the ATS group — the
+  dual of the decoder's §7.3.8.5 read. Both slice encoders track the
+  eq. 1042 `QpY_PREV` chain in decode order (restored with every tree
+  trial; a CU without residual takes `QpY_PREV`, and that is the QP
+  stamped for deblocking), the emit pass replays it, and the delta is
+  the −26..=25 representative of `target − QpY_PREV` modulo 52. Each CU
+  is decided at its target QP with the λ of that QP; on P/B slices
+  every candidate's rate includes the delta it would signal. Policy:
+  8×8 luma units, activity `log2( σ² + 29 )` (the floor is half the
+  SSIM `C2`, so near-flat units do not pull the QP down to code faint
+  noise), offset `s · ( A − Ā )` clamped to ±8, a CU takes the rounded
+  mean over its units; predicted pictures run at half strength. All
+  integer arithmetic (exact repeated-squaring `log2`), so streams stay
+  platform-identical. `aq=<s>` (0..=4, QP per doubling of the variance).
+  Measured at `aq=1` against `aq=0` (QP 32-50, 176×144 / 96×64 / 64×48,
+  Y / YUV / SSIM BD-rate; SSIM as `−10 log10( 1 − SSIM )`): noise
+  corpus intra +4.9 % / +4.4 % / **−1.6 %**, P +3.3 % / +2.7 % /
+  **−1.7 %**, low-delay B +3.1 % / +2.7 % / **−1.9 %**; the new mixed
+  corpus (`rd_curve scene=mixed`: flat sky, grain field, hard-edged
+  blocks, moving disc) intra +4.0 % / +3.4 % / **−2.4 %**, P +3.3 % /
+  +1.9 % / **−0.8 %**, B +2.9 % / +1.9 % / **−1.4 %**. The classic
+  trade — SSIM gains for a PSNR cost — so off by default; the pure
+  signalling cost (an all-zero map) is +0.1 %. Stronger settings lose
+  SSIM on this content too (intra `aq=2` +8 %, full-strength P +5.8 %
+  on the mixed corpus): the corpus textures are independent per-frame
+  grain, whose removal SSIM's structure term punishes. `rd_curve` gains
+  the luma SSIM column and `scene=mixed`. **Decoder fix (§8.8.2.3 step
+  3):** the deblocking `qP` was the slice QP for luma and
+  `slice_qp + offset` without the `ChromaQpTable` for chroma; it is now
+  the `QpY` of the CU holding `q0` (luma) and that CU's eqs. 1044-1047
+  `QpCb` / `QpCr` through Table 5 / Table 6, clipped by eq. 1139 —
+  identical for single-QP slices below the table knee, and required
+  once `cu_qp_delta` moves the QP. Pins: the delta writer reads back on
+  both entropy shapes; the exact `log2`; every chain target reachable;
+  the intra size × QP × tree × entropy × deblock matrix decodes
+  recon-exactly through the `cu_qp_delta_enabled_flag == 1` walker with
+  the decoder reading exactly the coded deltas; I/P/B GOPs through the
+  registry (both entropy shapes, deblocking, ADCC); the q-side deblock
+  QP and the chroma table mapping. The fuzz target drives `aq`.
+
 - **Decoder: stream output parameters + `Frame::StreamParams` (core
   0.1.43 contract, round 483).** The decoder answered `None` from
   `output_params()` / `output_pixel_format()` and never signalled a

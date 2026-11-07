@@ -120,7 +120,7 @@ use crate::deblock::SideInfoGrid;
 use crate::headers_enc::{
     EncSequenceConfig, SliceAlfFields, append_length_prefixed_nal, append_length_prefixed_nal_tid,
     iqt_chroma_qp_offset, write_idr_slice_header_alf, write_inter_slice_header_alf,
-    write_p_slice_header, write_pps_rbsp, write_sps_rbsp,
+    write_p_slice_header, write_pps_rbsp_dqp, write_sps_rbsp,
 };
 use crate::nal::NalUnitType;
 use crate::picture::YuvPicture;
@@ -136,6 +136,10 @@ use crate::slice_enc_p::{ColMotion, InterEncInputs, PEncStats, RefEntry, encode_
 
 /// Default slice QP when the caller doesn't pass the `qp` option.
 pub const DEFAULT_QP: i32 = 30;
+
+/// Default adaptive-quantisation strength (Q8, QP per doubling of the
+/// local variance); 0 = off.
+const DEFAULT_AQ_Q8: u32 = 0;
 
 /// Encode one 4:2:0 source picture (any 8..=16 bit depth the recon
 /// chain supports) into a complete key access unit
@@ -247,6 +251,7 @@ fn encode_idr_au_coded_gop(
         ats,
         adcc,
         alf,
+        aq,
     } = tools;
     let out = crate::slice_enc::encode_idr_slice_data_out(src, slice_qp, tools)?;
     let (payload, recon, stats) = (out.payload, out.recon, out.stats);
@@ -275,7 +280,7 @@ fn encode_idr_au_coded_gop(
     };
     let mut bytes = Vec::new();
     append_length_prefixed_nal(&mut bytes, NalUnitType::Sps, &write_sps_rbsp(&cfg)?);
-    append_length_prefixed_nal(&mut bytes, NalUnitType::Pps, &write_pps_rbsp()?);
+    append_length_prefixed_nal(&mut bytes, NalUnitType::Pps, &write_pps_rbsp_dqp(aq > 0)?);
     if let Some(p) = &out.alf {
         // The ALF APS (§7.3.2.3) precedes the slice that references it.
         append_length_prefixed_nal(&mut bytes, NalUnitType::Aps, &p.aps_rbsp);
@@ -447,6 +452,17 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
     let adcc = parse_bool("adcc", false)?;
     // Round 458: the adaptive loop filter — default ON.
     let alf = parse_bool("alf", true)?;
+    // Round 483: adaptive quantisation (CU-level cu_qp_delta) — the
+    // strength in QP per doubling of the local variance, 0 = off.
+    let aq = match params.options.get("aq") {
+        None => DEFAULT_AQ_Q8,
+        Some(s) => s
+            .parse::<f64>()
+            .ok()
+            .filter(|v| (0.0..=4.0).contains(v))
+            .map(|v| (v * 256.0).round() as u32)
+            .ok_or_else(|| Error::invalid(format!("evc encoder: aq option {s:?} not in 0..=4")))?,
+    };
     // Round 458: hierarchical sub-GOPs (log2 length, 0 = low delay).
     let sub_gop_log2 = match params.options.get("sub_gop") {
         None => 0u32,
@@ -606,6 +622,7 @@ pub fn make_evc_encoder(params: &CodecParameters) -> Result<EvcEncoder> {
         ats,
         adcc,
         alf,
+        aq,
         sub_gop_log2,
         pending: Vec::new(),
         recon_log: None,
@@ -811,6 +828,8 @@ pub struct EvcEncoder {
     ats: bool,
     /// `sps_adcc_flag`.
     adcc: bool,
+    /// Adaptive-quantisation strength (Q8; 0 = off) — `cu_qp_delta`.
+    aq: u32,
     /// `sps_alf_flag`.
     alf: bool,
     /// `log2_sub_gop_length` — 0 low delay, else hierarchical B.
@@ -924,6 +943,7 @@ impl EvcEncoder {
                     ats: self.ats,
                     adcc: self.adcc,
                     alf: self.alf,
+                    aq: self.aq,
                 },
                 self.refs,
                 self.sub_gop_log2,
@@ -1073,6 +1093,7 @@ impl EvcEncoder {
                 ats: self.ats,
                 adcc: self.adcc,
                 alf: self.alf,
+                aq: self.aq,
             },
         )?;
         let off = iqt_chroma_qp_offset(frame_qp, self.iqt);
@@ -2199,6 +2220,111 @@ mod tests {
             }
         }
         assert!(any_aps, "the noisy scene elects an ALF somewhere");
+    }
+
+    /// A scene whose activity varies: flat left half, ±30 grain on the
+    /// right half, a block translating across both.
+    fn aq_scene(w: u32, h: u32, t: usize) -> VideoFrame {
+        let mut f = synth_frame(w as usize, h as usize);
+        let mut s = 0x2468_ACE1u32 ^ (t as u32).wrapping_mul(0x9E37_79B9);
+        for (i, v) in f.planes[0].data.iter_mut().enumerate() {
+            let (x, y) = (i % w as usize, i / w as usize);
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let mut px = if x < w as usize / 2 {
+                90 + (y as i32) / 4
+            } else {
+                110 + ((s >> 24) % 61) as i32 - 30
+            };
+            let bx = 4 + 3 * t;
+            if x >= bx && x < bx + 10 && (8..20).contains(&y) {
+                px = 200;
+            }
+            *v = px.clamp(0, 255) as u8;
+        }
+        f.pts = Some(t as i64);
+        f
+    }
+
+    /// Round 483 — **adaptive quantisation** through the registry: the
+    /// PPS declares `cu_qp_delta_enabled_flag`, the per-CU deltas move
+    /// the eq. 1042 chain over the full ±range of the map, and I / P /
+    /// B GOPs on both entropy shapes, with and without deblocking (the
+    /// §8.8.2 per-CU qP) and ADCC, decode sample-exactly to the
+    /// encoder's reconstruction.
+    #[test]
+    fn aq_gop_round_trips_through_the_registry() {
+        let (w, h) = (72u32, 40u32);
+        for &(cm, b, deblock, adcc, aq) in &[
+            ("1", "0", "0", "0", "1.5"),
+            ("1", "1", "1", "0", "2"),
+            ("0", "0", "1", "0", "1"),
+            ("1", "1", "0", "1", "3"),
+        ] {
+            let mut p = params(w, h);
+            p.options.insert("gop", "3");
+            p.options.insert("refs", "2");
+            p.options.insert("qp", "34");
+            p.options.insert("cm_init", cm);
+            p.options.insert("eipd", cm);
+            p.options.insert("btt", cm);
+            p.options.insert("ats", cm);
+            p.options.insert("b", b);
+            p.options.insert("deblock", deblock);
+            p.options.insert("adcc", adcc);
+            p.options.insert("alf", cm);
+            p.options.insert("aq", aq);
+            let tag = format!("cm{cm} b{b} db{deblock} adcc{adcc} aq{aq}");
+            let mut enc = make_evc_encoder(&p).unwrap();
+            let mut plain = p.clone();
+            plain.options.insert("aq", "0");
+            let mut enc0 = make_evc_encoder(&plain).unwrap();
+            let dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = crate::decoder::make_decoder(&dparams).unwrap();
+            for t in 0..5usize {
+                let f = Frame::Video(aq_scene(w, h, t));
+                enc.send_frame(&f).unwrap();
+                enc0.send_frame(&f).unwrap();
+                let pkt = enc.receive_packet().unwrap();
+                let pkt0 = enc0.receive_packet().unwrap();
+                assert_ne!(
+                    pkt.data, pkt0.data,
+                    "{tag} frame {t}: AQ changes the stream"
+                );
+                if t % 3 == 0 {
+                    let nals = crate::nal::iter_length_prefixed(&pkt.data).unwrap();
+                    let pps = crate::pps::parse(nals[1].rbsp()).unwrap();
+                    assert!(pps.cu_qp_delta_enabled_flag, "{tag}");
+                }
+                dec.send_packet(&pkt).unwrap();
+                let vf = match dec.receive_frame().unwrap() {
+                    Frame::Video(vf) => vf,
+                    other => panic!("expected video frame, got {other:?}"),
+                };
+                let recon = enc.last_recon().unwrap();
+                for (c, plane) in [&recon.y, &recon.cb, &recon.cr].iter().enumerate() {
+                    let got: Vec<u16> = vf.planes[c].data.iter().map(|&v| u16::from(v)).collect();
+                    let stride = if c == 0 {
+                        recon.y_stride()
+                    } else {
+                        recon.c_stride()
+                    };
+                    let rows = if c == 0 { h as usize } else { h as usize / 2 };
+                    let cols = if c == 0 { w as usize } else { w as usize / 2 };
+                    for yy in 0..rows {
+                        assert_eq!(
+                            &got[yy * vf.planes[c].stride..yy * vf.planes[c].stride + cols],
+                            &plane[yy * stride..yy * stride + cols],
+                            "{tag} frame {t} plane {c} row {yy}"
+                        );
+                    }
+                }
+            }
+        }
+        for bad in ["-1", "5", "x"] {
+            let mut p = params(w, h);
+            p.options.insert("aq", bad);
+            assert!(make_encoder(&p).is_err(), "aq={bad}");
+        }
     }
 
     /// Round 458 — **ADCC** through the registry: P and B GOPs with the

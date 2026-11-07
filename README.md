@@ -578,7 +578,8 @@ coding order. 4:2:0 input at 8 / 10 / 12 bits; any non-zero **even**
 geometry (multiple-of-8 round-up + §7.4.3.1 conformance-cropping
 window). Options: `qp` 0..=51 (default 30), `gop` (default 1 =
 all-intra), `b`, `refs` 1..=5, `btt` (default **on**), `ats` + `iqt` (default
-**on**), `adcc` (default off), `alf` (default **on**), `sub_gop` 0..=3
+**on**), `adcc` (default off), `alf` (default **on**), `aq` 0..=4
+(adaptive quantisation, default off), `sub_gop` 0..=3
 (hierarchical B, default 0), `eipd` (default **on**), `cm_init`
 (default **on**), `deblock`, `bitrate` + `fps`
 (one-pass rate control), `pass=1|2` + `stats=<path>` + `vbv` (two-pass
@@ -647,6 +648,12 @@ core:
   (intra +1.0 %, P +2.9 % Y BD-rate): the run-length syntax's
   context-adaptive unary levels beat ADCC's fixed-length escapes on
   dense large-magnitude residuals.
+* **CU QP delta + adaptive quantisation** (`aq`, round 483, `aq=<s>`,
+  default off) — `cu_qp_delta_enabled_flag = 1`, the §7.3.8.5 delta in
+  every CBF-carrying TU against the decode-order eq. 1042 chain, a
+  per-CU target from 8×8 activity `log2( σ² + 29 )` (half strength on
+  P/B). At `aq=1`: SSIM BD-rate −0.8 … −2.4 %, PSNR +2.9 … +4.9 %
+  (I/P/B over two corpora) — a perceptual knob, hence off.
 * **Two-pass rate control** (`rate_plan`) — pass 1 records `idr qp
   bits` per frame; pass 2 plans one dithered sequence-wide base QP under
   a leaky-bucket buffer and re-plans every frame with an
@@ -662,9 +669,10 @@ errata #313), explicit inter (per-list `ref_idx` across every active
 reference, quarter-pel search, bi re-fit) and intra — committing
 reconstruction + motion grid + HMVP in decode order; the registered
 encoder keeps a mirror DPB driven by the shared `ref_lists`
-derivations. `examples/rd_curve.rs` is the rate/PSNR measurement tool
-over the synthetic corpus (176×144 / 96×64 / 64×48 moving scenes) the
-numbers above come from.
+derivations. `examples/rd_curve.rs` is the rate / PSNR / luma-SSIM
+measurement tool over the synthetic corpora (176×144 / 96×64 / 64×48
+moving scenes; `scene=mixed` the varying-activity one) the numbers
+above come from.
 
 **Validation posture (stated plainly):** no external EVC validator
 binary is staged under `docs/video/evc/` and no EVC-capable `ffmpeg`
@@ -677,7 +685,8 @@ MD5 stream fixtures, single-byte mutation gates, and the `fuzz/`
 harness (`rdoq_trellis`, `encode_roundtrip`; nightly `Fuzz` workflow).
 Cross-implementation decode remains open until a validator lands.
 
-Encoder follow-ups: CU-level QP delta / adaptive quantization, a
+Encoder follow-ups: the `sps_dquant_flag = 1` quantisation-group
+signalling (the per-TU delta already costs only 0.1 %), a
 `dts` model for the reordered packets, an ADCC trellis, the 7-tap ALF luma type and
 temporal APS reuse, the inferred-orientation ATS-inter shapes once
 the §7.3.8.5/§7.4.9.5 orientation reading is settled; decoder audit:

@@ -400,14 +400,47 @@ fn filter_edge_4tap(s: &mut [i32; 4], s_t_prime: i32, max_val: i32) {
     s[3] = new_d;
 }
 
+/// §8.8.2.3 step 3, `cIdx == 0`: `qP` is the `QpY` of the CU where
+/// sample `q0` lies; `fallback` covers an unstamped cell.
+fn luma_edge_qp(q: CuSideInfo, fallback: i32) -> i32 {
+    if q.cu_log2_w != 0 {
+        i32::from(q.qp_y)
+    } else {
+        fallback
+    }
+}
+
+/// §8.8.2.3 step 3, `cIdx != 0`: `qP` is the `QpCb` / `QpCr` of the CU
+/// where `q0` lies — eqs. 1044-1047 over that CU's `QpY` (the
+/// `ChromaQpTable` of Table 5, or Table 6 under `sps_iqt_flag`, the
+/// mapping the scaling process uses) — then eq. 1139 `Clip3(0, 51, qP)`.
+#[derive(Clone, Copy)]
+struct ChromaEdgeQp {
+    slice_qp: i32,
+    offset: i32,
+    bit_depth: u32,
+    iqt: bool,
+}
+
+impl ChromaEdgeQp {
+    fn of(&self, q: CuSideInfo) -> i32 {
+        let qp_y = luma_edge_qp(q, self.slice_qp);
+        let qp_bd_offset_c = 6 * (self.bit_depth as i32 - 8);
+        (crate::dequant::qp_prime_c(qp_y, self.offset, self.bit_depth, self.iqt) - qp_bd_offset_c)
+            .clamp(0, 51)
+    }
+}
+
 /// Run the §8.8.2 luma deblocking pass over a full picture.
 ///
 /// Returns the number of edges filtered (4-sample runs). The picture
 /// buffer in `pic.y` is modified in place; chroma planes are left
 /// untouched in this round.
 ///
-/// `slice_qp` is the per-slice QP used in Table 33 lookups; round-5
-/// fixtures keep `cu_qp_delta = 0` so the slice QP applies uniformly.
+/// The Table 33 lookup runs at §8.8.2.3 step 3's `qP`: the `QpY` of
+/// the CU holding sample `q0` (the per-CU `qp_y` the walkers stamp — it
+/// differs from `slice_qp` under `cu_qp_delta`). `slice_qp` stands in
+/// only for a cell no CU has stamped (hand-built grids).
 pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i32) -> Result<u32> {
     let pic_w = pic.width as usize;
     let pic_h = pic.height as usize;
@@ -432,7 +465,7 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
             let p = side_info.at(x.saturating_sub(1) >> 2, y >> 2);
             let q = side_info.at(x >> 2, y >> 2);
             let bs = derive_bs(p, q);
-            let s_t_val = s_t(slice_qp, bs);
+            let s_t_val = s_t(luma_edge_qp(q, slice_qp), bs);
             let s_t_prime = s_t_val << ((pic.bit_depth as i32) - 8);
             for j in 0..4 {
                 if x < 2 || x + 1 >= pic_w {
@@ -471,7 +504,7 @@ pub fn deblock_luma(pic: &mut YuvPicture, side_info: &SideInfoGrid, slice_qp: i3
             let p = side_info.at(x >> 2, y.saturating_sub(1) >> 2);
             let q = side_info.at(x >> 2, y >> 2);
             let bs = derive_bs(p, q);
-            let s_t_val = s_t(slice_qp, bs);
+            let s_t_val = s_t(luma_edge_qp(q, slice_qp), bs);
             let s_t_prime = s_t_val << ((pic.bit_depth as i32) - 8);
             for i in 0..4 {
                 if y < 2 || y + 1 >= pic_h {
@@ -532,20 +565,22 @@ fn chroma_subsampling(chroma_format_idc: u32) -> (usize, usize) {
 /// Run the §8.8.2 chroma deblocking pass over a single chroma plane
 /// (`c_idx ∈ {1, 2}`). The BS derivation reads the luma 4×4 side-info
 /// grid (cbf_luma is the spec's chroma-edge trigger per §8.8.2.3 step 2);
-/// the Table 33 lookup uses
-/// `qp_c = Clip3(0, 51, slice_qp + chroma_qp_offset)` (eq. 1194).
-/// Returns the number of 4-sample chroma edges filtered.
+/// the Table 33 lookup runs at the §8.8.2.3 step-3 `qP`: the `QpCb` /
+/// `QpCr` (eqs. 1044-1047, clipped to 0..=51 by eq. 1139) of the CU
+/// holding `q0`, from that CU's stamped `QpY` (`slice_qp` for an
+/// unstamped cell). Returns the number of 4-sample chroma edges
+/// filtered.
 ///
 /// `chroma_qp_offset` is `slice_cb_qp_offset` for `c_idx=1` and
-/// `slice_cr_qp_offset` for `c_idx=2`. The Baseline PPS does not carry
-/// `pps_cb_qp_offset`/`pps_cr_qp_offset` (they're always 0), so passing
-/// only the slice-level offset is sufficient.
+/// `slice_cr_qp_offset` for `c_idx=2`; `sps_iqt_flag` selects the
+/// Table 6 `ChromaQpTable` over Table 5.
 pub fn deblock_chroma(
     pic: &mut YuvPicture,
     side_info: &SideInfoGrid,
     slice_qp: i32,
     chroma_qp_offset: i32,
     c_idx: u32,
+    sps_iqt_flag: bool,
 ) -> Result<u32> {
     if pic.chroma_format_idc == 0 {
         return Ok(0);
@@ -558,10 +593,12 @@ pub fn deblock_chroma(
     let plane_h = pic.height as usize / sub_h;
     let stride = pic.c_stride();
     let max_val = (1i32 << pic.bit_depth) - 1;
-    // qp_c = Clip3(0, 51, slice_qp + chroma_qp_offset). Round-6 has no
-    // ChromaQpTable mapping (sps_chroma_qp_table_present_flag=0 in
-    // Baseline fixtures), so this is the direct identity.
-    let qp_c = (slice_qp + chroma_qp_offset).clamp(0, 51);
+    let qp_c = ChromaEdgeQp {
+        slice_qp,
+        offset: chroma_qp_offset,
+        bit_depth: pic.bit_depth,
+        iqt: sps_iqt_flag,
+    };
     let mut edges = 0u32;
 
     // Luma 4×4 grid stride is 4 luma pels; chroma stride is 4 / sub_w
@@ -597,7 +634,7 @@ pub fn deblock_chroma(
             let p = side_info.at(x_luma.saturating_sub(1) >> 2, y_luma >> 2);
             let q = side_info.at(x_luma >> 2, y_luma >> 2);
             let bs = derive_bs(p, q);
-            let s_t_val = s_t(qp_c, bs);
+            let s_t_val = s_t(qp_c.of(q), bs);
             let s_t_prime = s_t_val << ((pic.bit_depth as i32) - 8);
             // Inner loop: 4 chroma samples down the edge (sample by
             // sample so we re-fetch BS for each luma cell crossed).
@@ -609,7 +646,7 @@ pub fn deblock_chroma(
                 let p_j = side_info.at(x_luma.saturating_sub(1) >> 2, yj_l >> 2);
                 let q_j = side_info.at(x_luma >> 2, yj_l >> 2);
                 let bs_j = derive_bs(p_j, q_j);
-                let st_j = s_t(qp_c, bs_j);
+                let st_j = s_t(qp_c.of(q_j), bs_j);
                 let stp_j = st_j << ((pic.bit_depth as i32) - 8);
                 let stp_use = if stp_j != 0 { stp_j } else { s_t_prime };
                 if stp_use <= 0 {
@@ -651,7 +688,7 @@ pub fn deblock_chroma(
             let p = side_info.at(x_luma >> 2, y_luma.saturating_sub(1) >> 2);
             let q = side_info.at(x_luma >> 2, y_luma >> 2);
             let bs = derive_bs(p, q);
-            let s_t_val = s_t(qp_c, bs);
+            let s_t_val = s_t(qp_c.of(q), bs);
             let s_t_prime = s_t_val << ((pic.bit_depth as i32) - 8);
             for i in 0..4 {
                 if yc < 2 || yc + 1 >= plane_h {
@@ -661,7 +698,7 @@ pub fn deblock_chroma(
                 let p_i = side_info.at(xi_l >> 2, y_luma.saturating_sub(1) >> 2);
                 let q_i = side_info.at(xi_l >> 2, y_luma >> 2);
                 let bs_i = derive_bs(p_i, q_i);
-                let st_i = s_t(qp_c, bs_i);
+                let st_i = s_t(qp_c.of(q_i), bs_i);
                 let stp_i = st_i << ((pic.bit_depth as i32) - 8);
                 let stp_use = if stp_i != 0 { stp_i } else { s_t_prime };
                 if stp_use <= 0 {
@@ -1295,7 +1332,7 @@ mod tests {
         // Chroma: the boundary maps to chroma x = 4; it too stays
         // unfiltered under the exemption.
         let mut pic_c = mk_pic();
-        deblock_chroma(&mut pic_c, &grid, 32, 0, 1).unwrap();
+        deblock_chroma(&mut pic_c, &grid, 32, 0, 1, false).unwrap();
         for j in 0..4usize {
             for i in 3..5usize {
                 let want = if i < 4 { 90 } else { 96 };
@@ -1541,8 +1578,8 @@ mod tests {
         let grid = SideInfoGrid::new(16, 16); // all Intra
         // 8×8 chroma plane, edges at xC=2,4,6 (3 verticals) × 2 row runs
         // (yC=0,4) = 6 vertical; same horizontal → 12 total.
-        let n_cb = deblock_chroma(&mut pic, &grid, 32, 0, 1).unwrap();
-        let n_cr = deblock_chroma(&mut pic, &grid, 32, 0, 2).unwrap();
+        let n_cb = deblock_chroma(&mut pic, &grid, 32, 0, 1, false).unwrap();
+        let n_cr = deblock_chroma(&mut pic, &grid, 32, 0, 2, false).unwrap();
         assert_eq!(n_cb, 12);
         assert_eq!(n_cr, 12);
         assert_eq!(pic.cb, cb_orig);
@@ -1606,7 +1643,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let n = deblock_chroma(&mut pic, &grid, 27, 0, 1).unwrap();
+        let n = deblock_chroma(&mut pic, &grid, 27, 0, 1, false).unwrap();
         assert!(n > 0);
         // The step at xC=3..4 (sB and sC) must be smoothed by the spec
         // formula: sB' = 111, sC' = 119. Far-side samples (xC=2 and 5)
@@ -1667,14 +1704,14 @@ mod tests {
         let mut pic_a = YuvPicture::new(16, 16, 1, 8).unwrap();
         seed(&mut pic_a);
         let pic_a_before = pic_a.cb.clone();
-        deblock_chroma(&mut pic_a, &grid, 17, 0, 1).unwrap();
+        deblock_chroma(&mut pic_a, &grid, 17, 0, 1, false).unwrap();
         assert_eq!(pic_a.cb, pic_a_before, "QP=17, offset=0 → no filter");
 
         // With offset: slice_qp=17 + offset=+10 → QP_C=27 → sT'=2 → filter.
         let mut pic_b = YuvPicture::new(16, 16, 1, 8).unwrap();
         seed(&mut pic_b);
         let pic_b_before = pic_b.cb.clone();
-        deblock_chroma(&mut pic_b, &grid, 17, 10, 1).unwrap();
+        deblock_chroma(&mut pic_b, &grid, 17, 10, 1, false).unwrap();
         assert_ne!(
             pic_b.cb, pic_b_before,
             "QP=17, offset=+10 → QP_C=27 → filter must run"
@@ -1682,6 +1719,96 @@ mod tests {
         // Spot-check sB/sC modified at row 0.
         assert_eq!(pic_b.cb[3], 111);
         assert_eq!(pic_b.cb[4], 119);
+    }
+
+    /// Round 483 — §8.8.2.3 step 3: `qP` is the `QpY` (luma) / the
+    /// eqs. 1044-1047 `QpCb` (chroma) of the CU holding `q0`, not the
+    /// slice QP — under `cu_qp_delta` the two differ. The same chroma
+    /// ramp filters when the q-side CU sits at QpY 27 and stays put at
+    /// QpY 17, whatever `slice_qp` says; the chroma mapping runs the
+    /// Table 5 / Table 6 `ChromaQpTable`.
+    #[test]
+    fn deblock_qp_is_the_q_side_cu_qp() {
+        let seed = |pic: &mut YuvPicture| {
+            for j in 0..8 {
+                pic.cb[j * 8 + 2] = 100;
+                pic.cb[j * 8 + 3] = 110;
+                pic.cb[j * 8 + 4] = 120;
+                pic.cb[j * 8 + 5] = 130;
+            }
+        };
+        let grid_at = |q_qp: u8| {
+            let mut grid = SideInfoGrid::new(16, 16);
+            for (x0, cbf, qp) in [(0u32, 1u8, 40u8), (8, 0, q_qp)] {
+                grid.stamp_block(
+                    x0,
+                    0,
+                    8,
+                    16,
+                    CuSideInfo {
+                        pred_mode: CuPredMode::Inter,
+                        cbf_luma: cbf,
+                        ref_idx_l0: 0,
+                        cu_x0: x0 as u16,
+                        cu_log2_w: 3,
+                        cu_log2_h: 4,
+                        qp_y: qp,
+                        ..Default::default()
+                    },
+                );
+            }
+            grid
+        };
+        for slice_qp in [0, 17, 27, 51] {
+            let mut lo = YuvPicture::new(16, 16, 1, 8).unwrap();
+            seed(&mut lo);
+            let before = lo.cb.clone();
+            deblock_chroma(&mut lo, &grid_at(17), slice_qp, 0, 1, false).unwrap();
+            assert_eq!(
+                lo.cb, before,
+                "slice_qp {slice_qp}: q-side QpY 17 → no filter"
+            );
+            let mut hi = YuvPicture::new(16, 16, 1, 8).unwrap();
+            seed(&mut hi);
+            deblock_chroma(&mut hi, &grid_at(27), slice_qp, 0, 1, false).unwrap();
+            assert_eq!(
+                (hi.cb[3], hi.cb[4]),
+                (111, 119),
+                "slice_qp {slice_qp}: QpY 27"
+            );
+        }
+        let cell = |qp: u8| CuSideInfo {
+            cu_log2_w: 3,
+            qp_y: qp,
+            ..Default::default()
+        };
+        for (iqt, off) in [(false, 0), (false, 3), (true, -2)] {
+            let m = ChromaEdgeQp {
+                slice_qp: 0,
+                offset: off,
+                bit_depth: 8,
+                iqt,
+            };
+            for qp in 0..=51u8 {
+                let qpi = (i32::from(qp) + off).clamp(0, 57);
+                let want = if iqt {
+                    crate::dra::table6_qp_c(qpi)
+                } else {
+                    crate::dra::table5_qp_c(qpi)
+                };
+                assert_eq!(
+                    m.of(cell(qp)),
+                    want.clamp(0, 51),
+                    "iqt {iqt} off {off} qp {qp}"
+                );
+            }
+        }
+        assert_eq!(luma_edge_qp(cell(33), 20), 33);
+        assert_eq!(
+            luma_edge_qp(CuSideInfo::default(), 20),
+            20,
+            "unstamped cell"
+        );
     }
 
     // =================================================================

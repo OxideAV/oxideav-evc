@@ -2184,6 +2184,7 @@ pub fn decode_baseline_idr_slice_tiled(
                     decode.slice_qp,
                     decode.slice_cb_qp_offset,
                     1,
+                    decode.sps_iqt_flag,
                 )?;
                 edges += crate::deblock::deblock_chroma(
                     &mut pic,
@@ -2191,6 +2192,7 @@ pub fn decode_baseline_idr_slice_tiled(
                     decode.slice_qp,
                     decode.slice_cr_qp_offset,
                     2,
+                    decode.sps_iqt_flag,
                 )?;
             }
             stats.deblock_edges = edges;
@@ -4304,6 +4306,7 @@ pub fn decode_baseline_inter_slice_tiled(
                     decode.slice_qp,
                     decode.slice_cb_qp_offset,
                     1,
+                    decode.sps_iqt_flag,
                 )?;
                 edges += crate::deblock::deblock_chroma(
                     &mut pic,
@@ -4311,6 +4314,7 @@ pub fn decode_baseline_inter_slice_tiled(
                     decode.slice_qp,
                     decode.slice_cr_qp_offset,
                     2,
+                    decode.sps_iqt_flag,
                 )?;
             }
             stats.deblock_edges = edges;

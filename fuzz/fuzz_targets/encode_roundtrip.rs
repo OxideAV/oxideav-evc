@@ -44,6 +44,9 @@ fuzz_target!(|data: &[u8]| {
     let adcc = cm_init && data[4] & 1 != 0;
     let alf = data[4] & 2 != 0;
     let sub_gop = if b_pictures { (data[4] >> 2) & 3 } else { 0 };
+    // Adaptive quantisation (cu_qp_delta): off, 1, 2 or 4 QP per
+    // doubling of the local variance.
+    let aq = ["0", "1", "2", "4"][usize::from((data[4] >> 4) & 3)];
     let (pf, bytes_per, max_val) = if ten_bit {
         (PixelFormat::Yuv420P10Le, 2usize, 1023u16)
     } else {
@@ -65,6 +68,7 @@ fuzz_target!(|data: &[u8]| {
     p.options.insert("adcc", if adcc { "1" } else { "0" });
     p.options.insert("alf", if alf { "1" } else { "0" });
     p.options.insert("sub_gop", sub_gop.to_string());
+    p.options.insert("aq", aq);
     let mut enc = oxideav_evc::encoder::make_evc_encoder(&p).expect("encoder");
     let mut dec = oxideav_evc::decoder::make_decoder(&CodecParameters::video(CodecId::new("evc")))
         .expect("decoder");

@@ -53,6 +53,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::alf_enc::AlfSliceParams;
+use crate::aq::{AqMap, QpChain};
 use crate::ats::{self, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
@@ -109,6 +110,11 @@ pub struct EncStats {
     pub split_flag_bins: u32,
     /// The `sps_btt_flag == 1` tree syntax (round 458).
     pub tree: TreeStats,
+    /// `cu_qp_delta_abs` symbols coded (round 483, adaptive
+    /// quantisation).
+    pub cu_qp_delta_syms: u32,
+    /// Of those, the non-zero deltas.
+    pub cu_qp_delta_nonzero: u32,
 }
 
 impl Default for EncStats {
@@ -123,6 +129,8 @@ impl Default for EncStats {
             cbf_chroma_set: 0,
             split_flag_bins: 0,
             tree: TreeStats::default(),
+            cu_qp_delta_syms: 0,
+            cu_qp_delta_nonzero: 0,
         }
     }
 }
@@ -141,6 +149,18 @@ struct LeafPlan {
     cbf_cb: bool,
     levels_cr: Vec<i32>,
     cbf_cr: bool,
+    /// The CU's quantisation QP (the adaptive-quantisation target;
+    /// the slice QP without AQ).
+    qp: i32,
+    /// The CU's eq. 1042 `QpY` — `qp` when it signals a delta, the
+    /// decode-order `QpY_PREV` when it carries no residual.
+    qp_y: i32,
+}
+
+impl LeafPlan {
+    fn cbf_any(&self) -> bool {
+        self.cbf_y || self.cbf_cb || self.cbf_cr
+    }
 }
 
 /// A decided `split_unit()` subtree.
@@ -171,6 +191,13 @@ struct EncCtx<'a> {
     /// `slice_cb_qp_offset == slice_cr_qp_offset` the slice header
     /// carries ([`crate::headers_enc::iqt_chroma_qp_offset`]).
     chroma_qp_offset: i32,
+    /// `slice_qp`.
+    slice_qp: i32,
+    /// The adaptive-quantisation map (`None`: every CU at the slice QP,
+    /// `cu_qp_delta_enabled_flag = 0`).
+    aq: Option<AqMap>,
+    /// The decode-order eq. 1042 `QpY_PREV` chain.
+    chain: QpChain,
 }
 
 /// The SPS tool set an IDR picture is coded under (round 458) — the
@@ -197,6 +224,11 @@ pub struct IntraToolset {
     /// ([`crate::alf_enc`]); the APS and slice fields come back in
     /// [`IntraEncOutput::alf`].
     pub alf: bool,
+    /// Adaptive-quantisation strength in QP per doubling of the local
+    /// variance, Q8 ([`crate::aq`]); `0` = off. Non-zero signals
+    /// `cu_qp_delta_enabled_flag = 1` (the PPS the caller writes must
+    /// say so) and a per-CU `cu_qp_delta`.
+    pub aq: u32,
 }
 
 /// Output of [`encode_idr_slice_data_out`].
@@ -219,6 +251,7 @@ struct IntraSnap {
     pixels: RegionSave,
     grid: SideInfoGrid,
     model: BitCostModel,
+    chain: QpChain,
 }
 
 impl TreeCoder for EncCtx<'_> {
@@ -242,6 +275,7 @@ impl TreeCoder for EncCtx<'_> {
             pixels: save_region(&self.recon, x0, y0, lw, lh),
             grid: self.side_info.clone(),
             model: model.clone(),
+            chain: self.chain,
         }
     }
     fn restore(
@@ -256,6 +290,7 @@ impl TreeCoder for EncCtx<'_> {
         restore_region(&mut self.recon, &snap.pixels, x0, y0, lw, lh);
         self.side_info = snap.grid.clone();
         *model = snap.model.clone();
+        self.chain = snap.chain;
     }
     fn decide_leaf(
         &mut self,
@@ -363,6 +398,7 @@ pub fn encode_idr_slice_data_tree(
             ats: false,
             adcc: false,
             alf: false,
+            aq: 0,
         },
     )
 }
@@ -397,6 +433,7 @@ pub fn encode_idr_slice_data_out(
         ats,
         adcc,
         alf,
+        aq,
     } = tools;
     if ats && !iqt {
         return Err(Error::invalid(
@@ -441,7 +478,11 @@ pub fn encode_idr_slice_data_out(
         iqt,
         ats,
         chroma_qp_offset: crate::headers_enc::iqt_chroma_qp_offset(slice_qp, iqt),
+        slice_qp,
+        aq: (aq > 0).then(|| AqMap::build(src, aq)),
+        chain: QpChain::new(slice_qp),
     };
+    let dqp = ctx.aq.is_some();
     let mut stats = EncStats::default();
     // The decide pass's rate model: the same context table the emit
     // pass starts from, advanced by every decided bin in decode order,
@@ -480,12 +521,12 @@ pub fn encode_idr_slice_data_out(
         let layout = crate::tiles::PicTileLayout::single_tile(ctx.pic_w, ctx.pic_h);
         side_info.tile_bounds = crate::tiles::TileBounds::for_loop_filters(&layout);
         for (x0, y0, node) in &roots {
-            stamp_decided(&mut side_info, slice_qp, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
+            stamp_decided(&mut side_info, *x0, *y0, CTB_LOG2, CTB_LOG2, node);
         }
         crate::deblock::deblock_luma(&mut ctx.recon, &side_info, slice_qp)?;
         let off = ctx.chroma_qp_offset;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 1)?;
-        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 2)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 1, ctx.iqt)?;
+        crate::deblock::deblock_chroma(&mut ctx.recon, &side_info, slice_qp, off, 2, ctx.iqt)?;
     }
     // §8.8.4 ALF (round 458): designed on the deblocked reconstruction
     // under the decoder's IDR edge availability (§6.4.4 with no motion
@@ -513,6 +554,7 @@ pub fn encode_idr_slice_data_out(
     // The emit-order grid: the §8.4.2 neighbour probes must see exactly
     // the CUs the decoder has already reconstructed at that point.
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
+    let mut emit_chain = QpChain::new(slice_qp);
     for (ctu_idx, (x0, y0, node)) in roots.iter().enumerate() {
         // §7.3.8.2 lines 2626-2627: the per-CTB luma alf_ctb_flag
         // (Table 40, ctxInc 0) ahead of the coding tree.
@@ -528,15 +570,22 @@ pub fn encode_idr_slice_data_out(
                            lw: u32,
                            lh: u32,
                            plan: &LeafPlan| {
+            let delta = emit_chain.delta(dqp, plan.qp, plan.cbf_any());
+            let qp_y = emit_chain.advance(dqp, plan.qp, plan.cbf_any());
+            debug_assert_eq!(qp_y, plan.qp_y, "decide and emit chains agree");
+            if let Some(d) = delta {
+                stats.cu_qp_delta_syms += 1;
+                stats.cu_qp_delta_nonzero += u32::from(d != 0);
+            }
             emit_leaf(
-                enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, ctx.ats, x0, y0, lw, lh,
+                enc, sel, plan, grid, ctx.pic_w, ctx.pic_h, ctx.ats, x0, y0, lw, lh, delta,
             );
             grid.stamp_block(
                 x0,
                 y0,
                 1u32 << lw,
                 1u32 << lh,
-                leaf_side_info(plan, ctx.qp, x0, y0, lw, lh),
+                leaf_side_info(plan, x0, y0, lw, lh),
             );
             stats.leaves += 1;
             stats.cbf_luma_set += u32::from(plan.cbf_y);
@@ -579,7 +628,6 @@ pub fn encode_idr_slice_data_out(
 /// the §8.8.2 boundary-strength derivation.
 fn stamp_decided(
     side_info: &mut SideInfoGrid,
-    slice_qp: i32,
     x0: u32,
     y0: u32,
     log2_w: u32,
@@ -592,21 +640,14 @@ fn stamp_decided(
             y,
             1u32 << lw,
             1u32 << lh,
-            leaf_side_info(plan, slice_qp, x, y, lw, lh),
+            leaf_side_info(plan, x, y, lw, lh),
         );
     });
 }
 
 /// The side info of one decided intra leaf — what the decoder's
 /// `decode_transform_unit` stamps for a MODE_INTRA CU.
-fn leaf_side_info(
-    plan: &LeafPlan,
-    qp: i32,
-    x0: u32,
-    y0: u32,
-    log2_w: u32,
-    log2_h: u32,
-) -> CuSideInfo {
+fn leaf_side_info(plan: &LeafPlan, x0: u32, y0: u32, log2_w: u32, log2_h: u32) -> CuSideInfo {
     CuSideInfo {
         pred_mode: CuPredMode::Intra,
         cbf_luma: u8::from(plan.cbf_y),
@@ -615,9 +656,42 @@ fn leaf_side_info(
         cu_log2_w: log2_w as u8,
         cu_log2_h: log2_h as u8,
         intra_luma_mode: plan.intra.stamp_value(),
-        qp_y: qp.clamp(0, 51) as u8,
+        qp_y: plan.qp_y.clamp(0, 51) as u8,
         ..Default::default()
     }
+}
+
+/// Decide one leaf at its adaptive-quantisation QP: [`decide_leaf_at`]
+/// with the CU's target QP and λ installed, the `cu_qp_delta` rate
+/// added to the cost when the leaf carries residual, and the eq. 1042
+/// chain advanced.
+fn decide_leaf(
+    ctx: &mut EncCtx<'_>,
+    model: &mut BitCostModel,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+) -> Result<(LeafPlan, f64)> {
+    let Some(target) = ctx
+        .aq
+        .as_ref()
+        .map(|a| a.cu_qp(ctx.slice_qp, x0, y0, log2_w, log2_h))
+    else {
+        return decide_leaf_at(ctx, model, x0, y0, log2_w, log2_h);
+    };
+    let saved = (ctx.qp, ctx.lambda);
+    ctx.qp = target;
+    ctx.lambda = rd_lambda(target, ctx.bit_depth);
+    let lambda = ctx.lambda;
+    let out = decide_leaf_at(ctx, model, x0, y0, log2_w, log2_h);
+    (ctx.qp, ctx.lambda) = saved;
+    let (plan, mut cost) = out?;
+    if let Some(d) = ctx.chain.delta(true, target, plan.cbf_any()) {
+        cost += lambda * model.measure(|m| crate::aq::emit_cu_qp_delta(m, ctx.sel, d));
+    }
+    ctx.chain.advance(true, target, plan.cbf_any());
+    Ok((plan, cost))
 }
 
 /// Decide one leaf: 5-mode luma search + §8.4.3 DM chroma, committing the
@@ -625,7 +699,7 @@ fn leaf_side_info(
 /// `intra_reconstruct_cb_in_tile`) and the winning bins (into `model`),
 /// returning the plan + RD cost. Every candidate's rate is the exact
 /// cost of its bin string at the current context state.
-fn decide_leaf(
+fn decide_leaf_at(
     ctx: &mut EncCtx<'_>,
     model: &mut BitCostModel,
     x0: u32,
@@ -815,6 +889,8 @@ fn decide_leaf(
                 cbf_cb,
                 levels_cr,
                 cbf_cr,
+                qp: ctx.qp,
+                qp_y: ctx.qp,
             },
             best_cost + best_c_cost,
         )
@@ -956,11 +1032,19 @@ fn decide_leaf(
                 cbf_cb,
                 levels_cr,
                 cbf_cr,
+                qp: ctx.qp,
+                qp_y: ctx.qp,
             },
             cost,
         )
     };
 
+    // The CU's eq. 1042 QpY and its delta (the wrapper advances the
+    // chain once the leaf is final).
+    let mut plan = plan;
+    let dqp = ctx.aq.is_some();
+    let delta = ctx.chain.delta(dqp, plan.qp, plan.cbf_any());
+    plan.qp_y = ctx.chain.qp_y(dqp, plan.qp, plan.cbf_any());
     // Advance the rate model over the decided leaf's exact bin string
     // (the §8.4.2 probes read the L/A/R neighbours, which this CU's own
     // stamp does not touch — so the pre-stamp grid is the emit grid),
@@ -978,6 +1062,7 @@ fn decide_leaf(
             y0,
             log2_w,
             log2_h,
+            delta,
         )
     });
     ctx.side_info.stamp_block(
@@ -985,7 +1070,7 @@ fn decide_leaf(
         y0,
         w as u32,
         h as u32,
-        leaf_side_info(&plan, ctx.qp, x0, y0, log2_w, log2_h),
+        leaf_side_info(&plan, x0, y0, log2_w, log2_h),
     );
     Ok((plan, cost))
 }
@@ -1361,6 +1446,7 @@ fn emit_leaf<S: BinSink>(
     y0: u32,
     log2_w: u32,
     log2_h: u32,
+    qp_delta: Option<i32>,
 ) {
     match plan.intra {
         IntraSel::Baseline(mode_idx) => emit_intra_pred_mode(enc, sel, mode_idx),
@@ -1381,9 +1467,14 @@ fn emit_leaf<S: BinSink>(
     enc.encode_decision(t, i, u8::from(plan.cbf_cr));
     let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
     enc.encode_decision(t, i, u8::from(plan.cbf_y));
+    // §7.3.8.5 lines 3073-3078: cu_qp_delta (any CBF, `sps_dquant_flag
+    // == 0`).
+    if let Some(d) = qp_delta {
+        crate::aq::emit_cu_qp_delta(enc, sel, d);
+    }
     if plan.cbf_y {
         // §7.3.8.5 lines 3080-3087: the ATS-intra group, after the
-        // (absent) cu_qp_delta block and before the residuals.
+        // cu_qp_delta block and before the residuals.
         if ats::ats_intra_flag_present(ats_enabled, log2_w, log2_h, true) {
             ats::write_ats_intra(
                 enc,
@@ -1682,6 +1773,66 @@ mod tests {
         }
     }
 
+    /// Round 483 — **adaptive quantisation**: the per-CU `cu_qp_delta`
+    /// (`sps_dquant_flag == 0` shape) round-trips recon-exactly through
+    /// the decoder's `cu_qp_delta_enabled_flag == 1` walker on both
+    /// trees and entropy shapes, with deblocking (the §8.8.2 per-CU qP)
+    /// on and off; the decoder reads exactly the deltas the encoder
+    /// coded, and the map drives non-zero ones.
+    #[test]
+    fn aq_cu_qp_delta_round_trip_recon_exact() {
+        for &(cm_init, btt) in &[(false, false), (true, false), (true, true)] {
+            for &deblock in &[false, true] {
+                for &(w, h) in &[(64u32, 64u32), (72, 40), (176, 144)] {
+                    for &qp in &[20i32, 36, 48] {
+                        let mut src = synth_picture(w, h, 0xA9 ^ (w * 31 + h * 7 + qp as u32));
+                        // Flatten the left half so the activity varies.
+                        for y in 0..h as usize {
+                            for x in 0..w as usize / 2 {
+                                src.y[y * w as usize + x] = 100 + (y as u16 & 3);
+                            }
+                        }
+                        let tools = IntraToolset {
+                            deblock,
+                            cm_init,
+                            eipd: cm_init,
+                            btt,
+                            iqt: false,
+                            ats: false,
+                            adcc: false,
+                            alf: false,
+                            aq: 512,
+                        };
+                        let (payload, enc_recon, stats) =
+                            encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
+                        let tag = format!("{w}x{h} qp{qp} cm{cm_init} btt{btt} db{deblock}");
+                        assert!(stats.cu_qp_delta_nonzero > 0, "{tag}: the map moves the QP");
+                        let mut walk = if btt {
+                            walk_inputs_btt(w, h, cm_init)
+                        } else {
+                            walk_inputs_cm(w, h, cm_init)
+                        };
+                        walk.sps_eipd_flag = cm_init;
+                        walk.cu_qp_delta_enabled = true;
+                        let inputs = SliceDecodeInputs {
+                            enable_deblock: deblock,
+                            ..decode_inputs(qp)
+                        };
+                        let (dec, dec_stats) = decode_baseline_idr_slice(&payload, walk, inputs)
+                            .unwrap_or_else(|e| panic!("{tag}: {e}"));
+                        assert_eq!(dec.y, enc_recon.y, "{tag}: luma");
+                        assert_eq!(dec.cb, enc_recon.cb, "{tag}: cb");
+                        assert_eq!(dec.cr, enc_recon.cr, "{tag}: cr");
+                        assert_eq!(
+                            dec_stats.cu_qp_delta_abs_bins, stats.cu_qp_delta_syms,
+                            "{tag}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Round 458 — **ADCC**: the §7.3.8.8 residual writer with its
     /// candidate-set RDOQ round-trips recon-exactly through the
     /// decoder's `sps_adcc_flag == 1` walker (both trees, with and
@@ -1703,6 +1854,7 @@ mod tests {
                             ats,
                             adcc: true,
                             alf: false,
+                            aq: 0,
                         };
                         let (payload, enc_recon, stats) =
                             encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");
@@ -1773,6 +1925,7 @@ mod tests {
                             ats: true,
                             adcc: false,
                             alf: false,
+                            aq: 0,
                         };
                         let (payload, enc_recon, stats) =
                             encode_idr_slice_data_cfg(&src, qp, tools).expect("encode");

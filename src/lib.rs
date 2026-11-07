@@ -98,6 +98,8 @@ pub mod amvr_syntax;
 #[doc(hidden)]
 pub mod aps;
 #[doc(hidden)]
+pub mod aq;
+#[doc(hidden)]
 pub mod ats;
 #[doc(hidden)]
 pub mod bin_cost;

@@ -59,6 +59,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::alf_enc::AlfSliceParams;
+use crate::aq::{AqMap, QpChain};
 use crate::ats::{self, AllowAtsInter, AtsInter, AtsIntra};
 use crate::bin_cost::BitCostModel;
 use crate::cabac::{BinSink, CabacEncoder, InitType};
@@ -178,6 +179,11 @@ pub struct InterEncInputs<'a> {
     /// `sps_alf_flag` — design and apply the adaptive loop filter on
     /// this picture (round 458); see [`InterEncOutput::alf`].
     pub alf: bool,
+    /// Adaptive-quantisation strength (Q8; 0 = off) — the per-CU
+    /// `cu_qp_delta` of [`crate::aq`], applied at half strength on a
+    /// predicted picture; non-zero needs the PPS's
+    /// `cu_qp_delta_enabled_flag`.
+    pub aq: u32,
 }
 
 /// Output of [`encode_inter_slice_data`].
@@ -250,6 +256,18 @@ enum PLeaf {
     },
 }
 
+impl PLeaf {
+    /// Whether the CU's TU carries any CBF (the `cu_qp_delta` gate).
+    fn cbf_any(&self) -> bool {
+        match self {
+            Self::Skip { .. } => false,
+            Self::Direct { res, .. } | Self::Inter { res, .. } | Self::Intra { res, .. } => {
+                res.any()
+            }
+        }
+    }
+}
+
 /// The best explicit-inter candidate of a leaf under evaluation.
 struct Explicit {
     leaf: PLeaf,
@@ -289,6 +307,12 @@ struct PCtx<'a> {
     ats: bool,
     /// The slice header's chroma QP offset (both planes).
     chroma_qp_offset: i32,
+    /// `slice_qp`.
+    slice_qp: i32,
+    /// The adaptive-quantisation map (`None`: `cu_qp_delta` off).
+    aq: Option<AqMap>,
+    /// The decode-order eq. 1042 `QpY_PREV` chain.
+    chain: QpChain,
 }
 
 /// The decode-order state a tree trial rewinds: the block's recon,
@@ -298,6 +322,7 @@ struct InterSnap {
     grid: SideInfoGrid,
     hmvp: HmvpCandList,
     model: BitCostModel,
+    chain: QpChain,
 }
 
 impl TreeCoder for PCtx<'_> {
@@ -322,6 +347,7 @@ impl TreeCoder for PCtx<'_> {
             grid: self.side_info.clone(),
             hmvp: self.hmvp.clone(),
             model: model.clone(),
+            chain: self.chain,
         }
     }
     fn restore(
@@ -337,6 +363,7 @@ impl TreeCoder for PCtx<'_> {
         self.side_info = snap.grid.clone();
         self.hmvp = snap.hmvp.clone();
         *model = snap.model.clone();
+        self.chain = snap.chain;
     }
     fn decide_leaf(
         &mut self,
@@ -357,6 +384,21 @@ impl<'a> PCtx<'a> {
 
     fn n_refs(&self, list: usize) -> u32 {
         self.refs[list].len() as u32
+    }
+
+    /// The `cu_qp_delta` a CU at the current QP would signal if its TU
+    /// carries a CBF (`None`: `cu_qp_delta` off).
+    fn pending_delta(&self) -> Option<i32> {
+        self.aq
+            .as_ref()
+            .map(|_| crate::aq::wrap_delta(self.qp, self.chain.prev))
+    }
+
+    /// The adaptive-quantisation target QP of a CU.
+    fn target_qp(&self, x0: u32, y0: u32, lw: u32, lh: u32) -> i32 {
+        self.aq
+            .as_ref()
+            .map_or(self.slice_qp, |a| a.cu_qp(self.slice_qp, x0, y0, lw, lh))
     }
 
     fn pocs(&self) -> InterPocs<'_> {
@@ -414,6 +456,7 @@ pub fn encode_p_slice_data(
             ats: false,
             adcc: false,
             alf: false,
+            aq: 0,
         },
     )?;
     Ok((out.payload, out.recon, out.stats))
@@ -515,7 +558,11 @@ pub fn encode_inter_slice_data(
         iqt: inputs.iqt,
         ats: inputs.ats,
         chroma_qp_offset: crate::headers_enc::iqt_chroma_qp_offset(slice_qp, inputs.iqt),
+        slice_qp,
+        aq: (inputs.aq > 0).then(|| AqMap::build(src, inputs.aq / 2)),
+        chain: QpChain::new(slice_qp),
     };
+    let dqp = ctx.aq.is_some();
     let mut stats = PEncStats::default();
     // The decide pass's rate model — the emit pass's context table,
     // advanced by every decided bin in decode order.
@@ -560,6 +607,7 @@ pub fn encode_inter_slice_data(
             slice_qp,
             ctx.chroma_qp_offset,
             1,
+            ctx.iqt,
         )?;
         crate::deblock::deblock_chroma(
             &mut ctx.recon,
@@ -567,6 +615,7 @@ pub fn encode_inter_slice_data(
             slice_qp,
             ctx.chroma_qp_offset,
             2,
+            ctx.iqt,
         )?;
     }
     // §8.8.4 ALF (round 458) on the deblocked reconstruction under the
@@ -598,6 +647,7 @@ pub fn encode_inter_slice_data(
         enc.init_main_profile(InitType::Pb, slice_qp);
     }
     let mut emit_grid = SideInfoGrid::new(ctx.pic_w, ctx.pic_h);
+    let mut emit_chain = QpChain::new(slice_qp);
     for (ctu_idx, (x0, y0, node)) in roots.iter().enumerate() {
         if let Some(flags) = &ctb_flags {
             let (t, i) = sel.ctx(MainCtxTable::AlfCtbFlag, 0);
@@ -611,7 +661,12 @@ pub fn encode_inter_slice_data(
                            lw: u32,
                            lh: u32,
                            plan: &PLeaf| {
-            emit_leaf(enc, &mut stats, &ctx, sel, grid, x0, y0, lw, lh, plan);
+            let target = ctx.target_qp(x0, y0, lw, lh);
+            let delta = dqp.then(|| crate::aq::wrap_delta(target, emit_chain.prev));
+            let qp_y = emit_chain.advance(dqp, target, plan.cbf_any());
+            emit_leaf(
+                enc, &mut stats, &ctx, sel, grid, x0, y0, lw, lh, plan, delta, qp_y,
+            );
         };
         tree_enc::emit_tree(
             &mut enc,
@@ -1010,7 +1065,9 @@ fn quantize_inter_residual(
         ats_inter: None,
     };
     let (log2_w, log2_h) = ((w as u32).trailing_zeros(), (h as u32).trailing_zeros());
-    let bits = model.measure(|m| emit_inter_residual(m, ctx.sel, ctx.ats, &res, log2_w, log2_h));
+    let dqp = ctx.pending_delta();
+    let bits =
+        model.measure(|m| emit_inter_residual(m, ctx.sel, ctx.ats, &res, log2_w, log2_h, dqp));
     let dist = if res.any() {
         dist_y + dist_cb + dist_cr
     } else {
@@ -1061,7 +1118,9 @@ fn refine_inter_sbt(
     let lambda_c = crate::slice_enc::rd_lambda_at_qp_prime(qp_c);
     let mut best = full;
     let full_dist = sbt_dist(src, pred, &best.1, max_val);
-    let full_bits = model.measure(|m| emit_inter_residual(m, sel, true, &best.0, log2_w, log2_h));
+    let dqp = ctx.pending_delta();
+    let full_bits =
+        model.measure(|m| emit_inter_residual(m, sel, true, &best.0, log2_w, log2_h, dqp));
     best.2 = full_dist;
     best.3 = full_bits;
     let mut best_cost = full_dist + ctx.lambda * full_bits;
@@ -1140,7 +1199,7 @@ fn refine_inter_sbt(
             cbf_cr,
             ats_inter: Some(choice),
         };
-        let bits = model.measure(|m| emit_inter_residual(m, sel, true, &res, log2_w, log2_h));
+        let bits = model.measure(|m| emit_inter_residual(m, sel, true, &res, log2_w, log2_h, dqp));
         // Distortion: the sub-block's coded error plus the pure
         // prediction error everywhere else.
         let outside = |src: &[i32],
@@ -1464,7 +1523,35 @@ fn refine_bi_l1(
     Ok(best)
 }
 
+/// Decide one leaf at its adaptive-quantisation QP: [`decide_leaf_at`]
+/// with the CU's target QP and λ installed (every candidate's rate then
+/// carries the `cu_qp_delta` it would signal), the side-info stamp
+/// corrected to the CU's eq. 1042 `QpY` (`QpY_PREV` without residual)
+/// and the chain advanced.
 fn decide_leaf(
+    ctx: &mut PCtx<'_>,
+    model: &mut BitCostModel,
+    x0: u32,
+    y0: u32,
+    log2_w: u32,
+    log2_h: u32,
+) -> Result<(PLeaf, f64)> {
+    if ctx.aq.is_none() {
+        return decide_leaf_at(ctx, model, x0, y0, log2_w, log2_h);
+    }
+    let target = ctx.target_qp(x0, y0, log2_w, log2_h);
+    let saved = (ctx.qp, ctx.lambda);
+    ctx.qp = target;
+    ctx.lambda = crate::slice_enc::rd_lambda(target, ctx.bit_depth);
+    let out = decide_leaf_at(ctx, model, x0, y0, log2_w, log2_h);
+    (ctx.qp, ctx.lambda) = saved;
+    let (leaf, cost) = out?;
+    let qp_y = ctx.chain.advance(true, target, leaf.cbf_any());
+    crate::aq::restamp_qp(&mut ctx.side_info, x0, y0, log2_w, log2_h, qp_y);
+    Ok((leaf, cost))
+}
+
+fn decide_leaf_at(
     ctx: &mut PCtx<'_>,
     model: &mut BitCostModel,
     x0: u32,
@@ -1493,7 +1580,19 @@ fn decide_leaf(
     // decode-order grid, exactly as the emit pass will).
     let leaf_bits = |model: &mut BitCostModel, ctx: &PCtx<'_>, leaf: &PLeaf| -> f64 {
         model.measure(|m| {
-            emit_leaf_bins(m, ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h, leaf);
+            let dqp = ctx.pending_delta();
+            emit_leaf_bins(
+                m,
+                ctx,
+                sel,
+                &ctx.side_info,
+                x0,
+                y0,
+                log2_w,
+                log2_h,
+                leaf,
+                dqp,
+            );
         })
     };
 
@@ -2145,7 +2244,21 @@ fn decide_leaf(
     // Advance the rate model over the decided leaf's exact bin string
     // (the §9.3.4.2.4 probes read the L/A/R neighbours, which this
     // CU's own stamp does not touch — the emit pass sees the same).
-    model.commit(|m| emit_leaf_bins(m, ctx, sel, &ctx.side_info, x0, y0, log2_w, log2_h, &leaf));
+    let dqp = ctx.pending_delta();
+    model.commit(|m| {
+        emit_leaf_bins(
+            m,
+            ctx,
+            sel,
+            &ctx.side_info,
+            x0,
+            y0,
+            log2_w,
+            log2_h,
+            &leaf,
+            dqp,
+        )
+    });
     Ok((leaf, cost))
 }
 
@@ -2292,6 +2405,7 @@ fn emit_inter_residual<S: BinSink>(
     res: &Residual,
     log2_w: u32,
     log2_h: u32,
+    qp_delta: Option<i32>,
 ) {
     let any = res.any();
     let (t, i) = sel.ctx(MainCtxTable::CbfAll, 0);
@@ -2306,6 +2420,11 @@ fn emit_inter_residual<S: BinSink>(
             enc.encode_decision(t, i, u8::from(res.cbf_y));
         } else {
             debug_assert!(res.cbf_y, "quiet chroma infers cbf_luma = 1 (§7.4.9.5)");
+        }
+        // §7.3.8.5 lines 3073-3078: cu_qp_delta (some CBF,
+        // `sps_dquant_flag == 0`).
+        if let Some(d) = qp_delta {
+            crate::aq::emit_cu_qp_delta(enc, sel, d);
         }
         // §7.3.8.5 lines 3088-3100: the ATS-inter group on a MODE_INTER
         // CU with some cbf and an allowed sub-block orientation.
@@ -2390,6 +2509,7 @@ fn emit_leaf_bins<S: BinSink>(
     log2_w: u32,
     log2_h: u32,
     plan: &PLeaf,
+    qp_delta: Option<i32>,
 ) {
     let is_b = ctx.slice_is_b;
     match plan {
@@ -2409,7 +2529,7 @@ fn emit_leaf_bins<S: BinSink>(
             enc.encode_decision(t, i, 0); // pred_mode_flag = 0 (MODE_INTER)
             let (t, i) = sel.ctx(MainCtxTable::DirectModeFlag, 0);
             enc.encode_decision(t, i, 1); // direct_mode_flag = 1
-            emit_inter_residual(enc, sel, ctx.ats, res, log2_w, log2_h);
+            emit_inter_residual(enc, sel, ctx.ats, res, log2_w, log2_h, qp_delta);
         }
         PLeaf::Inter { l0, l1, res } => {
             let (t, i) = skip_flag_ctx(ctx, sel, grid, x0, y0, log2_w, log2_h);
@@ -2432,7 +2552,7 @@ fn emit_leaf_bins<S: BinSink>(
             if let Some(lp) = l1 {
                 emit_list_pred(enc, sel, lp, ctx.n_refs(1));
             }
-            emit_inter_residual(enc, sel, ctx.ats, res, log2_w, log2_h);
+            emit_inter_residual(enc, sel, ctx.ats, res, log2_w, log2_h, qp_delta);
         }
         PLeaf::Intra { intra, ats, res } => {
             emit_intra_head(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, *intra);
@@ -2448,6 +2568,11 @@ fn emit_leaf_bins<S: BinSink>(
             enc.encode_decision(t, i, u8::from(res.cbf_cr));
             let (t, i) = sel.ctx(MainCtxTable::CbfLuma, 0);
             enc.encode_decision(t, i, u8::from(res.cbf_y));
+            if res.any()
+                && let Some(d) = qp_delta
+            {
+                crate::aq::emit_cu_qp_delta(enc, sel, d);
+            }
             if res.cbf_y {
                 if ats::ats_intra_flag_present(ctx.ats, log2_w, log2_h, true) {
                     ats::write_ats_intra(enc, EipdCtx::for_slice(sel.cm_init, sel.init_type), *ats);
@@ -2480,17 +2605,19 @@ fn emit_leaf<S: BinSink>(
     log2_w: u32,
     log2_h: u32,
     plan: &PLeaf,
+    qp_delta: Option<i32>,
+    qp_y: i32,
 ) {
     let (w, h) = (1u32 << log2_w, 1u32 << log2_h);
     let is_b = ctx.slice_is_b;
-    emit_leaf_bins(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, plan);
+    emit_leaf_bins(enc, ctx, sel, grid, x0, y0, log2_w, log2_h, plan, qp_delta);
     let stamp_inter = |grid: &mut SideInfoGrid, l0: ListMotion, l1: ListMotion, cbf_y: bool| {
         grid.stamp_block(
             x0,
             y0,
             w,
             h,
-            inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, ctx.qp),
+            inter_side_info(x0, y0, log2_w, log2_h, l0, l1, cbf_y, qp_y),
         );
     };
     stats.leaves += 1;
@@ -2544,7 +2671,7 @@ fn emit_leaf<S: BinSink>(
                     cu_log2_w: log2_w as u8,
                     cu_log2_h: log2_h as u8,
                     intra_luma_mode: intra.stamp_value(),
-                    qp_y: ctx.qp.clamp(0, 51) as u8,
+                    qp_y: qp_y.clamp(0, 51) as u8,
                     ..Default::default()
                 },
             );
@@ -3014,6 +3141,7 @@ mod tests {
                 ats: false,
                 adcc: false,
                 alf: false,
+                aq: 0,
             },
         );
         assert!(bad.is_err());
@@ -3035,6 +3163,7 @@ mod tests {
                 ats: false,
                 adcc: false,
                 alf: false,
+                aq: 0,
             },
         );
         assert!(bad_b.is_err());
@@ -3076,6 +3205,7 @@ mod tests {
                     ats: false,
                     adcc: false,
                     alf: false,
+                    aq: 0,
                 },
             )
             .unwrap();
@@ -3173,6 +3303,7 @@ mod tests {
                             ats: false,
                             adcc: false,
                             alf: false,
+                            aq: 0,
                         },
                     )
                     .unwrap();
@@ -3218,6 +3349,7 @@ mod tests {
                                 ats: false,
                                 adcc: false,
                                 alf: false,
+                                aq: 0,
                             },
                         )
                         .unwrap();
@@ -3299,6 +3431,7 @@ mod tests {
                 ats: false,
                 adcc: false,
                 alf: false,
+                aq: 0,
             },
         )
         .unwrap();
@@ -3333,6 +3466,7 @@ mod tests {
                 ats: false,
                 adcc: false,
                 alf: false,
+                aq: 0,
             },
         )
         .unwrap();
@@ -3400,6 +3534,7 @@ mod tests {
                     ats: false,
                     adcc: false,
                     alf: false,
+                    aq: 0,
                 },
             )
             .unwrap()
