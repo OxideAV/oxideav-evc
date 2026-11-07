@@ -252,7 +252,10 @@ fn main() {
                 packets.push(pkt);
             }
             if let Some(prefix) = &out {
-                let all: Vec<u8> = packets.iter().flat_map(|p| p.data.iter().copied()).collect();
+                let all: Vec<u8> = packets
+                    .iter()
+                    .flat_map(|p| p.data.iter().copied())
+                    .collect();
                 std::fs::write(format!("{prefix}-{w}x{h}-q{qp}.evc"), all).expect("write stream");
             }
             for pkt in &packets {
@@ -261,7 +264,13 @@ fn main() {
             }
             dec.flush().expect("decoder flush");
             let mut decoded = 0usize;
-            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            loop {
+                let vf = match dec.receive_frame() {
+                    Ok(Frame::Video(vf)) => vf,
+                    // A mid-stream shape announcement carries no picture.
+                    Ok(f) if f.is_stream_params() => continue,
+                    _ => break,
+                };
                 decoded += 1;
                 let t = (vf.pts.expect("pts") / 3000) as usize;
                 let src = &sources[t];
