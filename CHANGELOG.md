@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-evc/compare/v0.0.4...v0.0.5) - 2026-11-07
+
+### Other
+
+- rd_curve skips Frame::StreamParams events in its decode loop (and the out= writer's rustfmt layout)
+- rd_curve out=<prefix> writes the measured streams; README records the black-box ffprobe parse result
+- ADCC group-trellis RDOQ under exact adaptive rates; ADCC stays default off (measured)
+- CU QP delta + adaptive quantisation (aq option, default off); deblocking qP from the q-side CU
+- decoder output_params + Frame::StreamParams on a mid-stream SPS shape change; encoder refuses the event
+- edition 2024, MSRV 1.95
+- hierarchical B sub-GOPs — DocOffset coding order, temporal layers, past/future lists; decoder output ordered per coded sequence; debug-build test fix
+- ALF encoder — per-class Wiener design, class merging, CTB election, alf_data()/APS writer; decoder honours slice_alf_enabled_flag
+- ADCC encoder — §7.3.8.8 residual writer + candidate-set RDOQ, default off (measured loss on the corpus)
+- IQT + ATS encoder — typed forward quantizer, ATS-intra kernel search, ATS-inter sub-block transforms, chroma QP balance
+- BTT encoder — binary/ternary coding tree, RD-exact lookahead search, both slice encoders
+- EIPD intra — 33-mode search, MPM/PIMS/rem-mode + intra_chroma_pred_mode duals, default on
+- fuzz harness — RDOQ trellis + whole-encoder round trip; two trellis findings fixed
+- two-pass rate control — first-pass stats, slope-refined re-planning under a buffer model
+- RDOQ — rate-distortion optimised quantization over the §7.3.8.7 RLE syntax
+- RD λ calibrated to the realised §8.7 quantizer step
+- exact entropy-coder bit costs in the encoder's decide pass
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
