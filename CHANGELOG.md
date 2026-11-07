@@ -8,6 +8,45 @@
 
 ### Other
 
+- **Encoder: ADCC group-trellis RDOQ with exact adaptive rates (round
+  483); ADCC stays default off (measured).** `rdoq_adcc` is now a
+  trellis over the §7.3.8.8 structure: per 16-coefficient group in
+  coding order, every coefficient (reverse scan) tries `{ 0, ⌊|c|⌋,
+  ⌈|c|⌉ }` (the last position keeps a level; zeroing is not tried
+  above 2) against `Σ w · ( c − l )² + λ · R_group` in up to two
+  sweeps, `R_group` the exact cost of the group's whole bin string —
+  significance map with its neighbour stencils over the decoder's
+  progressive `TransCoeffLevel` view of the decided groups, the
+  first-eight greaterA budget, the single greaterB, the group's escape
+  state and Rice parameters, signs — at the context states the model,
+  the last-position bins and every decided group leave, **including
+  the adaptation inside the string** (a new adapting probe over the
+  model: a 384-entry slot map for Tables 87-90 plus an undo log, so a
+  trial copies nothing). The decided group is committed into the probe;
+  the block then re-measures with its last one to six non-zero
+  coefficients trimmed. The round-458 candidate set
+  (`rdoq_adcc_candidates`, now costed with the same adaptive probe) is
+  the start vector and competes at the end, so the result is never
+  worse under the objective. The writer is split into the
+  last-position / per-group pieces the trellis drives (bin-identical).
+  Measured, ADCC against the run-length syntax (QP 32-50, Y / YUV /
+  SSIM BD-rate): noise corpus intra **+0.45 %** / +0.37 % / +0.21 %
+  (candidate set: +0.75 %), P **+1.72 %** / +1.00 % / +1.78 %
+  (candidate set: +2.84 %; trellis vs candidate set −1.10 % Y); mixed
+  corpus intra +0.67 % / +0.10 % / −0.63 %, P +0.89 % / +0.38 % /
+  −0.54 %. Still a loss, so `adcc` stays off for Main; the encode is
+  ~2× the candidate set's (≈5× the run-length path). Restricting the
+  candidates to `{ 0, ⌊|c|⌋, round( |c| ) }` was faster but worse
+  (+0.61 % / +0.86 % intra) — the run-length start vector rounds
+  low and the ceiling recovers it. Docs question surfaced: Tables 89 /
+  90 hold 47 / 18 contexts per initType while the §9.3.4.2.7 / .8
+  derivations reach only 0..12 and give chroma no offset of its own
+  (luma and chroma share the low contexts), unlike §9.3.4.2.6's
+  explicit chroma `ctxOffset = 18` — ADCC's efficiency here is bounded
+  by that reading. Pins: the trellis never scores worse than rounding
+  or the candidate set and re-measures exactly; the ADCC round-trip
+  matrices and registry GOPs unchanged in shape and still exact.
+
 - **Encoder: CU-level QP delta + adaptive quantisation (round 483),
   registry option `aq`, default off.** New `aq` module. The PPS
   declares `cu_qp_delta_enabled_flag = 1` (`log2_cu_qp_delta_area_minus6

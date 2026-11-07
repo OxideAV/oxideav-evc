@@ -643,11 +643,16 @@ core:
   −0.8 % Y / −6.3 % YUV; vs low-delay P −5.0 % / −10.7 %.
 * **ADCC** (`sps_adcc_flag = 1`, round 458, `adcc=1`, default off) —
   the §7.3.8.8 residual writer (exact dual of the reader, stencils
-  over the decoder's progressive coefficient view) with a
-  candidate-set RDOQ. A measured loss on the noise-heavy corpus
-  (intra +1.0 %, P +2.9 % Y BD-rate): the run-length syntax's
-  context-adaptive unary levels beat ADCC's fixed-length escapes on
-  dense large-magnitude residuals.
+  over the decoder's progressive coefficient view) with a group
+  trellis RDOQ (round 483: per 16-coefficient group in coding order,
+  `{0, ⌊|c|⌋, ⌈|c|⌉}` per coefficient under the exact adaptive cost of
+  the group's bin string, last-position trims, never worse than the
+  round-458 candidate set). The trellis cut the loss against the
+  run-length syntax from +0.8 % to **+0.5 %** (intra) and +2.8 % to
+  **+1.7 %** (P) Y BD-rate on the noise corpus (+0.7 % / +0.9 % on the
+  mixed corpus) at ~2× the ADCC encode time — still a loss, so still
+  off: the run-length syntax's context-adaptive unary levels beat
+  ADCC's bypass escapes on these dense residuals.
 * **CU QP delta + adaptive quantisation** (`aq`, round 483, `aq=<s>`,
   default off) — `cu_qp_delta_enabled_flag = 1`, the §7.3.8.5 delta in
   every CBF-carrying TU against the decode-order eq. 1042 chain, a
@@ -687,11 +692,14 @@ Cross-implementation decode remains open until a validator lands.
 
 Encoder follow-ups: the `sps_dquant_flag = 1` quantisation-group
 signalling (the per-TU delta already costs only 0.1 %), a
-`dts` model for the reordered packets, an ADCC trellis, the 7-tap ALF luma type and
+`dts` model for the reordered packets, the 7-tap ALF luma type and
 temporal APS reuse, the inferred-orientation ATS-inter shapes once
 the §7.3.8.5/§7.4.9.5 orientation reading is settled; decoder audit:
 `deblock=1` costs +73 % BD-rate on the corpus (§8.8.2 bS /
-thresholds).
+thresholds); the ADCC context ranges (Tables 89 / 90 hold 47 / 18
+contexts per initType where the §9.3.4.2.7 / .8 derivations reach 13
+and share the low ones between luma and chroma — an open docs
+question).
 
 ## Usage
 

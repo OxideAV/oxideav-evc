@@ -67,12 +67,17 @@
 //!   the slice when they pay for themselves.
 //! * `adcc` — **advanced residual coding** (round 458), default
 //!   **off**: `sps_adcc_flag = 1`, the §7.3.8.8 last-position /
-//!   significance / greater-flag / escape syntax with its candidate-set
-//!   RDOQ instead of the §7.3.8.7 run-length coding. Requires
-//!   `cm_init`; `adcc=1 cm_init=0` is refused. Off by default because
-//!   on the crate's noise-heavy corpus it costs more bits than the
-//!   run-length syntax at the same reconstruction (see the CHANGELOG
-//!   round-458 entry).
+//!   significance / greater-flag / escape syntax with its group-trellis
+//!   RDOQ (round 483) instead of the §7.3.8.7 run-length coding.
+//!   Requires `cm_init`; `adcc=1 cm_init=0` is refused. Off by default
+//!   because on the crate's corpora it still costs more bits than the
+//!   run-length syntax at the same quality (+0.5 … +1.7 % Y BD-rate,
+//!   see the CHANGELOG round-458 / round-483 entries).
+//! * `aq` — **adaptive quantisation** (round 483), default **off**:
+//!   the strength `s` (0..=4, QP per doubling of the local variance)
+//!   of the per-CU QP map of [`crate::aq`], signalled through
+//!   `cu_qp_delta` (`cu_qp_delta_enabled_flag = 1`). Trades PSNR for
+//!   SSIM (at `aq=1`: −0.8 … −2.4 % SSIM BD-rate, +2.9 … +4.9 % PSNR).
 //! * `ats` — **adaptive transform selection** (round 458), default
 //!   **on**: `sps_ats_flag = 1` — every intra luma TB up to 32×32 also
 //!   trials the four DST-VII / DCT-VIII kernel pairs, every inter
